@@ -46,7 +46,7 @@ use crate::{
     gateway::{GatewayService, ToolError},
     mcp::{
         JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, ROOT_INSTRUCTIONS, accepts_event_stream,
-        accepts_json, accepts_post_stream, catalog_capabilities, rpc_error,
+        accepts_json, accepts_post_stream, catalog_event_capabilities, rpc_error,
     },
     modern_validation::reject_invalid_request,
     subscriptions::AcceptedSubscription,
@@ -361,18 +361,7 @@ impl GatewayHandler {
 
 impl ServerHandler for GatewayHandler {
     fn get_info(&self) -> ServerConfig {
-        let mut capabilities = catalog_capabilities();
-        if let Some(tools) = &mut capabilities.tools {
-            tools.list_changed = Some(true);
-        }
-        if let Some(prompts) = &mut capabilities.prompts {
-            prompts.list_changed = Some(true);
-        }
-        if let Some(resources) = &mut capabilities.resources {
-            resources.list_changed = Some(true);
-            resources.subscribe = Some(true);
-        }
-        ServerConfig::new(capabilities)
+        ServerConfig::new(catalog_event_capabilities())
             .with_server_info(implementation())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
     }

@@ -59,6 +59,7 @@ pub enum RoleContext<'a> {
 struct McpAccess {
     auth: Arc<Authorizer>,
     require_auth: bool,
+    legacy_transport: bool,
 }
 
 impl Authorizer {
@@ -79,6 +80,22 @@ impl Authorizer {
             McpAccess {
                 auth: self.clone(),
                 require_auth,
+                legacy_transport: false,
+            },
+            authorize_mcp,
+        ))
+    }
+
+    pub(crate) fn protect_legacy_transport(
+        self: &Arc<Self>,
+        router: Router,
+        require_auth: bool,
+    ) -> Router {
+        router.route_layer(middleware::from_fn_with_state(
+            McpAccess {
+                auth: self.clone(),
+                require_auth,
+                legacy_transport: true,
             },
             authorize_mcp,
         ))
@@ -287,7 +304,7 @@ enum AuthError {
     ApiRequired,
     Invalid,
     Forbidden,
-    ServerMissing,
+    ServerMissing(Option<String>),
     TeamRevoked,
     Storage(sqlx::Error),
 }
@@ -311,7 +328,14 @@ impl IntoResponse for AuthError {
                 "Invalid authentication credentials",
             ),
             Self::Forbidden => (StatusCode::FORBIDDEN, "Access denied"),
-            Self::ServerMissing => (StatusCode::NOT_FOUND, "Server not found"),
+            Self::ServerMissing(None) => (StatusCode::NOT_FOUND, "Server not found"),
+            Self::ServerMissing(Some(id)) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"detail": format!("Server not found: {id}")})),
+                )
+                    .into_response();
+            }
             Self::TeamRevoked => (
                 StatusCode::FORBIDDEN,
                 "Token invalid: User is no longer a member of the associated team",
@@ -336,6 +360,10 @@ impl IntoResponse for AuthError {
 }
 
 impl Principal {
+    pub(crate) fn is_global_admin(&self) -> bool {
+        self.is_admin && self.visibility == TeamVisibility::Admin
+    }
+
     pub(crate) fn token_allows(&self, permission: &str) -> bool {
         auth::token_scope_grants(Some(&self.scopes), permission)
     }
@@ -393,7 +421,14 @@ async fn authorize_mcp(
 ) -> Result<Response, AuthError> {
     let server_id = path.as_ref().and_then(|path| path.server_id.as_deref());
     let principal = match bearer(request.headers())? {
-        None if access.require_auth => return Err(AuthError::Required),
+        None if access.require_auth => {
+            return Err(if access.legacy_transport {
+                AuthError::ApiRequired
+            } else {
+                AuthError::Required
+            });
+        }
+        None if access.legacy_transport => return Err(AuthError::Forbidden),
         None => None,
         Some(token) => Some(
             access
@@ -410,7 +445,9 @@ async fn authorize_mcp(
                 .database
                 .catalog_server(id)
                 .await?
-                .ok_or(AuthError::ServerMissing)?;
+                .ok_or_else(|| {
+                    AuthError::ServerMissing(access.legacy_transport.then(|| id.to_owned()))
+                })?;
             if server.oauth_enabled && principal.is_none() {
                 return Err(AuthError::Required);
             }

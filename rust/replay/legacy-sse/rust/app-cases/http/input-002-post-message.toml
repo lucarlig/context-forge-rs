@@ -1,0 +1,14 @@
+[request]
+method = "POST"
+path = "/message"
+body = "{}"
+
+[request.headers]
+Content-Type = "application/json"
+
+[response]
+status = 401
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin"

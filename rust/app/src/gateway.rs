@@ -32,7 +32,7 @@ use crate::{
         RegistrationError, ToolDefinition, slugify,
     },
     database::Database,
-    mcp::{HttpOptions, ProtocolMode, SessionSettings},
+    mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings},
     sessions::Session,
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
     upstream::{ToolContext, UpstreamClient, UpstreamError},
@@ -170,6 +170,14 @@ impl GatewayService {
 
     pub fn mcp_router(self: &Arc<Self>, require_auth: bool, mode: ProtocolMode) -> Router {
         self.mcp_router_with_options(require_auth, mode, HttpOptions::default())
+    }
+
+    pub fn legacy_sse_router(
+        self: &Arc<Self>,
+        require_auth: bool,
+        settings: SseSettings,
+    ) -> Router {
+        crate::legacy_sse::router(self.clone(), require_auth, settings)
     }
 
     pub fn mcp_router_with_sessions(

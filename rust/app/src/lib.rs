@@ -10,6 +10,7 @@ mod events;
 pub mod gateway;
 mod identity;
 pub mod jwt;
+mod legacy_sse;
 pub mod mcp;
 mod modern;
 mod modern_validation;

@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let redis = settings.redis.as_ref().map(RedisProbe::new).transpose()?;
     let verifier = Settings::jwt_verifier()?;
     let require_mcp_auth = Settings::mcp_requires_auth()?;
+    let require_api_auth = Settings::api_requires_auth()?;
     if verifier.is_some() || !require_mcp_auth {
         database.migrate_identity().await?;
         database.migrate_catalog().await?;
@@ -58,8 +59,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Settings::mcp_inbound_protocol_mode()?,
         http_options,
     );
+    let legacy_sse =
+        service.legacy_sse_router(require_api_auth, Settings::sse_settings(shutdown.clone())?);
     let app = probes::router(database, redis)
-        .merge(Settings::mcp_ingress_policy()?.apply(mcp))
+        .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse)))
         .merge(service.registration_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     tracing::info!(address = %listener.local_addr()?, "gateway listening");

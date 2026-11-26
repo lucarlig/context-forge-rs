@@ -20,4 +20,4 @@ The stateful MCP milestone is verified. The Rust gateway handles legacy session 
 
 The MCP catalog milestone is verified. Registration discovers resources, URI templates, and prompts. Legacy and modern MCP can list them, read local and federated resources, render prompts with stored JSON Schema validation, and complete prompt arguments and resource URIs. Legacy MCP can change the running log level. Modern subscriptions stream catalog registration changes and relay updates from visible upstream resources. The [catalog recordings](replay/mcp-catalog/README.md) document the database fixtures and verification on SQLite and PostgreSQL.
 
-The next milestone covers legacy SSE, WebSocket, and stdio transports and translation.
+The transport milestone is in progress. The Rust gateway accepts authenticated legacy SSE connections at the root and virtual-server endpoints and routes POST messages to the owning stream. See the [legacy SSE recordings](replay/legacy-sse/README.md). Legacy SSE upstreams, multi-worker SSE routing, WebSocket, and stdio translation remain open.

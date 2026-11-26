@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+pub use crate::legacy_sse::SseSettings;
 pub use crate::redis_sessions::RedisSessionDirectory;
 pub use crate::subscriptions::ListenSettings;
 
@@ -1514,6 +1515,82 @@ pub(crate) fn catalog_capabilities() -> ServerCapabilities {
     resources.list_changed = Some(false);
     resources.subscribe = Some(false);
     capabilities.resources = Some(resources);
+    capabilities
+}
+
+pub(crate) fn catalog_event_capabilities() -> ServerCapabilities {
+    let mut capabilities = catalog_capabilities();
+    if let Some(tools) = &mut capabilities.tools {
+        tools.list_changed = Some(true);
+    }
+    if let Some(prompts) = &mut capabilities.prompts {
+        prompts.list_changed = Some(true);
+    }
+    if let Some(resources) = &mut capabilities.resources {
+        resources.list_changed = Some(true);
+        resources.subscribe = Some(true);
+    }
+    capabilities
+}
+
+pub(crate) async fn legacy_transport_reply(
+    service: &Arc<GatewayService>,
+    principal: Option<&Principal>,
+    server: Option<&CatalogServer>,
+    mut request: Value,
+) -> Option<Value> {
+    let method = request["method"].as_str()?;
+    let id = request.get("id")?.clone();
+    if !(id.is_i64() || id.is_u64() || id.is_string()) {
+        return None;
+    }
+    if method == "initialize" {
+        let params = &request["params"];
+        let protocol_version = params["protocol_version"]
+            .as_str()
+            .or_else(|| params["protocolVersion"].as_str());
+        let result = protocol_version.filter(|version| !version.is_empty()).map(|version| {
+            let capabilities = legacy_transport_capabilities(version);
+            json!({
+                "protocolVersion":version,
+                "capabilities":capabilities,
+                "serverInfo":Implementation::new("ContextForge",env!("CARGO_PKG_VERSION")),
+                "instructions":server.and_then(|server| server.instructions.as_deref()).unwrap_or(ROOT_INSTRUCTIONS),
+            })
+        });
+        return Some(json!({"jsonrpc":"2.0","id":id,"result":result.unwrap_or_else(|| json!({}))}));
+    }
+    request["jsonrpc"] = json!("2.0");
+    let state = McpState {
+        service: service.clone(),
+        sessions: None,
+        modern: None,
+        json_response: true,
+    };
+    let reply = dispatch(
+        &state,
+        principal.cloned(),
+        server.cloned(),
+        None,
+        request,
+        false,
+    )
+    .await;
+    let result = match to_bytes(reply.into_body(), MAX_REQUEST_BODY_BYTES * 2).await {
+        Ok(body) => serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|mut body| body.as_object_mut()?.remove("result")),
+        Err(_) => None,
+    };
+    Some(json!({"jsonrpc":"2.0","id":id,"result":result.unwrap_or_else(|| json!({}))}))
+}
+
+#[allow(deprecated)]
+fn legacy_transport_capabilities(version: &str) -> ServerCapabilities {
+    let mut capabilities = catalog_event_capabilities();
+    if version != MODERN_VERSION {
+        capabilities.logging = Some(Default::default());
+    }
     capabilities
 }
 

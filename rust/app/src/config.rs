@@ -9,7 +9,7 @@ use crate::{
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
-        SessionSettings,
+        SessionSettings, SseSettings,
     },
     redis_sessions::{DEFAULT_AFFINITY_TTL, DEFAULT_LISTENER_TTL},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
@@ -119,8 +119,27 @@ impl Settings {
     pub fn mcp_requires_auth() -> Result<bool, Box<dyn Error + Send + Sync>> {
         match flag("MCP_REQUIRE_AUTH")? {
             Some(required) => Ok(required),
-            None => Ok(flag("AUTH_REQUIRED")?.unwrap_or(true)),
+            None => Self::api_requires_auth(),
         }
+    }
+
+    pub fn api_requires_auth() -> Result<bool, Box<dyn Error + Send + Sync>> {
+        Ok(flag("AUTH_REQUIRED")?.unwrap_or(true))
+    }
+
+    pub fn sse_settings(
+        shutdown: CancellationToken,
+    ) -> Result<SseSettings, Box<dyn Error + Send + Sync>> {
+        let keepalive = if flag("SSE_KEEPALIVE_ENABLED")?.unwrap_or(true) {
+            Some(positive_seconds("SSE_KEEPALIVE_INTERVAL", 30.0)?)
+        } else {
+            None
+        };
+        Ok(SseSettings {
+            retry_ms: parse("SSE_RETRY_TIMEOUT", 5000)?,
+            keepalive,
+            shutdown,
+        })
     }
 
     pub fn mcp_ingress_policy() -> Result<IngressPolicy, Box<dyn Error + Send + Sync>> {

@@ -15,7 +15,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Modern MCP negotiation, discovery, and standard routing headers
 - [x] Stateful sessions, streaming, cancellation, and event resumption
 - [x] Resources, prompts, completions, logging, and subscriptions
-- [ ] Legacy SSE, WebSocket, and stdio transports and translation
+- [ ] Legacy SSE, WebSocket, and stdio transports and translation (in progress)
 - [ ] Authenticated MCP upstreams, identity forwarding, and direct proxy mode
 - [ ] Gateway update, delete, refresh, health lifecycle, and full catalog APIs
 - [ ] Virtual-server management and OAuth resource metadata

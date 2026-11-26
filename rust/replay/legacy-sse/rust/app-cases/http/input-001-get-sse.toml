@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/sse"
+
+[request.headers]
+Accept = "text/event-stream"
+
+[response]
+status = 401
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin"

@@ -23,7 +23,7 @@ use context_forge_rs::{
     database::Database,
     gateway::{CatalogRefresh, GatewayService, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::{HttpOptions, ListenSettings, ProtocolMode, SessionSettings},
+    mcp::{HttpOptions, ListenSettings, ProtocolMode, SessionSettings, SseSettings},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 use futures_util::{StreamExt, stream};
@@ -38,6 +38,114 @@ const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
+
+#[tokio::test]
+async fn legacy_sse_routes_messages_to_the_bound_virtual_server_and_owner() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    sqlx::query("INSERT INTO servers (id, name, visibility) VALUES ('v', 'Virtual', 'public')")
+        .execute(pool)
+        .await
+        .unwrap();
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(EgressPolicy::default(), Duration::from_secs(5)),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.legacy_sse_router(
+        true,
+        SseSettings {
+            keepalive: None,
+            ..SseSettings::default()
+        },
+    ))
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let owner = token("member", json!(["alpha"]), json!({}));
+    let outsider = token("outsider", json!(["beta"]), json!({}));
+    let url = gateway.url("/servers/v/sse");
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut stream = client.get(url).bearer_auth(&owner).send().await.unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert_eq!(stream.headers()[header::CONTENT_TYPE], "text/event-stream");
+    let mut endpoint_frame = Vec::new();
+    while !endpoint_frame.ends_with(b"\r\n\r\n") {
+        endpoint_frame.extend_from_slice(&stream.chunk().await.unwrap().expect("endpoint frame"));
+    }
+    let endpoint = std::str::from_utf8(&endpoint_frame)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap()
+        .to_owned();
+    assert!(endpoint.starts_with(&gateway.url("/servers/v/message?session_id=")));
+    assert!(
+        std::str::from_utf8(&endpoint_frame)
+            .unwrap()
+            .contains("retry: 5000")
+    );
+
+    let ping = json!({"jsonrpc":"2.0","id":"ping","method":"ping"});
+    let (status, denied) = send(&client, endpoint.clone(), ping.clone(), Some(&outsider)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied["detail"], "Session access denied");
+    let wrong_path = endpoint.replace("/servers/v/message", "/message");
+    let (status, _) = send(&client, wrong_path, ping.clone(), Some(&owner)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, reply) = send(&client, endpoint.clone(), json!({
+        "jsonrpc":"2.0","id":"init","method":"initialize",
+        "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}
+    }), Some(&owner)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(reply, json!({"status":"success"}));
+
+    let mut buffered = Vec::new();
+    let (_, init) = next_sse_message(&mut stream, &mut buffered).await;
+    assert_eq!(init["id"], "init");
+    assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(
+        init["result"]["capabilities"]["resources"]["subscribe"],
+        true
+    );
+    for method in [
+        "notifications/initialized",
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+    ] {
+        let (_, reply) = next_sse_message(&mut stream, &mut buffered).await;
+        assert_eq!(reply["method"], method);
+    }
+    let (status, _) = send(&client, endpoint.clone(), ping.clone(), Some(&owner)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (_, reply) = next_sse_message(&mut stream, &mut buffered).await;
+    assert_eq!(reply, json!({"jsonrpc":"2.0","id":"ping","result":{}}));
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (status, _) = send(&client, endpoint.clone(), ping.clone(), Some(&owner)).await;
+            if status == StatusCode::NOT_FOUND {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the message endpoint closes with its stream");
+}
 
 const WATCHED_RESOURCE: &str = "fixture://notes/watched";
 
