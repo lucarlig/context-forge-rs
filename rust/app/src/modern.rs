@@ -34,7 +34,7 @@ use crate::{
     access::Principal,
     catalog::{CatalogServer, ToolDefinition},
     gateway::{GatewayService, ToolError},
-    mcp::{JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, accepts_json, rpc_error},
+    mcp::{JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, accepts_json, accepts_post_stream, rpc_error},
     modern_validation::reject_invalid_request,
 };
 
@@ -49,11 +49,12 @@ type Transport = StreamableHttpService<GatewayHandler, NeverSessionManager>;
 pub struct Modern {
     gateway: Arc<GatewayService>,
     transport: Transport,
+    json_response: bool,
 }
 
 impl Modern {
     /// Build the modern Streamable HTTP service for use behind the gateway ingress.
-    pub fn new(gateway: Arc<GatewayService>) -> Self {
+    pub fn new(gateway: Arc<GatewayService>, json_response: bool) -> Self {
         let config = StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
             .with_json_response(true)
@@ -63,6 +64,7 @@ impl Modern {
         Self {
             transport: transport(gateway.clone(), None, config),
             gateway,
+            json_response,
         }
     }
 
@@ -87,7 +89,9 @@ impl Modern {
             )
                 .into_response();
         }
-        if !accepts_json(request.headers()) {
+        if !accepts_json(request.headers())
+            || (!self.json_response && !accepts_post_stream(request.headers()))
+        {
             return StatusCode::NOT_ACCEPTABLE.into_response();
         }
 
@@ -418,7 +422,7 @@ mod tests {
 
     fn modern(database: Database) -> Modern {
         let authorizer = Authorizer::new(database.clone(), None, true);
-        Modern::new(test_service(database, authorizer))
+        Modern::new(test_service(database, authorizer), true)
     }
 
     fn request(method: &str, params: Value) -> Request {

@@ -1,0 +1,22 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-reference-server",
+  "run": [
+    "context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "normalizers": {
+    "runtime": "^(python|rust)$"
+  },
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "01-stateless-ping",
+    "02-legacy-json-only",
+    "03-legacy-sse-only",
+    "04-modern-json-only",
+    "05-stateless-initialized-notification"
+  ]
+}

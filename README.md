@@ -8,7 +8,7 @@ ContextForge RS is a standalone Rust rewrite of the [ContextForge gateway](https
 
 5 of 25 [port milestones](rust/MAP.md#milestones) are verified. Each milestone counts equally.
 
-The Rust binary serves health and readiness probes, modern and legacy stateless MCP, and scoped tool listing and invocation. Register a Streamable HTTP upstream through `POST /gateways` or `POST /v1/mcp-servers`. The gateway uses [rmcp](https://github.com/modelcontextprotocol/rust-sdk) protocol models and the modern Streamable HTTP server.
+The Rust binary serves health and readiness probes, modern and legacy MCP, and scoped tool listing and invocation. Register a Streamable HTTP upstream through `POST /gateways` or `POST /v1/mcp-servers`. The gateway uses [rmcp](https://github.com/modelcontextprotocol/rust-sdk) protocol models and the modern Streamable HTTP server.
 
 ```sh
 cargo run --locked
@@ -21,6 +21,8 @@ MCP requires a signed bearer token from an active account by default. Set `JWT_S
 The current registration path accepts `STREAMABLEHTTP` upstreams with no upstream authentication. For a local fixture, set `SSRF_ALLOW_LOCALHOST=true` to allow loopback connections. Readiness checks Redis when `CACHE_TYPE=redis` and `REDIS_URL` is set.
 
 The gateway negotiates modern and legacy MCP by default. Set `MCP_INBOUND_PROTOCOL_MODE=legacy` to accept legacy versions only. Set `MCP_CLIENT_CONNECT_MODE=legacy` to use legacy initialization for all upstreams.
+
+Set `USE_STATEFUL_SESSIONS=true` to enable legacy sessions on a single gateway process. Set `JSON_RESPONSE_ENABLED=false` to stream legacy POST replies over SSE. The [stateful MCP notes](rust/replay/mcp-stateful/README.md) track event delivery and resumption.
 
 ```sh
 cargo test --locked --workspace

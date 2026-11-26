@@ -26,7 +26,7 @@ use crate::{
         ToolDefinition,
     },
     database::Database,
-    mcp::{ProtocolMode, SessionSettings},
+    mcp::{HttpOptions, ProtocolMode, SessionSettings},
     upstream::{UpstreamClient, UpstreamError},
 };
 
@@ -112,7 +112,7 @@ impl GatewayService {
     }
 
     pub fn mcp_router(self: &Arc<Self>, require_auth: bool, mode: ProtocolMode) -> Router {
-        self.mcp_router_with_sessions(require_auth, mode, None)
+        self.mcp_router_with_options(require_auth, mode, HttpOptions::default())
     }
 
     pub fn mcp_router_with_sessions(
@@ -121,8 +121,24 @@ impl GatewayService {
         mode: ProtocolMode,
         sessions: Option<SessionSettings>,
     ) -> Router {
+        self.mcp_router_with_options(
+            require_auth,
+            mode,
+            HttpOptions {
+                sessions,
+                ..HttpOptions::default()
+            },
+        )
+    }
+
+    pub fn mcp_router_with_options(
+        self: &Arc<Self>,
+        require_auth: bool,
+        mode: ProtocolMode,
+        options: HttpOptions,
+    ) -> Router {
         self.access.protect_mcp(
-            crate::mcp::router(self.clone(), mode, sessions),
+            crate::mcp::router(self.clone(), mode, options),
             require_auth,
         )
     }

@@ -40,14 +40,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Settings::catalog_refresh()?,
     ));
     let shutdown = CancellationToken::new();
-    let sessions = Settings::mcp_sessions()?.map(|mut settings| {
+    let mut http_options = Settings::mcp_http_options()?;
+    if let Some(settings) = &mut http_options.sessions {
         settings.shutdown = shutdown.clone();
-        settings
-    });
-    let mcp = service.mcp_router_with_sessions(
+    }
+    let mcp = service.mcp_router_with_options(
         require_mcp_auth,
         Settings::mcp_inbound_protocol_mode()?,
-        sessions,
+        http_options,
     );
     let app = probes::router(database, redis)
         .merge(Settings::mcp_ingress_policy()?.apply(mcp))

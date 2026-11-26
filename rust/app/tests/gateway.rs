@@ -22,7 +22,7 @@ use context_forge_rs::{
     database::Database,
     gateway::{CatalogRefresh, GatewayService, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::{ProtocolMode, SessionSettings},
+    mcp::{HttpOptions, ProtocolMode, SessionSettings},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 use jiff::Timestamp;
@@ -758,6 +758,15 @@ async fn legacy_session_lifecycle_binds_owner_and_virtual_server() {
 
 #[tokio::test]
 async fn legacy_cancellation_targets_the_originating_session_and_upstream_request() {
+    check_legacy_cancellation(true).await;
+}
+
+#[tokio::test]
+async fn legacy_sse_post_opens_before_tool_completion_and_delivers_cancellation() {
+    check_legacy_cancellation(false).await;
+}
+
+async fn check_legacy_cancellation(json_response: bool) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
     let upstream = Running::start(
@@ -823,10 +832,13 @@ async fn legacy_cancellation_targets_the_originating_session_and_upstream_reques
         CatalogRefresh::default(),
     ));
     let gateway = Running::start(service.registration_router().merge(
-        service.mcp_router_with_sessions(
+        service.mcp_router_with_options(
             true,
             ProtocolMode::Legacy,
-            Some(SessionSettings::default()),
+            HttpOptions {
+                json_response,
+                sessions: Some(SessionSettings::default()),
+            },
         ),
     ))
     .await;
@@ -850,7 +862,7 @@ async fn legacy_cancellation_targets_the_originating_session_and_upstream_reques
         client
             .post(gateway.url("/mcp/"))
             .bearer_auth(credential)
-            .header(header::ACCEPT, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
             .header(header::CONTENT_TYPE, "application/json")
             .body(body.to_string())
     };
@@ -861,9 +873,15 @@ async fn legacy_cancellation_targets_the_originating_session_and_upstream_reques
             "params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}
         })).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        if !json_response {
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "text/event-stream"
+            );
+        }
         sessions.push(response.headers()["mcp-session-id"].clone());
     }
-    let call = tokio::spawn(
+    let mut call = tokio::spawn(
         request(
             &owner,
             json!({
@@ -882,6 +900,21 @@ async fn legacy_cancellation_targets_the_originating_session_and_upstream_reques
         panic!("upstream tool call must start before cancellation");
     };
     assert!(upstream_id.is_number());
+    let stream = if json_response {
+        None
+    } else {
+        let response = tokio::time::timeout(Duration::from_secs(1), &mut call)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        assert_eq!(response.headers()["mcp-session-id"], sessions[0]);
+        Some(response)
+    };
 
     for (credential, session, expected) in [
         (&outsider, &sessions[0], StatusCode::FORBIDDEN),
@@ -903,10 +936,22 @@ async fn legacy_cancellation_targets_the_originating_session_and_upstream_reques
             .unwrap(),
         ("cancel", upstream_id)
     );
-    let cancelled = call.await.unwrap().unwrap();
+    let cancelled = match stream {
+        Some(stream) => stream,
+        None => call.await.unwrap().unwrap(),
+    };
     assert_eq!(cancelled.status(), StatusCode::OK);
+    let body = cancelled.text().await.unwrap();
+    let data = if json_response {
+        body.as_str()
+    } else {
+        assert!(body.lines().any(|line| line == "event: message"));
+        body.lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap()
+    };
     assert_eq!(
-        serde_json::from_slice::<Value>(&cancelled.bytes().await.unwrap()).unwrap(),
+        serde_json::from_str::<Value>(data).unwrap(),
         json!({"jsonrpc":"2.0","id":"in-flight","error":{"code":-32800,"message":"Request cancelled"}})
     );
 }

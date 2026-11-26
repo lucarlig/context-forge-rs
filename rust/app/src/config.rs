@@ -5,7 +5,7 @@ use std::{collections::HashSet, env, error::Error, str::FromStr, time::Duration}
 use crate::{
     gateway::{CatalogRefresh, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::{IngressPolicy, ProtocolMode, SessionSettings},
+    mcp::{HttpOptions, IngressPolicy, ProtocolMode, SessionSettings},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 
@@ -132,7 +132,14 @@ impl Settings {
         }
     }
 
-    pub fn mcp_sessions() -> Result<Option<SessionSettings>, Box<dyn Error + Send + Sync>> {
+    pub fn mcp_http_options() -> Result<HttpOptions, Box<dyn Error + Send + Sync>> {
+        Ok(HttpOptions {
+            json_response: flag("JSON_RESPONSE_ENABLED")?.unwrap_or(true),
+            sessions: Self::mcp_sessions()?,
+        })
+    }
+
+    fn mcp_sessions() -> Result<Option<SessionSettings>, Box<dyn Error + Send + Sync>> {
         if !flag("USE_STATEFUL_SESSIONS")?.unwrap_or(false) {
             return Ok(None);
         }

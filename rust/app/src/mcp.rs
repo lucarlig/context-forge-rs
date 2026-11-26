@@ -5,7 +5,7 @@ use std::{collections::HashSet, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{DefaultBodyLimit, FromRequest, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -82,17 +82,32 @@ impl Default for SessionSettings {
     }
 }
 
+pub struct HttpOptions {
+    pub json_response: bool,
+    pub sessions: Option<SessionSettings>,
+}
+
+impl Default for HttpOptions {
+    fn default() -> Self {
+        Self {
+            json_response: true,
+            sessions: None,
+        }
+    }
+}
+
 struct McpState {
     service: Arc<GatewayService>,
     modern: Option<Modern>,
     sessions: Option<Sessions>,
+    json_response: bool,
 }
 
 /// Build the Streamable HTTP routes for mounting behind gateway access checks.
 pub(crate) fn router(
     service: Arc<GatewayService>,
     mode: ProtocolMode,
-    sessions: Option<SessionSettings>,
+    options: HttpOptions,
 ) -> Router {
     Router::new()
         .route("/mcp", any(handle_request))
@@ -103,8 +118,10 @@ pub(crate) fn router(
         .route("/v1/virtual-servers/{server_id}/mcp/", any(handle_request))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(Arc::new(McpState {
-            modern: (mode == ProtocolMode::Auto).then(|| Modern::new(service.clone())),
-            sessions: sessions.map(Sessions::new),
+            modern: (mode == ProtocolMode::Auto)
+                .then(|| Modern::new(service.clone(), options.json_response)),
+            sessions: options.sessions.map(Sessions::new),
+            json_response: options.json_response,
             service,
         }))
 }
@@ -367,7 +384,7 @@ fn session_from_request(
     sessions.access(session_header(request.headers())?, owner, server, delete)
 }
 
-async fn handle_post(state: &McpState, request: Request) -> Response {
+async fn handle_post(state: &Arc<McpState>, request: Request) -> Response {
     let content_type = request
         .headers()
         .get(CONTENT_TYPE)
@@ -383,7 +400,15 @@ async fn handle_post(state: &McpState, request: Request) -> Response {
         )
             .into_response();
     }
-    if !accepts_json(request.headers()) {
+    if !state.json_response
+        && !(accepts_json(request.headers()) && accepts_post_stream(request.headers()))
+    {
+        return transport_error(
+            StatusCode::NOT_ACCEPTABLE,
+            "Not Acceptable: Client must accept both application/json and text/event-stream",
+        );
+    }
+    if state.json_response && !accepts_json(request.headers()) {
         return transport_error(
             StatusCode::NOT_ACCEPTABLE,
             "Not Acceptable: Client must accept application/json",
@@ -426,16 +451,7 @@ async fn handle_post(state: &McpState, request: Request) -> Response {
     };
 
     match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => {
-            dispatch(
-                state,
-                principal.as_ref(),
-                server.as_ref(),
-                session_id.as_ref(),
-                &value,
-            )
-            .await
-        }
+        Ok(value) => dispatch(state, principal, server, session_id, value).await,
         Err(error) => rpc_error(
             StatusCode::BAD_REQUEST,
             &Value::Null,
@@ -447,6 +463,22 @@ async fn handle_post(state: &McpState, request: Request) -> Response {
 }
 
 pub(crate) fn accepts_json(headers: &HeaderMap) -> bool {
+    accepted_media_types(headers).any(|media_type| {
+        media_type == "*/*"
+            || media_type.eq_ignore_ascii_case("application/*")
+            || media_type.eq_ignore_ascii_case(JSON_MEDIA_TYPE)
+    })
+}
+
+pub(crate) fn accepts_post_stream(headers: &HeaderMap) -> bool {
+    accepted_media_types(headers).any(|media_type| {
+        media_type == "*/*"
+            || media_type.eq_ignore_ascii_case("text/*")
+            || media_type.eq_ignore_ascii_case("text/event-stream")
+    })
+}
+
+fn accepted_media_types(headers: &HeaderMap) -> impl Iterator<Item = &str> {
     headers
         .get_all(ACCEPT)
         .iter()
@@ -454,80 +486,104 @@ pub(crate) fn accepts_json(headers: &HeaderMap) -> bool {
         .flat_map(|header| header.split(','))
         .filter_map(|entry| entry.split(';').next())
         .map(str::trim)
-        .any(|media_type| {
-            media_type == "*/*"
-                || media_type.eq_ignore_ascii_case("application/*")
-                || media_type.eq_ignore_ascii_case(JSON_MEDIA_TYPE)
-        })
 }
 
 async fn dispatch(
     state: &McpState,
-    principal: Option<&Principal>,
-    server: Option<&CatalogServer>,
-    session_id: Option<&HeaderValue>,
-    value: &Value,
+    principal: Option<Principal>,
+    server: Option<CatalogServer>,
+    session_id: Option<HeaderValue>,
+    value: Value,
 ) -> Response {
-    let Some(message) = value.as_object() else {
+    let Value::Object(mut message) = value else {
         return invalid_envelope();
     };
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return invalid_envelope();
     }
-    let id = message.get("id");
-    if id.is_some_and(|id| !(id.is_string() || id.is_i64() || id.is_u64())) {
+    let id = message.remove("id");
+    if id
+        .as_ref()
+        .is_some_and(|id| !(id.is_string() || id.is_i64() || id.is_u64()))
+    {
         return invalid_envelope();
     }
+    let owner = principal.as_ref().map(|p| p.email.as_str());
+    let server_id = server.as_ref().map(|s| s.id.as_str());
 
-    if let Some(method) = message.get("method") {
-        let Some(method) = method.as_str() else {
+    if let Some(method) = message.remove("method") {
+        let Value::String(method) = method else {
             return invalid_envelope();
         };
-        let params = match message.get("params") {
+        let params = match message.remove("params") {
             None | Some(Value::Null) => None,
             Some(params @ Value::Object(_)) => Some(params),
             Some(_) => return invalid_envelope(),
         };
-        let owner = principal.map(|p| p.email.as_str());
-        let server_id = server.map(|s| s.id.as_str());
-        if let (Some(id), "initialize") = (id, method) {
-            let Some(result) = initialize(params, server) else {
+        if let (Some(id), "initialize") = (id.as_ref(), method.as_str()) {
+            let Some(result) = initialize(params.as_ref(), server.as_ref()) else {
                 return invalid_params(id);
             };
-            return match &state.sessions {
+            let session_id = match &state.sessions {
                 Some(sessions) => match sessions.create(owner, server_id) {
-                    Ok(session_id) => with_session(rpc_success(id, result), Some(&session_id)),
-                    Err(error) => session_error(error),
+                    Ok(session_id) => Some(session_id),
+                    Err(error) => return session_error(error),
                 },
-                None => rpc_success(id, result),
+                None => None,
             };
+            let reply = std::future::ready(rpc_success(id, result));
+            return post_reply(state.json_response, session_id, reply).await;
         }
         let session = match &state.sessions {
-            Some(sessions) => match sessions.access(session_id, owner, server_id, false) {
+            Some(sessions) => match sessions.access(session_id.as_ref(), owner, server_id, false) {
                 Ok(session) => Some(session),
                 Err(error) => return post_session_error(error),
             },
             None => None,
         };
-        let response = match (id, method, session) {
-            (None, "notifications/cancelled", Some(session)) => cancel_request(&session, params),
-            (None, _, _) => accepted(),
-            (Some(id), "ping", _) => rpc_success(id, Empty {}),
-            (Some(id), "tools/list", _) => {
-                list_tools(&state.service, principal, server, id, params).await
-            }
-            (Some(id), "tools/call", session) => {
-                call_tool(&state.service, principal, server, session, id, params).await
-            }
-            (Some(id), method, _) => rpc_error(
-                StatusCode::OK,
-                id,
-                METHOD_NOT_FOUND,
-                "Method not found",
-                Some(method),
-            ),
+        let Some(id) = id else {
+            let response = match (method.as_str(), session) {
+                ("notifications/cancelled", Some(session)) => {
+                    cancel_request(&session, params.as_ref())
+                }
+                _ => accepted(),
+            };
+            return with_session(response, session_id.as_ref());
         };
-        return with_session(response, session_id);
+        let stateful = session.is_some();
+        let service = state.service.clone();
+        let reply = async move {
+            let principal = principal.as_ref();
+            let server = server.as_ref();
+            let params = params.as_ref();
+            match method.as_str() {
+                "ping" => rpc_success(&id, Empty {}),
+                "tools/list" => list_tools(&service, principal, server, &id, params).await,
+                "tools/call" => call_tool(&service, principal, server, session, &id, params).await,
+                _ => rpc_error(
+                    StatusCode::OK,
+                    &id,
+                    METHOD_NOT_FOUND,
+                    "Method not found",
+                    Some(method),
+                ),
+            }
+        };
+        if stateful {
+            // Keep processing if the client loses the HTTP connection.
+            let task = tokio::spawn(reply);
+            return post_reply(state.json_response, session_id, async move {
+                match task.await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::error!(%error, "MCP request task failed");
+                        tool_error(&Value::Null, ToolError::Unavailable)
+                    }
+                }
+            })
+            .await;
+        }
+        return post_reply(state.json_response, session_id, reply).await;
     }
 
     let result = message.get("result");
@@ -542,19 +598,48 @@ async fn dispatch(
     };
     if id.is_some() && valid_response {
         if let Some(sessions) = &state.sessions
-            && let Err(error) = sessions.access(
-                session_id,
-                principal.map(|p| p.email.as_str()),
-                server.map(|s| s.id.as_str()),
-                false,
-            )
+            && let Err(error) = sessions.access(session_id.as_ref(), owner, server_id, false)
         {
             return post_session_error(error);
         }
-        return with_session(accepted(), session_id);
+        return with_session(accepted(), session_id.as_ref());
     }
 
     invalid_envelope()
+}
+
+async fn post_reply(
+    json_response: bool,
+    session_id: Option<HeaderValue>,
+    reply: impl Future<Output = Response> + Send + 'static,
+) -> Response {
+    let response = if json_response {
+        reply.await
+    } else {
+        let events = stream::once(async move {
+            let body = to_bytes(reply.await.into_body(), usize::MAX)
+                .await
+                .map_err(std::io::Error::other)?;
+            let data = std::str::from_utf8(&body).map_err(std::io::Error::other)?;
+            Ok::<_, std::io::Error>(Event::default().event("message").data(data))
+        });
+        (
+            [
+                (CACHE_CONTROL, "no-cache, no-transform"),
+                (
+                    axum::http::HeaderName::from_static("x-accel-buffering"),
+                    "no",
+                ),
+            ],
+            Sse::new(events).keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(15))
+                    .text("ping"),
+            ),
+        )
+            .into_response()
+    };
+    with_session(response, session_id.as_ref())
 }
 
 async fn list_tools(
@@ -579,7 +664,7 @@ async fn list_tools(
 }
 
 async fn call_tool(
-    service: &Arc<GatewayService>,
+    service: &GatewayService,
     principal: Option<&Principal>,
     server: Option<&CatalogServer>,
     session: Option<Arc<Session>>,
@@ -592,13 +677,12 @@ async fn call_tool(
     if params.input_responses.is_some() || params.request_state.is_some() {
         return invalid_params(id);
     }
-    let arguments = Value::Object(params.arguments.unwrap_or_default());
-    let result = if let Some(session) = session {
+    let pending = if let Some(session) = session {
         let Ok(request_id) = RequestId::deserialize(id) else {
             return invalid_envelope();
         };
-        let pending = match session.track(request_id) {
-            Ok(pending) => pending,
+        match session.track(request_id) {
+            Ok(pending) => Some(pending),
             Err(PendingError::DuplicateId) => {
                 return rpc_error(
                     StatusCode::OK,
@@ -617,45 +701,21 @@ async fn call_tool(
                     None::<()>,
                 );
             }
-        };
-        let service = service.clone();
-        let principal = principal.cloned();
-        let server = server.cloned();
-        // A lost HTTP connection does not cancel a stateful MCP request.
-        match tokio::spawn(async move {
-            let result = service
-                .call_tool(
-                    principal.as_ref(),
-                    server.as_ref(),
-                    &params.name,
-                    arguments,
-                    &pending.token,
-                )
-                .await;
-            if pending.token.is_cancelled() {
-                return Err(ToolError::Cancelled);
-            }
-            result
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(%error, "MCP tool task failed");
-                Err(ToolError::Unavailable)
-            }
         }
     } else {
-        service
-            .call_tool(
-                principal,
-                server,
-                &params.name,
-                arguments,
-                &CancellationToken::new(),
-            )
-            .await
+        None
     };
+    let cancellation = pending
+        .as_ref()
+        .map(|pending| pending.token.clone())
+        .unwrap_or_default();
+    let arguments = Value::Object(params.arguments.unwrap_or_default());
+    let result = service
+        .call_tool(principal, server, &params.name, arguments, &cancellation)
+        .await;
+    if cancellation.is_cancelled() {
+        return tool_error(id, ToolError::Cancelled);
+    }
     match result {
         Ok(result) => rpc_success(id, result),
         Err(error) => tool_error(id, error),
@@ -863,7 +923,11 @@ mod tests {
         })
         .unwrap();
         let auth = Authorizer::new(database.clone(), None, true);
-        router(test_service(database, auth), ProtocolMode::Legacy, None)
+        router(
+            test_service(database, auth),
+            ProtocolMode::Legacy,
+            HttpOptions::default(),
+        )
     }
 
     async fn request(
