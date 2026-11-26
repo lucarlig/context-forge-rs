@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Settings::catalog_refresh()?,
     ));
     let shutdown = CancellationToken::new();
-    let mut http_options = Settings::mcp_http_options()?;
+    let mut http_options = settings.mcp_http_options()?;
     if let Some(settings) = &mut http_options.sessions {
         settings.shutdown = shutdown.clone();
     }

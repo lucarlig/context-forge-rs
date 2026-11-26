@@ -5,7 +5,7 @@ use std::{collections::HashSet, env, error::Error, str::FromStr, time::Duration}
 use crate::{
     gateway::{CatalogRefresh, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::{HttpOptions, IngressPolicy, ProtocolMode, SessionSettings},
+    mcp::{HttpOptions, IngressPolicy, ProtocolMode, RedisSessionDirectory, SessionSettings},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 
@@ -132,14 +132,14 @@ impl Settings {
         }
     }
 
-    pub fn mcp_http_options() -> Result<HttpOptions, Box<dyn Error + Send + Sync>> {
+    pub fn mcp_http_options(&self) -> Result<HttpOptions, Box<dyn Error + Send + Sync>> {
         Ok(HttpOptions {
             json_response: flag("JSON_RESPONSE_ENABLED")?.unwrap_or(true),
-            sessions: Self::mcp_sessions()?,
+            sessions: self.mcp_sessions()?,
         })
     }
 
-    fn mcp_sessions() -> Result<Option<SessionSettings>, Box<dyn Error + Send + Sync>> {
+    fn mcp_sessions(&self) -> Result<Option<SessionSettings>, Box<dyn Error + Send + Sync>> {
         if !flag("USE_STATEFUL_SESSIONS")?.unwrap_or(false) {
             return Ok(None);
         }
@@ -156,12 +156,22 @@ impl Settings {
         if event_capacity == 0 || event_ttl == 0 {
             return Err("MCP event history settings must be positive".into());
         }
+        let redis = if flag("MCPGATEWAY_SESSION_AFFINITY_ENABLED")?.unwrap_or(false) {
+            self.redis
+                .as_ref()
+                .map(RedisSessionDirectory::new)
+                .transpose()
+                .map_err(|_| "invalid REDIS_URL")?
+        } else {
+            None
+        };
         Ok(Some(SessionSettings {
             ttl: Duration::from_secs(ttl),
             get_stream_enabled: flag("MCP_GET_STREAM_ENABLED")?
                 .unwrap_or(defaults.get_stream_enabled),
             event_capacity,
             event_ttl: Duration::from_secs(event_ttl),
+            redis,
             ..defaults
         }))
     }

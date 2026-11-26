@@ -13,5 +13,6 @@ pub mod mcp;
 mod modern;
 mod modern_validation;
 pub mod probes;
+mod redis_sessions;
 mod sessions;
 pub mod upstream;

@@ -39,11 +39,18 @@ In the Redis affinity profile, two pinned gateway processes shared an isolated S
 
 Bind session access to the authorized principal and virtual server on every request. Apply the ownership check regardless of the cache backend. DELETE must invalidate the session for both POST and GET and close active streams. Verify those rules, cross-session cursor isolation, and cancellation through a live Rust gateway before checking off the milestone. [Legacy MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
 
-Rust forwards typed logging and catalog notifications from upstream POST responses and persistent GET streams. It associates upstream sessions with the downstream session, gateway endpoint, and authorization scope. Its live test confirms upstream session reuse, notification delivery after a tool returns, upstream reconnection with `Last-Event-ID`, and upstream closure after downstream DELETE. It also verifies replay and rejection with a narrowed bearer token. Server-initiated requests and shared session affinity remain open.
+Rust forwards typed logging and catalog notifications from upstream POST responses and persistent GET streams. It associates upstream sessions with the downstream session, gateway endpoint, and authorization scope. Its live test confirms upstream session reuse, notification delivery after a tool returns, upstream reconnection with `Last-Event-ID`, and upstream closure after downstream DELETE. It also verifies replay and rejection with a narrowed bearer token. Server-initiated requests remain open.
 
 ## Rust lifecycle replay
 
-The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Shared session affinity remains open.
+The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion.
+
+Set `CACHE_TYPE=redis`, `REDIS_URL`, and `MCPGATEWAY_SESSION_AFFINITY_ENABLED=true` to store ownership and expiry in Redis. Redis validates the principal and virtual-server binding before allowing a lookup, renewal, or deletion. The gateway returns HTTP `503` when the directory is unavailable. A live run against Valkey verified registration, renewal, deletion, and recovery after a cache restart. Cross-worker request forwarding remains open.
+
+```sh
+REDIS_URL=redis://127.0.0.1:6379/0 \
+  cargo test --locked --lib shared_directory_scopes -- --ignored
+```
 
 The public legacy JSON profile produced five recordings with rust-anything v5.0.1. The original matched all five. Rust matched the unknown-session POST and missing-session GET. Initialization advertises the Rust version and the implemented capabilities. Missing-session POST and DELETE errors omit the generated session ID that v1.1.2 sends before initialization.
 

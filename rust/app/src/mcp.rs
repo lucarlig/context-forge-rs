@@ -8,7 +8,7 @@ use axum::{
     body::{Body, Bytes, to_bytes},
     extract::{DefaultBodyLimit, FromRequest, Request, State},
     http::{
-        HeaderMap, HeaderValue, Method, StatusCode,
+        Extensions, HeaderMap, HeaderValue, Method, StatusCode,
         header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN, RETRY_AFTER, VARY},
         uri::Authority,
     },
@@ -29,6 +29,8 @@ use rmcp::model::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+
+pub use crate::redis_sessions::RedisSessionDirectory;
 
 use crate::{
     access::{self, Principal},
@@ -76,6 +78,7 @@ pub struct SessionSettings {
     pub shutdown: CancellationToken,
     pub event_capacity: usize,
     pub event_ttl: Duration,
+    pub redis: Option<RedisSessionDirectory>,
 }
 
 impl Default for SessionSettings {
@@ -86,6 +89,7 @@ impl Default for SessionSettings {
             shutdown: CancellationToken::new(),
             event_capacity: 100,
             event_ttl: Duration::from_secs(3600),
+            redis: None,
         }
     }
 }
@@ -246,7 +250,7 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
     let mut response = match *request.method() {
         Method::GET => handle_get(&state, request).await,
         Method::POST => handle_post(&state, request).await,
-        Method::DELETE => delete_session(state.sessions.as_ref(), &request),
+        Method::DELETE => delete_session(state.sessions.as_ref(), request).await,
         _ => {
             let mut response =
                 transport_error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
@@ -279,7 +283,14 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
             "GET /mcp stream disabled by operator (MCP_GET_STREAM_ENABLED=False).",
         );
     }
-    let session = match session_from_request(sessions, &request, false) {
+    let session = match session_from_request(
+        sessions,
+        request.headers(),
+        request.extensions(),
+        false,
+    )
+    .await
+    {
         Ok(session) => session,
         Err(SessionError::Missing) => {
             return get_not_allowed(
@@ -429,33 +440,30 @@ pub(crate) fn accepts_event_stream(headers: &HeaderMap) -> bool {
         })
 }
 
-fn delete_session(sessions: Option<&Sessions>, request: &Request) -> Response {
+async fn delete_session(sessions: Option<&Sessions>, request: Request) -> Response {
     let Some(sessions) = sessions else {
         return transport_error(
             StatusCode::METHOD_NOT_ALLOWED,
             "Method Not Allowed: Session termination not supported",
         );
     };
-    match session_from_request(sessions, request, true) {
+    match session_from_request(sessions, request.headers(), request.extensions(), true).await {
         Ok(_) => Json(json!({"jsonrpc": "2.0", "result": {}})).into_response(),
         Err(error) => session_error(error),
     }
 }
 
-fn session_from_request(
+async fn session_from_request(
     sessions: &Sessions,
-    request: &Request,
+    headers: &HeaderMap,
+    extensions: &Extensions,
     delete: bool,
 ) -> Result<Arc<Session>, SessionError> {
-    let owner = request
-        .extensions()
-        .get::<Principal>()
-        .map(|p| p.email.as_str());
-    let server = request
-        .extensions()
-        .get::<CatalogServer>()
-        .map(|s| s.id.as_str());
-    sessions.access(session_header(request.headers())?, owner, server, delete)
+    let owner = extensions.get::<Principal>().map(|p| p.email.as_str());
+    let server = extensions.get::<CatalogServer>().map(|s| s.id.as_str());
+    sessions
+        .access(session_header(headers)?, owner, server, delete)
+        .await
 }
 
 async fn handle_post(state: &Arc<McpState>, request: Request) -> Response {
@@ -605,7 +613,7 @@ async fn dispatch(
             };
             let can_prime = result.protocol_version == ProtocolVersion::V_2025_11_25;
             let (session_id, journal) = match &state.sessions {
-                Some(sessions) => match sessions.create(owner, server_id) {
+                Some(sessions) => match sessions.create(owner, server_id).await {
                     Ok((session_id, session)) => {
                         let journal = post_journal(
                             &session,
@@ -624,7 +632,10 @@ async fn dispatch(
             return post_reply(state.json_response, session_id, reply, None, journal).await;
         }
         let session = match &state.sessions {
-            Some(sessions) => match sessions.access(session_id.as_ref(), owner, server_id, false) {
+            Some(sessions) => match sessions
+                .access(session_id.as_ref(), owner, server_id, false)
+                .await
+            {
                 Ok(session) => Some(session),
                 Err(error) => return post_session_error(error),
             },
@@ -723,7 +734,9 @@ async fn dispatch(
     };
     if id.is_some() && valid_response {
         if let Some(sessions) = &state.sessions
-            && let Err(error) = sessions.access(session_id.as_ref(), owner, server_id, false)
+            && let Err(error) = sessions
+                .access(session_id.as_ref(), owner, server_id, false)
+                .await
         {
             return post_session_error(error);
         }
@@ -1050,7 +1063,7 @@ fn session_header(headers: &HeaderMap) -> Result<Option<&HeaderValue>, SessionEr
 }
 
 fn post_session_error(error: SessionError) -> Response {
-    if error == SessionError::NotFound {
+    if matches!(error, SessionError::NotFound | SessionError::Remote(_)) {
         return transport_error(StatusCode::NOT_FOUND, "Session not found");
     }
     session_error(error)
@@ -1067,6 +1080,11 @@ fn session_error(error: SessionError) -> Response {
         SessionError::NotFound => (StatusCode::NOT_FOUND, "Session not found"),
         SessionError::Forbidden => (StatusCode::FORBIDDEN, "Session access denied"),
         SessionError::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "Session capacity reached"),
+        SessionError::Remote(_) => (StatusCode::NOT_FOUND, "Session not found"),
+        SessionError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Session ownership unavailable",
+        ),
     };
     (status, Json(Detail { detail })).into_response()
 }

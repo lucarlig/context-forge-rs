@@ -74,6 +74,8 @@ pub(crate) enum SessionError {
     NotFound,
     Forbidden,
     Capacity,
+    Remote(Uuid),
+    Unavailable,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -126,7 +128,27 @@ impl Sessions {
         }
     }
 
-    pub(crate) fn create(
+    pub(crate) async fn create(
+        &self,
+        owner: Option<&str>,
+        server: Option<&str>,
+    ) -> Result<(HeaderValue, Arc<Session>), SessionError> {
+        let (id, session) = self.create_local(owner, server)?;
+        if let Some(redis) = &self.settings.redis
+            && let Err(error) = redis.register(&id, owner, server, self.settings.ttl).await
+        {
+            session.lifetime.shutdown.cancel();
+            self.registry
+                .lock()
+                .expect("session map lock")
+                .entries
+                .remove(&id);
+            return Err(error);
+        }
+        Ok((id, session))
+    }
+
+    fn create_local(
         &self,
         owner: Option<&str>,
         server: Option<&str>,
@@ -168,7 +190,7 @@ impl Sessions {
         }
     }
 
-    pub(crate) fn access(
+    pub(crate) async fn access(
         &self,
         id: Option<&HeaderValue>,
         owner: Option<&str>,
@@ -176,6 +198,30 @@ impl Sessions {
         delete: bool,
     ) -> Result<Arc<Session>, SessionError> {
         let id = id.ok_or(SessionError::Missing)?;
+        if let Some(redis) = &self.settings.redis {
+            redis
+                .access(id, owner, server, self.settings.ttl, delete)
+                .await?;
+        }
+        let session = self.access_local(id, owner, server, delete);
+        if matches!(session, Err(SessionError::NotFound))
+            && !delete
+            && let Some(redis) = &self.settings.redis
+        {
+            let _ = redis
+                .access(id, owner, server, self.settings.ttl, true)
+                .await;
+        }
+        session
+    }
+
+    fn access_local(
+        &self,
+        id: &HeaderValue,
+        owner: Option<&str>,
+        server: Option<&str>,
+        delete: bool,
+    ) -> Result<Arc<Session>, SessionError> {
         let mut registry = self.registry.lock().expect("session map lock");
         self.sweep(&mut registry);
         let entries = &mut registry.entries;
