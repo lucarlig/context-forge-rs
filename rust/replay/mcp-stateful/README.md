@@ -33,6 +33,8 @@ The reference fixture published synthetic `notifications/message` events to the 
 | Send `Last-Event-ID` for `A` | `B` |
 | Send an unknown `Last-Event-ID` and publish a fresh event | `D` |
 
+A live upstream fixture also confirmed the production delivery path without injecting events into the reference event bus. A stateful tool call triggered log notifications on both the upstream POST response and its passive GET stream. The downstream GET received the POST notification `C` followed by the upstream GET notifications `A` and `B`. Reconnecting with the cursor for `C` replayed `A` and `B`.
+
 Bind session access to the authorized principal and virtual server on every request. Apply the ownership check regardless of the cache backend. DELETE must invalidate the session for both POST and GET and close active streams. Verify those rules, cross-session cursor isolation, and cancellation through a live Rust gateway before checking off the milestone. [Legacy MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
 
 ## Rust lifecycle replay
