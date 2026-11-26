@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    collections::HashMap,
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -12,10 +13,10 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
-    routing::post,
+    routing::{get, post},
 };
 use context_forge_rs::{
     access::Authorizer,
@@ -40,6 +41,130 @@ const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
+
+type SseFixtureSessions = Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;
+
+async fn open_upstream_sse(State(sessions): State<SseFixtureSessions>) -> Response {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    sessions.lock().unwrap().insert(id.clone(), sender);
+    let endpoint = stream::iter([Ok::<_, Infallible>(
+        Event::default()
+            .event("endpoint")
+            .data(format!("/message/{id}")),
+    )]);
+    let events = stream::unfold(receiver, |mut receiver| async move {
+        let message: Value = receiver.recv().await?;
+        Some((
+            Ok(Event::default().event("message").data(message.to_string())),
+            receiver,
+        ))
+    });
+    Sse::new(endpoint.chain(events)).into_response()
+}
+
+async fn message_upstream_sse(
+    State(sessions): State<SseFixtureSessions>,
+    Path(session): Path<String>,
+    Json(request): Json<Value>,
+) -> StatusCode {
+    let method = request["method"].as_str().unwrap();
+    if method == "notifications/initialized" {
+        return StatusCode::ACCEPTED;
+    }
+    let result = match method {
+        "initialize" => json!({"protocolVersion":PROTOCOL,"capabilities":{"tools":{}},
+            "serverInfo":{"name":"SSE fixture","version":"1"}}),
+        "tools/list" => json!({"tools":[{"name":"echo","inputSchema":{
+            "type":"object","properties":{"message":{"type":"string"}},"required":["message"]
+        }}]}),
+        "tools/call" => {
+            json!({"content":[{"type":"text","text":request["params"]["arguments"]["message"]}]})
+        }
+        _ => panic!("unexpected SSE method {method}"),
+    };
+    let sender = sessions.lock().unwrap().get(&session).unwrap().clone();
+    sender
+        .send(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+        .await
+        .unwrap();
+    StatusCode::ACCEPTED
+}
+
+#[tokio::test]
+async fn registration_invokes_sse_upstream_and_rejects_cross_origin_message_endpoint() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let upstream = Running::start(
+        Router::new()
+            .route("/sse", get(open_upstream_sse))
+            .route("/message/{session}", post(message_upstream_sse))
+            .route(
+                "/wrong-origin",
+                get(|| async {
+                    Sse::new(stream::iter([Ok::<_, Infallible>(
+                        Event::default()
+                            .event("endpoint")
+                            .data("http://127.0.0.1:1/message"),
+                    )]))
+                }),
+            )
+            .with_state(SseFixtureSessions::default()),
+    )
+    .await;
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        ),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(
+        service
+            .registration_router()
+            .merge(service.mcp_router(false, ProtocolMode::Auto)),
+    )
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let register = async |name: &str, path: &str| {
+        send(
+            &client,
+            gateway.url("/gateways"),
+            json!({"name":name,"url":upstream.url(path),"visibility":"public"}),
+            Some(&admin),
+        )
+        .await
+    };
+    let (status, denied) = register("wrong", "/wrong-origin").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(denied["message"], "Gateway URL is invalid or disallowed");
+    let (status, registration) = register("legacy", "/sse").await;
+    assert_eq!(status, StatusCode::OK, "{registration}");
+    assert_eq!(registration["transport"], "SSE");
+    let (status, reply) = send(
+        &client,
+        gateway.url("/mcp/"),
+        json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"legacy-echo","arguments":{"message":"echo over SSE"}}
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["result"]["content"][0]["text"], "echo over SSE");
+}
 
 #[tokio::test]
 async fn websocket_relay_requires_header_authentication_and_returns_rpc_errors() {

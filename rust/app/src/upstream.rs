@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Outbound MCP Streamable HTTP over a validated, pinned destination.
+//! Outbound MCP Streamable HTTP and SSE over validated, pinned destinations.
 
 use std::{
     collections::HashSet,
@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use axum::body::Bytes;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use ipnet::IpNet;
 use reqwest::{
@@ -261,6 +262,46 @@ pub enum ConnectMode {
     Legacy,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum UpstreamTransport {
+    StreamableHttp,
+    Sse,
+}
+
+impl UpstreamTransport {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("STREAMABLEHTTP") {
+            Some(Self::StreamableHttp)
+        } else if name.eq_ignore_ascii_case("SSE") {
+            Some(Self::Sse)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::StreamableHttp => "STREAMABLEHTTP",
+            Self::Sse => "SSE",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UpstreamEndpoint<'a> {
+    pub url: &'a str,
+    pub transport: UpstreamTransport,
+}
+
+impl<'a> UpstreamEndpoint<'a> {
+    fn streamable(url: &'a str) -> Self {
+        Self {
+            url,
+            transport: UpstreamTransport::StreamableHttp,
+        }
+    }
+}
+
 pub struct DiscoveredCatalog {
     pub capabilities: Value,
     pub tools: Vec<Value>,
@@ -302,7 +343,7 @@ impl UpstreamAssociation {
     async fn session(
         &self,
         upstream: &UpstreamClient,
-        endpoint: &str,
+        endpoint: UpstreamEndpoint<'_>,
         deadline: Instant,
         context: &ToolContext<'_>,
     ) -> Result<Arc<Session>, UpstreamError> {
@@ -316,14 +357,16 @@ impl UpstreamAssociation {
         }
         let session = Arc::new(upstream.open_session(endpoint, deadline).await?);
         let stop = CancellationToken::new();
-        if session.session_id.is_some() {
+        if session.session_id.is_some() || session.sse.is_some() {
             let session = session.clone();
             let stop = stop.clone();
             let lifetime = self.lifetime.clone();
             let notifications = context.notifications.clone();
             tokio::spawn(async move {
                 let listener = async {
-                    if let Some(journal) = notifications.as_deref() {
+                    if session.sse.is_none()
+                        && let Some(journal) = notifications.as_deref()
+                    {
                         session.follow_notifications(journal).await;
                     }
                     std::future::pending::<()>().await;
@@ -371,7 +414,9 @@ impl UpstreamClient {
 
     pub async fn list_tools(&self, url: &str) -> Result<DiscoveredCatalog, UpstreamError> {
         let deadline = self.deadline()?;
-        let session = self.open_session(url, deadline).await?;
+        let session = self
+            .open_session(UpstreamEndpoint::streamable(url), deadline)
+            .await?;
         let result = timeout_at(deadline, session.list_tools()).await;
         session.close().await;
         result.map_err(|_| UpstreamError::Timeout)?
@@ -379,10 +424,10 @@ impl UpstreamClient {
 
     pub(crate) async fn discover_catalog(
         &self,
-        url: &str,
+        endpoint: UpstreamEndpoint<'_>,
     ) -> Result<(DiscoveredCatalog, DiscoveredMetadata), UpstreamError> {
         let deadline = self.deadline()?;
-        let session = self.open_session(url, deadline).await?;
+        let session = self.open_session(endpoint, deadline).await?;
         let result = timeout_at(deadline, async {
             let catalog = match session.list_tools().await {
                 Err(error)
@@ -436,7 +481,7 @@ impl UpstreamClient {
             return Err(UpstreamError::InvalidResponse);
         };
         self.call_tool_with_context(
-            url,
+            UpstreamEndpoint::streamable(url),
             CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
             ToolContext {
                 cancellation: &CancellationToken::new(),
@@ -451,7 +496,7 @@ impl UpstreamClient {
 
     pub(crate) async fn call_tool_with_context(
         &self,
-        url: &str,
+        endpoint: UpstreamEndpoint<'_>,
         mut params: CallToolRequestParams,
         context: ToolContext<'_>,
         association: Option<&UpstreamAssociation>,
@@ -459,7 +504,7 @@ impl UpstreamClient {
         params.meta = None;
         params.arguments.get_or_insert_default();
         self.request_with_context(
-            url,
+            endpoint,
             CallToolRequest::new(params).into(),
             context,
             association,
@@ -469,7 +514,7 @@ impl UpstreamClient {
 
     pub(crate) async fn request_with_context(
         &self,
-        url: &str,
+        endpoint: UpstreamEndpoint<'_>,
         request: ClientRequest,
         context: ToolContext<'_>,
         association: Option<&UpstreamAssociation>,
@@ -491,8 +536,12 @@ impl UpstreamClient {
             None
         };
         let session = match association {
-            Some(association) => association.session(self, url, deadline, &context).await?,
-            None => Arc::new(self.open_session(url, deadline).await?),
+            Some(association) => {
+                association
+                    .session(self, endpoint, deadline, &context)
+                    .await?
+            }
+            None => Arc::new(self.open_session(endpoint, deadline).await?),
         };
         if cancellation.is_cancelled() {
             if association.is_none() {
@@ -542,7 +591,9 @@ impl UpstreamClient {
         mut on_event: impl FnMut(ResourceListenEvent),
     ) -> Result<ResourceListenEnd, UpstreamError> {
         let deadline = self.deadline()?;
-        let session = self.open_session(endpoint, deadline).await?;
+        let session = self
+            .open_session(UpstreamEndpoint::streamable(endpoint), deadline)
+            .await?;
         let Some(version) = session
             .protocol_version
             .as_ref()
@@ -651,16 +702,22 @@ impl UpstreamClient {
 
     async fn open_session(
         &self,
-        endpoint: &str,
+        endpoint: UpstreamEndpoint<'_>,
         deadline: Instant,
     ) -> Result<Session, UpstreamError> {
-        let mut session = timeout_at(deadline, self.connect(endpoint))
+        let mut session = timeout_at(deadline, self.connect(endpoint.url))
             .await
             .map_err(|_| UpstreamError::Timeout)??;
         let result = timeout_at(deadline, async {
-            match self.mode {
-                ConnectMode::Auto => session.negotiate().await,
-                ConnectMode::Legacy => session.initialize().await,
+            match (endpoint.transport, self.mode) {
+                (UpstreamTransport::Sse, _) => {
+                    session.open_sse().await?;
+                    session.initialize().await
+                }
+                (UpstreamTransport::StreamableHttp, ConnectMode::Auto) => session.negotiate().await,
+                (UpstreamTransport::StreamableHttp, ConnectMode::Legacy) => {
+                    session.initialize().await
+                }
             }
         })
         .await
@@ -698,6 +755,7 @@ impl UpstreamClient {
             capabilities: Value::Null,
             protocol_version: None,
             session_id: None,
+            sse: None,
             next_id: AtomicI64::new(1),
         })
     }
@@ -750,10 +808,46 @@ struct Session {
     capabilities: Value,
     protocol_version: Option<ProtocolVersion>,
     session_id: Option<HeaderValue>,
+    sse: Option<Mutex<Option<SseInbox>>>,
     next_id: AtomicI64,
 }
 
 impl Session {
+    async fn open_sse(&mut self) -> Result<(), UpstreamError> {
+        let response = self.request_builder(Method::GET, None).send().await?;
+        if !response.status().is_success() {
+            return Err(http_error(response).await);
+        }
+        if !response_media_type(&response)
+            .is_some_and(|media| media.eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(UpstreamError::InvalidResponse);
+        }
+        let mut inbox = SseInbox::new(response);
+        while let Some(frame) = inbox.next().await? {
+            if inbox.decoder.event_type.as_deref() != Some("endpoint") {
+                continue;
+            }
+            let address =
+                std::str::from_utf8(&frame).map_err(|_| UpstreamError::InvalidResponse)?;
+            let endpoint = self
+                .url
+                .join(address.trim())
+                .map_err(|_| UpstreamError::InvalidResponse)?;
+            if endpoint.origin() != self.url.origin()
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.fragment().is_some()
+            {
+                return Err(UpstreamError::BlockedDestination);
+            }
+            self.url = endpoint;
+            self.sse = Some(Mutex::new(Some(inbox)));
+            return Ok(());
+        }
+        Err(UpstreamError::InvalidResponse)
+    }
+
     async fn negotiate(&mut self) -> Result<(), UpstreamError> {
         for first_attempt in [true, false] {
             match timeout(DISCOVERY_TIMEOUT, self.discover()).await {
@@ -841,7 +935,9 @@ impl Session {
         let request = InitializeRequest::new(params);
         let (response, id) = self.send_request(request.into(), None, false).await?;
 
-        self.session_id = read_session_id(&response)?;
+        if self.sse.is_none() {
+            self.session_id = read_session_id(&response)?;
+        }
         let reply = read_reply(self, response, id, None, None).await?;
         let requested = reply.result.get("protocolVersion").and_then(Value::as_str);
         let version = ProtocolVersion::KNOWN_VERSIONS
@@ -1060,7 +1156,7 @@ impl Session {
         if response.status().is_success() {
             Ok(response)
         } else if response.status() == reqwest::StatusCode::NOT_FOUND
-            && self.session_id.is_some()
+            && (self.session_id.is_some() || self.sse.is_some())
             && version.is_some_and(ProtocolVersion::has_initialize)
         {
             Err(UpstreamError::SessionExpired)
@@ -1085,6 +1181,11 @@ impl Session {
     }
 
     async fn close(&self) {
+        if let Some(inbox) = &self.sse
+            && let Ok(mut inbox) = timeout(TERMINATION_TIMEOUT, inbox.lock()).await
+        {
+            inbox.take();
+        }
         if self.session_id.is_some() {
             let request = self.request_builder(Method::DELETE, self.protocol_version.as_ref());
             let _ = timeout(TERMINATION_TIMEOUT, request.send()).await;
@@ -1193,6 +1294,49 @@ impl Session {
             *cursor = stream.last_event_id.clone();
         }
         Ok(())
+    }
+}
+
+struct SseInbox {
+    response: Response,
+    buffered: Bytes,
+    decoder: SseDecoder,
+}
+
+impl SseInbox {
+    fn new(response: Response) -> Self {
+        Self {
+            response,
+            buffered: Bytes::new(),
+            decoder: SseDecoder::default(),
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<Vec<u8>>, UpstreamError> {
+        loop {
+            if self.buffered.is_empty() {
+                let Some(chunk) = self.response.chunk().await? else {
+                    return Ok(None);
+                };
+                if chunk.len() > MAX_MESSAGE_BYTES {
+                    return Err(UpstreamError::LimitExceeded);
+                }
+                self.buffered = chunk;
+            }
+            let mut remaining = self.buffered.as_ref();
+            let frame = self.decoder.next_frame(&mut remaining);
+            self.buffered = self.buffered.slice(self.buffered.len() - remaining.len()..);
+            if frame
+                .as_ref()
+                .is_some_and(|frame| frame.len() > MAX_MESSAGE_BYTES)
+                || self.decoder.line.len() + self.decoder.event.len() > MAX_MESSAGE_BYTES
+            {
+                return Err(UpstreamError::LimitExceeded);
+            }
+            if frame.is_some() {
+                return Ok(frame);
+            }
+        }
     }
 }
 
@@ -1321,6 +1465,29 @@ async fn read_reply(
     mut progress: Option<&ToolProgress>,
     notifications: Option<&PassiveEvents>,
 ) -> Result<Reply, UpstreamError> {
+    if let Some(inbox) = &session.sse {
+        let mut inbox = inbox.lock().await;
+        let inbox = inbox.as_mut().ok_or(UpstreamError::SessionExpired)?;
+        let mut received = 0;
+        while let Some(frame) = inbox.next().await? {
+            received += frame.len();
+            if received > MAX_MESSAGE_BYTES {
+                return Err(UpstreamError::LimitExceeded);
+            }
+            if !matches!(inbox.decoder.event_type.as_deref(), None | Some("message")) {
+                continue;
+            }
+            if let Some(result) =
+                handle_reply_frame(session, &frame, id, &mut progress, notifications).await?
+            {
+                return Ok(Reply {
+                    result,
+                    bytes: received,
+                });
+            }
+        }
+        return Err(UpstreamError::SessionExpired);
+    }
     check_message_length(&response)?;
     match response_media_type(&response) {
         Some(media) if media.eq_ignore_ascii_case("application/json") => {
@@ -1345,27 +1512,9 @@ async fn read_reply(
         }
         let mut bytes = chunk.as_ref();
         while let Some(frame) = stream.next_frame(&mut bytes) {
-            let message = decode_message(&frame)?;
-            if let JsonRpcMessage::Request(request) = message {
-                session.answer_server_request(request).await;
-                continue;
-            }
-            if let JsonRpcMessage::Notification(notification) = &message {
-                if let Some(relay) = progress
-                    && let Some(params) =
-                        matching_progress(&notification.notification, id, &relay.token)
-                    && !matches!(
-                        timeout(PROGRESS_SEND_TIMEOUT, relay.sender.send(params)).await,
-                        Ok(Ok(()))
-                    )
-                {
-                    progress = None;
-                }
-                if let Some(journal) = notifications {
-                    publish_notification(journal, &notification.notification).await;
-                }
-            }
-            if let Some(result) = take_result(message, id)? {
+            if let Some(result) =
+                handle_reply_frame(session, &frame, id, &mut progress, notifications).await?
+            {
                 return Ok(Reply {
                     result,
                     bytes: received,
@@ -1374,6 +1523,35 @@ async fn read_reply(
         }
     }
     Err(UpstreamError::InvalidResponse)
+}
+
+async fn handle_reply_frame(
+    session: &Session,
+    frame: &[u8],
+    id: i64,
+    progress: &mut Option<&ToolProgress>,
+    notifications: Option<&PassiveEvents>,
+) -> Result<Option<Value>, UpstreamError> {
+    let message = decode_message(frame)?;
+    if let JsonRpcMessage::Request(request) = message {
+        session.answer_server_request(request).await;
+        return Ok(None);
+    }
+    if let JsonRpcMessage::Notification(notification) = &message {
+        if let Some(relay) = progress
+            && let Some(params) = matching_progress(&notification.notification, id, &relay.token)
+            && !matches!(
+                timeout(PROGRESS_SEND_TIMEOUT, relay.sender.send(params)).await,
+                Ok(Ok(()))
+            )
+        {
+            *progress = None;
+        }
+        if let Some(journal) = notifications {
+            publish_notification(journal, &notification.notification).await;
+        }
+    }
+    take_result(message, id)
 }
 
 async fn publish_notification(journal: &PassiveEvents, payload: &Value) {
@@ -1444,6 +1622,8 @@ struct SseDecoder {
     read_first_line: bool,
     pending_id: Option<HeaderValue>,
     last_event_id: Option<HeaderValue>,
+    pending_event_type: Option<String>,
+    event_type: Option<String>,
 }
 
 impl SseDecoder {
@@ -1469,6 +1649,7 @@ impl SseDecoder {
                 if let Some(id) = self.pending_id.take() {
                     self.last_event_id = (!id.is_empty()).then_some(id);
                 }
+                self.event_type = self.pending_event_type.take();
                 if !self.event.is_empty() {
                     self.line.clear();
                     return Some(std::mem::take(&mut self.event));
@@ -1481,6 +1662,11 @@ impl SseDecoder {
                     .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
             } else if let Some(id) = line.strip_prefix(b"id:") {
                 self.pending_id = HeaderValue::from_bytes(id.strip_prefix(b" ").unwrap_or(id)).ok();
+            } else if let Some(kind) = line.strip_prefix(b"event:") {
+                self.pending_event_type =
+                    std::str::from_utf8(kind.strip_prefix(b" ").unwrap_or(kind))
+                        .ok()
+                        .map(str::to_owned);
             }
             self.line.clear();
         }

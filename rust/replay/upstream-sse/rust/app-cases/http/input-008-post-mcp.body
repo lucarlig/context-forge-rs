@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"cacheScope":"private","resources":[{"description":"Fixture resource","mimeType":"text/plain","name":"fixture-welcome","uri":"fixture://notes/welcome"}],"resultType":"complete","ttlMs":300000,"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"ContextForge","version":"1.1.2"}}}}

@@ -21,7 +21,7 @@ use crate::{
     mcp::{RedisSessionDirectory, SessionSettings},
     redis_events::RedisEventJournal,
     redis_sessions::RedisListener,
-    upstream::UpstreamAssociation,
+    upstream::{UpstreamAssociation, UpstreamEndpoint, UpstreamTransport},
 };
 
 const MAX_SESSIONS: usize = 4096;
@@ -61,6 +61,7 @@ pub(crate) struct Session {
 struct UpstreamKey {
     gateway: String,
     endpoint: String,
+    transport: UpstreamTransport,
     authorization: Option<[u8; 32]>,
 }
 
@@ -334,12 +335,13 @@ impl Session {
     pub(crate) fn upstream(
         &self,
         gateway: &str,
-        endpoint: &str,
+        endpoint: UpstreamEndpoint<'_>,
         authorization: Option<[u8; 32]>,
     ) -> Option<Arc<UpstreamAssociation>> {
         let key = UpstreamKey {
             gateway: gateway.to_owned(),
-            endpoint: endpoint.to_owned(),
+            endpoint: endpoint.url.to_owned(),
+            transport: endpoint.transport,
             authorization,
         };
         let mut upstreams = self

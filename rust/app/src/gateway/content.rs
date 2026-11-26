@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use super::{GatewayService, Principal, Session, ToolContext, UpstreamError, access};
 use crate::catalog::{CatalogServer, ContentGateway, PromptContentRecord, ResourceContentRecord};
+use crate::upstream::UpstreamEndpoint;
 
 impl GatewayService {
     pub(crate) async fn read_resource(
@@ -287,22 +288,24 @@ impl GatewayService {
         context: ToolContext<'_>,
         downstream: Option<&Session>,
     ) -> Result<Value, ErrorData> {
-        if !gateway.available {
-            return Err(ErrorData::internal_error(
-                "Upstream gateway unavailable",
-                None,
-            ));
-        }
+        let transport = gateway
+            .transport
+            .filter(|_| gateway.available)
+            .ok_or_else(|| ErrorData::internal_error("Upstream gateway unavailable", None))?;
+        let endpoint = UpstreamEndpoint {
+            url: &gateway.url,
+            transport,
+        };
         let association = downstream.and_then(|session| {
             session.upstream(
                 &gateway.id,
-                &gateway.url,
+                endpoint,
                 principal.map(Principal::authorization_fingerprint),
             )
         });
         let modern = context.client_capabilities.is_some();
         let completion = matches!(request, ClientRequest::CompleteRequest(_));
-        self.upstream.request_with_context(&gateway.url, request, context, association.as_deref())
+        self.upstream.request_with_context(endpoint, request, context, association.as_deref())
             .await.map_err(|error| match error {
                 UpstreamError::CompletionUnsupported => ErrorData::new(
                     ErrorCode::METHOD_NOT_FOUND,

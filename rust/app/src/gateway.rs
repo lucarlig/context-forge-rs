@@ -35,7 +35,7 @@ use crate::{
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     sessions::Session,
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
-    upstream::{ToolContext, UpstreamClient, UpstreamError},
+    upstream::{ToolContext, UpstreamClient, UpstreamEndpoint, UpstreamError, UpstreamTransport},
 };
 
 pub struct GatewayService {
@@ -351,23 +351,28 @@ impl GatewayService {
             result = self.lookup_invokable_tool(principal, server, &request.name) => result?,
         }
         .ok_or(ToolError::NotFound)?;
-        if tool.gateway_transport != "STREAMABLEHTTP"
-            || tool.gateway_mode != "cache"
-            || tool.request_type != "STREAMABLEHTTP"
+        let transport =
+            UpstreamTransport::from_name(&tool.gateway_transport).ok_or(ToolError::Unavailable)?;
+        if tool.gateway_mode != "cache"
+            || UpstreamTransport::from_name(&tool.request_type) != Some(transport)
             || tool.requires_gateway_policy
         {
             return Err(ToolError::Unavailable);
         }
+        let endpoint = UpstreamEndpoint {
+            url: &tool.gateway_url,
+            transport,
+        };
         let association = downstream.and_then(|session| {
             let authorization = principal.map(Principal::authorization_fingerprint);
             context.notifications = session.passive_journal(authorization);
-            session.upstream(&tool.gateway_id, &tool.gateway_url, authorization)
+            session.upstream(&tool.gateway_id, endpoint, authorization)
         });
         request.name = tool.original_name.into();
         let legacy_caller = context.client_capabilities.is_none();
         let result = self
             .upstream
-            .call_tool_with_context(&tool.gateway_url, request, context, association.as_deref())
+            .call_tool_with_context(endpoint, request, context, association.as_deref())
             .await;
         match result {
             Ok(result) if legacy_caller && result["resultType"] == "input_required" => {
@@ -564,14 +569,17 @@ async fn register(
             "Invalid gateway name",
         ));
     }
+    let transport = UpstreamTransport::from_name(input.transport.as_deref().unwrap_or("SSE"))
+        .ok_or_else(|| {
+            RegistrationResponse::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Unsupported gateway transport, mode, or authentication",
+            )
+        })?;
     if input
-        .transport
+        .gateway_mode
         .as_deref()
-        .is_none_or(|transport| !transport.eq_ignore_ascii_case("STREAMABLEHTTP"))
-        || input
-            .gateway_mode
-            .as_deref()
-            .is_some_and(|mode| mode != "cache")
+        .is_some_and(|mode| mode != "cache")
         || input
             .auth_type
             .as_deref()
@@ -609,7 +617,7 @@ async fn register(
     let url = input.url.trim();
     let (discovery, metadata) = service
         .upstream
-        .discover_catalog(url)
+        .discover_catalog(UpstreamEndpoint { url, transport })
         .await
         .map_err(|error| {
             tracing::warn!(%error, "upstream gateway discovery failed");
@@ -641,6 +649,7 @@ async fn register(
         name,
         slug: &slug,
         url,
+        transport,
         description,
         capabilities: &discovery.capabilities,
         visibility,
@@ -729,7 +738,7 @@ fn registration_response(
     let now = Timestamp::now().to_string();
     let mut response = json!({
         "id": gateway.id, "name": gateway.name, "slug": gateway.slug, "url": gateway.url,
-        "description": gateway.description, "transport": "STREAMABLEHTTP",
+        "description": gateway.description, "transport": gateway.transport.name(),
         "capabilities": gateway.capabilities, "createdAt": now, "updatedAt": now, "lastSeen": now,
         "status": "active", "registrationAttempts": 0, "enabled": true, "reachable": true,
         "ownerEmail": gateway.owner_email, "teamId": gateway.team_id, "visibility": gateway.visibility,

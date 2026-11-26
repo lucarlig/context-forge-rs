@@ -8,7 +8,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{auth::TeamVisibility, database::Database, upstream::DiscoveredMetadata};
+use crate::{
+    auth::TeamVisibility,
+    database::Database,
+    upstream::{DiscoveredMetadata, UpstreamTransport},
+};
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
 const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
@@ -117,6 +121,7 @@ pub(crate) enum CatalogList {
 pub(crate) struct ContentGateway {
     pub(crate) id: String,
     pub(crate) url: String,
+    pub(crate) transport: Option<UpstreamTransport>,
     pub(crate) available: bool,
 }
 
@@ -172,6 +177,7 @@ pub struct GatewayRegistration<'a> {
     pub name: &'a str,
     pub slug: &'a str,
     pub url: &'a str,
+    pub transport: UpstreamTransport,
     pub description: Option<&'a str>,
     pub capabilities: &'a Value,
     pub visibility: &'a str,
@@ -383,7 +389,7 @@ macro_rules! metadata_query {
 
 macro_rules! content_gateway_columns {
     () => {
-        concat!("g.id, g.url, COALESCE(g.transport = 'STREAMABLEHTTP' AND g.gateway_mode = 'cache' AND NOT ", gateway_policy!(), ", FALSE)")
+        concat!("g.id, g.url, g.transport, COALESCE(UPPER(g.transport) IN ('SSE', 'STREAMABLEHTTP') AND g.gateway_mode = 'cache' AND NOT ", gateway_policy!(), ", FALSE)")
     };
 }
 
@@ -426,6 +432,7 @@ type ResourceContentRow = (
     Option<Vec<u8>>,
     Option<String>,
     Option<String>,
+    Option<String>,
     bool,
 );
 type PromptContentRow = (
@@ -434,6 +441,7 @@ type PromptContentRow = (
     Option<String>,
     Option<String>,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -447,6 +455,7 @@ type ResourceSubscriptionRow = (
     Option<String>,
     Option<String>,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     bool,
@@ -548,7 +557,7 @@ macro_rules! insert_gateway {
             "INSERT INTO gateways (
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
                 updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status
-            ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", 'STREAMABLEHTTP', TRUE,
+            ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, 'cache', 'active')"
         )
     };
@@ -562,7 +571,7 @@ macro_rules! insert_tool {
                 title, input_schema, output_schema, annotations, url, enabled, reachable, created_at, updated_at,
                 jsonpath_filter, integration_type, request_type, created_by, owner_email, team_id, visibility
             ) VALUES ($1, $2, $3, $4, $5, $4, $6, $6, $7, ", $input_schema, ", ", $output_schema, ", ", $annotations, ",
-                $11, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '', 'MCP', 'STREAMABLEHTTP', $12, $12, $13, $14)"
+                $11, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '', 'MCP', $15, $12, $12, $13, $14)"
         )
     };
 }
@@ -771,7 +780,11 @@ impl Database {
                     "resources",
                     "server_resource_association",
                     "resource_id",
-                    concat!("item.gateway_id IS NOT NULL AND item.uri IN (", $uris, ")")
+                    concat!(
+                        "UPPER(g.transport) = 'STREAMABLEHTTP' AND item.uri IN (",
+                        $uris,
+                        ")"
+                    )
                 );
                 sqlx::query_as::<_, ResourceSubscriptionRow>(query)
                     .bind(server)
@@ -800,7 +813,7 @@ impl Database {
         };
         Ok(rows
             .into_iter()
-            .filter_map(|(_, _, _, _, uri, gateway_id, url, available)| {
+            .filter_map(|(_, _, _, _, uri, gateway_id, url, _, available)| {
                 match (gateway_id, url, available) {
                     (Some(gateway_id), Some(url), true) => Some(ResourceSubscriptionTarget {
                         gateway_id,
@@ -935,8 +948,19 @@ impl Database {
                 "ambiguous prompt name in visible catalog".into(),
             ));
         }
-        let Some((_, _, _, description, original_name, template, schema, id, url, available)) =
-            rows.pop()
+        let Some((
+            _,
+            _,
+            _,
+            description,
+            original_name,
+            template,
+            schema,
+            id,
+            url,
+            transport,
+            available,
+        )) = rows.pop()
         else {
             return Ok(None);
         };
@@ -945,9 +969,7 @@ impl Database {
             description,
             template,
             argument_schema: decode_optional_json(schema.as_deref())?,
-            gateway: id
-                .zip(url)
-                .map(|(id, url)| ContentGateway { id, url, available }),
+            gateway: content_gateway(id, url, transport.as_deref(), available),
         }))
     }
 
@@ -1073,6 +1095,7 @@ impl Database {
                     .bind(gateway.owner_email)
                     .bind(gateway.team_id)
                     .bind(gateway.visibility)
+                    .bind(gateway.transport.name())
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1097,6 +1120,7 @@ impl Database {
                         .bind(gateway.owner_email)
                         .bind(gateway.team_id)
                         .bind(gateway.visibility)
+                        .bind(gateway.transport.name())
                         .execute(&mut *$tx)
                         .await?;
                 }
@@ -1184,15 +1208,27 @@ fn visible_team_ids(scope: CatalogScope<'_>) -> Result<String, sqlx::Error> {
 }
 
 fn resource_content_record(row: ResourceContentRow) -> ResourceContentRecord {
-    let (_, _, _, _, _, mime, text, blob, id, url, available) = row;
+    let (_, _, _, _, _, mime, text, blob, id, url, transport, available) = row;
     ResourceContentRecord {
         mime,
         text,
         blob,
-        gateway: id
-            .zip(url)
-            .map(|(id, url)| ContentGateway { id, url, available }),
+        gateway: content_gateway(id, url, transport.as_deref(), available),
     }
+}
+
+fn content_gateway(
+    id: Option<String>,
+    url: Option<String>,
+    transport: Option<&str>,
+    available: bool,
+) -> Option<ContentGateway> {
+    Some(ContentGateway {
+        id: id?,
+        url: url?,
+        transport: transport.and_then(UpstreamTransport::from_name),
+        available,
+    })
 }
 
 fn uri_matches_template(uri: &str, mut template: &str) -> bool {
@@ -1434,6 +1470,7 @@ mod tests {
             name: id,
             slug: id,
             url,
+            transport: UpstreamTransport::StreamableHttp,
             description: Some("Catalog fixture"),
             capabilities,
             visibility,

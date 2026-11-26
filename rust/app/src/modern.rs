@@ -935,6 +935,7 @@ mod tests {
                         name: gateway,
                         slug: gateway,
                         url: &format!("http://localhost:9000/{gateway}"),
+                        transport: crate::upstream::UpstreamTransport::StreamableHttp,
                         description: None,
                         capabilities: &capabilities,
                         visibility: gateway,
