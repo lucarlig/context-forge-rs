@@ -55,6 +55,7 @@ const LAST_EVENT_ID: &str = "last-event-id";
 const RUNTIME_HEADER: &str = "x-contextforge-mcp-runtime";
 const LEGACY_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const MODERN_VERSION: &str = "2026-07-28";
+pub(crate) const ROOT_INSTRUCTIONS: &str = "ContextForge providing federated tools, resources and prompts. Use /admin interface for configuration.";
 const SUPPORTED_VERSIONS: [&str; 5] = [
     LEGACY_VERSIONS[0],
     LEGACY_VERSIONS[1],
@@ -1493,7 +1494,10 @@ fn initialize(params: Option<&Value>, server: Option<&CatalogServer>) -> Option<
             "ContextForge",
             env!("CARGO_PKG_VERSION"),
         ));
-    result.instructions = server.and_then(|server| server.instructions.clone());
+    result.instructions = match server {
+        Some(server) => server.instructions.clone(),
+        None => Some(ROOT_INSTRUCTIONS.to_owned()),
+    };
     Some(result)
 }
 
@@ -1789,7 +1793,8 @@ mod tests {
                         "protocolVersion": expected,
                         "capabilities": {"completions": {}, "logging": {}, "tools": {"listChanged": false}, "prompts": {"listChanged": false},
                             "resources": {"listChanged": false, "subscribe": false}},
-                        "serverInfo": { "name": "ContextForge", "version": env!("CARGO_PKG_VERSION") }
+                        "serverInfo": { "name": "ContextForge", "version": env!("CARGO_PKG_VERSION") },
+                        "instructions": ROOT_INSTRUCTIONS,
                     }
                 })
             );

@@ -16,6 +16,7 @@ mod modern_validation;
 pub mod probes;
 mod redis_events;
 mod redis_sessions;
+mod resource_relay;
 mod sessions;
 mod subscriptions;
 pub mod upstream;

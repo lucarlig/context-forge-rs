@@ -16,6 +16,7 @@ use jiff::Timestamp;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, MetaObject,
+    SubscriptionFilter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,7 +34,7 @@ use crate::{
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings},
     sessions::Session,
-    subscriptions::{CatalogSubscriptions, ListenSettings},
+    subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
     upstream::{ToolContext, UpstreamClient, UpstreamError},
 };
 
@@ -44,7 +45,7 @@ pub struct GatewayService {
     pagination: Pagination,
     refresh: CatalogRefresh,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
-    pub(crate) subscriptions: CatalogSubscriptions,
+    subscriptions: CatalogSubscriptions,
 }
 
 pub struct CatalogRefresh {
@@ -118,6 +119,17 @@ impl GatewayService {
     pub fn with_listen_settings(mut self, settings: ListenSettings) -> Self {
         self.subscriptions = CatalogSubscriptions::new(settings);
         self
+    }
+
+    pub(crate) async fn prepare_subscription(
+        &self,
+        requested: SubscriptionFilter,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+    ) -> Result<AcceptedSubscription, ErrorData> {
+        self.subscriptions
+            .prepare(&self.database, &self.upstream, requested, principal, server)
+            .await
     }
 
     #[allow(deprecated)]

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
@@ -13,7 +14,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, Sse, sse::Event},
     routing::post,
 };
 use context_forge_rs::{
@@ -25,16 +26,190 @@ use context_forge_rs::{
     mcp::{HttpOptions, ListenSettings, ProtocolMode, SessionSettings},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
+use futures_util::{StreamExt, stream};
 use jiff::Timestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
+
+const WATCHED_RESOURCE: &str = "fixture://notes/watched";
+
+#[derive(Default)]
+struct ResourceStreamFixture {
+    opened: AtomicUsize,
+    release: CancellationToken,
+    closed: CancellationToken,
+}
+
+async fn modern_resource_fixture(
+    State(fixture): State<Arc<ResourceStreamFixture>>,
+    Json(request): Json<Value>,
+) -> Response {
+    let id = &request["id"];
+    let mut result = match request["method"].as_str().unwrap() {
+        "server/discover" => json!({
+            "supportedVersions":["2026-07-28"],
+            "capabilities":{"resources":{"subscribe":true}}
+        }),
+        "tools/list" => json!({"tools":[]}),
+        "resources/list" => json!({"resources":[{"name":"watched","uri":WATCHED_RESOURCE}]}),
+        "resources/templates/list" => json!({"resourceTemplates":[]}),
+        "subscriptions/listen" => {
+            let notifications = &request["params"]["notifications"];
+            assert_eq!(
+                notifications["resourceSubscriptions"],
+                json!([WATCHED_RESOURCE])
+            );
+            fixture.opened.fetch_add(1, Ordering::SeqCst);
+            let disconnected = fixture.closed.clone().drop_guard();
+            let frame = |method: &str, mut params: Value| {
+                params["_meta"] = json!({"io.modelcontextprotocol/subscriptionId":id});
+                Ok::<Event, Infallible>(
+                    Event::default().event("message").data(
+                        json!({
+                            "jsonrpc":"2.0","method":method,"params":params
+                        })
+                        .to_string(),
+                    ),
+                )
+            };
+            let unrequested = frame(
+                "notifications/resources/updated",
+                json!({"uri":"fixture://notes/unrequested"}),
+            );
+            let frames = stream::once(std::future::ready(frame(
+                "notifications/subscriptions/acknowledged",
+                json!({"notifications":notifications}),
+            )))
+            .chain(stream::once(async move {
+                fixture.release.cancelled().await;
+                unrequested
+            }))
+            .chain(stream::once(std::future::ready(frame(
+                "notifications/resources/updated",
+                json!({"uri":WATCHED_RESOURCE}),
+            ))))
+            .chain(stream::pending())
+            .map(move |event| {
+                let _ = &disconnected;
+                event
+            });
+            return Sse::new(frames).into_response();
+        }
+        method => panic!("unexpected upstream method {method}"),
+    };
+    result["resultType"] = json!("complete");
+    result["ttlMs"] = json!(0);
+    result["cacheScope"] = json!("private");
+    result["_meta"] =
+        json!({"io.modelcontextprotocol/serverInfo":{"name":"fixture","version":"1"}});
+    Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+}
+
+#[tokio::test]
+async fn modern_resource_subscriptions_share_scoped_upstream_watches() {
+    const METHOD: &str = "subscriptions/listen";
+    const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let fixture = Arc::new(ResourceStreamFixture::default());
+    let upstream = Running::start(
+        Router::new()
+            .route("/mcp", post(modern_resource_fixture))
+            .with_state(fixture.clone()),
+    )
+    .await;
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    sqlx::query("INSERT INTO servers (id, name, visibility) VALUES ('v', 'Virtual', 'public')")
+        .execute(pool)
+        .await
+        .unwrap();
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        ),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(
+        service
+            .registration_router()
+            .merge(service.mcp_router(false, ProtocolMode::Auto)),
+    )
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registration) = send(&client, gateway.url("/gateways"), json!({
+        "name":"resource-fixture","url":upstream.url("/mcp"),"visibility":"public","transport":"STREAMABLEHTTP"
+    }), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{registration}");
+    let listen = |path: &str, id| {
+        client.post(gateway.url(path))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", METHOD)
+            .body(modern_request(METHOD, id, json!({"notifications":{
+                "resourceSubscriptions":[WATCHED_RESOURCE,"fixture://absent",WATCHED_RESOURCE]
+            }})).to_string())
+    };
+    let mut scoped = listen("/servers/v/mcp/", 30).send().await.unwrap();
+    let (_, ack) = next_sse_message(&mut scoped, &mut Vec::new()).await;
+    assert_eq!(ack["params"]["notifications"], json!({}));
+    drop(scoped);
+
+    let mut first = listen("/mcp/", 31).send().await.unwrap();
+    let mut second = listen("/mcp/", 32).send().await.unwrap();
+    let mut first_buffer = Vec::new();
+    let mut second_buffer = Vec::new();
+    for (response, buffered, id) in [
+        (&mut first, &mut first_buffer, 31),
+        (&mut second, &mut second_buffer, 32),
+    ] {
+        let (_, ack) = next_sse_message(response, buffered).await;
+        assert_eq!(ack["params"]["_meta"][SUBSCRIPTION_ID], id);
+        assert_eq!(
+            ack["params"]["notifications"]["resourceSubscriptions"],
+            json!([WATCHED_RESOURCE])
+        );
+    }
+    fixture.release.cancel();
+    for (response, buffered, id) in [
+        (&mut first, &mut first_buffer, 31),
+        (&mut second, &mut second_buffer, 32),
+    ] {
+        let (_, update) = next_sse_message(response, buffered).await;
+        assert_eq!(update["method"], "notifications/resources/updated");
+        assert_eq!(update["params"]["uri"], WATCHED_RESOURCE);
+        assert_eq!(update["params"]["_meta"][SUBSCRIPTION_ID], id);
+    }
+    assert_eq!(fixture.opened.load(Ordering::SeqCst), 1);
+    drop(first);
+    assert!(!fixture.closed.is_cancelled());
+    drop(second);
+    tokio::time::timeout(Duration::from_secs(3), fixture.closed.cancelled())
+        .await
+        .expect("the upstream stream closes when the last subscriber leaves");
+}
 
 #[tokio::test]
 async fn modern_catalog_subscription_streams_registration_and_tears_down() {

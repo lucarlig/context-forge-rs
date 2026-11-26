@@ -4,11 +4,11 @@ ContextForge RS is a standalone Rust rewrite of the [ContextForge gateway](https
 
 ## Full-port progress
 
-`██████░░░░░░░░░░░░░░░░░░░` **24%**
+`███████░░░░░░░░░░░░░░░░░░` **28%**
 
-6 of 25 [port milestones](rust/MAP.md#milestones) are verified. Each milestone counts equally.
+7 of 25 [port milestones](rust/MAP.md#milestones) are verified. Each milestone counts equally.
 
-The Rust binary serves health and readiness probes, modern and legacy MCP, and scoped tool listing and invocation. Register a Streamable HTTP upstream through `POST /gateways` or `POST /v1/mcp-servers`. The gateway uses [rmcp](https://github.com/modelcontextprotocol/rust-sdk) protocol models and the modern Streamable HTTP server.
+The Rust binary serves health and readiness probes, modern and legacy MCP, scoped tool invocation, resource reads, prompt retrieval, and completions. Modern clients can subscribe to catalog changes and visible upstream resource updates. Register a Streamable HTTP upstream through `POST /gateways` or `POST /v1/mcp-servers`. The gateway uses [rmcp](https://github.com/modelcontextprotocol/rust-sdk) protocol models and the modern Streamable HTTP server.
 
 ```sh
 cargo run --locked

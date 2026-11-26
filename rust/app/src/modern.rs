@@ -45,16 +45,14 @@ use crate::{
     catalog::{CatalogList, CatalogServer, ToolDefinition},
     gateway::{GatewayService, ToolError},
     mcp::{
-        JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, accepts_event_stream, accepts_json,
-        accepts_post_stream, catalog_capabilities, rpc_error,
+        JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, ROOT_INSTRUCTIONS, accepts_event_stream,
+        accepts_json, accepts_post_stream, catalog_capabilities, rpc_error,
     },
     modern_validation::reject_invalid_request,
     subscriptions::AcceptedSubscription,
     upstream::{ToolContext, ToolProgress},
 };
 
-const ROOT_INSTRUCTIONS: &str =
-    "ContextForge provides federated tools. Register MCP servers through /v1/mcp-servers.";
 const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const MODERN_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 
@@ -146,7 +144,7 @@ impl Modern {
             Ok(bytes) => bytes,
             Err(error) => return error.into_response(),
         };
-        let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(mut body) = serde_json::from_slice::<Value>(&bytes) else {
             return rpc_error(
                 StatusCode::BAD_REQUEST,
                 &Value::Null,
@@ -166,11 +164,15 @@ impl Modern {
             if parts.extensions.get::<AcceptsProgress>().is_none() {
                 return StatusCode::NOT_ACCEPTABLE.into_response();
             }
-            let subscription = match self.gateway.subscriptions.prepare(
-                listen.params.notifications,
-                parts.extensions.get::<Principal>(),
-                parts.extensions.get::<CatalogServer>().is_some(),
-            ) {
+            let subscription = match self
+                .gateway
+                .prepare_subscription(
+                    listen.params.notifications,
+                    parts.extensions.get::<Principal>(),
+                    parts.extensions.get::<CatalogServer>(),
+                )
+                .await
+            {
                 Ok(subscription) => subscription,
                 Err(error) => {
                     return rpc_error(
@@ -182,13 +184,16 @@ impl Modern {
                     );
                 }
             };
+            body["params"]["notifications"] = serde_json::to_value(&subscription.filter)
+                .expect("serialize MCP notification filter");
+            let body = serde_json::to_vec(&body).expect("serialize authorized MCP request");
             let transport = transport(
                 self.gateway.clone(),
                 None,
                 Some(subscription),
                 self.transport.config.clone(),
             );
-            return handle(&transport, Request::from_parts(parts, Body::from(bytes))).await;
+            return handle(&transport, Request::from_parts(parts, Body::from(body))).await;
         }
         if matches!(
             body["method"].as_str(),
@@ -365,6 +370,7 @@ impl ServerHandler for GatewayHandler {
         }
         if let Some(resources) = &mut capabilities.resources {
             resources.list_changed = Some(true);
+            resources.subscribe = Some(true);
         }
         ServerConfig::new(capabilities)
             .with_server_info(implementation())

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -22,8 +22,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     access::{self, Principal},
-    catalog::GatewayRegistration,
+    catalog::{CatalogScope, CatalogServer, GatewayRegistration},
+    database::Database,
+    resource_relay::{ResourceRelay, ResourceWatches},
+    upstream::UpstreamClient,
 };
+
+const MAX_RESOURCE_URIS_PER_LISTEN: usize = 64;
 
 pub struct ListenSettings {
     pub max_lifetime: Duration,
@@ -47,6 +52,7 @@ pub(crate) struct CatalogSubscriptions {
     settings: ListenSettings,
     active: Arc<Mutex<HashMap<Option<String>, usize>>>,
     registrations: broadcast::Sender<RegistrationChange>,
+    resources: ResourceRelay,
 }
 
 #[derive(Clone)]
@@ -62,6 +68,7 @@ impl CatalogSubscriptions {
             settings,
             active: Arc::default(),
             registrations: broadcast::channel(256).0,
+            resources: ResourceRelay::new(),
         }
     }
 
@@ -73,11 +80,13 @@ impl CatalogSubscriptions {
         });
     }
 
-    pub(crate) fn prepare(
+    pub(crate) async fn prepare(
         &self,
+        database: &Database,
+        upstream: &UpstreamClient,
         requested: SubscriptionFilter,
         principal: Option<&Principal>,
-        server_scoped: bool,
+        server: Option<&CatalogServer>,
     ) -> Result<AcceptedSubscription, ErrorData> {
         let allowed =
             |permission| principal.is_none_or(|principal| principal.token_allows(permission));
@@ -120,6 +129,41 @@ impl CatalogSubscriptions {
             }
             *active.entry(key.clone()).or_default() += 1;
         }
+        let slot = Slot {
+            key,
+            active: self.active.clone(),
+        };
+        let mut distinct = HashSet::new();
+        let wanted = requested
+            .resource_subscriptions
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|uri| permitted_resources && distinct.insert(*uri))
+            .take(MAX_RESOURCE_URIS_PER_LISTEN)
+            .collect::<Vec<_>>();
+        let targets = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            database
+                .resource_subscription_targets(
+                    access::catalog_scope(principal),
+                    server.map(|server| server.id.as_str()),
+                    &wanted,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "resource subscription target lookup failed");
+                    ErrorData::internal_error("Internal server error", None)
+                })?
+        };
+        let resources = self.resources.watch(targets, upstream);
+        let accepted_uris: Vec<_> = wanted
+            .into_iter()
+            .filter(|uri| resources.contains_uri(uri))
+            .map(str::to_owned)
+            .collect();
+        filter.resource_subscriptions = (!accepted_uris.is_empty()).then_some(accepted_uris);
         let lifetime = principal
             .and_then(|principal| principal.expires_at)
             .map_or(self.settings.max_lifetime, |expiry| {
@@ -134,13 +178,11 @@ impl CatalogSubscriptions {
         Ok(AcceptedSubscription {
             filter,
             stream: Arc::new(Mutex::new(Some(SubscriptionStream {
-                _slot: Slot {
-                    key,
-                    active: self.active.clone(),
-                },
+                _slot: slot,
                 registrations: self.registrations.subscribe(),
+                resources,
                 principal: principal.cloned(),
-                server_scoped,
+                server_scoped: server.is_some(),
                 expires: Instant::now() + lifetime,
                 shutdown: self.settings.shutdown.clone(),
             }))),
@@ -196,6 +238,7 @@ impl AcceptedSubscription {
 struct SubscriptionStream {
     _slot: Slot,
     registrations: broadcast::Receiver<RegistrationChange>,
+    resources: ResourceWatches,
     principal: Option<Principal>,
     server_scoped: bool,
     expires: Instant,
@@ -207,12 +250,15 @@ impl SubscriptionStream {
         let shutdown = self.shutdown.clone();
         let receives_catalog_changes =
             !self.server_scoped && wants_list_changes(context.accepted());
+        let receives_resource_updates = !self.resources.is_empty();
+        let scope = access::catalog_scope(self.principal.as_ref());
         tokio::select! {
             biased;
             () = context.cancelled() => return,
             () = sleep_until(self.expires) => {},
             () = shutdown.cancelled() => {},
-            _ = self.publish_changes(&context), if receives_catalog_changes => return,
+            _ = publish_changes(&mut self.registrations, scope, &context), if receives_catalog_changes => return,
+            _ = self.resources.publish_updates(&context), if receives_resource_updates => return,
         }
         let request = context.request_context();
         let mut meta = NotificationMetaObject::new();
@@ -230,36 +276,36 @@ impl SubscriptionStream {
         )
         .await;
     }
+}
 
-    async fn publish_changes(
-        &mut self,
-        context: &SubscriptionContext,
-    ) -> Result<(), SubscriptionSendError> {
-        let scope = access::catalog_scope(self.principal.as_ref());
-        let filter = context.accepted();
-        let sink = context.sink();
-        loop {
-            let change = match self.registrations.recv().await {
-                Ok(change) => change,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
-            };
-            if !scope.visible(
-                &change.visibility,
-                change.team_id.as_deref(),
-                Some(&change.owner),
-            ) {
-                continue;
-            }
-            if filter.prompts_list_changed == Some(true) {
-                sink.notify_prompt_list_changed().await?;
-            }
-            if filter.resources_list_changed == Some(true) {
-                sink.notify_resource_list_changed().await?;
-            }
-            if filter.tools_list_changed == Some(true) {
-                sink.notify_tool_list_changed().await?;
-            }
+async fn publish_changes(
+    registrations: &mut broadcast::Receiver<RegistrationChange>,
+    scope: CatalogScope<'_>,
+    context: &SubscriptionContext,
+) -> Result<(), SubscriptionSendError> {
+    let filter = context.accepted();
+    let sink = context.sink();
+    loop {
+        let change = match registrations.recv().await {
+            Ok(change) => change,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        };
+        if !scope.visible(
+            &change.visibility,
+            change.team_id.as_deref(),
+            Some(&change.owner),
+        ) {
+            continue;
+        }
+        if filter.prompts_list_changed == Some(true) {
+            sink.notify_prompt_list_changed().await?;
+        }
+        if filter.resources_list_changed == Some(true) {
+            sink.notify_resource_list_changed().await?;
+        }
+        if filter.tools_list_changed == Some(true) {
+            sink.notify_tool_list_changed().await?;
         }
     }
 }

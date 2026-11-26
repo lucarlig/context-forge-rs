@@ -120,6 +120,13 @@ pub(crate) struct ContentGateway {
     pub(crate) available: bool,
 }
 
+#[derive(Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ResourceSubscriptionTarget {
+    pub(crate) gateway_id: String,
+    pub(crate) url: String,
+    pub(crate) uri: String,
+}
+
 pub(crate) struct ResourceContentRecord {
     pub(crate) mime: Option<String>,
     pub(crate) text: Option<String>,
@@ -337,7 +344,7 @@ macro_rules! tool_query {
 }
 
 macro_rules! metadata_query {
-    ($team_ids:literal, $columns:expr, $table:literal, $association:literal, $id:literal, $filter:literal) => {
+    ($team_ids:literal, $columns:expr, $table:literal, $association:literal, $id:literal, $filter:expr) => {
         concat!(
             "WITH visible_team_ids(id) AS (",
             $team_ids,
@@ -429,6 +436,17 @@ type PromptContentRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
+type ResourceSubscriptionRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
     Option<String>,
     Option<String>,
     bool,
@@ -734,6 +752,65 @@ impl Database {
             .resource_content_rows(scope, server, None, Some(template), None, 1)
             .await?;
         Ok(rows.pop().map(resource_content_record))
+    }
+
+    pub(crate) async fn resource_subscription_targets(
+        &self,
+        scope: CatalogScope<'_>,
+        server: Option<&str>,
+        uris: &[&str],
+    ) -> Result<Vec<ResourceSubscriptionTarget>, sqlx::Error> {
+        let teams = visible_team_ids(scope)?;
+        let uris =
+            serde_json::to_string(uris).map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        macro_rules! select {
+            ($pool:ident, $teams:literal, $uris:literal) => {{
+                let query = metadata_query!(
+                    $teams,
+                    concat!("item.uri, ", content_gateway_columns!()),
+                    "resources",
+                    "server_resource_association",
+                    "resource_id",
+                    concat!("item.gateway_id IS NOT NULL AND item.uri IN (", $uris, ")")
+                );
+                sqlx::query_as::<_, ResourceSubscriptionRow>(query)
+                    .bind(server)
+                    .bind(i64::MAX)
+                    .bind(None::<&str>)
+                    .bind(scope.email)
+                    .bind(scope.visibility == &TeamVisibility::Admin)
+                    .bind(scope.can_own())
+                    .bind(teams)
+                    .bind(uris)
+                    .fetch_all($pool)
+                    .await?
+            }};
+        }
+        let rows = match self {
+            Self::Sqlite(pool) => select!(
+                pool,
+                "SELECT value FROM json_each($7)",
+                "SELECT value FROM json_each($8)"
+            ),
+            Self::Postgres(pool) => select!(
+                pool,
+                "SELECT json_array_elements_text(CAST($7 AS JSON))",
+                "SELECT json_array_elements_text(CAST($8 AS JSON))"
+            ),
+        };
+        Ok(rows
+            .into_iter()
+            .filter_map(|(_, _, _, _, uri, gateway_id, url, available)| {
+                match (gateway_id, url, available) {
+                    (Some(gateway_id), Some(url), true) => Some(ResourceSubscriptionTarget {
+                        gateway_id,
+                        uri,
+                        url,
+                    }),
+                    _ => None,
+                }
+            })
+            .collect())
     }
 
     pub(crate) async fn resource_completions(

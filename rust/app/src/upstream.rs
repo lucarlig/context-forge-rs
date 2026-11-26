@@ -27,7 +27,8 @@ use rmcp::model::{
     JsonRpcMessage, JsonRpcRequest, ListPromptsRequest, ListResourceTemplatesRequest,
     ListResourcesRequest, ListToolsRequest, PaginatedRequestParams, ProgressNotificationParam,
     ProgressToken, Prompt, ProtocolVersion, RequestId, RequestMetaObject, Resource,
-    ResourceTemplate, ServerJsonRpcMessage, ServerNotification, ServerRequest,
+    ResourceTemplate, ServerJsonRpcMessage, ServerNotification, ServerRequest, SubscriptionFilter,
+    SubscriptionsListenRequest, SubscriptionsListenRequestParams,
 };
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
@@ -219,6 +220,17 @@ pub enum UpstreamError {
         message: String,
         data: Option<Value>,
     },
+}
+
+pub(crate) enum ResourceListenEvent {
+    Acknowledged,
+    Updated,
+}
+
+pub(crate) enum ResourceListenEnd {
+    Legacy,
+    Declined,
+    Disconnected,
 }
 
 impl From<reqwest::Error> for UpstreamError {
@@ -521,6 +533,114 @@ impl UpstreamClient {
             _ => {}
         }
         result
+    }
+
+    pub(crate) async fn listen_resource(
+        &self,
+        endpoint: &str,
+        uri: &str,
+        mut on_event: impl FnMut(ResourceListenEvent),
+    ) -> Result<ResourceListenEnd, UpstreamError> {
+        let deadline = self.deadline()?;
+        let session = self.open_session(endpoint, deadline).await?;
+        let Some(version) = session
+            .protocol_version
+            .as_ref()
+            .filter(|version| !version.has_initialize())
+        else {
+            session.close().await;
+            return Ok(ResourceListenEnd::Legacy);
+        };
+        let filter = SubscriptionFilter::builder()
+            .resource_subscription(uri)
+            .build();
+        let request =
+            SubscriptionsListenRequest::new(SubscriptionsListenRequestParams::new(filter));
+        let (mut response, id) = timeout_at(
+            deadline,
+            session.send_request(request.into(), Some(version), false),
+        )
+        .await
+        .map_err(|_| UpstreamError::Timeout)??;
+        if !response.status().is_success() {
+            return Err(UpstreamError::Status(response.status().as_u16()));
+        }
+        if !response_media_type(&response)
+            .is_some_and(|media| media.eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(UpstreamError::InvalidResponse);
+        }
+
+        let subscription_id = RequestId::Number(id);
+        let mut decoder = SseDecoder::default();
+        let mut acknowledged = false;
+        loop {
+            let chunk = if acknowledged {
+                response.chunk().await?
+            } else {
+                timeout_at(deadline, response.chunk())
+                    .await
+                    .map_err(|_| UpstreamError::Timeout)??
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if chunk.len() > MAX_MESSAGE_BYTES {
+                return Err(UpstreamError::LimitExceeded);
+            }
+            let mut bytes = chunk.as_ref();
+            while let Some(frame) = decoder.next_frame(&mut bytes) {
+                if frame.len() > MAX_MESSAGE_BYTES {
+                    return Err(UpstreamError::LimitExceeded);
+                }
+                let message = decode_message(&frame)?;
+                let JsonRpcMessage::Notification(notification) = message else {
+                    if take_result(message, id)?.is_some() {
+                        return Ok(ResourceListenEnd::Disconnected);
+                    }
+                    continue;
+                };
+                let Ok(notification) = ServerNotification::deserialize(notification.notification)
+                else {
+                    continue;
+                };
+                if notification.get_meta().subscription_id() != Some(subscription_id.clone()) {
+                    continue;
+                }
+                match notification {
+                    ServerNotification::SubscriptionsAcknowledgedNotification(ack)
+                        if !acknowledged =>
+                    {
+                        if !ack
+                            .params
+                            .notifications
+                            .resource_subscriptions
+                            .as_ref()
+                            .is_some_and(|uris| uris.iter().any(|accepted| accepted == uri))
+                        {
+                            return Ok(ResourceListenEnd::Declined);
+                        }
+                        acknowledged = true;
+                        on_event(ResourceListenEvent::Acknowledged);
+                    }
+                    ServerNotification::ResourceUpdatedNotification(update)
+                        if acknowledged && update.params.uri == uri =>
+                    {
+                        on_event(ResourceListenEvent::Updated);
+                    }
+                    ServerNotification::CancelledNotification(cancel)
+                        if cancel.params.request_id == Some(subscription_id.clone()) =>
+                    {
+                        return Ok(ResourceListenEnd::Disconnected);
+                    }
+                    _ => {}
+                }
+            }
+            if decoder.line.len() + decoder.event.len() > MAX_MESSAGE_BYTES {
+                return Err(UpstreamError::LimitExceeded);
+            }
+        }
+        Ok(ResourceListenEnd::Disconnected)
     }
 
     fn deadline(&self) -> Result<Instant, UpstreamError> {
