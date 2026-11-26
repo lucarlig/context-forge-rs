@@ -1,0 +1,26 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-legacy-reference-server",
+  "run": [
+    "context-forge-legacy-reference-server"
+  ],
+  "normalizers": {
+    "runtime": "^(python|rust)$"
+  },
+  "timeout_secs": 30,
+  "http": {
+    "ready_secs": 25
+  },
+  "recorded": [
+    "01-initialize",
+    "02-initialized",
+    "03-tools-list",
+    "04-tools-call",
+    "05-ping",
+    "06-missing-protocol-version",
+    "07-unknown-method",
+    "08-invalid-protocol-header",
+    "09-get-stateless",
+    "10-no-trailing-slash"
+  ]
+}

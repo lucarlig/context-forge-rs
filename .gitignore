@@ -2,4 +2,4 @@
 /mcp.db
 /mcp.db-*
 /.env
-/rust/app-cases/replay-report.md
+**/app-cases/replay-report.md

@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-
-// SPDX-License-Identifier: Apache-2.0
 //! Token visibility and permission scope for verified claims.
 
 use std::collections::HashSet;
@@ -20,7 +18,7 @@ pub enum TeamVisibility {
 }
 
 impl TeamVisibility {
-    fn from_teams(teams: Vec<String>) -> Self {
+    pub(crate) fn from_teams(teams: Vec<String>) -> Self {
         if teams.is_empty() {
             Self::Public
         } else {

@@ -9,6 +9,7 @@
     "ready_secs": 25
   },
   "recorded": [
+    "01-unauthenticated-initialize",
     "health",
     "ready"
   ]

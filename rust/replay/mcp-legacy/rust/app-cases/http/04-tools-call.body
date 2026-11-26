@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"echo: hello","type":"text"}],"isError":false,"structuredContent":{"result":"echo: hello"}}}
