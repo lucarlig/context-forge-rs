@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Extension, Json, Router,
@@ -25,7 +25,7 @@ use crate::{
         ToolDefinition,
     },
     database::Database,
-    mcp::ProtocolMode,
+    mcp::{ProtocolMode, SessionSettings},
     upstream::{UpstreamClient, UpstreamError},
 };
 
@@ -118,10 +118,12 @@ impl GatewayService {
         self: &Arc<Self>,
         require_auth: bool,
         mode: ProtocolMode,
-        ttl: Option<Duration>,
+        sessions: Option<SessionSettings>,
     ) -> Router {
-        self.access
-            .protect_mcp(crate::mcp::router(self.clone(), mode, ttl), require_auth)
+        self.access.protect_mcp(
+            crate::mcp::router(self.clone(), mode, sessions),
+            require_auth,
+        )
     }
 
     pub(crate) async fn catalog_ttl_ms(&self, server: Option<&CatalogServer>) -> u64 {

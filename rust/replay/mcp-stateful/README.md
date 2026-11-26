@@ -37,9 +37,9 @@ Bind session access to the authorized principal and virtual server on every requ
 
 ## Rust lifecycle replay
 
-The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Modern requests still use the stateless transport. The live Rust gateway test covers owner access after token renewal, principal and virtual-server isolation, notification acknowledgement, and POST and DELETE after termination. Passive GET, streaming, cancellation, and event resumption remain open.
+The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Event delivery, POST streaming, cancellation, and resumption remain open.
 
-The public legacy JSON profile produced four recordings with rust-anything v5.0.1. The original matched all four. Rust matched the unknown-session response. Initialization advertises the Rust version and the implemented capabilities. Both missing-session error responses omit the generated session ID that v1.1.2 sends even though initialization never occurred.
+The public legacy JSON profile produced five recordings with rust-anything v5.0.1. The original matched all five. Rust matched the unknown-session POST and missing-session GET. Initialization advertises the Rust version and the implemented capabilities. Missing-session POST and DELETE errors omit the generated session ID that v1.1.2 sends before initialization.
 
 ```sh
 USE_STATEFUL_SESSIONS=true MCP_REQUIRE_AUTH=false MCP_INBOUND_PROTOCOL_MODE=legacy \

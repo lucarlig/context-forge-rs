@@ -10,6 +10,7 @@ use context_forge_rs::{
     probes::{self, RedisProbe},
 };
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -38,10 +39,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Settings::mcp_pagination()?,
         Settings::catalog_refresh()?,
     ));
+    let shutdown = CancellationToken::new();
+    let sessions = Settings::mcp_sessions()?.map(|mut settings| {
+        settings.shutdown = shutdown.clone();
+        settings
+    });
     let mcp = service.mcp_router_with_sessions(
         require_mcp_auth,
         Settings::mcp_inbound_protocol_mode()?,
-        Settings::mcp_session_ttl()?,
+        sessions,
     );
     let app = probes::router(database, redis)
         .merge(Settings::mcp_ingress_policy()?.apply(mcp))
@@ -52,7 +58,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        shutdown.cancel();
+    })
     .await?;
     Ok(())
 }

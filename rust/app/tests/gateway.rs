@@ -22,7 +22,7 @@ use context_forge_rs::{
     database::Database,
     gateway::{CatalogRefresh, GatewayService, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::ProtocolMode,
+    mcp::{ProtocolMode, SessionSettings},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 use jiff::Timestamp;
@@ -554,7 +554,7 @@ async fn legacy_session_lifecycle_binds_owner_and_virtual_server() {
     let gateway = Running::start(service.mcp_router_with_sessions(
         true,
         ProtocolMode::Auto,
-        Some(Duration::from_secs(3600)),
+        Some(SessionSettings::default()),
     ))
     .await;
     let client = Client::builder()
@@ -670,6 +670,63 @@ async fn legacy_session_lifecycle_binds_owner_and_virtual_server() {
         delete(&outsider).send().await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
+
+    let get = |credential, path, accept| {
+        client
+            .get(gateway.url(path))
+            .bearer_auth(credential)
+            .header(header::ACCEPT, accept)
+            .header("mcp-session-id", &session)
+    };
+    let missing = client
+        .get(gateway.url("/mcp/"))
+        .bearer_auth(&owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(missing.headers()[header::ALLOW], "POST, DELETE");
+    for (credential, path, accept, status) in [
+        (
+            &owner,
+            "/mcp/",
+            "text/event-stream;q=0",
+            StatusCode::NOT_ACCEPTABLE,
+        ),
+        (
+            &outsider,
+            "/mcp/",
+            "text/event-stream",
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &owner,
+            "/servers/fixture/mcp/",
+            "text/event-stream",
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        assert_eq!(
+            get(credential, path, accept).send().await.unwrap().status(),
+            status
+        );
+    }
+    let mut stream = get(&renewed, "/mcp/", "Text/Event-Stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert_eq!(
+        stream.headers()[header::CONTENT_TYPE],
+        "text/event-stream; charset=utf-8"
+    );
+    let conflict = get(&owner, "/mcp", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(conflict.headers()[header::RETRY_AFTER], "1");
+
     let response = delete(&renewed).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -686,6 +743,15 @@ async fn legacy_session_lifecycle_binds_owner_and_virtual_server() {
     );
     assert_eq!(
         delete(&owner).send().await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(stream.chunk().await.unwrap().is_none());
+    assert_eq!(
+        get(&owner, "/mcp/", "text/event-stream")
+            .send()
+            .await
+            .unwrap()
+            .status(),
         StatusCode::NOT_FOUND
     );
 }

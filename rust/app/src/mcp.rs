@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! MCP Streamable HTTP ingress.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -9,26 +9,31 @@ use axum::{
     extract::{DefaultBodyLimit, FromRequest, Request, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
-        header::{ACCEPT, ALLOW, CONTENT_TYPE, HOST, ORIGIN, VARY},
+        header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN, RETRY_AFTER, VARY},
         uri::Authority,
     },
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::any,
 };
+use futures_util::stream;
 use rmcp::model::{
     CallToolRequestParams, Implementation, InitializeRequestParams, InitializeResult,
     PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ToolsCapability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     access::Principal,
     catalog::CatalogServer,
     gateway::{GatewayService, ToolError},
     modern::Modern,
-    sessions::{SessionError, Sessions},
+    sessions::{Session, SessionError, Sessions},
 };
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -59,6 +64,22 @@ pub enum ProtocolMode {
     Legacy,
 }
 
+pub struct SessionSettings {
+    pub ttl: Duration,
+    pub get_stream_enabled: bool,
+    pub shutdown: CancellationToken,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(3600),
+            get_stream_enabled: true,
+            shutdown: CancellationToken::new(),
+        }
+    }
+}
+
 struct McpState {
     service: Arc<GatewayService>,
     modern: Option<Modern>,
@@ -69,7 +90,7 @@ struct McpState {
 pub(crate) fn router(
     service: Arc<GatewayService>,
     mode: ProtocolMode,
-    session_ttl: Option<Duration>,
+    sessions: Option<SessionSettings>,
 ) -> Router {
     Router::new()
         .route("/mcp", any(handle_request))
@@ -81,7 +102,7 @@ pub(crate) fn router(
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(Arc::new(McpState {
             modern: (mode == ProtocolMode::Auto).then(|| Modern::new(service.clone())),
-            sessions: session_ttl.map(Sessions::new),
+            sessions: sessions.map(Sessions::new),
             service,
         }))
 }
@@ -196,14 +217,7 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
 
     let is_head = request.method() == Method::HEAD;
     let mut response = match *request.method() {
-        Method::GET => (
-            StatusCode::METHOD_NOT_ALLOWED,
-            [(ALLOW, "POST, DELETE")],
-            Json(Detail {
-                detail: "Stateful sessions disabled on this gateway; passive SSE stream is not available.",
-            }),
-        )
-            .into_response(),
+        Method::GET => handle_get(state.sessions.as_ref(), &request),
         Method::POST => handle_post(&state, request).await,
         Method::DELETE => delete_session(state.sessions.as_ref(), &request),
         _ => {
@@ -227,6 +241,101 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
     response
 }
 
+fn handle_get(sessions: Option<&Sessions>, request: &Request) -> Response {
+    let Some(sessions) = sessions else {
+        return get_not_allowed(
+            "Stateful sessions disabled on this gateway; passive SSE stream is not available.",
+        );
+    };
+    if !sessions.get_stream_enabled() {
+        return get_not_allowed(
+            "GET /mcp stream disabled by operator (MCP_GET_STREAM_ENABLED=False).",
+        );
+    }
+    let session = match session_from_request(sessions, request, false) {
+        Ok(session) => session,
+        Err(SessionError::Missing) => {
+            return get_not_allowed(
+                "Passive SSE stream requires an Mcp-Session-Id from a prior initialize.",
+            );
+        }
+        Err(error) => return session_error(error),
+    };
+    if !accepts_event_stream(request.headers()) {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            Json(Detail {
+                detail: "GET /mcp requires Accept: text/event-stream",
+            }),
+        )
+            .into_response();
+    }
+    let Some(listener) = session.listen() else {
+        return (
+            StatusCode::CONFLICT,
+            [(RETRY_AFTER, "1")],
+            Json(Detail {
+                detail: "Another GET /mcp stream is already open for this session.",
+            }),
+        )
+            .into_response();
+    };
+    let events = stream::unfold(listener, |listener| async move {
+        listener.wait_until_closed().await;
+        None::<(Result<Event, Infallible>, _)>
+    });
+    (
+        [
+            (CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+            (CACHE_CONTROL, "no-cache"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
+        ],
+        Sse::new(events).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        ),
+    )
+        .into_response()
+}
+
+fn get_not_allowed(detail: &'static str) -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(ALLOW, "POST, DELETE")],
+        Json(Detail { detail }),
+    )
+        .into_response()
+}
+
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    if !headers.contains_key(ACCEPT) {
+        return true;
+    }
+    headers
+        .get_all(ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|entry| {
+            let mut fields = entry.split(';');
+            let media = fields.next().unwrap_or_default().trim();
+            let quality = fields
+                .filter_map(|param| param.split_once('='))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                .map_or(1.0, |(_, value)| {
+                    value.trim().parse::<f64>().unwrap_or_default()
+                });
+            quality > 0.0
+                && (media == "*/*"
+                    || media.eq_ignore_ascii_case("text/*")
+                    || media.eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
 fn delete_session(sessions: Option<&Sessions>, request: &Request) -> Response {
     let Some(sessions) = sessions else {
         return transport_error(
@@ -234,6 +343,17 @@ fn delete_session(sessions: Option<&Sessions>, request: &Request) -> Response {
             "Method Not Allowed: Session termination not supported",
         );
     };
+    match session_from_request(sessions, request, true) {
+        Ok(_) => Json(json!({"jsonrpc": "2.0", "result": {}})).into_response(),
+        Err(error) => session_error(error),
+    }
+}
+
+fn session_from_request(
+    sessions: &Sessions,
+    request: &Request,
+    delete: bool,
+) -> Result<Arc<Session>, SessionError> {
     let owner = request
         .extensions()
         .get::<Principal>()
@@ -242,14 +362,7 @@ fn delete_session(sessions: Option<&Sessions>, request: &Request) -> Response {
         .extensions()
         .get::<CatalogServer>()
         .map(|s| s.id.as_str());
-    let id = match session_header(request.headers()) {
-        Ok(id) => id,
-        Err(error) => return session_error(error),
-    };
-    match sessions.access(id, owner, server, true) {
-        Ok(()) => Json(json!({"jsonrpc": "2.0", "result": {}})).into_response(),
-        Err(error) => session_error(error),
-    }
+    sessions.access(session_header(request.headers())?, owner, server, delete)
 }
 
 async fn handle_post(state: &McpState, request: Request) -> Response {

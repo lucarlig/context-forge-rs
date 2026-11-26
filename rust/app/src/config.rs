@@ -5,7 +5,7 @@ use std::{collections::HashSet, env, error::Error, str::FromStr, time::Duration}
 use crate::{
     gateway::{CatalogRefresh, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::{IngressPolicy, ProtocolMode},
+    mcp::{IngressPolicy, ProtocolMode, SessionSettings},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 
@@ -132,15 +132,21 @@ impl Settings {
         }
     }
 
-    pub fn mcp_session_ttl() -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
+    pub fn mcp_sessions() -> Result<Option<SessionSettings>, Box<dyn Error + Send + Sync>> {
         if !flag("USE_STATEFUL_SESSIONS")?.unwrap_or(false) {
             return Ok(None);
         }
-        let ttl = parse("SESSION_TTL", 3600)?;
+        let defaults = SessionSettings::default();
+        let ttl = parse("SESSION_TTL", defaults.ttl.as_secs())?;
         if ttl == 0 {
             return Err("SESSION_TTL must be positive".into());
         }
-        Ok(Some(Duration::from_secs(ttl)))
+        Ok(Some(SessionSettings {
+            ttl: Duration::from_secs(ttl),
+            get_stream_enabled: flag("MCP_GET_STREAM_ENABLED")?
+                .unwrap_or(defaults.get_stream_enabled),
+            ..defaults
+        }))
     }
 
     pub fn upstream_client() -> Result<UpstreamClient, Box<dyn Error + Send + Sync>> {
