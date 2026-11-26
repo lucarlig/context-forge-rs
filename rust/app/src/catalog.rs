@@ -107,6 +107,27 @@ pub(crate) enum CatalogList {
     Prompts,
 }
 
+pub(crate) struct ContentGateway {
+    pub(crate) id: String,
+    pub(crate) url: String,
+    pub(crate) available: bool,
+}
+
+pub(crate) struct ResourceContentRecord {
+    pub(crate) mime: Option<String>,
+    pub(crate) text: Option<String>,
+    pub(crate) blob: Option<Vec<u8>>,
+    pub(crate) gateway: Option<ContentGateway>,
+}
+
+pub(crate) struct PromptContentRecord {
+    pub(crate) original_name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) template: Option<String>,
+    pub(crate) argument_schema: Option<Value>,
+    pub(crate) gateway: Option<ContentGateway>,
+}
+
 impl CatalogList {
     pub(crate) fn method(self) -> &'static str {
         match self {
@@ -234,6 +255,41 @@ macro_rules! non_empty_json {
     };
 }
 
+macro_rules! gateway_policy {
+    () => {
+        concat!(
+            "(LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none')
+            OR COALESCE(g.ca_certificate, '') <> ''
+            OR COALESCE(g.client_cert, '') <> ''
+            OR COALESCE(g.client_key, '') <> ''
+            OR ",
+            non_empty_json!("g.auth_value"),
+            "
+            OR ",
+            non_empty_json!("g.oauth_config"),
+            "
+            OR ",
+            non_empty_json!("g.auth_query_params"),
+            "
+            OR ",
+            non_empty_json!("g.sigv4_config"),
+            "
+            OR ",
+            non_empty_json!("g.identity_propagation"),
+            "
+            OR ",
+            non_empty_json!("g.passthrough_headers"),
+            "
+            OR ",
+            non_empty_json!("g.add_headers"),
+            "
+            OR ",
+            non_empty_json!("g.remove_headers"),
+            ")"
+        )
+    };
+}
+
 // Keep configured gateway and tool policies visible to callers before network dispatch.
 macro_rules! tool_query {
     ($team_ids:literal) => {
@@ -241,23 +297,12 @@ macro_rules! tool_query {
             "WITH visible_team_ids(id) AS (", $team_ids, ")
              SELECT t.id, t.original_name, g.id, g.name, g.url, g.gateway_mode, g.transport, t.request_type,
                 (
-                    LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none')
+                    ", gateway_policy!(), "
                     OR LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none')
                     OR COALESCE(t.auth_value, '') <> ''
-                    OR COALESCE(g.ca_certificate, '') <> ''
-                    OR COALESCE(g.client_cert, '') <> ''
-                    OR COALESCE(g.client_key, '') <> ''
                     OR COALESCE(t.jsonpath_filter, '') <> ''
                     OR COALESCE(t.timeout_ms, 0) <> 0
                     OR t.validation_refusal IS NOT NULL
-                    OR ", non_empty_json!("g.auth_value"), "
-                    OR ", non_empty_json!("g.oauth_config"), "
-                    OR ", non_empty_json!("g.auth_query_params"), "
-                    OR ", non_empty_json!("g.sigv4_config"), "
-                    OR ", non_empty_json!("g.identity_propagation"), "
-                    OR ", non_empty_json!("g.passthrough_headers"), "
-                    OR ", non_empty_json!("g.add_headers"), "
-                    OR ", non_empty_json!("g.remove_headers"), "
                     OR ", non_empty_json!("t.headers"), "
                     OR ", non_empty_json!("t.sigv4_config"), "
                     OR ", non_empty_json!("t.plugin_chain_pre"), "
@@ -285,7 +330,7 @@ macro_rules! tool_query {
 }
 
 macro_rules! metadata_query {
-    ($team_ids:literal, $columns:literal, $table:literal, $association:literal, $id:literal, $filter:literal) => {
+    ($team_ids:literal, $columns:expr, $table:literal, $association:literal, $id:literal, $filter:literal) => {
         concat!(
             "WITH visible_team_ids(id) AS (",
             $team_ids,
@@ -321,6 +366,64 @@ macro_rules! metadata_query {
         )
     };
 }
+
+macro_rules! content_gateway_columns {
+    () => {
+        concat!("g.id, g.url, COALESCE(g.transport = 'STREAMABLEHTTP' AND g.gateway_mode = 'cache' AND NOT ", gateway_policy!(), ", FALSE)")
+    };
+}
+
+macro_rules! resource_content_query {
+    ($teams:literal) => {
+        metadata_query!($teams,
+            concat!("item.uri_template, item.mime_type, CASE WHEN item.gateway_id IS NULL THEN item.text_content END,
+            CASE WHEN item.gateway_id IS NULL THEN item.binary_content END, ", content_gateway_columns!()),
+            "resources", "server_resource_association", "resource_id",
+            "((CAST($8 AS TEXT) IS NOT NULL AND item.uri = $8) OR (CAST($8 AS TEXT) IS NULL AND item.uri_template IS NOT NULL))")
+    };
+}
+
+macro_rules! prompt_content_query {
+    ($teams:literal) => {
+        metadata_query!(
+            $teams,
+            concat!(
+                "item.original_name, item.template, CAST(item.argument_schema AS TEXT), ",
+                content_gateway_columns!()
+            ),
+            "prompts",
+            "server_prompt_association",
+            "prompt_id",
+            "(item.name = $8 OR item.id = $8)"
+        )
+    };
+}
+
+type ResourceContentRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+type PromptContentRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
 
 macro_rules! catalog_metadata_query {
     ($list:expr, $teams:literal) => {
@@ -573,6 +676,129 @@ impl Database {
             .collect()
     }
 
+    pub(crate) async fn resource_content(
+        &self,
+        scope: CatalogScope<'_>,
+        server: Option<&str>,
+        uri: &str,
+    ) -> Result<Option<ResourceContentRecord>, sqlx::Error> {
+        let mut exact = self
+            .resource_content_rows(scope, server, Some(uri), None, 2)
+            .await?;
+        if exact.len() > 1 {
+            return Err(sqlx::Error::Protocol(
+                "ambiguous resource URI in visible catalog".into(),
+            ));
+        }
+        if let Some(row) = exact.pop() {
+            return Ok(Some(resource_content_record(row)));
+        }
+        let mut after = None;
+        loop {
+            let rows = self
+                .resource_content_rows(scope, server, None, after.as_deref(), 64)
+                .await?;
+            let remaining = rows.len() == 64;
+            for row in rows {
+                if row
+                    .4
+                    .as_deref()
+                    .is_some_and(|template| uri_matches_template(uri, template))
+                {
+                    return Ok(Some(resource_content_record(row)));
+                }
+                after = Some(row.0);
+            }
+            if !remaining {
+                return Ok(None);
+            }
+        }
+    }
+
+    async fn resource_content_rows(
+        &self,
+        scope: CatalogScope<'_>,
+        server: Option<&str>,
+        uri: Option<&str>,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ResourceContentRow>, sqlx::Error> {
+        let teams = visible_team_ids(scope)?;
+        macro_rules! select {
+            ($pool:ident, $teams:literal) => {
+                sqlx::query_as::<_, ResourceContentRow>(resource_content_query!($teams))
+                    .bind(server)
+                    .bind(limit)
+                    .bind(after)
+                    .bind(scope.email)
+                    .bind(scope.visibility == &TeamVisibility::Admin)
+                    .bind(scope.can_own())
+                    .bind(teams)
+                    .bind(uri)
+                    .fetch_all($pool)
+                    .await
+            };
+        }
+        match self {
+            Self::Sqlite(pool) => select!(pool, "SELECT value FROM json_each($7)"),
+            Self::Postgres(pool) => {
+                select!(pool, "SELECT json_array_elements_text(CAST($7 AS JSON))")
+            }
+        }
+    }
+
+    pub(crate) async fn prompt_content(
+        &self,
+        scope: CatalogScope<'_>,
+        server: Option<&str>,
+        name: &str,
+    ) -> Result<Option<PromptContentRecord>, sqlx::Error> {
+        let teams = visible_team_ids(scope)?;
+        macro_rules! select {
+            ($pool:ident, $teams:literal) => {
+                sqlx::query_as::<_, PromptContentRow>(prompt_content_query!($teams))
+                    .bind(server)
+                    .bind(3_i64)
+                    .bind(None::<&str>)
+                    .bind(scope.email)
+                    .bind(scope.visibility == &TeamVisibility::Admin)
+                    .bind(scope.can_own())
+                    .bind(teams)
+                    .bind(name)
+                    .fetch_all($pool)
+                    .await?
+            };
+        }
+        let mut rows = match self {
+            Self::Sqlite(pool) => select!(pool, "SELECT value FROM json_each($7)"),
+            Self::Postgres(pool) => {
+                select!(pool, "SELECT json_array_elements_text(CAST($7 AS JSON))")
+            }
+        };
+        if rows.len() > 1 {
+            rows.retain(|row| row.1 == name);
+        }
+        if rows.len() > 1 {
+            return Err(sqlx::Error::Protocol(
+                "ambiguous prompt name in visible catalog".into(),
+            ));
+        }
+        let Some((_, _, _, description, original_name, template, schema, id, url, available)) =
+            rows.pop()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PromptContentRecord {
+            original_name,
+            description,
+            template,
+            argument_schema: decode_optional_json(schema.as_deref())?,
+            gateway: id
+                .zip(url)
+                .map(|(id, url)| ContentGateway { id, url, available }),
+        }))
+    }
+
     pub async fn find_mcp_tool(
         &self,
         scope: CatalogScope<'_>,
@@ -795,6 +1021,51 @@ impl Database {
         }
         Ok(())
     }
+}
+
+fn visible_team_ids(scope: CatalogScope<'_>) -> Result<String, sqlx::Error> {
+    let teams = match scope.visibility {
+        TeamVisibility::Teams(teams) => teams.as_slice(),
+        TeamVisibility::Admin | TeamVisibility::Public => &[],
+    };
+    serde_json::to_string(teams).map_err(|error| sqlx::Error::Encode(Box::new(error)))
+}
+
+fn resource_content_record(row: ResourceContentRow) -> ResourceContentRecord {
+    let (_, _, _, _, _, mime, text, blob, id, url, available) = row;
+    ResourceContentRecord {
+        mime,
+        text,
+        blob,
+        gateway: id
+            .zip(url)
+            .map(|(id, url)| ContentGateway { id, url, available }),
+    }
+}
+
+fn uri_matches_template(uri: &str, mut template: &str) -> bool {
+    let mut pattern = String::from(r"\A");
+    while let Some((literal, expression)) = template.split_once('{') {
+        pattern.push_str(&regex::escape(literal));
+        let Some((variable, remainder)) = expression.split_once('}') else {
+            return false;
+        };
+        if !variable.starts_with('?') {
+            if variable.is_empty() {
+                return false;
+            }
+            pattern.push_str(if variable.ends_with('*') {
+                ".+"
+            } else {
+                "[^/]+"
+            });
+        }
+        template = remainder;
+    }
+    pattern.push_str(&regex::escape(template));
+    pattern.push_str(r"\z");
+    let path = uri.split_once('?').map_or(uri, |(path, _)| path);
+    regex::Regex::new(&pattern).is_ok_and(|matcher| matcher.is_match(path))
 }
 
 fn prompt_argument_schema(prompt: &rmcp::model::Prompt) -> Value {

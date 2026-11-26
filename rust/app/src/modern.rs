@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Modern stateless MCP Streamable HTTP.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use axum::{
     body::{Body, Bytes, to_bytes},
@@ -16,13 +22,14 @@ use axum::{
 use rmcp::{
     RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities,
         ClientJsonRpcMessage, ClientRequest, ContentBlock, CustomRequest, CustomResult,
-        DiscoverResult, ElicitRequestParams, ErrorCode, ErrorData, Implementation,
-        InitializeRequestParams, InitializeResult, InputRequest, InputRequiredResult, JsonRpcError,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-        MetaObject, PaginatedRequestParams, ProgressNotification, ProgressNotificationParam,
-        ProtocolVersion, ResultType, ServerCapabilities, ServerConfig, Tool, ToolsCapability,
+        DiscoverResult, ElicitRequestParams, ErrorCode, ErrorData, GetPromptRequestParams,
+        GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult, InputRequest,
+        InputRequiredResult, JsonRpcError, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
+        ProgressNotification, ProgressNotificationParam, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ResultType, ServerConfig, Tool,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -38,7 +45,7 @@ use crate::{
     gateway::{GatewayService, ToolError},
     mcp::{
         JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, accepts_event_stream, accepts_json,
-        accepts_post_stream, rpc_error,
+        accepts_post_stream, catalog_capabilities, rpc_error,
     },
     modern_validation::reject_invalid_request,
     upstream::{ToolContext, ToolProgress},
@@ -53,6 +60,20 @@ type Transport = StreamableHttpService<GatewayHandler, NeverSessionManager>;
 
 #[derive(Clone)]
 struct AcceptsProgress;
+
+#[derive(Clone, Default)]
+struct ContentBadRequest(Arc<AtomicBool>);
+
+impl ContentBadRequest {
+    fn record<T>(parts: &Parts, reply: &Result<T, ErrorData>) {
+        if let Err(error) = reply
+            && error.code == ErrorCode::INVALID_PARAMS
+            && let Some(marker) = parts.extensions.get::<Self>()
+        {
+            marker.0.store(true, Ordering::Release);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Modern {
@@ -114,7 +135,7 @@ impl Modern {
             HeaderValue::from_static("application/json, text/event-stream"),
         );
 
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         let bytes = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
             Ok(bytes) => bytes,
             Err(error) => return error.into_response(),
@@ -130,6 +151,12 @@ impl Modern {
         };
         if let Some(response) = reject_invalid_request(&parts.headers, &body) {
             return response;
+        }
+        if matches!(
+            body["method"].as_str(),
+            Some("resources/read" | "prompts/get")
+        ) {
+            parts.extensions.insert(ContentBadRequest::default());
         }
         let scoped_tool =
             if parts.headers.get("mcp-method") == Some(&HeaderValue::from_static("tools/call")) {
@@ -189,7 +216,15 @@ impl Modern {
 }
 
 async fn handle(transport: &Transport, request: Request) -> Response {
-    let response = transport.handle(request).await.into_response();
+    let content_status = request.extensions().get::<ContentBadRequest>().cloned();
+    let mut response = transport.handle(request).await.into_response();
+    if response.status() == StatusCode::OK
+        && response.headers().get(CONTENT_TYPE) == Some(&HeaderValue::from_static(JSON_MEDIA_TYPE))
+        && content_status.is_some_and(|marker| marker.0.load(Ordering::Acquire))
+    {
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        return response;
+    }
     if !matches!(
         response.status(),
         StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
@@ -275,11 +310,7 @@ impl GatewayHandler {
 
 impl ServerHandler for GatewayHandler {
     fn get_info(&self) -> ServerConfig {
-        let mut capabilities = ServerCapabilities::default();
-        let mut tools = ToolsCapability::default();
-        tools.list_changed = Some(false);
-        capabilities.tools = Some(tools);
-        ServerConfig::new(capabilities)
+        ServerConfig::new(catalog_capabilities())
             .with_server_info(implementation())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
     }
@@ -372,20 +403,9 @@ impl ServerHandler for GatewayHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let parts = request_parts(&context)?;
-        let mut capabilities = context.client_capabilities().unwrap_or_default();
-        capabilities.experimental = None;
-        capabilities.extensions = None;
-        capabilities.extra.clear();
+        let capabilities = upstream_client_capabilities(&context);
         let name = request.name.clone();
-        let progress = parts
-            .extensions
-            .get::<AcceptsProgress>()
-            .and_then(|_| context.meta.get_progress_token())
-            .map(ToolProgress::channel);
-        let (relay, updates) = match progress {
-            Some((relay, updates)) => (Some(relay), Some(updates)),
-            None => (None, None),
-        };
+        let (relay, updates) = progress_relay(parts, &context);
         let invocation = self.gateway.call_tool(
             parts.extensions.get::<Principal>(),
             parts.extensions.get::<CatalogServer>(),
@@ -402,7 +422,7 @@ impl ServerHandler for GatewayHandler {
             Ok(value) if value["resultType"] == "input_required" => {
                 let mut result: InputRequiredResult = serde_json::from_value(value)
                     .map_err(|_| ErrorData::internal_error("Invalid upstream tool result", None))?;
-                check_tool_input(&result, &capabilities, &name)?;
+                check_required_input(&result, &capabilities, &format!("tool '{name}'"))?;
                 stamp_server_info(&mut result.meta);
                 return Ok(result.into());
             }
@@ -416,6 +436,88 @@ impl ServerHandler for GatewayHandler {
         result.result_type = Some(ResultType::COMPLETE);
         stamp_server_info(&mut result.meta);
         Ok(CallToolResponse::Complete(result))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let parts = request_parts(&context)?;
+        let capabilities = upstream_client_capabilities(&context);
+        let (relay, updates) = progress_relay(parts, &context);
+        let uri = request.uri.clone();
+        let invocation = self.gateway.read_resource(
+            request,
+            parts.extensions.get::<Principal>(),
+            parts.extensions.get::<CatalogServer>(),
+            ToolContext {
+                cancellation: &context.ct,
+                progress: relay.as_ref(),
+                notifications: None,
+                client_capabilities: Some(&capabilities),
+            },
+            None,
+        );
+        let reply = with_progress(invocation, updates, &context).await;
+        ContentBadRequest::record(parts, &reply);
+        match reply? {
+            ReadResourceResponse::Complete(mut result) => {
+                result.result_type = Some(ResultType::COMPLETE);
+                result.ttl_ms.get_or_insert(0);
+                if parts.extensions.get::<Principal>().is_some() {
+                    result.cache_scope = Some(CacheScope::Private);
+                } else {
+                    result.cache_scope.get_or_insert(CacheScope::Private);
+                }
+                stamp_server_info(&mut result.meta);
+                Ok(result.into())
+            }
+            ReadResourceResponse::InputRequired(mut result) => {
+                check_required_input(&result, &capabilities, &format!("resource '{uri}'"))?;
+                stamp_server_info(&mut result.meta);
+                Ok(result.into())
+            }
+            _ => Err(ErrorData::internal_error("Invalid resource result", None)),
+        }
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let parts = request_parts(&context)?;
+        let capabilities = upstream_client_capabilities(&context);
+        let (relay, updates) = progress_relay(parts, &context);
+        let name = request.name.clone();
+        let invocation = self.gateway.get_prompt(
+            request,
+            parts.extensions.get::<Principal>(),
+            parts.extensions.get::<CatalogServer>(),
+            ToolContext {
+                cancellation: &context.ct,
+                progress: relay.as_ref(),
+                notifications: None,
+                client_capabilities: Some(&capabilities),
+            },
+            None,
+        );
+        let reply = with_progress(invocation, updates, &context).await;
+        ContentBadRequest::record(parts, &reply);
+        match reply? {
+            GetPromptResponse::Complete(mut result) => {
+                result.result_type = Some(ResultType::COMPLETE);
+                stamp_server_info(&mut result.meta);
+                Ok(result.into())
+            }
+            GetPromptResponse::InputRequired(mut result) => {
+                check_required_input(&result, &capabilities, &format!("prompt '{name}'"))?;
+                stamp_server_info(&mut result.meta);
+                Ok(result.into())
+            }
+            _ => Err(ErrorData::internal_error("Invalid prompt result", None)),
+        }
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -435,10 +537,10 @@ impl ServerHandler for GatewayHandler {
 }
 
 #[allow(deprecated)]
-fn check_tool_input(
+fn check_required_input(
     result: &InputRequiredResult,
     capabilities: &ClientCapabilities,
-    tool: &str,
+    subject: &str,
 ) -> Result<(), ErrorData> {
     let Some(requests) = &result.input_requests else {
         return Ok(());
@@ -482,18 +584,44 @@ fn check_tool_input(
         };
         return Err(ErrorData::new(
             ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY,
-            format!("Client did not declare the {capability} capability required by tool '{tool}'"),
+            format!("Client did not declare the {capability} capability required by {subject}"),
             Some(json!({"requiredCapabilities":required})),
         ));
     }
     Ok(())
 }
 
-async fn with_progress(
-    invocation: impl Future<Output = Result<Value, ToolError>>,
+fn upstream_client_capabilities(context: &RequestContext<RoleServer>) -> ClientCapabilities {
+    let mut capabilities = context.client_capabilities().unwrap_or_default();
+    capabilities.experimental = None;
+    capabilities.extensions = None;
+    capabilities.extra.clear();
+    capabilities
+}
+
+fn progress_relay(
+    parts: &Parts,
+    context: &RequestContext<RoleServer>,
+) -> (
+    Option<ToolProgress>,
+    Option<tokio::sync::mpsc::Receiver<ProgressNotificationParam>>,
+) {
+    let progress = parts
+        .extensions
+        .get::<AcceptsProgress>()
+        .and_then(|_| context.meta.get_progress_token())
+        .map(ToolProgress::channel);
+    match progress {
+        Some((relay, updates)) => (Some(relay), Some(updates)),
+        None => (None, None),
+    }
+}
+
+async fn with_progress<T, E>(
+    invocation: impl Future<Output = Result<T, E>>,
     updates: Option<tokio::sync::mpsc::Receiver<ProgressNotificationParam>>,
     context: &RequestContext<RoleServer>,
-) -> Result<Value, ToolError> {
+) -> Result<T, E> {
     let Some(mut updates) = updates else {
         return invocation.await;
     };

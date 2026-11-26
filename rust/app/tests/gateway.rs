@@ -60,13 +60,34 @@ async fn catalog_fixture(Json(request): Json<Value>) -> Response {
         "prompts/list" => json!({"prompts":[{"name":"greet","arguments":[
             {"name":"who","required":true}
         ]}]}),
+        "resources/read"
+            if params["uri"] == "fixture://notes/ask" && params["requestState"].is_null() =>
+        {
+            json!({
+                "resultType":"input_required","requestState":"sealed","inputRequests":{"ask":{
+                    "method":"elicitation/create","params":{"mode":"form","message":"What is your name?",
+                        "requestedSchema":{"type":"object","properties":{"who":{"type":"string"}}}}
+                }}
+            })
+        }
+        "resources/read" if params["requestState"] == "sealed" => json!({"contents":[
+            {"uri":params["uri"],"text":params["inputResponses"]["ask"]["content"]["who"]}
+        ]}),
+        "resources/read" => json!({"contents":[
+            {"uri":params["uri"],"text":"Resource contents","mimeType":"text/plain"}
+        ]}),
+        "prompts/get" => {
+            assert_eq!(params["name"], "greet");
+            let who = params["arguments"]["who"].as_str().unwrap();
+            json!({"messages":[{"role":"user","content":{"type":"text","text":format!("Hello {who}")}}]})
+        }
         unknown => panic!("unexpected upstream method {unknown}"),
     };
     Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
 }
 
 #[tokio::test]
-async fn registration_discovers_all_resource_pages_and_prompt_metadata() {
+async fn registration_discovers_and_serves_federated_resources_and_prompts() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let upstream = Running::start(Router::new().route("/mcp", post(catalog_fixture))).await;
     let database = database().await;
@@ -130,6 +151,84 @@ async fn registration_discovers_all_resource_pages_and_prompt_metadata() {
         names.sort_unstable();
         assert_eq!(names, expected);
     }
+    for uri in [
+        "fixture://notes/first",
+        "fixture://notes/from-template?view=1",
+    ] {
+        let (_, reply) = send(
+            &client,
+            gateway.url("/mcp/"),
+            json!({
+                "jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":uri}
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reply["result"]["contents"],
+            json!([
+                {"uri":uri,"text":"Resource contents","mimeType":"text/plain"}
+            ])
+        );
+    }
+    let (_, reply) = send(&client, gateway.url("/mcp/"), json!({
+        "jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"fixture-greet","arguments":{"who":"World"}}
+    }), None).await;
+    assert_eq!(
+        reply["result"]["messages"][0]["content"]["text"],
+        "Hello World"
+    );
+    let (_, reply) = send(
+        &client,
+        gateway.url("/mcp/"),
+        json!({
+            "jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"greet"}
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(
+        reply["error"],
+        json!({"code":-32602,"message":"Unknown prompt: greet"})
+    );
+
+    let ask = "fixture://notes/ask";
+    let read = async |mut body: Value, elicitation| {
+        if elicitation {
+            body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+                json!({"elicitation":{}});
+        }
+        send_with_headers(
+            &client,
+            gateway.url("/mcp/"),
+            body,
+            None,
+            &[
+                ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", "resources/read"),
+                ("mcp-name", ask),
+            ],
+        )
+        .await
+    };
+    let (status, _) = read(
+        modern_request("resources/read", 5, json!({"uri":ask})),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, asked) = read(
+        modern_request("resources/read", 5, json!({"uri":ask})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{asked}");
+    assert_eq!(asked["result"]["resultType"], "input_required");
+    let (_, complete) = read(modern_request("resources/read", 6, json!({
+        "uri":ask,"requestState":asked["result"]["requestState"],"inputResponses":{"ask":{"action":"accept","content":{"who":"Ada"}}}
+    })), true).await;
+    assert_eq!(complete["result"]["contents"][0]["text"], "Ada");
+    assert_eq!(complete["result"]["cacheScope"], "private");
 }
 
 #[tokio::test]
@@ -147,8 +246,13 @@ async fn catalog_metadata_lists_scoped_resources_templates_and_prompts() {
             ('r3', 'fixture://notes/last', NULL, 'Last', 'text/plain', 'public', NULL),
             ('t1', 'fixture://notes/{name}', 'fixture://notes/{name}', 'Note', 'text/plain', 'public', NULL);
         INSERT INTO server_resource_association (server_id, resource_id) VALUES ('v', 'r3');
-        INSERT INTO prompts (id,name,original_name,custom_name,custom_name_slug,argument_schema)
-            VALUES ('p1','greet','greet','greet','greet','{"properties":{"who":{"type":"string"}},"required":["who"]}');
+        UPDATE resources SET binary_content = x'0001ff' WHERE id = 'r3';
+        INSERT INTO prompts (id,name,original_name,custom_name,custom_name_slug,argument_schema,template)
+            VALUES ('p1','greet','greet','greet','greet','{"properties":{"who":{"type":"string"}},"required":["who"]}',
+                '# User:
+Hello {{ who }}
+# Assistant:
+Greetings');
     "#).execute(pool).await.unwrap();
     let service = Arc::new(GatewayService::new(
         database.clone(),
@@ -210,6 +314,38 @@ async fn catalog_metadata_lists_scoped_resources_templates_and_prompts() {
         json!([{"name":"greet","arguments":[{"name":"who","description":"","required":true}]}])
     );
     assert_eq!(reply["result"]["cacheScope"], "private");
+    let (_, reply) = legacy(
+        "/servers/v/mcp/",
+        "resources/read",
+        json!({"uri":"fixture://notes/last"}),
+    )
+    .await;
+    assert_eq!(reply["result"]["contents"][0]["blob"], "AAH/");
+    let (_, reply) = legacy(
+        "/servers/v/mcp/",
+        "resources/read",
+        json!({"uri":"fixture://notes/first"}),
+    )
+    .await;
+    assert_eq!(
+        reply["error"]["message"],
+        "Unknown resource: fixture://notes/first"
+    );
+    let (_, reply) = legacy(
+        "/mcp/",
+        "prompts/get",
+        json!({"name":"greet","arguments":{"who":"World"}}),
+    )
+    .await;
+    assert_eq!(
+        reply["result"]["messages"],
+        json!([
+            {"role":"user","content":{"type":"text","text":"Hello World"}},
+            {"role":"assistant","content":{"type":"text","text":"Greetings"}}
+        ])
+    );
+    let (_, reply) = legacy("/mcp/", "prompts/get", json!({"name":"greet"})).await;
+    assert_eq!(reply["error"]["message"], "Missing required arguments: who");
 }
 
 struct Running {

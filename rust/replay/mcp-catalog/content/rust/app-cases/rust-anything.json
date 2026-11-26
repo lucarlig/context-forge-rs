@@ -1,0 +1,25 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-reference-server",
+  "run": [
+    "context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "normalizers": {
+    "runtime": "^(python|rust)$"
+  },
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "legacy-10",
+    "legacy-7",
+    "legacy-8",
+    "legacy-9",
+    "modern-10",
+    "modern-7",
+    "modern-8",
+    "modern-9"
+  ]
+}

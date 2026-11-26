@@ -442,13 +442,28 @@ impl UpstreamClient {
         context: ToolContext<'_>,
         association: Option<&UpstreamAssociation>,
     ) -> Result<Value, UpstreamError> {
+        params.meta = None;
+        params.arguments.get_or_insert_default();
+        self.request_with_context(
+            url,
+            CallToolRequest::new(params).into(),
+            context,
+            association,
+        )
+        .await
+    }
+
+    pub(crate) async fn request_with_context(
+        &self,
+        url: &str,
+        request: ClientRequest,
+        context: ToolContext<'_>,
+        association: Option<&UpstreamAssociation>,
+    ) -> Result<Value, UpstreamError> {
         let cancellation = context.cancellation;
         if cancellation.is_cancelled() {
             return Err(UpstreamError::Cancelled);
         }
-        params.meta = None;
-        params.arguments.get_or_insert_default();
-        let request = CallToolRequest::new(params);
         let deadline = self.deadline()?;
         let _operation = if let Some(association) = association {
             Some(tokio::select! {
@@ -478,7 +493,7 @@ impl UpstreamClient {
             () = cancellation.cancelled() => Err(UpstreamError::Cancelled),
             result = timeout_at(deadline, async {
                 started = true;
-                session.request_with_id(request.into(), id, Some(&context)).await
+                session.request_with_id(request, id, Some(&context)).await
             }) => {
                 result.unwrap_or(Err(UpstreamError::Timeout)).map(|reply| reply.result)
             }
@@ -900,8 +915,14 @@ impl Session {
             && let ClientJsonRpcMessage::Request(message) = message
         {
             request = request.header(METHOD_HEADER, message.request.method());
-            if let ClientRequest::CallToolRequest(call) = &message.request {
-                request = request.header(NAME_HEADER, scoped_name_header(&call.params.name)?);
+            let name = match &message.request {
+                ClientRequest::CallToolRequest(call) => Some(call.params.name.as_ref()),
+                ClientRequest::ReadResourceRequest(read) => Some(read.params.uri.as_str()),
+                ClientRequest::GetPromptRequest(prompt) => Some(prompt.params.name.as_str()),
+                _ => None,
+            };
+            if let Some(name) = name {
+                request = request.header(NAME_HEADER, scoped_name_header(name)?);
             }
         }
         let response = request

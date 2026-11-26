@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":9,"result":{"messages":[{"content":{"text":"Hello World","type":"text"},"role":"user"},{"content":{"text":"Greetings","type":"text"},"role":"assistant"}],"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"ContextForge","version":"1.1.2"}}}}

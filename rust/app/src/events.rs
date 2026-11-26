@@ -82,7 +82,7 @@ struct History {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JournalMode {
-    Response { needs_tool_execution: bool },
+    Response { permission: Option<&'static str> },
     Passive,
 }
 
@@ -119,13 +119,11 @@ impl Journal {
         }
     }
 
-    pub(crate) fn needs_tool_execution(&self) -> bool {
-        !matches!(
-            self.mode,
-            JournalMode::Response {
-                needs_tool_execution: false
-            }
-        )
+    pub(crate) fn permission(&self) -> Option<&'static str> {
+        match self.mode {
+            JournalMode::Response { permission } => permission,
+            JournalMode::Passive => Some("tools.execute"),
+        }
     }
 
     fn prune_old_frames(&self, history: &mut History) {
@@ -299,9 +297,7 @@ mod tests {
     async fn replay_stops_at_an_evicted_cursor_and_drains_a_retained_stream() {
         let journal = Arc::new(Journal::new(
             None,
-            JournalMode::Response {
-                needs_tool_execution: false,
-            },
+            JournalMode::Response { permission: None },
             2,
             Duration::from_secs(60),
             Arc::new(Semaphore::new(4096)),

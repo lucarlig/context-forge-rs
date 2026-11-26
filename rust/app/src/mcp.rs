@@ -21,10 +21,11 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt, stream};
 use rmcp::model::{
-    CallToolRequestParams, CancelledNotificationParam, Implementation, InitializeRequestParams,
-    InitializeResult, PaginatedRequestParams, ProgressNotification, ProgressNotificationParam,
-    ProgressToken, ProtocolVersion, RequestId, ServerCapabilities, ServerJsonRpcMessage,
-    ToolsCapability,
+    CallToolRequestParams, CancelledNotificationParam, ErrorData, GetPromptRequestParams,
+    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
+    PaginatedRequestParams, ProgressNotification, ProgressNotificationParam, ProgressToken,
+    PromptsCapability, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, RequestId,
+    ResourcesCapability, ServerCapabilities, ServerJsonRpcMessage, ToolsCapability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,7 +40,10 @@ use crate::{
     events::{Journal, parse_cursor},
     gateway::{GatewayService, ToolError},
     modern::Modern,
-    sessions::{PendingError, Session, SessionAccess, SessionError, Sessions, new_session_id},
+    sessions::{
+        PendingError, PendingRequest, Session, SessionAccess, SessionError, Sessions,
+        new_session_id,
+    },
     upstream::{ToolContext, ToolProgress},
 };
 
@@ -447,8 +451,8 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         if journal.authorization != authorization {
             return session_error(SessionError::Forbidden);
         }
-        if journal.needs_tool_execution() {
-            match allows_tool_events(state, principal, server).await {
+        if let Some(permission) = journal.permission() {
+            match allows_events(state, principal, server, permission).await {
                 Ok(true) => {}
                 Ok(false) => return session_error(SessionError::Forbidden),
                 Err(error) => return event_permission_error(error),
@@ -459,7 +463,7 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         }
         Some(replay)
     } else {
-        match allows_tool_events(state, principal, server).await {
+        match allows_events(state, principal, server, "tools.execute").await {
             Ok(true) => session.passive_journal(authorization).and_then(|journal| {
                 journal
                     .local()
@@ -539,7 +543,7 @@ async fn handle_shared_events(
         )
             .into_response();
     }
-    let allowed = match allows_tool_events(state, principal, server).await {
+    let allowed = match allows_events(state, principal, server, "tools.execute").await {
         Ok(allowed) => allowed,
         Err(error) => return event_permission_error(error),
     };
@@ -615,10 +619,11 @@ fn event_stream(
         .into_response()
 }
 
-async fn allows_tool_events(
+async fn allows_events(
     state: &McpState,
     principal: Option<&Principal>,
     server: Option<&CatalogServer>,
+    permission: &str,
 ) -> Result<bool, sqlx::Error> {
     let Some(principal) = principal else {
         return Ok(true);
@@ -626,12 +631,7 @@ async fn allows_tool_events(
     state
         .service
         .access
-        .allows(
-            principal,
-            "tools.execute",
-            access::role_context(server),
-            true,
-        )
+        .allows(principal, permission, access::role_context(server), true)
         .await
 }
 
@@ -872,7 +872,7 @@ async fn dispatch(
                             &session,
                             state.json_response,
                             principal.as_ref(),
-                            false,
+                            None,
                             can_prime,
                         );
                         (Some(session_id), journal)
@@ -904,16 +904,22 @@ async fn dispatch(
             return with_session(response, session_id.as_ref());
         };
         let stateful = session.is_some();
+        let permission = match method.as_str() {
+            "tools/call" => Some("tools.execute"),
+            "resources/read" => Some("resources.read"),
+            "prompts/get" => Some("prompts.read"),
+            _ => None,
+        };
         let journal = session.as_ref().and_then(|session| {
             post_journal(
                 session,
                 state.json_response,
                 principal.as_ref(),
-                method == "tools/call",
+                permission,
                 prime,
             )
         });
-        let (progress, updates) = match (!state.json_response && method == "tools/call")
+        let (progress, updates) = match (!state.json_response && permission.is_some())
             .then(|| progress_token(params.as_ref()))
             .flatten()
         {
@@ -975,6 +981,87 @@ async fn dispatch(
                         progress.as_ref(),
                     )
                     .await
+                }
+                "resources/read" => {
+                    let Some(Ok(params)) = params.map(ReadResourceRequestParams::deserialize)
+                    else {
+                        return invalid_params(&id);
+                    };
+                    if params.input_responses.is_some() || params.request_state.is_some() {
+                        return invalid_params(&id);
+                    }
+                    let pending = match track_request(session.as_ref(), &id) {
+                        Ok(pending) => pending,
+                        Err(reply) => return *reply,
+                    };
+                    let cancellation = pending
+                        .as_ref()
+                        .map(|pending| pending.token.clone())
+                        .unwrap_or_default();
+                    let context = ToolContext {
+                        cancellation: &cancellation,
+                        progress: progress.as_ref(),
+                        notifications: None,
+                        client_capabilities: None,
+                    };
+                    let result = service
+                        .read_resource(params, principal, server, context, session.as_deref())
+                        .await;
+                    if cancellation.is_cancelled() {
+                        return tool_error(&id, ToolError::Cancelled);
+                    }
+                    match result {
+                        Ok(ReadResourceResponse::Complete(mut result)) => {
+                            result.result_type = None;
+                            result.ttl_ms = None;
+                            result.cache_scope = None;
+                            rpc_success(&id, result)
+                        }
+                        Ok(_) => content_error(
+                            &id,
+                            ErrorData::internal_error("Elicitation not supported", None),
+                        ),
+                        Err(error) => content_error(&id, error),
+                    }
+                }
+                "prompts/get" => {
+                    let Some(Ok(params)) = params.map(GetPromptRequestParams::deserialize) else {
+                        return invalid_params(&id);
+                    };
+                    if params.input_responses.is_some() || params.request_state.is_some() {
+                        return invalid_params(&id);
+                    }
+                    let pending = match track_request(session.as_ref(), &id) {
+                        Ok(pending) => pending,
+                        Err(reply) => return *reply,
+                    };
+                    let cancellation = pending
+                        .as_ref()
+                        .map(|pending| pending.token.clone())
+                        .unwrap_or_default();
+                    let context = ToolContext {
+                        cancellation: &cancellation,
+                        progress: progress.as_ref(),
+                        notifications: None,
+                        client_capabilities: None,
+                    };
+                    let result = service
+                        .get_prompt(params, principal, server, context, session.as_deref())
+                        .await;
+                    if cancellation.is_cancelled() {
+                        return tool_error(&id, ToolError::Cancelled);
+                    }
+                    match result {
+                        Ok(GetPromptResponse::Complete(mut result)) => {
+                            result.result_type = None;
+                            rpc_success(&id, result)
+                        }
+                        Ok(_) => content_error(
+                            &id,
+                            ErrorData::internal_error("Elicitation not supported", None),
+                        ),
+                        Err(error) => content_error(&id, error),
+                    }
                 }
                 _ => rpc_error(
                     StatusCode::OK,
@@ -1040,16 +1127,13 @@ fn post_journal(
     session: &Session,
     json_response: bool,
     principal: Option<&Principal>,
-    needs_tool_execution: bool,
+    permission: Option<&'static str>,
     prime: bool,
 ) -> Option<(Arc<Journal>, bool)> {
     if json_response {
         return None;
     }
-    Some((
-        session.start_journal(principal, needs_tool_execution)?,
-        prime,
-    ))
+    Some((session.start_journal(principal, permission)?, prime))
 }
 
 async fn post_reply(
@@ -1242,33 +1326,9 @@ async fn call_tool(
     if params.input_responses.is_some() || params.request_state.is_some() {
         return invalid_params(id);
     }
-    let pending = if let Some(session) = &session {
-        let Ok(request_id) = RequestId::deserialize(id) else {
-            return invalid_envelope();
-        };
-        match session.clone().track(request_id) {
-            Ok(pending) => Some(pending),
-            Err(PendingError::DuplicateId) => {
-                return rpc_error(
-                    StatusCode::OK,
-                    id,
-                    INVALID_REQUEST,
-                    "Request ID already in use",
-                    None::<()>,
-                );
-            }
-            Err(PendingError::Capacity) => {
-                return rpc_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    id,
-                    INVALID_REQUEST,
-                    "Too many in-flight requests",
-                    None::<()>,
-                );
-            }
-        }
-    } else {
-        None
+    let pending = match track_request(session.as_ref(), id) {
+        Ok(pending) => pending,
+        Err(response) => return *response,
     };
     let cancellation = pending
         .as_ref()
@@ -1295,6 +1355,37 @@ async fn call_tool(
         Ok(result) => rpc_success(id, result),
         Err(error) => tool_error(id, error),
     }
+}
+
+fn track_request(
+    session: Option<&Arc<Session>>,
+    id: &Value,
+) -> Result<Option<PendingRequest>, Box<Response>> {
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    let request_id = RequestId::deserialize(id).map_err(|_| Box::new(invalid_envelope()))?;
+    match session.clone().track(request_id) {
+        Ok(pending) => Ok(Some(pending)),
+        Err(PendingError::DuplicateId) => Err(Box::new(rpc_error(
+            StatusCode::OK,
+            id,
+            INVALID_REQUEST,
+            "Request ID already in use",
+            None::<()>,
+        ))),
+        Err(PendingError::Capacity) => Err(Box::new(rpc_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            id,
+            INVALID_REQUEST,
+            "Too many in-flight requests",
+            None::<()>,
+        ))),
+    }
+}
+
+fn content_error(id: &Value, error: ErrorData) -> Response {
+    rpc_error(StatusCode::OK, id, error.code.0, &error.message, error.data)
 }
 
 fn cancel_request(session: &Session, params: Option<&Value>) -> Response {
@@ -1339,11 +1430,7 @@ fn initialize(params: Option<&Value>, server: Option<&CatalogServer>) -> Option<
     } else {
         ProtocolVersion::LATEST_WITH_INITIALIZE
     };
-    let mut capabilities = ServerCapabilities::default();
-    let mut tools = ToolsCapability::default();
-    tools.list_changed = Some(false);
-    capabilities.tools = Some(tools);
-    let mut result = InitializeResult::new(capabilities)
+    let mut result = InitializeResult::new(catalog_capabilities())
         .with_protocol_version(protocol_version)
         .with_server_info(Implementation::new(
             "ContextForge",
@@ -1351,6 +1438,21 @@ fn initialize(params: Option<&Value>, server: Option<&CatalogServer>) -> Option<
         ));
     result.instructions = server.and_then(|server| server.instructions.clone());
     Some(result)
+}
+
+pub(crate) fn catalog_capabilities() -> ServerCapabilities {
+    let mut capabilities = ServerCapabilities::default();
+    let mut tools = ToolsCapability::default();
+    tools.list_changed = Some(false);
+    capabilities.tools = Some(tools);
+    let mut prompts = PromptsCapability::default();
+    prompts.list_changed = Some(false);
+    capabilities.prompts = Some(prompts);
+    let mut resources = ResourcesCapability::default();
+    resources.list_changed = Some(false);
+    resources.subscribe = Some(false);
+    capabilities.resources = Some(resources);
+    capabilities
 }
 
 fn with_session(mut response: Response, id: Option<&HeaderValue>) -> Response {
@@ -1627,7 +1729,8 @@ mod tests {
                     "id": "initialize-1",
                     "result": {
                         "protocolVersion": expected,
-                        "capabilities": {"tools": {"listChanged": false}},
+                        "capabilities": {"tools": {"listChanged": false}, "prompts": {"listChanged": false},
+                            "resources": {"listChanged": false, "subscribe": false}},
                         "serverInfo": { "name": "ContextForge", "version": env!("CARGO_PKG_VERSION") }
                     }
                 })

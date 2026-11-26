@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod content;
+
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{

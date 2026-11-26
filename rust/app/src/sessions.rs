@@ -360,7 +360,7 @@ impl Session {
     pub(crate) fn start_journal(
         &self,
         principal: Option<&Principal>,
-        needs_tool_execution: bool,
+        permission: Option<&'static str>,
     ) -> Option<Arc<Journal>> {
         if self.event_capacity == 0 {
             return None;
@@ -373,9 +373,7 @@ impl Session {
         }
         let journal = Arc::new(Journal::new(
             principal.map(Principal::authorization_fingerprint),
-            JournalMode::Response {
-                needs_tool_execution,
-            },
+            JournalMode::Response { permission },
             self.event_capacity,
             self.event_ttl,
             self.event_budget.clone(),
