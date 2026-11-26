@@ -955,3 +955,191 @@ async fn check_legacy_cancellation(json_response: bool) {
         json!({"jsonrpc":"2.0","id":"in-flight","error":{"code":-32800,"message":"Request cancelled"}})
     );
 }
+
+async fn next_sse_message(response: &mut reqwest::Response, buffered: &mut Vec<u8>) -> Value {
+    loop {
+        while let Some(end) = buffered.iter().position(|&byte| byte == b'\n') {
+            let line: Vec<u8> = buffered.drain(..=end).collect();
+            if let Some(data) = line.strip_prefix(b"data:").map(<[u8]>::trim_ascii)
+                && !data.is_empty()
+            {
+                return serde_json::from_slice(data).unwrap();
+            }
+        }
+        let bytes = response.chunk().await.unwrap().expect("next SSE frame");
+        buffered.extend_from_slice(&bytes);
+    }
+}
+
+async fn fixture_progress(
+    State(release): State<Arc<tokio::sync::Semaphore>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let id = &body["id"];
+    let result = match body["method"].as_str().unwrap() {
+        "initialize" => json!({
+            "protocolVersion":PROTOCOL, "capabilities":{"tools":{}},
+            "serverInfo":{"name":"progress fixture","version":"1"}
+        }),
+        "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+        "tools/list" => json!({"tools":[{"name":"hold","inputSchema":{"type":"object"}}]}),
+        "tools/call" => {
+            let token = body["params"]["_meta"]["progressToken"].clone();
+            let waiting = body["params"]["arguments"]["wait"] == true;
+            if waiting {
+                assert!(
+                    token.is_number(),
+                    "outbound request is missing a progress token"
+                );
+            }
+            let frames = [json!("foreign"), token].into_iter().map(|token| {
+                Ok::<_, std::convert::Infallible>(
+                    axum::response::sse::Event::default().json_data(json!({
+                        "jsonrpc":"2.0", "method":"notifications/progress",
+                        "params":{"progressToken":token,"progress":1,"total":2,"message":"working"}
+                    })).unwrap()
+                )
+            });
+            let final_result = json!({
+                "jsonrpc":"2.0","id":id,
+                "result":{"content":[{"type":"text","text":"done"}],"isError":false}
+            });
+            use futures_util::{StreamExt, stream};
+            let events = stream::iter(frames).chain(stream::once(async move {
+                if waiting {
+                    release.acquire().await.unwrap().forget();
+                }
+                Ok(axum::response::sse::Event::default()
+                    .json_data(final_result)
+                    .unwrap())
+            }));
+            return axum::response::Sse::new(events).into_response();
+        }
+        unexpected => panic!("unexpected upstream method {unexpected}"),
+    };
+    Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+}
+
+#[tokio::test]
+async fn tool_progress_streams_before_completion_on_legacy_and_modern_mcp() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let upstream = Running::start(
+        Router::new()
+            .route("/mcp", post(fixture_progress))
+            .with_state(release.clone()),
+    )
+    .await;
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let legacy = Running::start(service.registration_router().merge(
+        service.mcp_router_with_options(
+            false,
+            ProtocolMode::Legacy,
+            HttpOptions {
+                json_response: false,
+                sessions: Some(SessionSettings::default()),
+            },
+        ),
+    ))
+    .await;
+    let modern = Running::start(service.mcp_router(false, ProtocolMode::Auto)).await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registration) = send(&client, legacy.url("/gateways"), json!({
+         "name":"progress-fixture", "url":upstream.url("/mcp"), "transport":"STREAMABLEHTTP", "visibility":"public"
+    }), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{registration}");
+
+    let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }});
+    let legacy_post = |value: Value| {
+        client
+            .post(legacy.url("/mcp/"))
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-protocol-version", PROTOCOL)
+            .body(value.to_string())
+    };
+    let response = legacy_post(initialize).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = response.headers()["mcp-session-id"].clone();
+    assert_eq!(
+        legacy_post(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .header("mcp-session-id", &session)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED,
+    );
+
+    let modern_post = |accept, wait| {
+        let mut request = modern_request(
+            "tools/call",
+            2,
+            json!({"name":"progress-fixture-hold","arguments":{"wait":wait}}),
+        );
+        request["params"]["_meta"]["progressToken"] = json!("client-token");
+        client
+            .post(modern.url("/mcp/"))
+            .header(header::ACCEPT, accept)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "progress-fixture-hold")
+            .body(request.to_string())
+    };
+    let requests = [
+        legacy_post(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"progress-fixture-hold","arguments":{"wait":true},"_meta":{"progressToken":"client-token"}
+        }})).header("mcp-session-id", session),
+        modern_post("application/json, text/event-stream", true),
+    ];
+    for request in requests {
+        let mut response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream")
+        );
+        let mut buffered = Vec::new();
+        let progress = next_sse_message(&mut response, &mut buffered).await;
+        assert_eq!(
+            progress,
+            json!({
+                "jsonrpc":"2.0","method":"notifications/progress",
+                "params":{"progressToken":"client-token","progress":1.0,"total":2.0,"message":"working"}
+            })
+        );
+        release.add_permits(1);
+        let result = next_sse_message(&mut response, &mut buffered).await;
+        assert_eq!(result["id"], 2);
+        assert_eq!(result["result"]["content"][0]["text"], "done");
+    }
+
+    let response = modern_post("application/json", false).send().await.unwrap();
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["result"]["content"][0]["text"], "done");
+}

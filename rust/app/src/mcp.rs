@@ -19,10 +19,11 @@ use axum::{
     },
     routing::any,
 };
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use rmcp::model::{
     CallToolRequestParams, CancelledNotificationParam, Implementation, InitializeRequestParams,
-    InitializeResult, PaginatedRequestParams, ProtocolVersion, RequestId, ServerCapabilities,
+    InitializeResult, PaginatedRequestParams, ProgressNotification, ProgressNotificationParam,
+    ProgressToken, ProtocolVersion, RequestId, ServerCapabilities, ServerJsonRpcMessage,
     ToolsCapability,
 };
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ use crate::{
     gateway::{GatewayService, ToolError},
     modern::Modern,
     sessions::{PendingError, Session, SessionError, Sessions},
+    upstream::ToolProgress,
 };
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -330,7 +332,7 @@ fn get_not_allowed(detail: &'static str) -> Response {
         .into_response()
 }
 
-fn accepts_event_stream(headers: &HeaderMap) -> bool {
+pub(crate) fn accepts_event_stream(headers: &HeaderMap) -> bool {
     if !headers.contains_key(ACCEPT) {
         return true;
     }
@@ -532,7 +534,7 @@ async fn dispatch(
                 None => None,
             };
             let reply = std::future::ready(rpc_success(id, result));
-            return post_reply(state.json_response, session_id, reply).await;
+            return post_reply(state.json_response, session_id, reply, None).await;
         }
         let session = match &state.sessions {
             Some(sessions) => match sessions.access(session_id.as_ref(), owner, server_id, false) {
@@ -551,6 +553,16 @@ async fn dispatch(
             return with_session(response, session_id.as_ref());
         };
         let stateful = session.is_some();
+        let (progress, updates) = match (!state.json_response && method == "tools/call")
+            .then(|| progress_token(params.as_ref()))
+            .flatten()
+        {
+            Some(token) => {
+                let (progress, updates) = ToolProgress::channel(token);
+                (Some(progress), Some(updates))
+            }
+            None => (None, None),
+        };
         let service = state.service.clone();
         let reply = async move {
             let principal = principal.as_ref();
@@ -559,7 +571,18 @@ async fn dispatch(
             match method.as_str() {
                 "ping" => rpc_success(&id, Empty {}),
                 "tools/list" => list_tools(&service, principal, server, &id, params).await,
-                "tools/call" => call_tool(&service, principal, server, session, &id, params).await,
+                "tools/call" => {
+                    call_tool(
+                        &service,
+                        principal,
+                        server,
+                        session,
+                        &id,
+                        params,
+                        progress.as_ref(),
+                    )
+                    .await
+                }
                 _ => rpc_error(
                     StatusCode::OK,
                     &id,
@@ -572,18 +595,23 @@ async fn dispatch(
         if stateful {
             // Keep processing if the client loses the HTTP connection.
             let task = tokio::spawn(reply);
-            return post_reply(state.json_response, session_id, async move {
-                match task.await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        tracing::error!(%error, "MCP request task failed");
-                        tool_error(&Value::Null, ToolError::Unavailable)
+            return post_reply(
+                state.json_response,
+                session_id,
+                async move {
+                    match task.await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::error!(%error, "MCP request task failed");
+                            tool_error(&Value::Null, ToolError::Unavailable)
+                        }
                     }
-                }
-            })
+                },
+                updates,
+            )
             .await;
         }
-        return post_reply(state.json_response, session_id, reply).await;
+        return post_reply(state.json_response, session_id, reply, updates).await;
     }
 
     let result = message.get("result");
@@ -608,21 +636,45 @@ async fn dispatch(
     invalid_envelope()
 }
 
+fn progress_token(params: Option<&Value>) -> Option<ProgressToken> {
+    ProgressToken::deserialize(params?.get("_meta")?.get("progressToken")?).ok()
+}
+
 async fn post_reply(
     json_response: bool,
     session_id: Option<HeaderValue>,
     reply: impl Future<Output = Response> + Send + 'static,
+    updates: Option<tokio::sync::mpsc::Receiver<ProgressNotificationParam>>,
 ) -> Response {
     let response = if json_response {
         reply.await
     } else {
-        let events = stream::once(async move {
-            let body = to_bytes(reply.await.into_body(), usize::MAX)
-                .await
-                .map_err(std::io::Error::other)?;
-            let data = std::str::from_utf8(&body).map_err(std::io::Error::other)?;
-            Ok::<_, std::io::Error>(Event::default().event("message").data(data))
-        });
+        let events = stream::unfold(Some((Box::pin(reply), updates)), |state| async move {
+            let (mut reply, mut updates) = state?;
+            let terminal = if let Some(receiver) = &mut updates {
+                tokio::select! {
+                    biased;
+                    next = receiver.recv() => match next {
+                        Some(progress) => {
+                            return Some((vec![progress_event(progress)], Some((reply, updates))));
+                        }
+                        None => reply.await,
+                    },
+                    terminal = &mut reply => terminal,
+                }
+            } else {
+                reply.await
+            };
+            let mut events = Vec::new();
+            if let Some(mut receiver) = updates {
+                while let Ok(progress) = receiver.try_recv() {
+                    events.push(progress_event(progress));
+                }
+            }
+            events.push(terminal_event(terminal).await);
+            Some((events, None))
+        })
+        .flat_map(stream::iter);
         (
             [
                 (CACHE_CONTROL, "no-cache, no-transform"),
@@ -640,6 +692,23 @@ async fn post_reply(
             .into_response()
     };
     with_session(response, session_id.as_ref())
+}
+
+fn progress_event(progress: ProgressNotificationParam) -> Result<Event, std::io::Error> {
+    let notification =
+        ServerJsonRpcMessage::notification(ProgressNotification::new(progress).into());
+    Event::default()
+        .event("message")
+        .json_data(notification)
+        .map_err(std::io::Error::other)
+}
+
+async fn terminal_event(reply: Response) -> Result<Event, std::io::Error> {
+    let body = to_bytes(reply.into_body(), usize::MAX)
+        .await
+        .map_err(std::io::Error::other)?;
+    let data = std::str::from_utf8(&body).map_err(std::io::Error::other)?;
+    Ok(Event::default().event("message").data(data))
 }
 
 async fn list_tools(
@@ -670,6 +739,7 @@ async fn call_tool(
     session: Option<Arc<Session>>,
     id: &Value,
     params: Option<&Value>,
+    progress: Option<&ToolProgress>,
 ) -> Response {
     let Some(Ok(params)) = params.map(CallToolRequestParams::deserialize) else {
         return invalid_params(id);
@@ -711,7 +781,14 @@ async fn call_tool(
         .unwrap_or_default();
     let arguments = Value::Object(params.arguments.unwrap_or_default());
     let result = service
-        .call_tool(principal, server, &params.name, arguments, &cancellation)
+        .call_tool(
+            principal,
+            server,
+            &params.name,
+            arguments,
+            &cancellation,
+            progress,
+        )
         .await;
     if cancellation.is_cancelled() {
         return tool_error(id, ToolError::Cancelled);

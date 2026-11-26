@@ -37,7 +37,7 @@ Bind session access to the authorized principal and virtual server on every requ
 
 ## Rust lifecycle replay
 
-The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Progress and passive event delivery, resumption and shared session affinity remain open.
+The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Passive event delivery, resumption, and shared session affinity remain open.
 
 The public legacy JSON profile produced five recordings with rust-anything v5.0.1. The original matched all five. Rust matched the unknown-session POST and missing-session GET. Initialization advertises the Rust version and the implemented capabilities. Missing-session POST and DELETE errors omit the generated session ID that v1.1.2 sends before initialization.
 
@@ -65,3 +65,7 @@ JSON_RESPONSE_ENABLED=false USE_STATEFUL_SESSIONS=false MCP_REQUIRE_AUTH=false \
   rust-anything app replay rust/replay/mcp-stateful/sse-stateless \
   --build "$PWD/target/debug/context-forge-rs"
 ```
+
+## Progress during tool calls
+
+A synthetic upstream posted one progress event with an unrelated token, then one with the numeric token it received in `tools/call`. Both gateways delivered the matching event before the terminal reply and replaced its token with the caller's string token. The reference sent SSE for legacy streaming mode and for modern clients that accepted both media types and supplied a progress token. Legacy JSON mode returned a single JSON result. Rust also keeps modern responses in JSON when the client accepts only JSON. The live Rust test holds the upstream result until the client reads its progress event.

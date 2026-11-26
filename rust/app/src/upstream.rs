@@ -19,9 +19,10 @@ use reqwest::{
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
     ClientCapabilities, ClientJsonRpcMessage, ClientRequest, DiscoverRequest,
-    DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetExtensions, Implementation,
-    InitializeRequest, InitializeRequestParams, InitializedNotification, JsonRpcMessage,
-    ListToolsRequest, PaginatedRequestParams, ProtocolVersion, RequestId, RequestMetaObject,
+    DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetExtensions, GetMeta,
+    Implementation, InitializeRequest, InitializeRequestParams, InitializedNotification,
+    JsonRpcMessage, ListToolsRequest, PaginatedRequestParams, ProgressNotificationParam,
+    ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
 };
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
@@ -29,6 +30,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     net::lookup_host,
+    sync::mpsc,
     time::{Instant, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
@@ -49,6 +51,21 @@ const MAX_SESSION_ID_BYTES: usize = 512;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATION_TIMEOUT: Duration = Duration::from_millis(250);
+const PROGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) struct ToolProgress {
+    token: ProgressToken,
+    sender: mpsc::Sender<ProgressNotificationParam>,
+}
+
+impl ToolProgress {
+    pub(crate) fn channel(
+        token: ProgressToken,
+    ) -> (Self, mpsc::Receiver<ProgressNotificationParam>) {
+        let (sender, receiver) = mpsc::channel(16);
+        (Self { token, sender }, receiver)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct EgressPolicy {
@@ -242,16 +259,17 @@ impl UpstreamClient {
         name: &str,
         arguments: Value,
     ) -> Result<Value, UpstreamError> {
-        self.call_tool_with_cancellation(url, name, arguments, &CancellationToken::new())
+        self.call_tool_with_context(url, name, arguments, &CancellationToken::new(), None)
             .await
     }
 
-    pub(crate) async fn call_tool_with_cancellation(
+    pub(crate) async fn call_tool_with_context(
         &self,
         url: &str,
         name: &str,
         arguments: Value,
         cancellation: &CancellationToken,
+        progress: Option<&ToolProgress>,
     ) -> Result<Value, UpstreamError> {
         if cancellation.is_cancelled() {
             return Err(UpstreamError::Cancelled);
@@ -276,7 +294,7 @@ impl UpstreamClient {
                 }
                 Err(UpstreamError::Cancelled)
             }
-            result = timeout_at(deadline, session.request(request.into())) => {
+            result = timeout_at(deadline, session.request(request.into(), progress)) => {
                 result.unwrap_or(Err(UpstreamError::Timeout)).map(|reply| reply.result)
             }
         };
@@ -438,9 +456,10 @@ impl Session {
             .send_request(
                 DiscoverRequest::new(DiscoverRequestParams {}).into(),
                 Some(&MODERN_VERSION),
+                false,
             )
             .await?;
-        let mut reply = read_reply(response, id).await?;
+        let mut reply = read_reply(response, id, None).await?;
         let Some(fields) = reply.result.as_object_mut() else {
             return Ok(false);
         };
@@ -473,10 +492,10 @@ impl Session {
         let params = InitializeRequestParams::new(ClientCapabilities::default(), client_info())
             .with_protocol_version(PROTOCOL_VERSION);
         let request = InitializeRequest::new(params);
-        let (response, id) = self.send_request(request.into(), None).await?;
+        let (response, id) = self.send_request(request.into(), None, false).await?;
 
         self.session_id = read_session_id(&response)?;
-        let reply = read_reply(response, id).await?;
+        let reply = read_reply(response, id, None).await?;
         let requested = reply.result.get("protocolVersion").and_then(Value::as_str);
         let version = ProtocolVersion::KNOWN_VERSIONS
             .iter()
@@ -505,7 +524,7 @@ impl Session {
         for _ in 0..MAX_TOOL_PAGES {
             let params = PaginatedRequestParams::default().with_cursor(cursor.take());
             let reply = self
-                .request(ListToolsRequest::with_param(params).into())
+                .request(ListToolsRequest::with_param(params).into(), None)
                 .await?;
             received += reply.bytes;
             let Value::Object(mut result) = reply.result else {
@@ -544,16 +563,23 @@ impl Session {
         Err(UpstreamError::LimitExceeded)
     }
 
-    async fn request(&mut self, request: ClientRequest) -> Result<Reply, UpstreamError> {
+    async fn request(
+        &mut self,
+        request: ClientRequest,
+        progress: Option<&ToolProgress>,
+    ) -> Result<Reply, UpstreamError> {
         let version = self.protocol_version.clone();
-        let (response, id) = self.send_request(request, version.as_ref()).await?;
-        read_reply(response, id).await
+        let (response, id) = self
+            .send_request(request, version.as_ref(), progress.is_some())
+            .await?;
+        read_reply(response, id, progress).await
     }
 
     async fn send_request(
         &mut self,
         mut request: ClientRequest,
         version: Option<&ProtocolVersion>,
+        report_progress: bool,
     ) -> Result<(Response, i64), UpstreamError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -565,6 +591,11 @@ impl Session {
                     client_info(),
                     ClientCapabilities::default(),
                 ));
+        }
+        if report_progress {
+            request
+                .get_meta_mut()
+                .set_progress_token(ProgressToken(RequestId::Number(id)));
         }
         let response = self
             .post(
@@ -764,12 +795,19 @@ async fn http_error(response: Response) -> UpstreamError {
     UpstreamError::Status(status.as_u16())
 }
 
-async fn read_reply(mut response: Response, id: i64) -> Result<Reply, UpstreamError> {
+type WireMessage = JsonRpcMessage<Value, Value, Value>;
+
+async fn read_reply(
+    mut response: Response,
+    id: i64,
+    mut progress: Option<&ToolProgress>,
+) -> Result<Reply, UpstreamError> {
     check_message_length(&response)?;
     match response_media_type(&response) {
         Some(media) if media.eq_ignore_ascii_case("application/json") => {
             let body = read_json_body(response).await?;
-            let result = take_result(&body, id)?.ok_or(UpstreamError::InvalidResponse)?;
+            let result =
+                take_result(decode_message(&body)?, id)?.ok_or(UpstreamError::InvalidResponse)?;
             return Ok(Reply {
                 result,
                 bytes: body.len(),
@@ -786,19 +824,53 @@ async fn read_reply(mut response: Response, id: i64) -> Result<Reply, UpstreamEr
         if received > MAX_MESSAGE_BYTES {
             return Err(UpstreamError::LimitExceeded);
         }
-        if let Some(result) = stream.feed(&chunk, id)? {
-            return Ok(Reply {
-                result,
-                bytes: received,
-            });
+        let mut bytes = chunk.as_ref();
+        while let Some(frame) = stream.next_frame(&mut bytes) {
+            let message = decode_message(&frame)?;
+            if let (Some(relay), JsonRpcMessage::Notification(notification)) = (progress, &message)
+                && let Some(params) =
+                    matching_progress(&notification.notification, id, &relay.token)
+                && !matches!(
+                    timeout(PROGRESS_SEND_TIMEOUT, relay.sender.send(params)).await,
+                    Ok(Ok(()))
+                )
+            {
+                progress = None;
+            }
+            if let Some(result) = take_result(message, id)? {
+                return Ok(Reply {
+                    result,
+                    bytes: received,
+                });
+            }
         }
     }
     Err(UpstreamError::InvalidResponse)
 }
 
-fn take_result(body: &[u8], id: i64) -> Result<Option<Value>, UpstreamError> {
-    let message: JsonRpcMessage<Value, Value, Value> =
-        serde_json::from_slice(body).map_err(|_| UpstreamError::InvalidResponse)?;
+fn decode_message(body: &[u8]) -> Result<WireMessage, UpstreamError> {
+    serde_json::from_slice(body).map_err(|_| UpstreamError::InvalidResponse)
+}
+
+fn matching_progress(
+    message: &Value,
+    id: i64,
+    token: &ProgressToken,
+) -> Option<ProgressNotificationParam> {
+    if message.get("method")?.as_str()? != "notifications/progress" {
+        return None;
+    }
+    let params = ProgressNotificationParam::deserialize(message.get("params")?).ok()?;
+    if params.progress_token != ProgressToken(RequestId::Number(id)) {
+        return None;
+    }
+    let mut progress = ProgressNotificationParam::new(token.clone(), params.progress);
+    progress.total = params.total;
+    progress.message = params.message;
+    Some(progress)
+}
+
+fn take_result(message: WireMessage, id: i64) -> Result<Option<Value>, UpstreamError> {
     let expected = RequestId::Number(id);
     match message {
         JsonRpcMessage::Response(response) if response.id == expected => Ok(Some(response.result)),
@@ -826,8 +898,9 @@ struct SseDecoder {
 }
 
 impl SseDecoder {
-    fn feed(&mut self, chunk: &[u8], id: i64) -> Result<Option<Value>, UpstreamError> {
-        for &byte in chunk {
+    fn next_frame(&mut self, chunk: &mut &[u8]) -> Option<Vec<u8>> {
+        while let Some((&byte, rest)) = chunk.split_first() {
+            *chunk = rest;
             if std::mem::take(&mut self.after_cr) && byte == b'\n' {
                 continue;
             }
@@ -844,11 +917,8 @@ impl SseDecoder {
                 &self.line
             };
             if line.is_empty() && !self.event.is_empty() {
-                let result = take_result(&self.event, id)?;
-                self.event.clear();
-                if result.is_some() {
-                    return Ok(result);
-                }
+                self.line.clear();
+                return Some(std::mem::take(&mut self.event));
             } else if let Some(data) = line.strip_prefix(b"data:") {
                 if !self.event.is_empty() {
                     self.event.push(b'\n');
@@ -858,7 +928,7 @@ impl SseDecoder {
             }
             self.line.clear();
         }
-        Ok(None)
+        None
     }
 }
 
@@ -1386,15 +1456,25 @@ mod tests {
     #[test]
     fn sse_accepts_split_multiline_events_and_ignores_unmatched_ids() {
         let mut stream = SseDecoder::default();
-        for chunk in [
+        for mut chunk in [
             b"\xef\xbb".as_slice(),
             b"\xbfdata: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}\r",
             b"\n\r\ndata: {\"jsonrpc\":\"2.0\",\r\n",
             b"data: \"id\":2,\"result\":",
             b"{\"ok\":true}}\r\n",
         ] {
-            assert!(stream.feed(chunk, 2).unwrap().is_none());
+            while let Some(frame) = stream.next_frame(&mut chunk) {
+                assert!(
+                    take_result(decode_message(&frame).unwrap(), 2)
+                        .unwrap()
+                        .is_none()
+                );
+            }
         }
-        assert_eq!(stream.feed(b"\r\n", 2).unwrap(), Some(json!({"ok": true})));
+        let frame = stream.next_frame(&mut b"\r\n".as_slice()).unwrap();
+        assert_eq!(
+            take_result(decode_message(&frame).unwrap(), 2).unwrap(),
+            Some(json!({"ok": true}))
+        );
     }
 }

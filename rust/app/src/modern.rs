@@ -19,8 +19,9 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage,
         ClientRequest, ContentBlock, CustomRequest, CustomResult, DiscoverResult, ErrorCode,
         ErrorData, Implementation, InitializeRequestParams, InitializeResult, JsonRpcError,
-        ListToolsResult, MetaObject, PaginatedRequestParams, ProtocolVersion, ResultType,
-        ServerCapabilities, ServerConfig, Tool, ToolsCapability,
+        ListToolsResult, MetaObject, PaginatedRequestParams, ProgressNotification,
+        ProgressNotificationParam, ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
+        Tool, ToolsCapability,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -34,8 +35,12 @@ use crate::{
     access::Principal,
     catalog::{CatalogServer, ToolDefinition},
     gateway::{GatewayService, ToolError},
-    mcp::{JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, accepts_json, accepts_post_stream, rpc_error},
+    mcp::{
+        JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, accepts_event_stream, accepts_json,
+        accepts_post_stream, rpc_error,
+    },
     modern_validation::reject_invalid_request,
+    upstream::ToolProgress,
 };
 
 const ROOT_INSTRUCTIONS: &str =
@@ -44,6 +49,9 @@ const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const MODERN_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 
 type Transport = StreamableHttpService<GatewayHandler, NeverSessionManager>;
+
+#[derive(Clone)]
+struct AcceptsProgress;
 
 #[derive(Clone)]
 pub struct Modern {
@@ -93,6 +101,9 @@ impl Modern {
             || (!self.json_response && !accepts_post_stream(request.headers()))
         {
             return StatusCode::NOT_ACCEPTABLE.into_response();
+        }
+        if accepts_event_stream(request.headers()) {
+            request.extensions_mut().insert(AcceptsProgress);
         }
 
         // The SDK requires both Accept types even when JSON mode is enabled.
@@ -307,17 +318,24 @@ impl ServerHandler for GatewayHandler {
                 None,
             ));
         }
-        let mut result = match self
-            .gateway
-            .call_tool(
-                parts.extensions.get::<Principal>(),
-                parts.extensions.get::<CatalogServer>(),
-                &request.name,
-                Value::Object(request.arguments.unwrap_or_default()),
-                &context.ct,
-            )
-            .await
-        {
+        let progress = parts
+            .extensions
+            .get::<AcceptsProgress>()
+            .and_then(|_| context.meta.get_progress_token())
+            .map(ToolProgress::channel);
+        let (relay, updates) = match progress {
+            Some((relay, updates)) => (Some(relay), Some(updates)),
+            None => (None, None),
+        };
+        let invocation = self.gateway.call_tool(
+            parts.extensions.get::<Principal>(),
+            parts.extensions.get::<CatalogServer>(),
+            &request.name,
+            Value::Object(request.arguments.unwrap_or_default()),
+            &context.ct,
+            relay.as_ref(),
+        );
+        let mut result = match with_progress(invocation, updates, &context).await {
             Ok(value) => serde_json::from_value::<CallToolResult>(value)
                 .map_err(|_| ErrorData::internal_error("Invalid upstream tool result", None))?,
             Err(ToolError::NotFound) => CallToolResult::error(vec![ContentBlock::text(format!(
@@ -345,6 +363,53 @@ impl ServerHandler for GatewayHandler {
     ) -> Result<CustomResult, ErrorData> {
         Err(method_not_found(request.method))
     }
+}
+
+async fn with_progress(
+    invocation: impl Future<Output = Result<Value, ToolError>>,
+    updates: Option<tokio::sync::mpsc::Receiver<ProgressNotificationParam>>,
+    context: &RequestContext<RoleServer>,
+) -> Result<Value, ToolError> {
+    let Some(mut updates) = updates else {
+        return invocation.await;
+    };
+    let mut invocation = std::pin::pin!(invocation);
+    let result = loop {
+        tokio::select! {
+            biased;
+            update = updates.recv() => {
+                let Some(update) = update else {
+                    return invocation.await;
+                };
+                if !send_progress(context, update).await {
+                    drop(updates);
+                    return invocation.await;
+                }
+            }
+            result = &mut invocation => break result,
+        }
+    };
+    while let Ok(update) = updates.try_recv() {
+        if !send_progress(context, update).await {
+            break;
+        }
+    }
+    result
+}
+
+async fn send_progress(
+    context: &RequestContext<RoleServer>,
+    update: ProgressNotificationParam,
+) -> bool {
+    let notification = ProgressNotification::new(update);
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            context.peer.send_notification(notification.into())
+        )
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 fn request_parts(context: &RequestContext<RoleServer>) -> Result<&Parts, ErrorData> {

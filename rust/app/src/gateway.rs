@@ -27,7 +27,7 @@ use crate::{
     },
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings},
-    upstream::{UpstreamClient, UpstreamError},
+    upstream::{ToolProgress, UpstreamClient, UpstreamError},
 };
 
 pub struct GatewayService {
@@ -218,6 +218,7 @@ impl GatewayService {
         name: &str,
         arguments: Value,
         cancellation: &CancellationToken,
+        progress: Option<&ToolProgress>,
     ) -> Result<Value, ToolError> {
         let tool = tokio::select! {
             biased;
@@ -233,11 +234,12 @@ impl GatewayService {
             return Err(ToolError::Unavailable);
         }
         self.upstream
-            .call_tool_with_cancellation(
+            .call_tool_with_context(
                 &tool.gateway_url,
                 &tool.original_name,
                 arguments,
                 cancellation,
+                progress,
             )
             .await
             .map_err(|error| {
