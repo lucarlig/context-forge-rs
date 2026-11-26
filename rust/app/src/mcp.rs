@@ -35,7 +35,7 @@ pub use crate::redis_sessions::RedisSessionDirectory;
 use crate::{
     access::{self, Principal},
     affinity::{self, Forwarded},
-    catalog::CatalogServer,
+    catalog::{CatalogList, CatalogServer},
     events::{Journal, parse_cursor},
     gateway::{GatewayService, ToolError},
     modern::Modern,
@@ -931,6 +931,39 @@ async fn dispatch(
             match method.as_str() {
                 "ping" => rpc_success(&id, Empty {}),
                 "tools/list" => list_tools(&service, principal, server, &id, params).await,
+                "resources/list" => {
+                    list_catalog_metadata(
+                        &service,
+                        CatalogList::Resources,
+                        principal,
+                        server,
+                        &id,
+                        params,
+                    )
+                    .await
+                }
+                "resources/templates/list" => {
+                    list_catalog_metadata(
+                        &service,
+                        CatalogList::Templates,
+                        principal,
+                        server,
+                        &id,
+                        params,
+                    )
+                    .await
+                }
+                "prompts/list" => {
+                    list_catalog_metadata(
+                        &service,
+                        CatalogList::Prompts,
+                        principal,
+                        server,
+                        &id,
+                        params,
+                    )
+                    .await
+                }
                 "tools/call" => {
                     call_tool(
                         &service,
@@ -1168,6 +1201,28 @@ async fn list_tools(
         .await
     {
         Ok(page) => rpc_success(id, page),
+        Err(error) => tool_error(id, error),
+    }
+}
+
+async fn list_catalog_metadata(
+    service: &GatewayService,
+    list: CatalogList,
+    principal: Option<&Principal>,
+    server: Option<&CatalogServer>,
+    id: &Value,
+    params: Option<&Value>,
+) -> Response {
+    let cursor = match params.map(PaginatedRequestParams::deserialize) {
+        None => None,
+        Some(Ok(params)) => params.cursor,
+        Some(Err(_)) => return invalid_params(id),
+    };
+    match service
+        .list_catalog_metadata(list, principal, server, cursor.as_deref())
+        .await
+    {
+        Ok(result) => rpc_success(id, result),
         Err(error) => tool_error(id, error),
     }
 }

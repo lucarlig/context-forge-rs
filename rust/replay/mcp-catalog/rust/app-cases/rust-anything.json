@@ -1,0 +1,23 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-reference-server",
+  "run": [
+    "context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "normalizers": {
+    "runtime": "^(python|rust)$"
+  },
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "legacy-prompts-list",
+    "legacy-resources-list",
+    "legacy-resources-templates-list",
+    "modern-prompts-list",
+    "modern-resources-list",
+    "modern-resources-templates-list"
+  ]
+}

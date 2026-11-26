@@ -120,6 +120,51 @@ CREATE TABLE IF NOT EXISTS tools (
 
 CREATE INDEX IF NOT EXISTS idx_tools_catalog_enabled_name ON tools (name, id) WHERE enabled = TRUE;
 
+CREATE TABLE IF NOT EXISTS resources (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    uri VARCHAR(767) NOT NULL,
+    uri_template TEXT,
+    name VARCHAR(255) NOT NULL,
+    original_name TEXT,
+    custom_name_slug TEXT,
+    title VARCHAR(255),
+    description TEXT,
+    mime_type VARCHAR(255),
+    size INTEGER,
+    text_content TEXT,
+    binary_content BYTEA,
+    extension_metadata JSON,
+    enabled BOOLEAN DEFAULT TRUE,
+    tags JSON NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    gateway_id VARCHAR(36) REFERENCES gateways(id) ON DELETE CASCADE,
+    team_id VARCHAR(36) REFERENCES email_teams(id) ON DELETE SET NULL,
+    owner_email VARCHAR(255),
+    visibility VARCHAR(20) NOT NULL DEFAULT 'public'
+);
+
+CREATE TABLE IF NOT EXISTS prompts (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    custom_name VARCHAR(255) NOT NULL,
+    custom_name_slug VARCHAR(255) NOT NULL,
+    title VARCHAR(255),
+    description TEXT,
+    template TEXT,
+    argument_schema JSON,
+    enabled BOOLEAN DEFAULT TRUE,
+    tags JSON NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    gateway_id VARCHAR(36) REFERENCES gateways(id) ON DELETE CASCADE,
+    team_id VARCHAR(36) REFERENCES email_teams(id) ON DELETE SET NULL,
+    owner_email VARCHAR(255),
+    visibility VARCHAR(20) NOT NULL DEFAULT 'public',
+    UNIQUE (gateway_id, original_name)
+);
+
 CREATE TABLE IF NOT EXISTS servers (
     id VARCHAR(36) PRIMARY KEY NOT NULL,
     name VARCHAR(255) NOT NULL,
@@ -157,3 +202,15 @@ CREATE TABLE IF NOT EXISTS server_tool_association (
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_tool_association_tool_id ON server_tool_association (tool_id);
+
+CREATE TABLE IF NOT EXISTS server_resource_association (
+    server_id VARCHAR(36) NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    resource_id VARCHAR(36) NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    PRIMARY KEY (server_id, resource_id)
+);
+
+CREATE TABLE IF NOT EXISTS server_prompt_association (
+    server_id VARCHAR(36) NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    prompt_id VARCHAR(36) NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+    PRIMARY KEY (server_id, prompt_id)
+);

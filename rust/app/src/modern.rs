@@ -20,21 +20,21 @@ use rmcp::{
         ClientJsonRpcMessage, ClientRequest, ContentBlock, CustomRequest, CustomResult,
         DiscoverResult, ElicitRequestParams, ErrorCode, ErrorData, Implementation,
         InitializeRequestParams, InitializeResult, InputRequest, InputRequiredResult, JsonRpcError,
-        ListToolsResult, MetaObject, PaginatedRequestParams, ProgressNotification,
-        ProgressNotificationParam, ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
-        Tool, ToolsCapability,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        MetaObject, PaginatedRequestParams, ProgressNotification, ProgressNotificationParam,
+        ProtocolVersion, ResultType, ServerCapabilities, ServerConfig, Tool, ToolsCapability,
     },
     service::RequestContext,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::{
     access::Principal,
-    catalog::{CatalogServer, ToolDefinition},
+    catalog::{CatalogList, CatalogServer, ToolDefinition},
     gateway::{GatewayService, ToolError},
     mcp::{
         JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, accepts_event_stream, accepts_json,
@@ -241,6 +241,38 @@ struct GatewayHandler {
     scoped_tool: Option<Tool>,
 }
 
+impl GatewayHandler {
+    async fn catalog_metadata<R: DeserializeOwned>(
+        &self,
+        list: CatalogList,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<R, ErrorData> {
+        let parts = request_parts(&context)?;
+        let server = parts.extensions.get::<CatalogServer>();
+        let mut page = self
+            .gateway
+            .list_catalog_metadata(
+                list,
+                parts.extensions.get::<Principal>(),
+                server,
+                request.as_ref().and_then(|params| params.cursor.as_deref()),
+            )
+            .await
+            .map_err(tool_error)?;
+        let mut meta = None;
+        stamp_server_info(&mut meta);
+        page["_meta"] = json!(meta);
+        page["resultType"] = json!(ResultType::COMPLETE);
+        page["cacheScope"] = json!("private");
+        page["ttlMs"] = json!(self.gateway.catalog_ttl_ms(server).await);
+        serde_json::from_value(page).map_err(|error| {
+            tracing::warn!(%error, method = list.method(), "invalid catalog metadata");
+            ErrorData::internal_error("Invalid catalog metadata", None)
+        })
+    }
+}
+
 impl ServerHandler for GatewayHandler {
     fn get_info(&self) -> ServerConfig {
         let mut capabilities = ServerCapabilities::default();
@@ -305,6 +337,33 @@ impl ServerHandler for GatewayHandler {
         result.next_cursor = page.next_cursor;
         stamp_server_info(&mut result.meta);
         Ok(result)
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        self.catalog_metadata(CatalogList::Resources, request, context)
+            .await
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        self.catalog_metadata(CatalogList::Templates, request, context)
+            .await
+    }
+
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        self.catalog_metadata(CatalogList::Prompts, request, context)
+            .await
     }
 
     async fn call_tool(

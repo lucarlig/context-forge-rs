@@ -22,8 +22,8 @@ use crate::{
     access::{self, Authorizer, Principal, RoleContext},
     auth::TeamVisibility,
     catalog::{
-        CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool, RegistrationError,
-        ToolDefinition,
+        CatalogList, CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool,
+        RegistrationError, ToolDefinition,
     },
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings},
@@ -172,7 +172,7 @@ impl GatewayService {
         }
 
         let server_id = server.map(|server| server.id.as_str());
-        let fingerprint = list_fingerprint(principal, server_id);
+        let fingerprint = list_fingerprint("tools/list", principal, server_id);
         let continuation = cursor
             .map(|cursor| self.pagination.decode(cursor, &fingerprint))
             .transpose()?;
@@ -207,6 +207,53 @@ impl GatewayService {
             tools: rows.into_iter().map(|row| row.definition).collect(),
             next_cursor,
         })
+    }
+
+    pub(crate) async fn list_catalog_metadata(
+        &self,
+        list: CatalogList,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        cursor: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        if principal.is_some_and(|principal| !principal.token_allows(list.permission())) {
+            return Err(ToolError::Denied);
+        }
+        let server = server.map(|server| server.id.as_str());
+        let fingerprint = list_fingerprint(list.method(), principal, server);
+        let continuation = cursor
+            .map(|cursor| self.pagination.decode(cursor, &fingerprint))
+            .transpose()?;
+        let size = self.pagination.page_size;
+        let mut rows = self
+            .database
+            .list_catalog_metadata(
+                list,
+                access::catalog_scope(principal),
+                server,
+                continuation.as_ref().map(|cursor| cursor.after_id.as_str()),
+                size + 1,
+            )
+            .await?;
+        let has_more = rows.len() > size as usize;
+        rows.truncate(size as usize);
+        let next_cursor = if has_more {
+            let (id, _) = rows.last().ok_or(ToolError::Unavailable)?;
+            let expires = continuation.map(|cursor| cursor.exp).unwrap_or_else(|| {
+                Timestamp::now()
+                    .as_second()
+                    .saturating_add(self.pagination.ttl)
+            });
+            Some(self.pagination.encode(id.clone(), fingerprint, expires)?)
+        } else {
+            None
+        };
+        let items: Vec<_> = rows.into_iter().map(|(_, item)| item).collect();
+        let mut result = json!({ (list.result_key()): items });
+        if let Some(cursor) = next_cursor {
+            result["nextCursor"] = cursor.into();
+        }
+        Ok(result)
     }
 
     pub(crate) async fn call_tool(
@@ -384,7 +431,7 @@ impl Pagination {
     }
 }
 
-fn list_fingerprint(principal: Option<&Principal>, server: Option<&str>) -> [u8; 32] {
+fn list_fingerprint(method: &str, principal: Option<&Principal>, server: Option<&str>) -> [u8; 32] {
     let (identity, scope) = match principal {
         None => (None, json!("public")),
         Some(principal) => (
@@ -400,7 +447,7 @@ fn list_fingerprint(principal: Option<&Principal>, server: Option<&str>) -> [u8;
             },
         ),
     };
-    let value = json!(["tools/list", identity, scope, server]).to_string();
+    let value = json!([method, identity, scope, server]).to_string();
     Sha256::digest(value.as_bytes()).into()
 }
 

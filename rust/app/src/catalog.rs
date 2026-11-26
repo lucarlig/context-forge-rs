@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{auth::TeamVisibility, database::Database};
@@ -98,6 +98,38 @@ pub struct CatalogTool {
     pub request_type: String,
     pub requires_gateway_policy: bool,
     pub definition: ToolDefinition,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CatalogList {
+    Resources,
+    Templates,
+    Prompts,
+}
+
+impl CatalogList {
+    pub(crate) fn method(self) -> &'static str {
+        match self {
+            Self::Resources => "resources/list",
+            Self::Templates => "resources/templates/list",
+            Self::Prompts => "prompts/list",
+        }
+    }
+
+    pub(crate) fn result_key(self) -> &'static str {
+        match self {
+            Self::Resources => "resources",
+            Self::Templates => "resourceTemplates",
+            Self::Prompts => "prompts",
+        }
+    }
+
+    pub(crate) fn permission(self) -> &'static str {
+        match self {
+            Self::Resources | Self::Templates => "resources.read",
+            Self::Prompts => "prompts.read",
+        }
+    }
 }
 
 pub struct GatewayRegistration<'a> {
@@ -241,6 +273,85 @@ macro_rules! tool_query {
         )
     };
 }
+
+macro_rules! metadata_query {
+    ($team_ids:literal, $columns:literal, $table:literal, $association:literal, $id:literal, $filter:literal) => {
+        concat!(
+            "WITH visible_team_ids(id) AS (",
+            $team_ids,
+            ")
+            SELECT item.id, item.name, item.title, item.description, ",
+            $columns,
+            "
+            FROM ",
+            $table,
+            " item LEFT JOIN gateways g ON g.id = item.gateway_id
+            WHERE item.enabled = TRUE AND ",
+            $filter,
+            "
+                AND ",
+            visible!("item"),
+            "
+                AND (item.gateway_id IS NULL OR (g.enabled = TRUE AND g.status = 'active' AND ",
+            visible!("g"),
+            "))
+                AND (CAST($3 AS TEXT) IS NULL OR item.id > $3)
+                AND (CAST($1 AS TEXT) IS NULL OR EXISTS (
+                    SELECT 1 FROM ",
+            $association,
+            " a
+                    JOIN servers s ON s.id = a.server_id
+                    WHERE a.server_id = $1 AND a.",
+            $id,
+            " = item.id AND s.enabled = TRUE AND ",
+            visible!("s"),
+            "
+                ))
+            ORDER BY item.id LIMIT $2"
+        )
+    };
+}
+
+macro_rules! catalog_metadata_query {
+    ($list:expr, $teams:literal) => {
+        match $list {
+            CatalogList::Resources => metadata_query!(
+                $teams,
+                "item.uri, item.mime_type, CAST(item.size AS BIGINT)",
+                "resources",
+                "server_resource_association",
+                "resource_id",
+                "item.uri_template IS NULL"
+            ),
+            CatalogList::Templates => metadata_query!(
+                $teams,
+                "item.uri_template, item.mime_type, CAST(NULL AS BIGINT)",
+                "resources",
+                "server_resource_association",
+                "resource_id",
+                "item.uri_template IS NOT NULL"
+            ),
+            CatalogList::Prompts => metadata_query!(
+                $teams,
+                "CAST(item.argument_schema AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS BIGINT)",
+                "prompts",
+                "server_prompt_association",
+                "prompt_id",
+                "TRUE"
+            ),
+        }
+    };
+}
+
+type MetadataRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
 
 const SERVER_QUERY: &str = "
     SELECT id, name, team_id, enabled, oauth_enabled, owner_email, visibility, instructions
@@ -413,6 +524,45 @@ impl Database {
             .await
     }
 
+    pub(crate) async fn list_catalog_metadata(
+        &self,
+        list: CatalogList,
+        scope: CatalogScope<'_>,
+        server: Option<&str>,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<(String, Value)>, sqlx::Error> {
+        let teams = match scope.visibility {
+            TeamVisibility::Teams(teams) => teams.as_slice(),
+            TeamVisibility::Admin | TeamVisibility::Public => &[],
+        };
+        let teams =
+            serde_json::to_string(teams).map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        macro_rules! select {
+            ($pool:ident, $teams:literal) => {
+                sqlx::query_as::<_, MetadataRow>(catalog_metadata_query!(list, $teams))
+                    .bind(server)
+                    .bind(i64::from(limit))
+                    .bind(after)
+                    .bind(scope.email)
+                    .bind(scope.visibility == &TeamVisibility::Admin)
+                    .bind(scope.can_own())
+                    .bind(teams)
+                    .fetch_all($pool)
+                    .await?
+            };
+        }
+        let rows = match self {
+            Self::Sqlite(pool) => select!(pool, "SELECT value FROM json_each($7)"),
+            Self::Postgres(pool) => {
+                select!(pool, "SELECT json_array_elements_text(CAST($7 AS JSON))")
+            }
+        };
+        rows.into_iter()
+            .map(|row| metadata_item(list, row))
+            .collect()
+    }
+
     pub async fn find_mcp_tool(
         &self,
         scope: CatalogScope<'_>,
@@ -579,6 +729,50 @@ impl Database {
         }
         Ok(())
     }
+}
+
+fn metadata_item(list: CatalogList, row: MetadataRow) -> Result<(String, Value), sqlx::Error> {
+    let (id, name, title, description, detail, mime, size) = row;
+    let mut item = serde_json::Map::new();
+    item.insert("name".to_owned(), name.into());
+    for (key, value) in [
+        ("title", title),
+        ("description", description),
+        ("mimeType", mime),
+    ] {
+        if let Some(value) = value {
+            item.insert(key.to_owned(), value.into());
+        }
+    }
+    match list {
+        CatalogList::Resources | CatalogList::Templates => {
+            let key = if matches!(list, CatalogList::Resources) {
+                "uri"
+            } else {
+                "uriTemplate"
+            };
+            let uri = detail.ok_or_else(|| {
+                sqlx::Error::Protocol("MCP resource URI missing from catalog".into())
+            })?;
+            item.insert(key.to_owned(), uri.into());
+            if let Some(size) = size.filter(|size| *size >= 0) {
+                item.insert("size".to_owned(), size.into());
+            }
+        }
+        CatalogList::Prompts => {
+            let schema = decode_optional_json(detail.as_deref())?.unwrap_or(Value::Null);
+            let required = schema["required"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let arguments: Vec<Value> = schema["properties"].as_object().into_iter().flatten().map(|(name, property)| {
+                json!({"name":name, "description":property["description"].as_str().unwrap_or_default(),
+                    "required":required.iter().any(|value| value.as_str() == Some(name))})
+            }).collect();
+            item.insert("arguments".to_owned(), arguments.into());
+        }
+    }
+    Ok((id, Value::Object(item)))
 }
 
 fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {

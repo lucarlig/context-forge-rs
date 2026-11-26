@@ -36,6 +36,86 @@ const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
 
+#[tokio::test]
+async fn catalog_metadata_lists_scoped_resources_templates_and_prompts() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    sqlx::raw_sql(r#"
+        INSERT INTO servers (id, name, visibility) VALUES ('v', 'Virtual', 'public');
+        INSERT INTO resources (id, uri, uri_template, name, mime_type, visibility, team_id) VALUES
+            ('r1', 'fixture://notes/first', NULL, 'First', 'text/plain', 'public', NULL),
+            ('r2', 'fixture://notes/team', NULL, 'Team', 'text/plain', 'team', 'alpha'),
+            ('r3', 'fixture://notes/last', NULL, 'Last', 'text/plain', 'public', NULL),
+            ('t1', 'fixture://notes/{name}', 'fixture://notes/{name}', 'Note', 'text/plain', 'public', NULL);
+        INSERT INTO server_resource_association (server_id, resource_id) VALUES ('v', 'r3');
+        INSERT INTO prompts (id,name,original_name,custom_name,custom_name_slug,argument_schema)
+            VALUES ('p1','greet','greet','greet','greet','{"properties":{"who":{"type":"string"}},"required":["who"]}');
+    "#).execute(pool).await.unwrap();
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(EgressPolicy::default(), Duration::from_secs(5)),
+        Pagination::new(1, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.mcp_router(false, ProtocolMode::Auto)).await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let legacy = async |path: &str, method: &str, params: Value| {
+        send(
+            &client,
+            gateway.url(path),
+            json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}),
+            None,
+        )
+        .await
+    };
+    let (status, reply) = legacy("/mcp/", "resources/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply["result"]["resources"][0]["name"], "First");
+    let cursor = reply["result"]["nextCursor"].as_str().unwrap();
+    let (_, reply) = legacy("/mcp/", "resources/list", json!({"cursor":cursor})).await;
+    assert_eq!(
+        reply["result"]["resources"],
+        json!([
+            {"uri":"fixture://notes/last","name":"Last","mimeType":"text/plain"}
+        ])
+    );
+    let (_, reply) = legacy(
+        "/mcp/",
+        "resources/templates/list",
+        json!({"cursor":cursor}),
+    )
+    .await;
+    assert_eq!(reply["error"]["code"], -32602);
+    let (_, reply) = legacy("/servers/v/mcp/", "resources/list", json!({})).await;
+    assert_eq!(reply["result"]["resources"][0]["name"], "Last");
+    let (_, reply) = legacy("/mcp/", "resources/templates/list", json!({})).await;
+    assert_eq!(
+        reply["result"]["resourceTemplates"][0]["uriTemplate"],
+        "fixture://notes/{name}"
+    );
+    let (status, reply) = send_with_headers(
+        &client,
+        gateway.url("/mcp/"),
+        modern_request("prompts/list", 2, json!({})),
+        None,
+        &[
+            ("mcp-protocol-version", "2026-07-28"),
+            ("mcp-method", "prompts/list"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(
+        reply["result"]["prompts"],
+        json!([{"name":"greet","arguments":[{"name":"who","description":"","required":true}]}])
+    );
+    assert_eq!(reply["result"]["cacheScope"], "private");
+}
+
 struct Running {
     address: SocketAddr,
     shutdown: JoinHandle<()>,

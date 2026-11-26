@@ -14,7 +14,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Legacy stateless MCP registration, listing, and invocation for unauthenticated Streamable HTTP upstreams
 - [x] Modern MCP negotiation, discovery, and standard routing headers
 - [x] Stateful sessions, streaming, cancellation, and event resumption
-- [ ] Resources, prompts, completions, logging, and subscriptions
+- [ ] Resources, prompts, completions, logging, and subscriptions (in progress)
 - [ ] Legacy SSE, WebSocket, and stdio transports and translation
 - [ ] Authenticated MCP upstreams, identity forwarding, and direct proxy mode
 - [ ] Gateway update, delete, refresh, health lifecycle, and full catalog APIs

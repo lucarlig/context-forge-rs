@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"resourceTemplates":[{"mimeType":"text/plain","name":"fixture-note","uriTemplate":"fixture://notes/{name}"}]}}
