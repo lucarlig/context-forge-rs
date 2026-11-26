@@ -69,7 +69,7 @@ REDIS_URL=redis://127.0.0.1:6379/0 \
   cargo test --locked --test gateway redis_affinity_relays -- --ignored
 ```
 
-The public legacy JSON profile produced five recordings with rust-anything v5.0.1. The original matched all five. Rust matched the unknown-session POST and missing-session GET. Initialization advertises the Rust version and the implemented capabilities. Missing-session POST and DELETE errors omit the generated session ID that v1.1.2 sends before initialization.
+The public legacy JSON profile produced five recordings with rust-anything v5.0.1. The original matched all five and Rust matched four. The remaining initialization difference includes the Rust version and the current capability set and instructions. Missing-session POST and DELETE errors include a temporary session ID. The live test verifies that reusing either ID yields `404`.
 
 ```sh
 USE_STATEFUL_SESSIONS=true MCP_REQUIRE_AUTH=false MCP_INBOUND_PROTOCOL_MODE=legacy \

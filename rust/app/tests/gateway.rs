@@ -644,7 +644,6 @@ async fn legacy_session_lifecycle_binds_owner_and_virtual_server() {
             StatusCode::FORBIDDEN,
         ),
         ("/mcp/", None, Some(&session), StatusCode::UNAUTHORIZED),
-        ("/mcp/", Some(&renewed), None, StatusCode::BAD_REQUEST),
     ] {
         assert_eq!(
             ping(
@@ -670,6 +669,21 @@ async fn legacy_session_lifecycle_binds_owner_and_virtual_server() {
         delete(&outsider).send().await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
+    for request in [
+        ping("/mcp/", Some(&renewed), None),
+        client.delete(gateway.url("/mcp/")).bearer_auth(&renewed),
+    ] {
+        let error = request.send().await.unwrap();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let discarded_id = error.headers()["mcp-session-id"].to_str().unwrap();
+        assert!(uuid::Uuid::parse_str(discarded_id).is_ok());
+        let reuse = ping("/mcp/", Some(&renewed), None)
+            .header("mcp-session-id", discarded_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reuse.status(), StatusCode::NOT_FOUND);
+    }
 
     let get = |credential, path, accept| {
         client

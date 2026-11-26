@@ -39,7 +39,7 @@ use crate::{
     events::Journal,
     gateway::{GatewayService, ToolError},
     modern::Modern,
-    sessions::{PendingError, Session, SessionError, Sessions},
+    sessions::{PendingError, Session, SessionError, Sessions, new_session_id},
     upstream::{ToolContext, ToolProgress},
 };
 
@@ -1156,7 +1156,9 @@ fn post_session_error(error: SessionError) -> Response {
 fn session_error(error: SessionError) -> Response {
     let (status, detail) = match error {
         SessionError::Missing => {
-            return transport_error(StatusCode::BAD_REQUEST, "Bad Request: Missing session ID");
+            let response =
+                transport_error(StatusCode::BAD_REQUEST, "Bad Request: Missing session ID");
+            return with_session(response, Some(&new_session_id()));
         }
         SessionError::InvalidHeader => {
             return transport_error(StatusCode::BAD_REQUEST, "Bad Request: Invalid session ID");

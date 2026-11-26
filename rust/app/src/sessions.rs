@@ -84,6 +84,11 @@ pub(crate) enum PendingError {
     Capacity,
 }
 
+pub(crate) fn new_session_id() -> HeaderValue {
+    HeaderValue::from_str(&Uuid::new_v4().simple().to_string())
+        .expect("UUID consists of visible ASCII")
+}
+
 impl Sessions {
     pub(crate) fn new(settings: SessionSettings) -> Self {
         Self {
@@ -179,8 +184,7 @@ impl Sessions {
             }
         }
         loop {
-            let id = HeaderValue::from_str(&Uuid::new_v4().simple().to_string())
-                .expect("UUID consists of visible ASCII");
+            let id = new_session_id();
             if let std::collections::hash_map::Entry::Vacant(entry) = entries.entry(id.clone()) {
                 let session = Arc::new(Session {
                     owner: owner.map(str::to_owned),
