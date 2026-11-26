@@ -21,8 +21,9 @@ use axum::{
 };
 use futures_util::stream;
 use rmcp::model::{
-    CallToolRequestParams, Implementation, InitializeRequestParams, InitializeResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ToolsCapability,
+    CallToolRequestParams, CancelledNotificationParam, Implementation, InitializeRequestParams,
+    InitializeResult, PaginatedRequestParams, ProtocolVersion, RequestId, ServerCapabilities,
+    ToolsCapability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,7 +34,7 @@ use crate::{
     catalog::CatalogServer,
     gateway::{GatewayService, ToolError},
     modern::Modern,
-    sessions::{Session, SessionError, Sessions},
+    sessions::{PendingError, Session, SessionError, Sessions},
 };
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -56,6 +57,7 @@ const INVALID_REQUEST: i32 = -32600;
 const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
 const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+const REQUEST_CANCELLED: i32 = -32800;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProtocolMode {
@@ -500,21 +502,24 @@ async fn dispatch(
                 None => rpc_success(id, result),
             };
         }
-        if let Some(sessions) = &state.sessions
-            && let Err(error) = sessions.access(session_id, owner, server_id, false)
-        {
-            return post_session_error(error);
-        }
-        let response = match (id, method) {
-            (None, _) => accepted(),
-            (Some(id), "ping") => rpc_success(id, Empty {}),
-            (Some(id), "tools/list") => {
+        let session = match &state.sessions {
+            Some(sessions) => match sessions.access(session_id, owner, server_id, false) {
+                Ok(session) => Some(session),
+                Err(error) => return post_session_error(error),
+            },
+            None => None,
+        };
+        let response = match (id, method, session) {
+            (None, "notifications/cancelled", Some(session)) => cancel_request(&session, params),
+            (None, _, _) => accepted(),
+            (Some(id), "ping", _) => rpc_success(id, Empty {}),
+            (Some(id), "tools/list", _) => {
                 list_tools(&state.service, principal, server, id, params).await
             }
-            (Some(id), "tools/call") => {
-                call_tool(&state.service, principal, server, id, params).await
+            (Some(id), "tools/call", session) => {
+                call_tool(&state.service, principal, server, session, id, params).await
             }
-            (Some(id), method) => rpc_error(
+            (Some(id), method, _) => rpc_error(
                 StatusCode::OK,
                 id,
                 METHOD_NOT_FOUND,
@@ -574,9 +579,10 @@ async fn list_tools(
 }
 
 async fn call_tool(
-    service: &GatewayService,
+    service: &Arc<GatewayService>,
     principal: Option<&Principal>,
     server: Option<&CatalogServer>,
+    session: Option<Arc<Session>>,
     id: &Value,
     params: Option<&Value>,
 ) -> Response {
@@ -587,13 +593,83 @@ async fn call_tool(
         return invalid_params(id);
     }
     let arguments = Value::Object(params.arguments.unwrap_or_default());
-    match service
-        .call_tool(principal, server, &params.name, arguments)
+    let result = if let Some(session) = session {
+        let Ok(request_id) = RequestId::deserialize(id) else {
+            return invalid_envelope();
+        };
+        let pending = match session.track(request_id) {
+            Ok(pending) => pending,
+            Err(PendingError::DuplicateId) => {
+                return rpc_error(
+                    StatusCode::OK,
+                    id,
+                    INVALID_REQUEST,
+                    "Request ID already in use",
+                    None::<()>,
+                );
+            }
+            Err(PendingError::Capacity) => {
+                return rpc_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    id,
+                    INVALID_REQUEST,
+                    "Too many in-flight requests",
+                    None::<()>,
+                );
+            }
+        };
+        let service = service.clone();
+        let principal = principal.cloned();
+        let server = server.cloned();
+        // A lost HTTP connection does not cancel a stateful MCP request.
+        match tokio::spawn(async move {
+            let result = service
+                .call_tool(
+                    principal.as_ref(),
+                    server.as_ref(),
+                    &params.name,
+                    arguments,
+                    &pending.token,
+                )
+                .await;
+            if pending.token.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
+            result
+        })
         .await
-    {
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(%error, "MCP tool task failed");
+                Err(ToolError::Unavailable)
+            }
+        }
+    } else {
+        service
+            .call_tool(
+                principal,
+                server,
+                &params.name,
+                arguments,
+                &CancellationToken::new(),
+            )
+            .await
+    };
+    match result {
         Ok(result) => rpc_success(id, result),
         Err(error) => tool_error(id, error),
     }
+}
+
+fn cancel_request(session: &Session, params: Option<&Value>) -> Response {
+    let Some(Ok(params)) = params.map(CancelledNotificationParam::deserialize) else {
+        return invalid_envelope();
+    };
+    if let Some(id) = params.request_id {
+        session.cancel_request(&id);
+    }
+    accepted()
 }
 
 fn invalid_params(id: &Value) -> Response {
@@ -612,6 +688,7 @@ fn tool_error(id: &Value, error: ToolError) -> Response {
         ToolError::NotFound => (0, "Unknown tool"),
         ToolError::Cursor => (INVALID_PARAMS, "Invalid cursor"),
         ToolError::Unavailable => (0, "Tool service unavailable"),
+        ToolError::Cancelled => (REQUEST_CANCELLED, "Request cancelled"),
         ToolError::Database(error) => {
             tracing::error!(%error, "MCP tool database operation failed");
             (0, "Tool service unavailable")

@@ -310,6 +310,7 @@ impl ServerHandler for GatewayHandler {
                 parts.extensions.get::<CatalogServer>(),
                 &request.name,
                 Value::Object(request.arguments.unwrap_or_default()),
+                &context.ct,
             )
             .await
         {
@@ -383,6 +384,7 @@ fn tool_error(error: ToolError) -> ErrorData {
         ToolError::NotFound => ErrorData::new(ErrorCode(0), "Unknown tool", None),
         ToolError::Cursor => ErrorData::invalid_params("Invalid cursor", None),
         ToolError::Unavailable => ErrorData::internal_error("Tool service unavailable", None),
+        ToolError::Cancelled => ErrorData::internal_error("Request cancelled", None),
         ToolError::Database(error) => {
             tracing::error!(%error, "MCP catalog lookup failed");
             ErrorData::internal_error("Tool service unavailable", None)

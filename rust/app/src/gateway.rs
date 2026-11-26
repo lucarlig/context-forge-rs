@@ -15,6 +15,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -200,11 +201,14 @@ impl GatewayService {
         server: Option<&CatalogServer>,
         name: &str,
         arguments: Value,
+        cancellation: &CancellationToken,
     ) -> Result<Value, ToolError> {
-        let tool = self
-            .lookup_invokable_tool(principal, server, name)
-            .await?
-            .ok_or(ToolError::NotFound)?;
+        let tool = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(ToolError::Cancelled),
+            result = self.lookup_invokable_tool(principal, server, name) => result?,
+        }
+        .ok_or(ToolError::NotFound)?;
         if tool.gateway_transport != "STREAMABLEHTTP"
             || tool.gateway_mode != "cache"
             || tool.request_type != "STREAMABLEHTTP"
@@ -213,9 +217,17 @@ impl GatewayService {
             return Err(ToolError::Unavailable);
         }
         self.upstream
-            .call_tool(&tool.gateway_url, &tool.original_name, arguments)
+            .call_tool_with_cancellation(
+                &tool.gateway_url,
+                &tool.original_name,
+                arguments,
+                cancellation,
+            )
             .await
             .map_err(|error| {
+                if matches!(error, UpstreamError::Cancelled) {
+                    return ToolError::Cancelled;
+                }
                 tracing::warn!(%error, gateway = %tool.gateway_id, "upstream tool call failed");
                 ToolError::Unavailable
             })
@@ -272,6 +284,8 @@ pub(crate) enum ToolError {
     NotFound,
     #[error("Tool service unavailable")]
     Unavailable,
+    #[error("Request cancelled")]
+    Cancelled,
     #[error("Invalid cursor")]
     Cursor,
     #[error("Catalog database failure")]

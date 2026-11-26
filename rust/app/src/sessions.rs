@@ -10,12 +10,14 @@ use std::{
 };
 
 use axum::http::HeaderValue;
+use rmcp::model::RequestId;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::mcp::SessionSettings;
 
 const MAX_SESSIONS: usize = 4096;
+const MAX_PENDING_REQUESTS: usize = 128;
 
 pub(crate) struct Sessions {
     settings: SessionSettings,
@@ -29,6 +31,7 @@ pub(crate) struct Session {
     last_seen: Mutex<Instant>,
     shutdown: CancellationToken,
     listener_open: AtomicBool,
+    pending: Mutex<HashMap<RequestId, CancellationToken>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -37,6 +40,12 @@ pub(crate) enum SessionError {
     InvalidHeader,
     NotFound,
     Forbidden,
+    Capacity,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PendingError {
+    DuplicateId,
     Capacity,
 }
 
@@ -75,6 +84,7 @@ impl Sessions {
                     last_seen: Mutex::new(Instant::now()),
                     shutdown: self.settings.shutdown.child_token(),
                     listener_open: AtomicBool::new(false),
+                    pending: Mutex::new(HashMap::new()),
                 }));
                 break id;
             }
@@ -130,6 +140,34 @@ impl Session {
             .map(|_| Listener(self))
     }
 
+    pub(crate) fn track(self: Arc<Self>, id: RequestId) -> Result<PendingRequest, PendingError> {
+        let mut pending = self.pending.lock().expect("pending request map lock");
+        if pending.len() >= MAX_PENDING_REQUESTS {
+            return Err(PendingError::Capacity);
+        }
+        let std::collections::hash_map::Entry::Vacant(entry) = pending.entry(id.clone()) else {
+            return Err(PendingError::DuplicateId);
+        };
+        let token = entry.insert(self.shutdown.child_token()).clone();
+        drop(pending);
+        Ok(PendingRequest {
+            session: self,
+            id,
+            token,
+        })
+    }
+
+    pub(crate) fn cancel_request(&self, id: &RequestId) {
+        if let Some(token) = self
+            .pending
+            .lock()
+            .expect("pending request map lock")
+            .get(id)
+        {
+            token.cancel();
+        }
+    }
+
     async fn wait_until_closed(&self) {
         while self.active(false) {
             let remaining = self.ttl.saturating_sub(
@@ -143,6 +181,22 @@ impl Session {
                 () = tokio::time::sleep(remaining) => {}
             }
         }
+    }
+}
+
+pub(crate) struct PendingRequest {
+    session: Arc<Session>,
+    id: RequestId,
+    pub(crate) token: CancellationToken,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.session
+            .pending
+            .lock()
+            .expect("pending request map lock")
+            .remove(&self.id);
     }
 }
 

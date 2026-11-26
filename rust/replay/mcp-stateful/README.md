@@ -37,7 +37,7 @@ Bind session access to the authorized principal and virtual server on every requ
 
 ## Rust lifecycle replay
 
-The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Event delivery, POST streaming, cancellation, and resumption remain open.
+The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Event delivery, POST streaming, and resumption remain open.
 
 The public legacy JSON profile produced five recordings with rust-anything v5.0.1. The original matched all five. Rust matched the unknown-session POST and missing-session GET. Initialization advertises the Rust version and the implemented capabilities. Missing-session POST and DELETE errors omit the generated session ID that v1.1.2 sends before initialization.
 
@@ -46,3 +46,7 @@ USE_STATEFUL_SESSIONS=true MCP_REQUIRE_AUTH=false MCP_INBOUND_PROTOCOL_MODE=lega
   DATABASE_URL=sqlite:///:memory: rust-anything app replay rust/replay/mcp-stateful \
   --build "$PWD/target/debug/context-forge-rs"
 ```
+
+## In-flight tool cancellation
+
+The pinned gateway acknowledged a stateful `notifications/cancelled` POST with `202` and returned JSON-RPC error `-32800` with `Request cancelled` to the outstanding tool request. The synthetic upstream observed the notification with its own request ID, even when the downstream request used a string ID. The live Rust test reproduced all three results and also verified that a different principal or a second session could not cancel the call.

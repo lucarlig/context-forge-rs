@@ -17,11 +17,11 @@ use reqwest::{
     header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, ClientCapabilities, ClientJsonRpcMessage,
-    ClientRequest, DiscoverRequest, DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData,
-    GetExtensions, Implementation, InitializeRequest, InitializeRequestParams,
-    InitializedNotification, JsonRpcMessage, ListToolsRequest, PaginatedRequestParams,
-    ProtocolVersion, RequestId, RequestMetaObject,
+    CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
+    ClientCapabilities, ClientJsonRpcMessage, ClientRequest, DiscoverRequest,
+    DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetExtensions, Implementation,
+    InitializeRequest, InitializeRequestParams, InitializedNotification, JsonRpcMessage,
+    ListToolsRequest, PaginatedRequestParams, ProtocolVersion, RequestId, RequestMetaObject,
 };
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
@@ -31,6 +31,7 @@ use tokio::{
     net::lookup_host,
     time::{Instant, timeout, timeout_at},
 };
+use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
@@ -167,6 +168,8 @@ pub enum UpstreamError {
     Resolve,
     #[error("upstream request timed out")]
     Timeout,
+    #[error("upstream request cancelled")]
+    Cancelled,
     #[error("upstream transport failed")]
     Transport,
     #[error("upstream returned HTTP {0}")]
@@ -239,6 +242,20 @@ impl UpstreamClient {
         name: &str,
         arguments: Value,
     ) -> Result<Value, UpstreamError> {
+        self.call_tool_with_cancellation(url, name, arguments, &CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn call_tool_with_cancellation(
+        &self,
+        url: &str,
+        name: &str,
+        arguments: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, UpstreamError> {
+        if cancellation.is_cancelled() {
+            return Err(UpstreamError::Cancelled);
+        }
         let Value::Object(arguments) = arguments else {
             return Err(UpstreamError::InvalidResponse);
         };
@@ -246,11 +263,25 @@ impl UpstreamClient {
             CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
         );
         let (mut session, deadline) = self.open_session(url).await?;
-        let result = timeout_at(deadline, session.request(request.into())).await;
+        if cancellation.is_cancelled() {
+            session.close().await;
+            return Err(UpstreamError::Cancelled);
+        }
+        let id = session.next_id;
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                if session.next_id != id {
+                    session.cancel(id).await;
+                }
+                Err(UpstreamError::Cancelled)
+            }
+            result = timeout_at(deadline, session.request(request.into())) => {
+                result.unwrap_or(Err(UpstreamError::Timeout)).map(|reply| reply.result)
+            }
+        };
         session.close().await;
         result
-            .map_err(|_| UpstreamError::Timeout)?
-            .map(|reply| reply.result)
     }
 
     async fn open_session(&self, endpoint: &str) -> Result<(Session, Instant), UpstreamError> {
@@ -592,6 +623,21 @@ impl Session {
         } else {
             Err(http_error(response).await)
         }
+    }
+
+    async fn cancel(&self, id: i64) {
+        let message = ClientJsonRpcMessage::notification(
+            CancelledNotification::new(CancelledNotificationParam::new(
+                Some(RequestId::Number(id)),
+                None,
+            ))
+            .into(),
+        );
+        let _ = timeout(
+            TERMINATION_TIMEOUT,
+            self.post(&message, self.protocol_version.as_ref()),
+        )
+        .await;
     }
 
     async fn close(&self) {

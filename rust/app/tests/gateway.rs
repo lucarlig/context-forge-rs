@@ -755,3 +755,158 @@ async fn legacy_session_lifecycle_binds_owner_and_virtual_server() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn legacy_cancellation_targets_the_originating_session_and_upstream_request() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = Running::start(
+        Router::new().route(
+            "/mcp",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let events = events.clone();
+                async move {
+                    let method = body["method"].as_str().unwrap();
+                    let id = &body["id"];
+                    if method != "initialize" {
+                        assert_eq!(headers["mcp-session-id"], "upstream-session");
+                    }
+                    let result = match method {
+                        "initialize" => {
+                            return (
+                                [("mcp-session-id", "upstream-session")],
+                                Json(json!({
+                                    "jsonrpc":"2.0", "id":id, "result":{
+                                        "protocolVersion":PROTOCOL, "capabilities":{"tools":{}},
+                                        "serverInfo":{"name":"fixture","version":"1"}
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+                        "tools/list" => {
+                            json!({"tools":[{"name":"hold","inputSchema":{"type":"object"}}]})
+                        }
+                        "tools/call" => {
+                            events.send(("call", id.clone())).unwrap();
+                            std::future::pending::<Value>().await
+                        }
+                        "notifications/cancelled" => {
+                            events
+                                .send(("cancel", body["params"]["requestId"].clone()))
+                                .unwrap();
+                            return StatusCode::ACCEPTED.into_response();
+                        }
+                        _ => panic!("unexpected upstream method {method}"),
+                    };
+                    Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+                }
+            })
+            .delete(|| async { StatusCode::OK }),
+        ),
+    )
+    .await;
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.registration_router().merge(
+        service.mcp_router_with_sessions(
+            true,
+            ProtocolMode::Legacy,
+            Some(SessionSettings::default()),
+        ),
+    ))
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, body) = send(
+        &client,
+        gateway.url("/gateways"),
+        json!({"name":"cancel-fixture","url":upstream.url("/mcp"),"transport":"STREAMABLEHTTP","visibility":"public"}),
+        Some(&admin),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let owner = token("member", json!(["alpha"]), json!({}));
+    let outsider = token("outsider", json!(["beta"]), json!({}));
+    let request = |credential: &str, body: Value| {
+        client
+            .post(gateway.url("/mcp/"))
+            .bearer_auth(credential)
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+    };
+    let mut sessions = Vec::new();
+    for id in [1, 2] {
+        let response = request(&owner, json!({
+            "jsonrpc":"2.0", "id":id, "method":"initialize",
+            "params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}
+        })).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        sessions.push(response.headers()["mcp-session-id"].clone());
+    }
+    let call = tokio::spawn(
+        request(
+            &owner,
+            json!({
+                "jsonrpc":"2.0", "id":"in-flight", "method":"tools/call",
+                "params":{"name":"cancel-fixture-hold","arguments":{}}
+            }),
+        )
+        .header("mcp-session-id", sessions[0].clone())
+        .send(),
+    );
+    let ("call", upstream_id) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("upstream tool call must start before cancellation");
+    };
+    assert!(upstream_id.is_number());
+
+    for (credential, session, expected) in [
+        (&outsider, &sessions[0], StatusCode::FORBIDDEN),
+        (&owner, &sessions[1], StatusCode::ACCEPTED),
+        (&owner, &sessions[0], StatusCode::ACCEPTED),
+    ] {
+        let notification = request(credential, json!({
+            "jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":"in-flight"}
+        })).header("mcp-session-id", session.clone()).send().await.unwrap();
+        assert_eq!(notification.status(), expected);
+        if session == sessions[1] || credential == &outsider {
+            assert!(received.try_recv().is_err());
+        }
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        ("cancel", upstream_id)
+    );
+    let cancelled = call.await.unwrap().unwrap();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cancelled.bytes().await.unwrap()).unwrap(),
+        json!({"jsonrpc":"2.0","id":"in-flight","error":{"code":-32800,"message":"Request cancelled"}})
+    );
+}
