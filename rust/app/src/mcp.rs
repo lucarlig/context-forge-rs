@@ -16,13 +16,22 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use serde::Serialize;
-use serde_json::{Map, Value};
+use rmcp::model::{
+    CallToolRequestParams, Implementation, InitializeRequestParams, InitializeResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ToolsCapability,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{
+    access::Principal,
+    catalog::CatalogServer,
+    gateway::{GatewayService, ToolError},
+};
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const RUNTIME_HEADER: &str = "x-contextforge-mcp-runtime";
 const LEGACY_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
-const LATEST_LEGACY_VERSION: &str = "2025-11-25";
 const JSON_MEDIA_TYPE: &str = "application/json";
 const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 
@@ -33,11 +42,14 @@ const INVALID_PARAMS: i32 = -32602;
 const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
 
 /// Build the root Streamable HTTP routes for mounting behind gateway access checks.
-pub fn router() -> Router {
+pub fn router(service: Arc<GatewayService>) -> Router {
     Router::new()
         .route("/mcp", any(handle_request))
         .route("/mcp/", any(handle_request))
+        .route("/servers/{server_id}/mcp", any(handle_request))
+        .route("/servers/{server_id}/mcp/", any(handle_request))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(service)
 }
 
 #[derive(Default)]
@@ -108,7 +120,7 @@ fn is_loopback_host(value: &str) -> bool {
         })
 }
 
-async fn handle_request(request: Request) -> Response {
+async fn handle_request(State(service): State<Arc<GatewayService>>, request: Request) -> Response {
     if let Some(version) = request.headers().get(PROTOCOL_VERSION_HEADER)
         && !version
             .to_str()
@@ -137,7 +149,7 @@ async fn handle_request(request: Request) -> Response {
             }),
         )
             .into_response(),
-        Method::POST => handle_post(request).await,
+        Method::POST => handle_post(&service, request).await,
         Method::DELETE => transport_error(
             StatusCode::METHOD_NOT_ALLOWED,
             "Method Not Allowed: Session termination not supported",
@@ -163,7 +175,7 @@ async fn handle_request(request: Request) -> Response {
     response
 }
 
-async fn handle_post(request: Request) -> Response {
+async fn handle_post(service: &GatewayService, mut request: Request) -> Response {
     let content_type = request
         .headers()
         .get(CONTENT_TYPE)
@@ -198,6 +210,8 @@ async fn handle_post(request: Request) -> Response {
         );
     }
 
+    let principal = request.extensions_mut().remove::<Principal>();
+    let server = request.extensions_mut().remove::<CatalogServer>();
     let bytes = match Bytes::from_request(request, &()).await {
         Ok(bytes) => bytes,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
@@ -211,7 +225,7 @@ async fn handle_post(request: Request) -> Response {
     };
 
     match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => dispatch(&value),
+        Ok(value) => dispatch(service, principal.as_ref(), server.as_ref(), &value).await,
         Err(error) => rpc_error(
             StatusCode::BAD_REQUEST,
             &Value::Null,
@@ -237,7 +251,12 @@ fn accepts_json(headers: &HeaderMap) -> bool {
         })
 }
 
-fn dispatch(value: &Value) -> Response {
+async fn dispatch(
+    service: &GatewayService,
+    principal: Option<&Principal>,
+    server: Option<&CatalogServer>,
+    value: &Value,
+) -> Response {
     let Some(message) = value.as_object() else {
         return invalid_envelope();
     };
@@ -255,13 +274,15 @@ fn dispatch(value: &Value) -> Response {
         };
         let params = match message.get("params") {
             None | Some(Value::Null) => None,
-            Some(Value::Object(params)) => Some(params),
+            Some(params @ Value::Object(_)) => Some(params),
             Some(_) => return invalid_envelope(),
         };
         return match (id, method) {
             (None, _) => accepted(),
             (Some(id), "initialize") => initialize(id, params),
             (Some(id), "ping") => rpc_success(id, Empty {}),
+            (Some(id), "tools/list") => list_tools(service, principal, server, id, params).await,
+            (Some(id), "tools/call") => call_tool(service, principal, server, id, params).await,
             (Some(id), method) => rpc_error(
                 StatusCode::OK,
                 id,
@@ -289,56 +310,96 @@ fn dispatch(value: &Value) -> Response {
     invalid_envelope()
 }
 
-fn initialize(id: &Value, params: Option<&Map<String, Value>>) -> Response {
-    let Some(requested_version) = params.and_then(initialize_version) else {
-        return rpc_error(
-            StatusCode::OK,
-            id,
-            INVALID_PARAMS,
-            "Invalid request parameters",
-            Some(""),
-        );
+async fn list_tools(
+    service: &GatewayService,
+    principal: Option<&Principal>,
+    server: Option<&CatalogServer>,
+    id: &Value,
+    params: Option<&Value>,
+) -> Response {
+    let cursor = match params.map(PaginatedRequestParams::deserialize) {
+        None => None,
+        Some(Ok(params)) => params.cursor,
+        Some(Err(_)) => return invalid_params(id),
     };
-    let protocol_version = if LEGACY_VERSIONS.contains(&requested_version) {
-        requested_version
-    } else {
-        LATEST_LEGACY_VERSION
-    };
+    match service
+        .list_tools(principal, server, cursor.as_deref())
+        .await
+    {
+        Ok(page) => rpc_success(id, page),
+        Err(error) => tool_error(id, error),
+    }
+}
 
-    rpc_success(
+async fn call_tool(
+    service: &GatewayService,
+    principal: Option<&Principal>,
+    server: Option<&CatalogServer>,
+    id: &Value,
+    params: Option<&Value>,
+) -> Response {
+    let Some(Ok(params)) = params.map(CallToolRequestParams::deserialize) else {
+        return invalid_params(id);
+    };
+    if params.input_responses.is_some() || params.request_state.is_some() {
+        return invalid_params(id);
+    }
+    let arguments = Value::Object(params.arguments.unwrap_or_default());
+    match service
+        .call_tool(principal, server, &params.name, arguments)
+        .await
+    {
+        Ok(result) => rpc_success(id, result),
+        Err(error) => tool_error(id, error),
+    }
+}
+
+fn invalid_params(id: &Value) -> Response {
+    rpc_error(
+        StatusCode::OK,
         id,
-        InitializeResult {
-            protocol_version,
-            capabilities: Empty {},
-            server_info: Implementation {
-                name: "ContextForge",
-                version: env!("CARGO_PKG_VERSION"),
-            },
-        },
+        INVALID_PARAMS,
+        "Invalid request parameters",
+        Some(""),
     )
 }
 
-fn initialize_version(params: &Map<String, Value>) -> Option<&str> {
-    let client_info = params.get("clientInfo")?.as_object()?;
-    client_info.get("name")?.as_str()?;
-    client_info.get("version")?.as_str()?;
-    params.get("capabilities")?.as_object()?;
-    params.get("protocolVersion")?.as_str()
+fn tool_error(id: &Value, error: ToolError) -> Response {
+    let (code, message) = match error {
+        ToolError::Denied => (0, "Access denied"),
+        ToolError::NotFound => (0, "Unknown tool"),
+        ToolError::Cursor => (INVALID_PARAMS, "Invalid cursor"),
+        ToolError::Unavailable => (0, "Tool service unavailable"),
+        ToolError::Database(error) => {
+            tracing::error!(%error, "MCP tool database operation failed");
+            (0, "Tool service unavailable")
+        }
+    };
+    rpc_error(StatusCode::OK, id, code, message, None::<()>)
 }
 
-#[derive(Serialize)]
-struct InitializeResult<'a> {
-    capabilities: Empty,
-    #[serde(rename = "protocolVersion")]
-    protocol_version: &'a str,
-    #[serde(rename = "serverInfo")]
-    server_info: Implementation,
-}
-
-#[derive(Serialize)]
-struct Implementation {
-    name: &'static str,
-    version: &'static str,
+fn initialize(id: &Value, params: Option<&Value>) -> Response {
+    let Some(Ok(params)) = params.map(InitializeRequestParams::deserialize) else {
+        return invalid_params(id);
+    };
+    let protocol_version = if LEGACY_VERSIONS.contains(&params.protocol_version.as_str()) {
+        params.protocol_version
+    } else {
+        ProtocolVersion::LATEST_WITH_INITIALIZE
+    };
+    let mut capabilities = ServerCapabilities::default();
+    let mut tools = ToolsCapability::default();
+    tools.list_changed = Some(false);
+    capabilities.tools = Some(tools);
+    rpc_success(
+        id,
+        InitializeResult::new(capabilities)
+            .with_protocol_version(protocol_version)
+            .with_server_info(Implementation::new(
+                "ContextForge",
+                env!("CARGO_PKG_VERSION"),
+            )),
+    )
 }
 
 #[derive(Serialize)]
@@ -430,9 +491,26 @@ fn rpc_error(
 mod tests {
     use axum::body::to_bytes;
     use serde_json::json;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     use super::*;
+    use crate::{access::Authorizer, config::Settings, database::Database, gateway::test_service};
+
+    fn test_router() -> Router {
+        let database = Database::from_settings(&Settings {
+            host: "127.0.0.1".into(),
+            port: 4444,
+            database_url: "sqlite:///:memory:".into(),
+            db_pool_size: 1,
+            db_pool_timeout: Duration::from_secs(1),
+            sqlite_busy_timeout: Duration::from_secs(5),
+            redis: None,
+        })
+        .unwrap();
+        let auth = Authorizer::new(database.clone(), None, true);
+        router(test_service(database, auth))
+    }
 
     async fn request(
         method: Method,
@@ -444,7 +522,7 @@ mod tests {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let response = router()
+        let response = test_router()
             .oneshot(request.body(Body::from(payload.to_owned())).unwrap())
             .await
             .unwrap();
@@ -464,7 +542,7 @@ mod tests {
             origins: ["https://console.example.test".into()].into(),
             hosts: ["gateway.example.test:8443".into()].into(),
         }
-        .apply(router());
+        .apply(test_router());
 
         for path in ["/mcp", "/mcp/"] {
             for (origin, host, status, detail) in [
@@ -548,7 +626,7 @@ mod tests {
                     "id": "initialize-1",
                     "result": {
                         "protocolVersion": expected,
-                        "capabilities": {},
+                        "capabilities": {"tools": {"listChanged": false}},
                         "serverInfo": { "name": "ContextForge", "version": env!("CARGO_PKG_VERSION") }
                     }
                 })

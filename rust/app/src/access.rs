@@ -7,20 +7,21 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use ipnet::IpNet;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     auth::{self, TeamVisibility},
+    catalog::{CatalogScope, CatalogServer},
     database::Database,
     identity::{Grant, Identity},
     jwt::{JwtError, JwtVerifier, TokenUse, VerifiedJwt},
-    mcp,
 };
 
 const GLOBAL_ONLY_PERMISSIONS: &[&str] = &[
@@ -71,14 +72,18 @@ impl Authorizer {
         }
     }
 
-    pub fn mcp_router(self, require_auth: bool) -> Router {
-        mcp::router().route_layer(middleware::from_fn_with_state(
+    pub fn protect_mcp(self: &Arc<Self>, router: Router, require_auth: bool) -> Router {
+        router.route_layer(middleware::from_fn_with_state(
             McpAccess {
-                auth: Arc::new(self),
+                auth: self.clone(),
                 require_auth,
             },
             authorize_mcp,
         ))
+    }
+
+    pub fn protect_api(self: &Arc<Self>, router: Router) -> Router {
+        router.route_layer(middleware::from_fn_with_state(self.clone(), authorize_api))
     }
 
     async fn authenticate(
@@ -276,8 +281,10 @@ fn verify_restrictions(
 #[derive(Debug)]
 enum AuthError {
     Required,
+    ApiRequired,
     Invalid,
     Forbidden,
+    ServerMissing,
     TeamRevoked,
     Storage(sqlx::Error),
 }
@@ -295,11 +302,13 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Authentication required for MCP endpoints",
             ),
+            Self::ApiRequired => (StatusCode::UNAUTHORIZED, "Authorization token required"),
             Self::Invalid => (
                 StatusCode::UNAUTHORIZED,
                 "Invalid authentication credentials",
             ),
             Self::Forbidden => (StatusCode::FORBIDDEN, "Access denied"),
+            Self::ServerMissing => (StatusCode::NOT_FOUND, "Server not found"),
             Self::TeamRevoked => (
                 StatusCode::FORBIDDEN,
                 "Token invalid: User is no longer a member of the associated team",
@@ -320,6 +329,12 @@ impl IntoResponse for AuthError {
             );
         }
         response
+    }
+}
+
+impl Principal {
+    pub(crate) fn token_allows(&self, permission: &str) -> bool {
+        auth::token_scope_grants(Some(&self.scopes), permission)
     }
 }
 
@@ -351,28 +366,101 @@ fn bearer(headers: &HeaderMap) -> Result<Option<&str>, AuthError> {
 
 async fn authorize_mcp(
     State(access): State<McpAccess>,
+    path: Option<Path<ServerPath>>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
-    match bearer(request.headers())? {
-        None if access.require_auth => Err(AuthError::Required),
-        None => Ok(next.run(request).await),
-        Some(token) => {
-            let peer = request
-                .extensions()
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|peer| peer.0.ip());
-            let principal = access.auth.authenticate(token, peer, None).await?;
-            if !access
+    let server_id = path.as_ref().and_then(|path| path.server_id.as_deref());
+    let principal = match bearer(request.headers())? {
+        None if access.require_auth => return Err(AuthError::Required),
+        None => None,
+        Some(token) => Some(
+            access
                 .auth
-                .allows(&principal, "servers.use", RoleContext::AnyTeam, true)
+                .authenticate(token, peer(&request), server_id)
+                .await?,
+        ),
+    };
+    let scope = catalog_scope(principal.as_ref());
+    let server = match server_id {
+        Some(id) => {
+            let server = access
+                .auth
+                .database
+                .catalog_server(id)
                 .await?
-            {
+                .ok_or(AuthError::ServerMissing)?;
+            if server.oauth_enabled && principal.is_none() {
+                return Err(AuthError::Required);
+            }
+            if !server.enabled || !server.is_visible(scope) {
                 return Err(AuthError::Forbidden);
             }
-            request.extensions_mut().insert(principal);
-            Ok(next.run(request).await)
+            Some(server)
         }
+        None => None,
+    };
+    if let Some(principal) = principal {
+        if !access
+            .auth
+            .allows(
+                &principal,
+                "servers.use",
+                role_context(server.as_ref()),
+                true,
+            )
+            .await?
+        {
+            return Err(AuthError::Forbidden);
+        }
+        request.extensions_mut().insert(principal);
+    }
+    if let Some(server) = server {
+        request.extensions_mut().insert(server);
+    }
+    Ok(next.run(request).await)
+}
+
+#[derive(Deserialize)]
+struct ServerPath {
+    server_id: Option<String>,
+}
+
+async fn authorize_api(
+    State(access): State<Arc<Authorizer>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let token = bearer(request.headers())?.ok_or(AuthError::ApiRequired)?;
+    let principal = access.authenticate(token, peer(&request), None).await?;
+    request.extensions_mut().insert(principal);
+    Ok(next.run(request).await)
+}
+
+fn peer(request: &Request) -> Option<IpAddr> {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0.ip())
+}
+
+pub(crate) fn catalog_scope(principal: Option<&Principal>) -> CatalogScope<'_> {
+    match principal {
+        Some(user) => CatalogScope {
+            email: Some(&user.email),
+            visibility: &user.visibility,
+        },
+        None => CatalogScope {
+            email: None,
+            visibility: &TeamVisibility::Public,
+        },
+    }
+}
+
+pub(crate) fn role_context(server: Option<&CatalogServer>) -> RoleContext<'_> {
+    match server.and_then(|server| server.team_id.as_deref()) {
+        Some(team) => RoleContext::Team(team),
+        None => RoleContext::AnyTeam,
     }
 }
 

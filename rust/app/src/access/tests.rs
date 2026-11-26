@@ -11,7 +11,7 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use tower::ServiceExt;
 
 use super::*;
-use crate::{config::Settings, jwt::JwtConfig};
+use crate::{config::Settings, gateway::test_service, jwt::JwtConfig};
 
 const KEY: &[u8] = &[0x9d; 32];
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"tests","version":"1"}}}"#;
@@ -86,7 +86,12 @@ async fn postgres_authorizes_against_the_native_identity_schema() {
             .unwrap()
     );
     assert_eq!(
-        request(auth.mcp_router(true), Some(&credential)).await.0,
+        request(
+            test_service(database, auth).mcp_router(true),
+            Some(&credential)
+        )
+        .await
+        .0,
         StatusCode::OK
     );
 }
@@ -159,7 +164,7 @@ async fn request(app: Router, credential: Option<&str>) -> (StatusCode, HeaderMa
 #[tokio::test]
 async fn mcp_requires_authentication_and_permissions_before_initialization() {
     let database = database().await;
-    let app = authorizer(&database).mcp_router(true);
+    let app = test_service(database.clone(), authorizer(&database)).mcp_router(true);
 
     let (status, headers, body) = request(app.clone(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -198,7 +203,7 @@ async fn mcp_requires_authentication_and_permissions_before_initialization() {
 #[tokio::test]
 async fn explicit_public_mode_grants_only_anonymous_requests_without_credentials() {
     let database = database().await;
-    let app = authorizer(&database).mcp_router(false);
+    let app = test_service(database.clone(), authorizer(&database)).mcp_router(false);
     assert_eq!(request(app.clone(), None).await.0, StatusCode::OK);
     assert_eq!(
         request(app, Some("invalid")).await.0,

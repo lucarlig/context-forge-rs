@@ -2,9 +2,12 @@
 
 pub mod access;
 pub mod auth;
+pub mod catalog;
 pub mod config;
 pub mod database;
+pub mod gateway;
 mod identity;
 pub mod jwt;
 pub mod mcp;
 pub mod probes;
+pub mod upstream;

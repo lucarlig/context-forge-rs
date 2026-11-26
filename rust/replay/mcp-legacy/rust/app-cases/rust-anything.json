@@ -22,5 +22,8 @@
     "08-invalid-protocol-header",
     "09-get-stateless",
     "10-no-trailing-slash"
+  ],
+  "normalize": [
+    "key-order"
   ]
 }

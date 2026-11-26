@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{error::Error, net::SocketAddr};
+use std::{error::Error, net::SocketAddr, sync::Arc};
 
 use context_forge_rs::{
     access::Authorizer,
     config::Settings,
     database::Database,
+    gateway::GatewayService,
     probes::{self, RedisProbe},
 };
 use tokio::net::TcpListener;
@@ -20,16 +21,26 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let database = Database::from_settings(&settings)?;
     let redis = settings.redis.as_ref().map(RedisProbe::new).transpose()?;
     let verifier = Settings::jwt_verifier()?;
-    if verifier.is_some() {
+    let require_mcp_auth = Settings::mcp_requires_auth()?;
+    if verifier.is_some() || !require_mcp_auth {
         database.migrate_identity().await?;
+        database.migrate_catalog().await?;
     }
-    let access = Authorizer::new(
+    let access = Arc::new(Authorizer::new(
         database.clone(),
         verifier,
         Settings::invalidate_sessions_on_password_change()?,
-    );
-    let mcp = access.mcp_router(Settings::mcp_requires_auth()?);
-    let app = probes::router(database, redis).merge(Settings::mcp_ingress_policy()?.apply(mcp));
+    ));
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        access,
+        Settings::upstream_client()?,
+        Settings::mcp_pagination()?,
+    ));
+    let mcp = service.mcp_router(require_mcp_auth);
+    let app = probes::router(database, redis)
+        .merge(Settings::mcp_ingress_policy()?.apply(mcp))
+        .merge(service.registration_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     tracing::info!(address = %listener.local_addr()?, "gateway listening");
     axum::serve(

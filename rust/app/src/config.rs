@@ -3,8 +3,10 @@
 use std::{collections::HashSet, env, error::Error, str::FromStr, time::Duration};
 
 use crate::{
+    gateway::Pagination,
     jwt::{JwtConfig, JwtVerifier},
     mcp::IngressPolicy,
+    upstream::{EgressPolicy, UpstreamClient},
 };
 
 pub struct Settings {
@@ -122,11 +124,53 @@ impl Settings {
         })
     }
 
+    pub fn upstream_client() -> Result<UpstreamClient, Box<dyn Error + Send + Sync>> {
+        let policy = EgressPolicy {
+            allow_localhost: flag("SSRF_ALLOW_LOCALHOST")?.unwrap_or(false),
+            allow_private_networks: flag("SSRF_ALLOW_PRIVATE_NETWORKS")?.unwrap_or(false),
+            allowed_networks: parse_networks("SSRF_ALLOWED_NETWORKS")?,
+            blocked_networks: parse_networks("SSRF_BLOCKED_NETWORKS")?,
+            blocked_hosts: allowlist("SSRF_BLOCKED_HOSTS")?.into_iter().collect(),
+        };
+        Ok(UpstreamClient::new(
+            policy,
+            positive_seconds("GATEWAY_HEALTH_CHECK_TIMEOUT", 30.0)?,
+        ))
+    }
+
+    pub fn mcp_pagination() -> Result<Pagination, Box<dyn Error + Send + Sync>> {
+        let size = parse("MCP_LIST_PAGE_SIZE", 100)?;
+        let lifetime = parse("MCP_LIST_CURSOR_TTL_SECONDS", 900)?;
+        if !(1..=1000).contains(&size) || lifetime <= 0 {
+            return Err("invalid MCP catalog page size or cursor lifetime".into());
+        }
+        let secret = value("AUTH_ENCRYPTION_SECRET", "")?;
+        let secret = if secret.is_empty() {
+            value("JWT_SECRET_KEY", "")?
+        } else {
+            secret
+        };
+        Ok(Pagination::new(
+            size,
+            lifetime,
+            (!secret.is_empty()).then_some(&secret),
+        ))
+    }
+
     pub fn invalidate_sessions_on_password_change() -> Result<bool, Box<dyn Error + Send + Sync>> {
         Ok(flag("PASSWORD_RESET_INVALIDATE_SESSIONS")?.unwrap_or(true))
     }
 }
 
+fn parse_networks(name: &str) -> Result<Vec<ipnet::IpNet>, Box<dyn Error + Send + Sync>> {
+    allowlist(name)?
+        .into_iter()
+        .map(|cidr| {
+            cidr.parse()
+                .map_err(|_| format!("invalid network in {name}").into())
+        })
+        .collect()
+}
 fn allowlist(name: &str) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
     let raw = value(name, "")?;
     let raw = raw.trim();
