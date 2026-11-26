@@ -2,7 +2,7 @@
 
 mod content;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use axum::{
     Extension, Json, Router,
@@ -31,7 +31,10 @@ use crate::{
         CatalogList, CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool,
         RegistrationError, ToolDefinition, slugify,
     },
-    credentials::{CredentialCipher, HeaderAuthError, HeaderAuthInput, decode_headers},
+    credentials::{
+        AuthError, AuthInput, CredentialCipher, CredentialError, UpstreamCredentials,
+        decode_headers, decode_query, validate_query_host,
+    },
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     sessions::Session,
@@ -48,6 +51,7 @@ pub struct GatewayService {
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
     credential_cipher: Option<CredentialCipher>,
+    query_auth_hosts: Option<HashSet<String>>,
 }
 
 pub struct CatalogRefresh {
@@ -111,6 +115,7 @@ impl GatewayService {
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
             credential_cipher: None,
+            query_auth_hosts: None,
         }
     }
 
@@ -126,6 +131,11 @@ impl GatewayService {
 
     pub fn with_credential_secret(mut self, secret: Option<&str>) -> Self {
         self.credential_cipher = secret.map(CredentialCipher::new);
+        self
+    }
+
+    pub fn with_query_auth_hosts(mut self, hosts: Option<HashSet<String>>) -> Self {
+        self.query_auth_hosts = hosts;
         self
     }
 
@@ -367,13 +377,17 @@ impl GatewayService {
         {
             return Err(ToolError::Unavailable);
         }
-        let headers = self
-            .configured_headers(&tool.gateway_id, &tool.gateway_url, tool.needs_header_auth)
+        let credentials = self
+            .configured_auth(
+                &tool.gateway_id,
+                &tool.gateway_url,
+                tool.needs_upstream_auth,
+            )
             .await?;
         let endpoint = UpstreamEndpoint {
             url: &tool.gateway_url,
             transport,
-            headers: headers.as_ref(),
+            credentials: credentials.as_ref(),
         };
         let association = downstream.and_then(|session| {
             let authorization = principal.map(Principal::authorization_fingerprint);
@@ -404,25 +418,47 @@ impl GatewayService {
         }
     }
 
-    async fn configured_headers(
+    async fn configured_auth(
         &self,
         id: &str,
         url: &str,
-        needs_header_auth: bool,
-    ) -> Result<Option<HeaderMap>, ToolError> {
-        if !needs_header_auth {
+        needs_upstream_auth: bool,
+    ) -> Result<Option<UpstreamCredentials>, ToolError> {
+        if !needs_upstream_auth {
             return Ok(None);
         }
-        let stored = self
+        let (kind, stored_headers, stored_query) = self
             .database
-            .gateway_header_auth(id, url)
+            .gateway_auth(id, url)
             .await?
             .ok_or(ToolError::Unavailable)?;
-        let headers = decode_headers(self.credential_cipher.as_ref(), &stored).map_err(|_| {
+        let cipher = self.credential_cipher.as_ref();
+        let credentials = if kind == "query_param" {
+            validate_query_host(self.query_auth_hosts.as_ref(), url)
+                .map_err(|_| ToolError::Unavailable)?;
+            decode_query(
+                cipher,
+                stored_query.as_deref().ok_or(ToolError::Unavailable)?,
+            )
+            .map(|query| UpstreamCredentials {
+                query,
+                ..UpstreamCredentials::default()
+            })
+        } else {
+            decode_headers(
+                cipher,
+                stored_headers.as_deref().ok_or(ToolError::Unavailable)?,
+            )
+            .map(|headers| UpstreamCredentials {
+                headers,
+                ..UpstreamCredentials::default()
+            })
+        }
+        .map_err(|CredentialError| {
             tracing::warn!(gateway = %id, "could not load upstream authentication");
             ToolError::Unavailable
         })?;
-        Ok(Some(headers))
+        Ok(Some(credentials))
     }
 
     pub(crate) async fn tool_definition(
@@ -584,7 +620,7 @@ struct RegisterGateway {
     #[serde(alias = "gatewayMode")]
     gateway_mode: Option<String>,
     #[serde(flatten)]
-    auth: HeaderAuthInput,
+    auth: AuthInput,
 }
 
 async fn register(
@@ -646,27 +682,31 @@ async fn register(
     let url = input.url.trim();
     let auth = input
         .auth
-        .prepare(service.credential_cipher.as_ref())
+        .prepare(service.credential_cipher.as_ref(), service.query_auth_hosts.as_ref(), url)
         .map_err(|error| match error {
-            HeaderAuthError::Invalid => RegistrationResponse::new(
+            AuthError::Invalid => RegistrationResponse::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Invalid upstream authentication credentials",
             ),
-            HeaderAuthError::Unsupported => RegistrationResponse::new(
+            AuthError::Unsupported => RegistrationResponse::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Unsupported gateway transport, mode, or authentication",
             ),
-            HeaderAuthError::Encryption(_) => RegistrationResponse::new(
+            AuthError::Encryption(_) => RegistrationResponse::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Gateway credential encryption unavailable",
             ),
+            AuthError::QueryDisabled => RegistrationResponse::new(StatusCode::UNPROCESSABLE_ENTITY,
+                "Query parameter authentication is disabled. Set INSECURE_ALLOW_QUERYPARAM_AUTH=true to enable."),
+            AuthError::QueryHost => RegistrationResponse::new(StatusCode::UNPROCESSABLE_ENTITY,
+                "Query parameter authentication is not allowed for the upstream host."),
         })?;
     let (discovery, metadata) = service
         .upstream
         .discover_catalog(UpstreamEndpoint {
             url,
             transport,
-            headers: auth.as_ref().map(|auth| &auth.headers),
+            credentials: auth.as_ref().map(|auth| &auth.credentials),
         })
         .await
         .map_err(|error| {

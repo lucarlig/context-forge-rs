@@ -18,7 +18,7 @@ use ipnet::IpNet;
 use reqwest::{
     Client, Method, Response,
     dns::{Name, Resolve, Resolving},
-    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue},
+    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
 };
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
@@ -44,7 +44,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use crate::{events::PassiveEvents, sessions::SessionLifetime};
+use crate::{
+    credentials::{QueryValues, UpstreamCredentials},
+    events::PassiveEvents,
+    sessions::SessionLifetime,
+};
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
 const MODERN_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
@@ -292,7 +296,7 @@ impl UpstreamTransport {
 pub(crate) struct UpstreamEndpoint<'a> {
     pub url: &'a str,
     pub transport: UpstreamTransport,
-    pub headers: Option<&'a HeaderMap>,
+    pub credentials: Option<&'a UpstreamCredentials>,
 }
 
 impl<'a> UpstreamEndpoint<'a> {
@@ -300,23 +304,31 @@ impl<'a> UpstreamEndpoint<'a> {
         Self {
             url,
             transport: UpstreamTransport::StreamableHttp,
-            headers: None,
+            credentials: None,
         }
     }
 
-    pub(crate) fn header_fingerprint(self) -> Option<[u8; 32]> {
-        let headers = self.headers.filter(|headers| !headers.is_empty())?;
-        let mut entries: Vec<_> = headers.iter().collect();
+    pub(crate) fn credential_fingerprint(self) -> Option<[u8; 32]> {
+        let credentials = self.credentials?;
+        let mut entries: Vec<_> = credentials.headers.iter().collect();
         entries.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
         let mut hash = Sha256::new();
+        hash.update((entries.len() as u64).to_be_bytes());
         for (name, value) in entries {
-            hash.update(name.as_str().as_bytes());
-            hash.update([0]);
-            hash.update(value.as_bytes());
-            hash.update([0]);
+            hash_field(&mut hash, name.as_str().as_bytes());
+            hash_field(&mut hash, value.as_bytes());
+        }
+        for (name, value) in &credentials.query {
+            hash_field(&mut hash, name.as_bytes());
+            hash_field(&mut hash, value.as_bytes());
         }
         Some(hash.finalize().into())
     }
+}
+
+fn hash_field(hash: &mut Sha256, field: &[u8]) {
+    hash.update((field.len() as u64).to_be_bytes());
+    hash.update(field);
 }
 
 pub struct DiscoveredCatalog {
@@ -756,8 +768,8 @@ impl UpstreamClient {
             .connect_timeout(CONNECT_TIMEOUT.min(self.timeout))
             .dns_resolver(Arc::new(DenyDns))
             .tls_backend_preconfigured(tls_config()?);
-        if let Some(headers) = endpoint.headers {
-            builder = builder.default_headers(headers.clone());
+        if let Some(credentials) = endpoint.credentials {
+            builder = builder.default_headers(credentials.headers.clone());
         }
         if let Some(domain) = url.domain() {
             let port = url
@@ -776,6 +788,9 @@ impl UpstreamClient {
             protocol_version: None,
             session_id: None,
             sse: None,
+            query: endpoint
+                .credentials
+                .map_or_else(QueryValues::new, |credentials| credentials.query.clone()),
             next_id: AtomicI64::new(1),
         })
     }
@@ -829,6 +844,7 @@ struct Session {
     protocol_version: Option<ProtocolVersion>,
     session_id: Option<HeaderValue>,
     sse: Option<Mutex<Option<SseStream>>>,
+    query: QueryValues,
     next_id: AtomicI64,
 }
 
@@ -1109,17 +1125,26 @@ impl Session {
         method: Method,
         version: Option<&ProtocolVersion>,
     ) -> reqwest::RequestBuilder {
-        let mut request = self
-            .client
-            .request(method.clone(), self.url.clone())
-            .header(
-                ACCEPT,
-                if method == Method::GET {
-                    "text/event-stream"
-                } else {
-                    ACCEPT_VALUE
-                },
-            );
+        let mut url = self.url.clone();
+        if !self.query.is_empty() {
+            let retained: Vec<_> = url
+                .query_pairs()
+                .filter(|(name, _)| !self.query.contains_key(name.as_ref()))
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect();
+            url.query_pairs_mut()
+                .clear()
+                .extend_pairs(retained)
+                .extend_pairs(&self.query);
+        }
+        let mut request = self.client.request(method.clone(), url).header(
+            ACCEPT,
+            if method == Method::GET {
+                "text/event-stream"
+            } else {
+                ACCEPT_VALUE
+            },
+        );
         if let Some(version) = version {
             request = request.header(PROTOCOL_HEADER, version.as_str());
         }

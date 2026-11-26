@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 use base64::{
@@ -14,6 +14,7 @@ use ring::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 pub(crate) struct CredentialCipher {
     key: LessSafeKey,
@@ -71,11 +72,18 @@ impl CredentialCipher {
 }
 
 type HeaderValues = BTreeMap<String, String>;
+pub(crate) type QueryValues = BTreeMap<String, String>;
+
+#[derive(Default)]
+pub(crate) struct UpstreamCredentials {
+    pub(crate) headers: HeaderMap,
+    pub(crate) query: QueryValues,
+}
 
 #[derive(Deserialize)]
-pub(crate) struct HeaderAuthInput {
+pub(crate) struct AuthInput {
     #[serde(alias = "authType")]
-    pub(crate) auth_type: Option<String>,
+    auth_type: Option<String>,
     #[serde(alias = "authUsername")]
     auth_username: Option<String>,
     #[serde(alias = "authPassword")]
@@ -88,6 +96,10 @@ pub(crate) struct HeaderAuthInput {
     auth_header_value: Option<String>,
     #[serde(alias = "authHeaders")]
     auth_headers: Option<Vec<ConfiguredHeader>>,
+    #[serde(alias = "authQueryParamKey")]
+    auth_query_param_key: Option<String>,
+    #[serde(alias = "authQueryParamValue")]
+    auth_query_param_value: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -96,29 +108,36 @@ struct ConfiguredHeader {
     value: String,
 }
 
-pub(crate) struct PreparedHeaderAuth<'a> {
+pub(crate) struct PreparedAuth<'a> {
     pub(crate) kind: &'static str,
-    pub(crate) encoded: String,
-    pub(crate) headers: HeaderMap,
+    pub(crate) encoded_headers: Option<String>,
+    pub(crate) encoded_query: Option<String>,
+    pub(crate) credentials: UpstreamCredentials,
     pub(crate) masked: Value,
     cipher: &'a CredentialCipher,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum HeaderAuthError {
+pub(crate) enum AuthError {
     #[error("invalid upstream authentication credentials")]
     Invalid,
     #[error("unsupported upstream authentication method")]
     Unsupported,
+    #[error("query parameter authentication is disabled")]
+    QueryDisabled,
+    #[error("query parameter authentication is not allowed for the upstream host")]
+    QueryHost,
     #[error(transparent)]
     Encryption(#[from] CredentialError),
 }
 
-impl HeaderAuthInput {
+impl AuthInput {
     pub(crate) fn prepare<'a>(
         &self,
         cipher: Option<&'a CredentialCipher>,
-    ) -> Result<Option<PreparedHeaderAuth<'a>>, HeaderAuthError> {
+        query_hosts: Option<&HashSet<String>>,
+        url: &str,
+    ) -> Result<Option<PreparedAuth<'a>>, AuthError> {
         let kind = self
             .auth_type
             .as_deref()
@@ -128,11 +147,35 @@ impl HeaderAuthInput {
         let mut masked = json!({"authType": kind, "authValue": "*****"});
         let (kind, values) = match kind.as_str() {
             "" | "none" => return Ok(None),
+            "query_param" => {
+                validate_query_host(query_hosts, url)?;
+                let key = required(self.auth_query_param_key.as_deref())?;
+                let value = required(self.auth_query_param_value.as_deref())?;
+                if !query_key(key) || value == "*****" {
+                    return Err(AuthError::Invalid);
+                }
+                let cipher = cipher.ok_or(CredentialError)?;
+                let query = QueryValues::from([(key.to_owned(), value.to_owned())]);
+                let encoded = QueryValues::from([(key.to_owned(), cipher.seal(&query)?)]);
+                return Ok(Some(PreparedAuth {
+                    kind: "query_param",
+                    encoded_headers: None,
+                    encoded_query: Some(
+                        serde_json::to_string(&encoded).map_err(|_| CredentialError)?,
+                    ),
+                    credentials: UpstreamCredentials {
+                        query,
+                        ..UpstreamCredentials::default()
+                    },
+                    masked: json!({"authType":"query_param","authQueryParamKey": key, "authQueryParamValueMasked": "*****"}),
+                    cipher,
+                }));
+            }
             "basic" => {
                 let username = required(self.auth_username.as_deref())?;
                 let password = required(self.auth_password.as_deref())?;
                 if username.contains(':') {
-                    return Err(HeaderAuthError::Invalid);
+                    return Err(AuthError::Invalid);
                 }
                 let encoded = BASE64_STANDARD.encode(format!("{username}:{password}"));
                 masked["authUsername"] = username.into();
@@ -172,7 +215,7 @@ impl HeaderAuthInput {
                     let name = required(Some(&entry.key))?;
                     let value = required(Some(&entry.value))?;
                     if values.insert(name.to_owned(), value.to_owned()).is_some() {
-                        return Err(HeaderAuthError::Invalid);
+                        return Err(AuthError::Invalid);
                     }
                     response.push(json!({"key": name, "value": "*****"}));
                 }
@@ -181,25 +224,95 @@ impl HeaderAuthInput {
                 masked["authHeaders"] = response.into();
                 ("authheaders", values)
             }
-            _ => return Err(HeaderAuthError::Unsupported),
+            _ => return Err(AuthError::Unsupported),
         };
-        let headers = http_headers(values.iter()).map_err(|_| HeaderAuthError::Invalid)?;
+        let headers = http_headers(values.iter()).map_err(|_| AuthError::Invalid)?;
         let cipher = cipher.ok_or(CredentialError)?;
         let encoded = cipher.seal(&values)?;
-        Ok(Some(PreparedHeaderAuth {
+        Ok(Some(PreparedAuth {
             kind,
-            encoded,
-            headers,
+            encoded_headers: Some(json!(encoded).to_string()),
+            encoded_query: None,
+            credentials: UpstreamCredentials {
+                headers,
+                ..UpstreamCredentials::default()
+            },
             masked,
             cipher,
         }))
     }
 }
 
-impl PreparedHeaderAuth<'_> {
-    pub(crate) fn matches_stored(&self, stored: &str) -> bool {
-        decode_headers(Some(self.cipher), stored).is_ok_and(|headers| self.headers == headers)
+impl PreparedAuth<'_> {
+    pub(crate) fn matches_stored(&self, headers: Option<&str>, query: Option<&str>) -> bool {
+        if self.kind == "query_param" {
+            return query.is_some_and(|stored| {
+                decode_query(Some(self.cipher), stored)
+                    .is_ok_and(|query| self.credentials.query == query)
+            });
+        }
+        headers.is_some_and(|stored| {
+            decode_headers(Some(self.cipher), stored)
+                .is_ok_and(|headers| self.credentials.headers == headers)
+        })
     }
+}
+
+pub(crate) fn validate_query_host(
+    hosts: Option<&HashSet<String>>,
+    url: &str,
+) -> Result<(), AuthError> {
+    let hosts = hosts.ok_or(AuthError::QueryDisabled)?;
+    if hosts.is_empty() {
+        return Ok(());
+    }
+    let url = Url::parse(url).map_err(|_| AuthError::QueryHost)?;
+    let host = url
+        .host_str()
+        .ok_or(AuthError::QueryHost)?
+        .trim_matches(['[', ']']);
+    if hosts
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(host))
+    {
+        Ok(())
+    } else {
+        Err(AuthError::QueryHost)
+    }
+}
+
+pub(crate) fn decode_query(
+    cipher: Option<&CredentialCipher>,
+    stored: &str,
+) -> Result<QueryValues, CredentialError> {
+    let cipher = cipher.ok_or(CredentialError)?;
+    let encoded: QueryValues = serde_json::from_str(stored).map_err(|_| CredentialError)?;
+    if encoded.is_empty() {
+        return Err(CredentialError);
+    }
+    encoded
+        .into_iter()
+        .map(|(key, ciphertext)| {
+            if !query_key(&key) {
+                return Err(CredentialError);
+            }
+            let mut pair: QueryValues = cipher.open(&ciphertext)?;
+            let value = pair
+                .remove(&key)
+                .filter(|value| !value.is_empty())
+                .ok_or(CredentialError)?;
+            Ok((key, value))
+        })
+        .collect()
+}
+
+fn query_key(key: &str) -> bool {
+    key.as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 pub(crate) fn decode_headers(
@@ -249,11 +362,11 @@ fn http_headers<'a>(
     Ok(headers)
 }
 
-fn required(value: Option<&str>) -> Result<&str, HeaderAuthError> {
+fn required(value: Option<&str>) -> Result<&str, AuthError> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
-        .ok_or(HeaderAuthError::Invalid)
+        .ok_or(AuthError::Invalid)
 }
 
 #[cfg(test)]
@@ -279,5 +392,39 @@ mod tests {
         let second = cipher.seal(&expected).unwrap();
         assert_ne!(first, second);
         assert_eq!(cipher.open::<HeaderValues>(&first).unwrap(), expected);
+    }
+
+    #[test]
+    fn query_credentials_require_an_allowed_host_and_are_sealed_separately() {
+        let cipher = CredentialCipher::new("synthetic query encryption key");
+        let input: AuthInput = serde_json::from_value(json!({
+            "authType": "query_param", "authQueryParamKey": "api-key", "authQueryParamValue": "synthetic value"
+        })).unwrap();
+        let url = "https://upstream.example.test/mcp";
+        assert!(matches!(
+            input.prepare(Some(&cipher), None, url),
+            Err(AuthError::QueryDisabled)
+        ));
+        let allowed = HashSet::from(["upstream.example.test".to_owned()]);
+        assert!(matches!(
+            input.prepare(
+                Some(&cipher),
+                Some(&allowed),
+                "https://other.example.test/mcp"
+            ),
+            Err(AuthError::QueryHost)
+        ));
+        let auth = input
+            .prepare(Some(&cipher), Some(&allowed), url)
+            .unwrap()
+            .unwrap();
+        assert!(auth.encoded_headers.is_none());
+        let stored = auth.encoded_query.as_deref().unwrap();
+        assert!(!stored.contains("synthetic value"));
+        assert!(auth.matches_stored(None, Some(stored)));
+        assert_eq!(
+            decode_query(Some(&cipher), stored).unwrap(),
+            auth.credentials.query
+        );
     }
 }

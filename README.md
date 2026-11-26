@@ -18,7 +18,7 @@ The binary listens on `127.0.0.1:4444` and uses `sqlite:///./mcp.db` by default.
 
 MCP requires a signed bearer token from an active account by default. Set `JWT_SECRET_KEY` for HMAC verification or set `JWT_ALGORITHM` and `JWT_PUBLIC_KEY_PATH` for asymmetric verification. Authenticated MCP currently reads accounts and roles from an existing v1.1.2 database or a test fixture. Configure `MCP_ALLOWED_ORIGINS` and `MCP_ALLOWED_HOSTS` to enforce ingress allowlists.
 
-The registration path accepts `STREAMABLEHTTP` and `SSE` upstreams. Set `AUTH_ENCRYPTION_SECRET` to register Basic, bearer, or custom-header credentials. For a local fixture, set `SSRF_ALLOW_LOCALHOST=true` to allow loopback connections. Readiness checks Redis when `CACHE_TYPE=redis` and `REDIS_URL` is set.
+The registration path accepts `STREAMABLEHTTP` and `SSE` upstreams. Set `AUTH_ENCRYPTION_SECRET` to register Basic, bearer, custom-header, or query parameter credentials. For a local fixture, set `SSRF_ALLOW_LOCALHOST=true` to allow loopback connections. Readiness checks Redis when `CACHE_TYPE=redis` and `REDIS_URL` is set. [Upstream authentication](rust/replay/upstream-auth/README.md)
 
 The gateway negotiates modern and legacy MCP by default. Set `MCP_INBOUND_PROTOCOL_MODE=legacy` to accept legacy versions only. Set `MCP_CLIENT_CONNECT_MODE=legacy` to use legacy initialization for all upstreams.
 

@@ -121,6 +121,13 @@ impl Settings {
         Ok((!secret.is_empty()).then_some(secret))
     }
 
+    pub fn query_auth_hosts() -> Result<Option<HashSet<String>>, Box<dyn Error + Send + Sync>> {
+        flag("INSECURE_ALLOW_QUERYPARAM_AUTH")?
+            .unwrap_or(false)
+            .then(|| allowlist("INSECURE_QUERYPARAM_AUTH_ALLOWED_HOSTS"))
+            .transpose()
+    }
+
     pub fn mcp_requires_auth() -> Result<bool, Box<dyn Error + Send + Sync>> {
         match flag("MCP_REQUIRE_AUTH")? {
             Some(required) => Ok(required),
