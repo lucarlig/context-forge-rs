@@ -32,7 +32,7 @@ use crate::{
         RegistrationError, ToolDefinition, slugify,
     },
     database::Database,
-    mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings},
+    mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     sessions::Session,
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
     upstream::{ToolContext, UpstreamClient, UpstreamError},
@@ -132,6 +132,19 @@ impl GatewayService {
             .await
     }
 
+    pub(crate) async fn visible_server(
+        &self,
+        id: &str,
+        principal: Option<&Principal>,
+    ) -> Result<Option<CatalogServer>, sqlx::Error> {
+        let scope = access::catalog_scope(principal);
+        Ok(self.database.catalog_server(id).await?.filter(|server| {
+            server.enabled
+                && server.is_visible(scope)
+                && (!server.oauth_enabled || principal.is_some())
+        }))
+    }
+
     #[allow(deprecated)]
     pub(crate) async fn set_log_level(
         &self,
@@ -194,6 +207,10 @@ impl GatewayService {
                 ..HttpOptions::default()
             },
         )
+    }
+
+    pub fn websocket_router(self: &Arc<Self>, settings: WebSocketSettings) -> Router {
+        crate::websocket::router(self.clone(), settings)
     }
 
     pub fn mcp_router_with_options(

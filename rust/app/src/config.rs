@@ -9,7 +9,7 @@ use crate::{
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
-        SessionSettings, SseSettings,
+        SessionSettings, SseSettings, WebSocketSettings,
     },
     redis_sessions::{DEFAULT_AFFINITY_TTL, DEFAULT_LISTENER_TTL},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
@@ -125,6 +125,17 @@ impl Settings {
 
     pub fn api_requires_auth() -> Result<bool, Box<dyn Error + Send + Sync>> {
         Ok(flag("AUTH_REQUIRED")?.unwrap_or(true))
+    }
+
+    pub fn websocket_settings(
+        shutdown: CancellationToken,
+    ) -> Result<WebSocketSettings, Box<dyn Error + Send + Sync>> {
+        Ok(WebSocketSettings {
+            enabled: flag("MCPGATEWAY_WS_RELAY_ENABLED")?.unwrap_or(false),
+            require_auth: flag("MCP_CLIENT_AUTH_ENABLED")?.unwrap_or(true)
+                || Self::api_requires_auth()?,
+            shutdown,
+        })
     }
 
     pub fn sse_settings(

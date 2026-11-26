@@ -21,3 +21,4 @@ mod resource_relay;
 mod sessions;
 mod subscriptions;
 pub mod upstream;
+mod websocket;

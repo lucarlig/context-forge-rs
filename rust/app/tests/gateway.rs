@@ -23,7 +23,9 @@ use context_forge_rs::{
     database::Database,
     gateway::{CatalogRefresh, GatewayService, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::{HttpOptions, ListenSettings, ProtocolMode, SessionSettings, SseSettings},
+    mcp::{
+        HttpOptions, ListenSettings, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings,
+    },
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 use futures_util::{StreamExt, stream};
@@ -38,6 +40,84 @@ const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
+
+#[tokio::test]
+async fn websocket_relay_requires_header_authentication_and_returns_rpc_errors() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{
+            Error as WebSocketError, Message, client::IntoClientRequest,
+            protocol::frame::coding::CloseCode,
+        },
+    };
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(EgressPolicy::default(), Duration::from_secs(5)),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.websocket_router(WebSocketSettings {
+        enabled: true,
+        require_auth: true,
+        shutdown: CancellationToken::new(),
+    }))
+    .await;
+    let url = format!("ws://{}/ws", gateway.address);
+    let admin = token("admin", Value::Null, json!({}));
+    for url in [url.clone(), format!("{url}?token={admin}")] {
+        let Err(WebSocketError::Http(response)) = connect_async(url).await else {
+            panic!("expected WebSocket handshake to be denied");
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {admin}").parse().unwrap(),
+    );
+    let (mut socket, response) = connect_async(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    socket.send(Message::Text("{".into())).await.unwrap();
+    let reply: Value =
+        serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(
+        reply,
+        json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})
+    );
+    for (method, expected) in [
+        ("ping", json!({"jsonrpc":"2.0","id":1,"result":{}})),
+        (
+            "other/method",
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found: other/method","data":{}}}),
+        ),
+    ] {
+        socket
+            .send(Message::Text(
+                json!({"jsonrpc":"2.0","id":1,"method":method})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let reply: Value =
+            serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        assert_eq!(reply, expected);
+    }
+    socket
+        .send(Message::Binary(vec![1, 2].into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Close(Some(frame)))) = socket.next().await else {
+        panic!("expected a close frame for binary data");
+    };
+    assert_eq!(frame.code, CloseCode::Error);
+}
 
 #[tokio::test]
 async fn legacy_sse_routes_messages_to_the_bound_virtual_server_and_owner() {

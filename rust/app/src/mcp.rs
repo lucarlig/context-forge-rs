@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 pub use crate::legacy_sse::SseSettings;
 pub use crate::redis_sessions::RedisSessionDirectory;
 pub use crate::subscriptions::ListenSettings;
+pub use crate::websocket::WebSocketSettings;
 
 use crate::{
     access::{self, Principal},
@@ -1558,7 +1559,12 @@ pub(crate) async fn legacy_transport_reply(
                 "instructions":server.and_then(|server| server.instructions.as_deref()).unwrap_or(ROOT_INSTRUCTIONS),
             })
         });
-        return Some(json!({"jsonrpc":"2.0","id":id,"result":result.unwrap_or_else(|| json!({}))}));
+        return Some(match result {
+            Some(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+            None => {
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32002,"message":"Missing protocol version","data":{}}})
+            }
+        });
     }
     request["jsonrpc"] = json!("2.0");
     let state = McpState {
@@ -1576,13 +1582,13 @@ pub(crate) async fn legacy_transport_reply(
         false,
     )
     .await;
-    let result = match to_bytes(reply.into_body(), MAX_REQUEST_BODY_BYTES * 2).await {
-        Ok(body) => serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|mut body| body.as_object_mut()?.remove("result")),
+    let payload = match to_bytes(reply.into_body(), MAX_REQUEST_BODY_BYTES * 2).await {
+        Ok(body) => serde_json::from_slice::<Value>(&body).ok(),
         Err(_) => None,
     };
-    Some(json!({"jsonrpc":"2.0","id":id,"result":result.unwrap_or_else(|| json!({}))}))
+    Some(payload.filter(|payload| payload["jsonrpc"] == "2.0").unwrap_or_else(|| {
+        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32600,"message":"Invalid Request"}})
+    }))
 }
 
 #[allow(deprecated)]

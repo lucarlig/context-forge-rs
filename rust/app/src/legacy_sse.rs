@@ -301,6 +301,11 @@ async fn respond(
             else {
                 continue;
             };
+            let reply = if reply.get("result").is_none() {
+                json!({"jsonrpc":"2.0","id":reply["id"],"result":{}})
+            } else {
+                reply
+            };
             if outgoing.send(reply).await.is_err() {
                 return;
             }

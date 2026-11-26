@@ -105,6 +105,39 @@ impl Authorizer {
         router.route_layer(middleware::from_fn_with_state(self.clone(), authorize_api))
     }
 
+    pub(crate) async fn websocket_principal(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<IpAddr>,
+        require_auth: bool,
+    ) -> Result<Option<Principal>, AuthError> {
+        let credential = bearer(headers)?;
+        let Some(credential) = credential else {
+            return if require_auth {
+                Err(AuthError::ApiRequired)
+            } else {
+                Ok(None)
+            };
+        };
+        let principal = self.authenticate(credential, peer, None).await?;
+        for permission in [
+            "tools.read",
+            "tools.execute",
+            "resources.read",
+            "prompts.read",
+            "servers.use",
+            "a2a.read",
+        ] {
+            if self
+                .allows(&principal, permission, RoleContext::AnyTeam, true)
+                .await?
+            {
+                return Ok(Some(principal));
+            }
+        }
+        Err(AuthError::Forbidden)
+    }
+
     async fn authenticate(
         &self,
         token: &str,
@@ -299,7 +332,7 @@ fn verify_restrictions(
 }
 
 #[derive(Debug)]
-enum AuthError {
+pub(crate) enum AuthError {
     Required,
     ApiRequired,
     Invalid,

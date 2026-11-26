@@ -61,8 +61,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
     let legacy_sse =
         service.legacy_sse_router(require_api_auth, Settings::sse_settings(shutdown.clone())?);
+    let websocket = service.websocket_router(Settings::websocket_settings(shutdown.clone())?);
     let app = probes::router(database, redis)
-        .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse)))
+        .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse).merge(websocket)))
         .merge(service.registration_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     tracing::info!(address = %listener.local_addr()?, "gateway listening");
