@@ -1,20 +1,37 @@
 # ContextForge RS port map
 
-Port all ContextForge gateway behavior to Rust. Ship a Rust binary and Rust-based build and test workflows with zero Python files or dependencies. The reference stays outside this repository.
+Port all ContextForge gateway behavior to Rust. Ship a Rust binary and Rust-based build and test workflows with zero Python files or dependencies. Keep the reference outside this repository.
 
-Reference: IBM/mcp-context-forge `v1.1.2` (`ddc60dad6a825646bfb149c72d9d835fac80fceb`).
+Reference release [v1.1.2](https://github.com/IBM/mcp-context-forge/releases/tag/v1.1.2), commit `ddc60dad6a825646bfb149c72d9d835fac80fceb`.
 
-| Unit | State |
-| --- | --- |
-| HTTP health and readiness handlers | Implemented. Probe replay and Rust failure tests cover the handlers. |
-| SQLite and PostgreSQL persistence | Connection pools and identity migration implemented. The remaining data and migration history are open. |
-| First-party JWT, team visibility, and RBAC | Implemented for root MCP ingress. SQLite and PostgreSQL tests cover persisted roles and denial paths. |
-| Request middleware | MCP Host and Origin allowlists implemented. Correlation IDs, security headers, rate limits, CORS, and trusted proxy headers are open. |
-| Registry and control plane | Open. Includes catalog and ownership, users, teams, tokens, roles, imports, exports, audit, and migrations. |
-| MCP data plane | Basic legacy stateless handshake and ping implemented. Catalog, execution, virtual servers, modern negotiation, streaming, replay, events, and other transports are open. |
-| A2A, REST, and gRPC federation | Open. |
-| Authentication providers and secrets | First-party bearer verification implemented. Login, issuance, token quotas, OAuth, SSO, and encrypted credentials are open. |
-| Plugins | Open. Includes native implementations, lifecycle hooks, configuration, and out-of-process extensions. |
-| Administration, observability, and operations | Open. Includes the UI backend, metrics, tracing, CLI commands, deployment, and migration verification. |
+## Milestones
 
-[Decisions](DECISIONS.md) · [Handoff](HANDOFF.md)
+Mark a milestone complete after testing it through its normal entry point. The README percentage counts checked milestones divided by the total.
+
+- [x] Health, readiness, and SQLite, PostgreSQL, and Redis connectivity probes
+- [x] First-party bearer verification, database roles and team scopes, and MCP ingress gates
+- [x] SQLite and PostgreSQL storage for gateway, tool, and virtual-server associations, with scoped pagination
+- [x] Legacy stateless MCP registration, listing, and invocation for unauthenticated Streamable HTTP upstreams
+- [ ] Modern MCP negotiation, discovery, and standard routing headers
+- [ ] Stateful sessions, streaming, cancellation, and event resumption
+- [ ] Resources, prompts, completions, logging, and subscriptions
+- [ ] Legacy SSE, WebSocket, and stdio transports and translation
+- [ ] Authenticated MCP upstreams, identity forwarding, and direct proxy mode
+- [ ] Gateway update, delete, refresh, health lifecycle, and full catalog APIs
+- [ ] Virtual-server management and OAuth resource metadata
+- [ ] API token issuance, usage limits, and lifecycle
+- [ ] User, team, role, and local login management
+- [ ] OAuth, SSO, dynamic registration, and external identities
+- [ ] Encrypted credential storage and rotation
+- [ ] Remaining database schema, migration history, import, and export
+- [ ] REST tool federation
+- [ ] gRPC tool federation
+- [ ] A2A federation and task lifecycle
+- [ ] Native plugins, policy evaluation, and external extensions
+- [ ] Admin backend and UI integration
+- [ ] HTTP security middleware, trusted proxies, correlation IDs, and rate limits
+- [ ] Audit logging, metrics, and tracing
+- [ ] CLI, packaging, and deployment
+- [ ] Whole-gateway parity, conformance, and Python-free release verification
+
+[Decisions](DECISIONS.md) · [Handoff and replay evidence](HANDOFF.md)
