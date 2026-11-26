@@ -5,6 +5,7 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod database;
+mod events;
 pub mod gateway;
 mod identity;
 pub mod jwt;

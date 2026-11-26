@@ -956,14 +956,24 @@ async fn check_legacy_cancellation(json_response: bool) {
     );
 }
 
-async fn next_sse_message(response: &mut reqwest::Response, buffered: &mut Vec<u8>) -> Value {
+async fn next_sse_message(
+    response: &mut reqwest::Response,
+    buffered: &mut Vec<u8>,
+) -> (Option<String>, Value) {
+    let mut id = None;
     loop {
         while let Some(end) = buffered.iter().position(|&byte| byte == b'\n') {
             let line: Vec<u8> = buffered.drain(..=end).collect();
+            if line.trim_ascii().is_empty() {
+                id = None;
+            }
+            if let Some(value) = line.strip_prefix(b"id:") {
+                id = Some(std::str::from_utf8(value.trim_ascii()).unwrap().to_owned());
+            }
             if let Some(data) = line.strip_prefix(b"data:").map(<[u8]>::trim_ascii)
                 && !data.is_empty()
             {
-                return serde_json::from_slice(data).unwrap();
+                return (id, serde_json::from_slice(data).unwrap());
             }
         }
         let bytes = response.chunk().await.unwrap().expect("next SSE frame");
@@ -1109,12 +1119,12 @@ async fn tool_progress_streams_before_completion_on_legacy_and_modern_mcp() {
             .body(request.to_string())
     };
     let requests = [
-        legacy_post(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+        (Some(session.clone()), legacy_post(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
             "name":"progress-fixture-hold","arguments":{"wait":true},"_meta":{"progressToken":"client-token"}
-        }})).header("mcp-session-id", session),
-        modern_post("application/json, text/event-stream", true),
+        }})).header("mcp-session-id", session)),
+        (None, modern_post("application/json, text/event-stream", true)),
     ];
-    for request in requests {
+    for (resumable, request) in requests {
         let mut response = request.send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
@@ -1124,7 +1134,7 @@ async fn tool_progress_streams_before_completion_on_legacy_and_modern_mcp() {
                 .starts_with("text/event-stream")
         );
         let mut buffered = Vec::new();
-        let progress = next_sse_message(&mut response, &mut buffered).await;
+        let (cursor, progress) = next_sse_message(&mut response, &mut buffered).await;
         assert_eq!(
             progress,
             json!({
@@ -1132,8 +1142,35 @@ async fn tool_progress_streams_before_completion_on_legacy_and_modern_mcp() {
                 "params":{"progressToken":"client-token","progress":1.0,"total":2.0,"message":"working"}
             })
         );
+        if let Some(session) = resumable {
+            let cursor = cursor.expect("stateful progress has a replay cursor");
+            let reconnect = || {
+                client
+                    .get(legacy.url("/mcp/"))
+                    .header(header::ACCEPT, "text/event-stream")
+                    .header("mcp-session-id", &session)
+                    .header("last-event-id", &cursor)
+            };
+            let still_open = reconnect().send().await.unwrap();
+            assert_eq!(still_open.status(), StatusCode::CONFLICT);
+            assert_eq!(still_open.headers()[header::RETRY_AFTER], "1");
+            drop(response);
+            response = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let reconnect = reconnect().send().await.unwrap();
+                    if reconnect.status() != StatusCode::CONFLICT {
+                        break reconnect;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            buffered.clear();
+        }
         release.add_permits(1);
-        let result = next_sse_message(&mut response, &mut buffered).await;
+        let (_, result) = next_sse_message(&mut response, &mut buffered).await;
         assert_eq!(result["id"], 2);
         assert_eq!(result["result"]["content"][0]["text"], "done");
     }
@@ -1142,4 +1179,143 @@ async fn tool_progress_streams_before_completion_on_legacy_and_modern_mcp() {
     assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
     let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
     assert_eq!(body["result"]["content"][0]["text"], "done");
+}
+
+#[tokio::test]
+async fn stream_resumption_never_reads_another_session_or_authorization_scope() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database.clone()),
+        UpstreamClient::new(EgressPolicy::default(), Duration::from_secs(5)),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.mcp_router_with_options(
+        true,
+        ProtocolMode::Legacy,
+        HttpOptions {
+            json_response: false,
+            sessions: Some(SessionSettings::default()),
+        },
+    ))
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let owner = token("member", json!(["alpha"]), json!({}));
+    let renewal = token("member", json!(["alpha"]), json!({}));
+    let limited = token(
+        "member",
+        json!(["alpha"]),
+        json!({"permissions": ["servers.use"]}),
+    );
+    let other = token("outsider", json!(["beta"]), json!({}));
+    let post = |body: Value| {
+        client
+            .post(gateway.url("/mcp/"))
+            .bearer_auth(&owner)
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-protocol-version", PROTOCOL)
+            .body(body.to_string())
+    };
+    let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }});
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let response = post(initialize.clone()).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        sessions.push(response.headers()["mcp-session-id"].clone());
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .starts_with("id:")
+        );
+    }
+
+    let mut cursors = Vec::new();
+    let calls = [
+        json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"unknown"}}),
+    ];
+    for call in calls {
+        let response = post(call)
+            .header("mcp-session-id", &sessions[0])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        let (priming, terminal) = body.split_once("\n\n").unwrap();
+        assert!(priming.lines().any(|line| line.trim_end() == "data:"));
+        let cursor = priming
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .unwrap()
+            .to_owned();
+        assert!(terminal.lines().any(|line| line.starts_with("id: ")));
+        cursors.push(cursor);
+    }
+
+    let get = |credential, session: &axum::http::HeaderValue, cursor: &str| {
+        client
+            .get(gateway.url("/mcp/"))
+            .bearer_auth(credential)
+            .header(header::ACCEPT, "text/event-stream")
+            .header("mcp-session-id", session.clone())
+            .header("last-event-id", cursor)
+    };
+    for credential in [&limited, &other] {
+        let response = get(credential, &sessions[0], &cursors[0])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let mut foreign = get(&renewal, &sessions[1], &cursors[0])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::OK);
+    let response = get(&renewal, &sessions[0], &cursors[0])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    let replies: Vec<Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert_eq!(replies, [json!({"jsonrpc":"2.0","id":2,"result":{}})]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), foreign.chunk())
+            .await
+            .is_err()
+    );
+    let Database::Sqlite(pool) = database else {
+        unreachable!()
+    };
+    sqlx::query(
+        "UPDATE roles SET permissions = '[\"servers.use\",\"tools.read\"]' WHERE id = 'developer'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let response = get(&renewal, &sessions[0], &cursors[1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

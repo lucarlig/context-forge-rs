@@ -31,8 +31,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    access::Principal,
+    access::{self, Principal},
     catalog::CatalogServer,
+    events::Journal,
     gateway::{GatewayService, ToolError},
     modern::Modern,
     sessions::{PendingError, Session, SessionError, Sessions},
@@ -41,6 +42,7 @@ use crate::{
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const SESSION_HEADER: &str = "mcp-session-id";
+const LAST_EVENT_ID: &str = "last-event-id";
 const RUNTIME_HEADER: &str = "x-contextforge-mcp-runtime";
 const LEGACY_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const MODERN_VERSION: &str = "2026-07-28";
@@ -72,6 +74,8 @@ pub struct SessionSettings {
     pub ttl: Duration,
     pub get_stream_enabled: bool,
     pub shutdown: CancellationToken,
+    pub event_capacity: usize,
+    pub event_ttl: Duration,
 }
 
 impl Default for SessionSettings {
@@ -80,6 +84,8 @@ impl Default for SessionSettings {
             ttl: Duration::from_secs(3600),
             get_stream_enabled: true,
             shutdown: CancellationToken::new(),
+            event_capacity: 100,
+            event_ttl: Duration::from_secs(3600),
         }
     }
 }
@@ -238,7 +244,7 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
 
     let is_head = request.method() == Method::HEAD;
     let mut response = match *request.method() {
-        Method::GET => handle_get(state.sessions.as_ref(), &request),
+        Method::GET => handle_get(&state, request).await,
         Method::POST => handle_post(&state, request).await,
         Method::DELETE => delete_session(state.sessions.as_ref(), &request),
         _ => {
@@ -262,8 +268,8 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
     response
 }
 
-fn handle_get(sessions: Option<&Sessions>, request: &Request) -> Response {
-    let Some(sessions) = sessions else {
+async fn handle_get(state: &McpState, request: Request) -> Response {
+    let Some(sessions) = &state.sessions else {
         return get_not_allowed(
             "Stateful sessions disabled on this gateway; passive SSE stream is not available.",
         );
@@ -273,7 +279,7 @@ fn handle_get(sessions: Option<&Sessions>, request: &Request) -> Response {
             "GET /mcp stream disabled by operator (MCP_GET_STREAM_ENABLED=False).",
         );
     }
-    let session = match session_from_request(sessions, request, false) {
+    let session = match session_from_request(sessions, &request, false) {
         Ok(session) => session,
         Err(SessionError::Missing) => {
             return get_not_allowed(
@@ -291,19 +297,60 @@ fn handle_get(sessions: Option<&Sessions>, request: &Request) -> Response {
         )
             .into_response();
     }
-    let Some(listener) = session.listen() else {
-        return (
-            StatusCode::CONFLICT,
-            [(RETRY_AFTER, "1")],
-            Json(Detail {
-                detail: "Another GET /mcp stream is already open for this session.",
-            }),
-        )
-            .into_response();
+    let replay = if let Some((journal, replay)) = request
+        .headers()
+        .get(LAST_EVENT_ID)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cursor| session.replay(cursor))
+    {
+        let principal = request.extensions().get::<Principal>();
+        if journal.authorization != principal.map(Principal::authorization_fingerprint) {
+            return session_error(SessionError::Forbidden);
+        }
+        if journal.needs_tool_execution
+            && let Some(principal) = principal
+        {
+            let server = request.extensions().get::<CatalogServer>();
+            match state
+                .service
+                .access
+                .allows(
+                    principal,
+                    "tools.execute",
+                    access::role_context(server),
+                    true,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return session_error(SessionError::Forbidden),
+                Err(error) => {
+                    tracing::error!(%error, "MCP stream replay permission lookup failed");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+            }
+        }
+        if journal.is_post_open() {
+            return stream_conflict("The original MCP POST stream is still open.");
+        }
+        Some(replay)
+    } else {
+        None
     };
-    let events = stream::unfold(listener, |listener| async move {
-        listener.wait_until_closed().await;
-        None::<(Result<Event, Infallible>, _)>
+    let Some(listener) = session.listen() else {
+        return stream_conflict("Another GET /mcp stream is already open for this session.");
+    };
+    let events = stream::unfold((listener, replay), |(listener, mut replay)| async move {
+        let Some(reader) = &mut replay else {
+            listener.wait_until_closed().await;
+            return None;
+        };
+        let frame = tokio::select! {
+            biased;
+            () = listener.wait_until_closed() => None,
+            frame = reader.next() => frame,
+        }?;
+        Some((Ok::<_, Infallible>(frame.into_event()), (listener, replay)))
     });
     (
         [
@@ -319,6 +366,15 @@ fn handle_get(sessions: Option<&Sessions>, request: &Request) -> Response {
                 .interval(Duration::from_secs(15))
                 .text("ping"),
         ),
+    )
+        .into_response()
+}
+
+fn stream_conflict(detail: &'static str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        [(RETRY_AFTER, "1")],
+        Json(Detail { detail }),
     )
         .into_response()
 }
@@ -438,6 +494,10 @@ async fn handle_post(state: &Arc<McpState>, request: Request) -> Response {
         None
     };
     let (mut parts, body) = request.into_parts();
+    let prime = parts
+        .headers
+        .get(PROTOCOL_VERSION_HEADER)
+        .is_some_and(|version| version == ProtocolVersion::V_2025_11_25.as_str());
     let principal = parts.extensions.remove::<Principal>();
     let server = parts.extensions.remove::<CatalogServer>();
     let bytes = match Bytes::from_request(Request::from_parts(parts, body), &()).await {
@@ -453,7 +513,7 @@ async fn handle_post(state: &Arc<McpState>, request: Request) -> Response {
     };
 
     match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => dispatch(state, principal, server, session_id, value).await,
+        Ok(value) => dispatch(state, principal, server, session_id, value, prime).await,
         Err(error) => rpc_error(
             StatusCode::BAD_REQUEST,
             &Value::Null,
@@ -496,6 +556,7 @@ async fn dispatch(
     server: Option<CatalogServer>,
     session_id: Option<HeaderValue>,
     value: Value,
+    prime: bool,
 ) -> Response {
     let Value::Object(mut message) = value else {
         return invalid_envelope();
@@ -526,15 +587,25 @@ async fn dispatch(
             let Some(result) = initialize(params.as_ref(), server.as_ref()) else {
                 return invalid_params(id);
             };
-            let session_id = match &state.sessions {
+            let can_prime = result.protocol_version == ProtocolVersion::V_2025_11_25;
+            let (session_id, journal) = match &state.sessions {
                 Some(sessions) => match sessions.create(owner, server_id) {
-                    Ok(session_id) => Some(session_id),
+                    Ok((session_id, session)) => {
+                        let journal = post_journal(
+                            &session,
+                            state.json_response,
+                            principal.as_ref(),
+                            false,
+                            can_prime,
+                        );
+                        (Some(session_id), journal)
+                    }
                     Err(error) => return session_error(error),
                 },
-                None => None,
+                None => (None, None),
             };
             let reply = std::future::ready(rpc_success(id, result));
-            return post_reply(state.json_response, session_id, reply, None).await;
+            return post_reply(state.json_response, session_id, reply, None, journal).await;
         }
         let session = match &state.sessions {
             Some(sessions) => match sessions.access(session_id.as_ref(), owner, server_id, false) {
@@ -553,6 +624,15 @@ async fn dispatch(
             return with_session(response, session_id.as_ref());
         };
         let stateful = session.is_some();
+        let journal = session.as_ref().and_then(|session| {
+            post_journal(
+                session,
+                state.json_response,
+                principal.as_ref(),
+                method == "tools/call",
+                prime,
+            )
+        });
         let (progress, updates) = match (!state.json_response && method == "tools/call")
             .then(|| progress_token(params.as_ref()))
             .flatten()
@@ -608,10 +688,11 @@ async fn dispatch(
                     }
                 },
                 updates,
+                journal,
             )
             .await;
         }
-        return post_reply(state.json_response, session_id, reply, updates).await;
+        return post_reply(state.json_response, session_id, reply, updates, None).await;
     }
 
     let result = message.get("result");
@@ -640,75 +721,152 @@ fn progress_token(params: Option<&Value>) -> Option<ProgressToken> {
     ProgressToken::deserialize(params?.get("_meta")?.get("progressToken")?).ok()
 }
 
+fn post_journal(
+    session: &Session,
+    json_response: bool,
+    principal: Option<&Principal>,
+    needs_tool_execution: bool,
+    prime: bool,
+) -> Option<(Arc<Journal>, bool)> {
+    if json_response {
+        return None;
+    }
+    Some((
+        session.start_journal(principal, needs_tool_execution)?,
+        prime,
+    ))
+}
+
 async fn post_reply(
     json_response: bool,
     session_id: Option<HeaderValue>,
     reply: impl Future<Output = Response> + Send + 'static,
     updates: Option<tokio::sync::mpsc::Receiver<ProgressNotificationParam>>,
+    journal: Option<(Arc<Journal>, bool)>,
 ) -> Response {
     let response = if json_response {
         reply.await
     } else {
-        let events = stream::unfold(Some((Box::pin(reply), updates)), |state| async move {
-            let (mut reply, mut updates) = state?;
-            let terminal = if let Some(receiver) = &mut updates {
-                tokio::select! {
-                    biased;
-                    next = receiver.recv() => match next {
-                        Some(progress) => {
-                            return Some((vec![progress_event(progress)], Some((reply, updates))));
-                        }
-                        None => reply.await,
-                    },
-                    terminal = &mut reply => terminal,
-                }
-            } else {
-                reply.await
-            };
-            let mut events = Vec::new();
-            if let Some(mut receiver) = updates {
-                while let Ok(progress) = receiver.try_recv() {
-                    events.push(progress_event(progress));
-                }
+        let frames = reply_frames(reply, updates);
+        match journal {
+            Some((journal, prime)) => {
+                let prefix = prime.then(|| journal.prime());
+                post_sse(recorded_events(journal, frames), prefix)
             }
-            events.push(terminal_event(terminal).await);
-            Some((events, None))
-        })
-        .flat_map(stream::iter);
-        (
-            [
-                (CACHE_CONTROL, "no-cache, no-transform"),
-                (
-                    axum::http::HeaderName::from_static("x-accel-buffering"),
-                    "no",
-                ),
-            ],
-            Sse::new(events).keep_alive(
-                KeepAlive::new()
-                    .interval(Duration::from_secs(15))
-                    .text("ping"),
+            None => post_sse(
+                frames
+                    .map(|frame| frame.map(|data| Event::default().event("message").data(&*data))),
+                None,
             ),
-        )
-            .into_response()
+        }
     };
     with_session(response, session_id.as_ref())
 }
 
-fn progress_event(progress: ProgressNotificationParam) -> Result<Event, std::io::Error> {
-    let notification =
-        ServerJsonRpcMessage::notification(ProgressNotification::new(progress).into());
-    Event::default()
-        .event("message")
-        .json_data(notification)
-        .map_err(std::io::Error::other)
+type ReplyFrame = Result<Arc<str>, std::io::Error>;
+
+fn reply_frames(
+    reply: impl Future<Output = Response> + Send + 'static,
+    updates: Option<tokio::sync::mpsc::Receiver<ProgressNotificationParam>>,
+) -> impl futures_util::Stream<Item = ReplyFrame> + Send + 'static {
+    stream::unfold(Some((Box::pin(reply), updates)), |state| async move {
+        let (mut reply, mut updates) = state?;
+        let terminal = if let Some(receiver) = &mut updates {
+            tokio::select! {
+                biased;
+                next = receiver.recv() => match next {
+                    Some(progress) => {
+                        return Some((vec![progress_frame(progress)], Some((reply, updates))));
+                    }
+                    None => reply.await,
+                },
+                terminal = &mut reply => terminal,
+            }
+        } else {
+            reply.await
+        };
+        let mut events = Vec::new();
+        if let Some(mut receiver) = updates {
+            while let Ok(progress) = receiver.try_recv() {
+                events.push(progress_frame(progress));
+            }
+        }
+        let bytes = to_bytes(terminal.into_body(), usize::MAX)
+            .await
+            .map_err(std::io::Error::other);
+        events.push(bytes.and_then(|body| {
+            std::str::from_utf8(&body)
+                .map(Arc::from)
+                .map_err(std::io::Error::other)
+        }));
+        Some((events, None))
+    })
+    .flat_map(stream::iter)
 }
 
-async fn terminal_event(reply: Response) -> Result<Event, std::io::Error> {
-    let body = to_bytes(reply.into_body(), usize::MAX)
-        .await
-        .map_err(std::io::Error::other)?;
-    let data = std::str::from_utf8(&body).map_err(std::io::Error::other)?;
-    Ok(Event::default().event("message").data(data))
+fn recorded_events(
+    journal: Arc<Journal>,
+    frames: impl futures_util::Stream<Item = ReplyFrame> + Send + 'static,
+) -> impl futures_util::Stream<Item = Result<Event, std::io::Error>> + Send + 'static {
+    let guard = journal.live_post();
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        let mut sender = Some(sender);
+        let mut frames = std::pin::pin!(frames);
+        while let Some(frame) = frames.next().await {
+            let event = frame.map(|data| journal.publish(Some(data)).into_event());
+            if let Some(output) = &sender
+                && !matches!(
+                    tokio::time::timeout(Duration::from_secs(5), output.send(event)).await,
+                    Ok(Ok(()))
+                )
+            {
+                sender = None;
+            }
+        }
+        journal.finish();
+    });
+    stream::unfold((receiver, guard), |(mut receiver, guard)| async move {
+        receiver
+            .recv()
+            .await
+            .map(|event| (event, (receiver, guard)))
+    })
+}
+
+fn post_sse(
+    events: impl futures_util::Stream<Item = Result<Event, std::io::Error>> + Send + 'static,
+    prefix: Option<Bytes>,
+) -> Response {
+    let response = (
+        [
+            (CACHE_CONTROL, "no-cache, no-transform"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
+        ],
+        Sse::new(events).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        ),
+    )
+        .into_response();
+    let Some(prefix) = prefix else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let frames = stream::iter([Ok(prefix)]).chain(body.into_data_stream());
+    Response::from_parts(parts, Body::from_stream(frames))
+}
+
+fn progress_frame(progress: ProgressNotificationParam) -> ReplyFrame {
+    let notification =
+        ServerJsonRpcMessage::notification(ProgressNotification::new(progress).into());
+    serde_json::to_string(&notification)
+        .map(Arc::from)
+        .map_err(std::io::Error::other)
 }
 
 async fn list_tools(

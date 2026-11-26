@@ -145,13 +145,23 @@ impl Settings {
         }
         let defaults = SessionSettings::default();
         let ttl = parse("SESSION_TTL", defaults.ttl.as_secs())?;
+        let event_capacity = parse(
+            "STREAMABLE_HTTP_MAX_EVENTS_PER_STREAM",
+            defaults.event_capacity,
+        )?;
+        let event_ttl = parse("STREAMABLE_HTTP_EVENT_TTL", defaults.event_ttl.as_secs())?;
         if ttl == 0 {
             return Err("SESSION_TTL must be positive".into());
+        }
+        if event_capacity == 0 || event_ttl == 0 {
+            return Err("MCP event history settings must be positive".into());
         }
         Ok(Some(SessionSettings {
             ttl: Duration::from_secs(ttl),
             get_stream_enabled: flag("MCP_GET_STREAM_ENABLED")?
                 .unwrap_or(defaults.get_stream_enabled),
+            event_capacity,
+            event_ttl: Duration::from_secs(event_ttl),
             ..defaults
         }))
     }

@@ -15,6 +15,7 @@ use axum::{
 use ipnet::IpNet;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{
     auth::{self, TeamVisibility},
@@ -335,6 +336,24 @@ impl IntoResponse for AuthError {
 impl Principal {
     pub(crate) fn token_allows(&self, permission: &str) -> bool {
         auth::token_scope_grants(Some(&self.scopes), permission)
+    }
+
+    pub(crate) fn authorization_fingerprint(&self) -> [u8; 32] {
+        let scope = match &self.visibility {
+            TeamVisibility::Public => json!("public"),
+            TeamVisibility::Admin => json!("admin"),
+            TeamVisibility::Teams(teams) => {
+                let mut sorted: Vec<_> = teams.iter().collect();
+                sorted.sort_unstable();
+                sorted.dedup();
+                json!(sorted)
+            }
+        };
+        let mut scopes: Vec<_> = self.scopes.iter().collect();
+        scopes.sort_unstable();
+        scopes.dedup();
+        let data = json!([self.email, self.is_admin, scope, scopes]).to_string();
+        Sha256::digest(data.as_bytes()).into()
     }
 }
 

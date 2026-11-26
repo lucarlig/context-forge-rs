@@ -37,7 +37,7 @@ Bind session access to the authorized principal and virtual server on every requ
 
 ## Rust lifecycle replay
 
-The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Passive event delivery, resumption, and shared session affinity remain open.
+The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Passive server-initiated event delivery and resumption, and shared session affinity, remain open.
 
 The public legacy JSON profile produced five recordings with rust-anything v5.0.1. The original matched all five. Rust matched the unknown-session POST and missing-session GET. Initialization advertises the Rust version and the implemented capabilities. Missing-session POST and DELETE errors omit the generated session ID that v1.1.2 sends before initialization.
 
@@ -55,7 +55,7 @@ The pinned gateway acknowledged a stateful `notifications/cancelled` POST with `
 
 With `JSON_RESPONSE_ENABLED=false`, both versions require clients to accept JSON and SSE. Legacy requests receive their terminal JSON-RPC message as an SSE event. Modern discovery returns JSON. The live Rust test opens the legacy POST stream before an upstream tool completes and reads the cancellation error from the stream.
 
-The pinned gateway's stateful initialization stream includes a priming event and event IDs. The Rust stream currently carries the terminal message. Event IDs and replay are pending.
+The pinned gateway and Rust include a priming event and event IDs for stateful initialization with protocol version `2025-11-25`.
 
 The pinned gateway and the Rust binary matched all five stateless POST replay cases.
 
@@ -69,3 +69,11 @@ JSON_RESPONSE_ENABLED=false USE_STATEFUL_SESSIONS=false MCP_REQUIRE_AUTH=false \
 ## Progress during tool calls
 
 A synthetic upstream posted one progress event with an unrelated token, then one with the numeric token it received in `tools/call`. Both gateways delivered the matching event before the terminal reply and replaced its token with the caller's string token. The reference sent SSE for legacy streaming mode and for modern clients that accepted both media types and supplied a progress token. Legacy JSON mode returned a single JSON result. Rust also keeps modern responses in JSON when the client accepts only JSON. The live Rust test holds the upstream result until the client reads its progress event.
+
+## Resuming a POST stream
+
+The Rust gateway retains event history per stateful POST stream. The client can reconnect with `Last-Event-ID` and receive frames after that cursor, including a pending terminal reply. Live tests disconnect after progress, resume the outstanding invocation, and verify session and authorization isolation, including a revoked tool permission. Unknown or expired cursors open the passive SSE connection.
+
+`STREAMABLE_HTTP_MAX_EVENTS_PER_STREAM` defaults to 100. `STREAMABLE_HTTP_EVENT_TTL` defaults to one hour after the stream finishes. The process retains at most 128 POST streams per session and budgets 64 MiB for retained events.
+
+The pinned gateway accepted the resume GET in the same progress fixture and delivered no events in the 1.5-second observation window. Rust implements POST resumption by stream ID as described by the transport specification. The reference's separate passive event-bus replay is still open in Rust. [MCP resumability specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery)
