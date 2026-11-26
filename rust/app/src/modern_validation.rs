@@ -84,7 +84,7 @@ pub(crate) fn reject_invalid_request(headers: &HeaderMap, body: &Value) -> Optio
             Some(""),
         ));
     }
-    if method == "initialize" {
+    if matches!(method, "initialize" | "logging/setLevel") {
         return Some(rpc_error(
             StatusCode::NOT_FOUND,
             id,

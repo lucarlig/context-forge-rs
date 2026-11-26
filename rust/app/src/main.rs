@@ -11,11 +11,16 @@ use context_forge_rs::{
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{
+    filter::LevelFilter, layer::SubscriberExt, reload, util::SubscriberInitExt,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+    let (filter, handle) = reload::Layer::new(LevelFilter::INFO);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
     let settings = Settings::from_env()?;
@@ -32,13 +37,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         verifier,
         Settings::invalidate_sessions_on_password_change()?,
     ));
-    let service = Arc::new(GatewayService::new(
-        database.clone(),
-        access,
-        Settings::upstream_client()?,
-        Settings::mcp_pagination()?,
-        Settings::catalog_refresh()?,
-    ));
+    let service = Arc::new(
+        GatewayService::new(
+            database.clone(),
+            access,
+            Settings::upstream_client()?,
+            Settings::mcp_pagination()?,
+            Settings::catalog_refresh()?,
+        )
+        .with_logging_filter(handle),
+    );
     let shutdown = CancellationToken::new();
     let mut http_options = settings.mcp_http_options()?;
     if let Some(settings) = &mut http_options.sessions {

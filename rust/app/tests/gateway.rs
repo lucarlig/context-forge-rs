@@ -36,6 +36,99 @@ const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
 
+#[tokio::test]
+async fn legacy_logging_changes_the_process_filter_with_scoped_permission() {
+    use tracing_subscriber::{filter::LevelFilter, reload};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let database = database().await;
+    let (_layer, handle) = reload::Layer::new(LevelFilter::INFO);
+    let service = Arc::new(
+        GatewayService::new(
+            database.clone(),
+            authorizer(database),
+            UpstreamClient::new(EgressPolicy::default(), Duration::from_secs(5)),
+            Pagination::new(100, 900, None),
+            CatalogRefresh::default(),
+        )
+        .with_logging_filter(handle.clone()),
+    );
+    let gateway = Running::start(service.mcp_router(false, ProtocolMode::Auto)).await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let restricted = token("admin", Value::Null, json!({"permissions":["tools.read"]}));
+    let rpc = async |level: &str, token: Option<&str>| {
+        send(
+            &client,
+            gateway.url("/mcp/"),
+            json!({"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":level}}),
+            token,
+        )
+        .await
+    };
+
+    let (status, reply) = rpc("debug", Some(&restricted)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply["error"], json!({"code":0,"message":"Access denied"}));
+    assert_eq!(
+        handle.with_current(|level| *level).unwrap(),
+        LevelFilter::INFO
+    );
+
+    for (wire, expected) in [
+        ("debug", LevelFilter::DEBUG),
+        ("notice", LevelFilter::INFO),
+        ("warning", LevelFilter::WARN),
+        ("alert", LevelFilter::ERROR),
+    ] {
+        let (status, reply) = rpc(wire, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply["result"], json!({}));
+        assert_eq!(handle.with_current(|level| *level).unwrap(), expected);
+    }
+    let (status, reply) = rpc("DEBUG", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        reply["error"],
+        json!({"code":-32602,"message":"Invalid request parameters","data":""})
+    );
+    assert_eq!(
+        handle.with_current(|level| *level).unwrap(),
+        LevelFilter::ERROR
+    );
+
+    let (_, reply) = send(
+        &client,
+        gateway.url("/mcp/"),
+        json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{
+            "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+        }}),
+        None,
+    )
+    .await;
+    assert_eq!(reply["result"]["capabilities"]["logging"], json!({}));
+
+    let (status, reply) = send_with_headers(
+        &client,
+        gateway.url("/mcp/"),
+        modern_request("logging/setLevel", 3, json!({"level":"debug"})),
+        None,
+        &[
+            ("mcp-method", "logging/setLevel"),
+            ("mcp-protocol-version", "2026-07-28"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        reply["error"],
+        json!({"code":-32601,"message":"Method not found","data":"logging/setLevel"})
+    );
+    assert_eq!(
+        handle.with_current(|level| *level).unwrap(),
+        LevelFilter::ERROR
+    );
+}
+
 async fn catalog_fixture(Json(request): Json<Value>) -> Response {
     let params = &request["params"];
     let result = match request["method"].as_str().unwrap() {

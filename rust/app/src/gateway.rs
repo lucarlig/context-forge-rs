@@ -14,10 +14,13 @@ use axum::{
 use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, MetaObject};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, MetaObject,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tracing_subscriber::{Registry, filter::LevelFilter, reload};
 use uuid::Uuid;
 
 use crate::{
@@ -39,6 +42,7 @@ pub struct GatewayService {
     upstream: UpstreamClient,
     pagination: Pagination,
     refresh: CatalogRefresh,
+    logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
 }
 
 pub struct CatalogRefresh {
@@ -99,7 +103,37 @@ impl GatewayService {
             upstream,
             pagination,
             refresh,
+            logging_filter: None,
         }
+    }
+
+    pub fn with_logging_filter(mut self, filter: reload::Handle<LevelFilter, Registry>) -> Self {
+        self.logging_filter = Some(filter);
+        self
+    }
+
+    #[allow(deprecated)]
+    pub(crate) async fn set_log_level(
+        &self,
+        level: rmcp::model::LoggingLevel,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+    ) -> Result<(), ErrorData> {
+        self.check_mcp_permission(principal, server, "admin.system_config")
+            .await?;
+        use rmcp::model::LoggingLevel::*;
+        let filter = match level {
+            Debug => LevelFilter::DEBUG,
+            Info | Notice => LevelFilter::INFO,
+            Warning => LevelFilter::WARN,
+            Error | Critical | Alert | Emergency => LevelFilter::ERROR,
+        };
+        if let Some(handle) = &self.logging_filter
+            && let Err(error) = handle.reload(filter)
+        {
+            tracing::warn!(%error, "MCP log level update failed");
+        }
+        Ok(())
     }
 
     pub fn registration_router(self: &Arc<Self>) -> Router {

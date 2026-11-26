@@ -23,7 +23,7 @@ impl GatewayService {
         context: ToolContext<'_>,
         downstream: Option<&Session>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        self.check_content_access(principal, server, "resources.read")
+        self.check_mcp_permission(principal, server, "resources.read")
             .await?;
         let resource = self
             .database
@@ -101,7 +101,7 @@ impl GatewayService {
         context: ToolContext<'_>,
         downstream: Option<&Session>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        self.check_content_access(principal, server, "prompts.read")
+        self.check_mcp_permission(principal, server, "prompts.read")
             .await?;
         let prompt = self
             .database
@@ -150,7 +150,7 @@ impl GatewayService {
             .map_err(|_| invalid_upstream_result())
     }
 
-    async fn check_content_access(
+    pub(super) async fn check_mcp_permission(
         &self,
         principal: Option<&Principal>,
         server: Option<&CatalogServer>,

@@ -19,4 +19,6 @@ Both gateways route a resource URI matching a stored template when the exact URI
 
 The local content suite under `content/` uses [a separate SQLite fixture](content/fixture.sql) for plain text, binary content, and a rendered prompt. The pinned gateway matched all eight recordings. Rust matched five, including the four legacy requests and the modern missing-argument error. The three successful modern responses differ only in the server version. Load `content/fixture.sql` and change the replay path above to `rust/replay/mcp-catalog/content` to run this suite.
 
-Completions, logging, and resource subscriptions remain open. Local prompt rendering currently validates required arguments and accepts strings. The renderer enforces an execution and output limit.
+The logging suite under `logging/` exercises valid legacy log levels, invalid legacy parameters, and the modern method-not-found response. Both gateways matched all 12 recordings. The Rust integration test also verifies runtime filter changes and covers an authenticated token whose scopes exclude `admin.system_config`. In permissive MCP mode the reference accepts anonymous level changes. Replay this suite with an empty disposable SQLite database and the same environment as the list cases.
+
+Completions and resource subscriptions remain open. Local prompt rendering currently validates required arguments and accepts strings. The renderer enforces an execution and output limit.

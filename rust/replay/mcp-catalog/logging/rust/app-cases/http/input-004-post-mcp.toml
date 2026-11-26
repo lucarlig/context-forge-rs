@@ -1,0 +1,17 @@
+[request]
+method = "POST"
+path = "/mcp/"
+body = '{"jsonrpc": "2.0", "id": 3, "method": "logging/setLevel", "params": {"level": "DEBUG"}}'
+
+[request.headers]
+Accept = "application/json"
+Content-Type = "application/json"
+MCP-Protocol-Version = "2025-11-25"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin"
+x-contextforge-mcp-runtime = "[..]"

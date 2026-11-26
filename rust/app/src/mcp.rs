@@ -908,6 +908,7 @@ async fn dispatch(
             "tools/call" => Some("tools.execute"),
             "resources/read" => Some("resources.read"),
             "prompts/get" => Some("prompts.read"),
+            "logging/setLevel" => Some("admin.system_config"),
             _ => None,
         };
         let journal = session.as_ref().and_then(|session| {
@@ -936,6 +937,7 @@ async fn dispatch(
             let params = params.as_ref();
             match method.as_str() {
                 "ping" => rpc_success(&id, Empty {}),
+                "logging/setLevel" => set_log_level(&service, principal, server, &id, params).await,
                 "tools/list" => list_tools(&service, principal, server, &id, params).await,
                 "resources/list" => {
                     list_catalog_metadata(
@@ -1388,6 +1390,23 @@ fn content_error(id: &Value, error: ErrorData) -> Response {
     rpc_error(StatusCode::OK, id, error.code.0, &error.message, error.data)
 }
 
+#[allow(deprecated)]
+async fn set_log_level(
+    service: &GatewayService,
+    principal: Option<&Principal>,
+    server: Option<&CatalogServer>,
+    id: &Value,
+    params: Option<&Value>,
+) -> Response {
+    let Some(Ok(params)) = params.map(rmcp::model::SetLevelRequestParams::deserialize) else {
+        return invalid_params(id);
+    };
+    match service.set_log_level(params.level, principal, server).await {
+        Ok(()) => rpc_success(id, Empty {}),
+        Err(error) => content_error(id, error),
+    }
+}
+
 fn cancel_request(session: &Session, params: Option<&Value>) -> Response {
     let Some(Ok(params)) = params.map(CancelledNotificationParam::deserialize) else {
         return invalid_envelope();
@@ -1423,6 +1442,7 @@ fn tool_error(id: &Value, error: ToolError) -> Response {
     rpc_error(StatusCode::OK, id, code, message, None::<()>)
 }
 
+#[allow(deprecated)]
 fn initialize(params: Option<&Value>, server: Option<&CatalogServer>) -> Option<InitializeResult> {
     let params = InitializeRequestParams::deserialize(params?).ok()?;
     let protocol_version = if LEGACY_VERSIONS.contains(&params.protocol_version.as_str()) {
@@ -1430,7 +1450,9 @@ fn initialize(params: Option<&Value>, server: Option<&CatalogServer>) -> Option<
     } else {
         ProtocolVersion::LATEST_WITH_INITIALIZE
     };
-    let mut result = InitializeResult::new(catalog_capabilities())
+    let mut capabilities = catalog_capabilities();
+    capabilities.logging = Some(Default::default());
+    let mut result = InitializeResult::new(capabilities)
         .with_protocol_version(protocol_version)
         .with_server_info(Implementation::new(
             "ContextForge",
@@ -1729,7 +1751,7 @@ mod tests {
                     "id": "initialize-1",
                     "result": {
                         "protocolVersion": expected,
-                        "capabilities": {"tools": {"listChanged": false}, "prompts": {"listChanged": false},
+                        "capabilities": {"logging": {}, "tools": {"listChanged": false}, "prompts": {"listChanged": false},
                             "resources": {"listChanged": false, "subscribe": false}},
                         "serverInfo": { "name": "ContextForge", "version": env!("CARGO_PKG_VERSION") }
                     }
