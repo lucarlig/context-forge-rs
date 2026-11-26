@@ -310,6 +310,9 @@ async fn forward_remote(state: &McpState, request: Request) -> Result<Request, B
     let Some(redis) = sessions.redis() else {
         return Ok(request);
     };
+    if *request.method() != Method::GET && !redis.affinity_enabled() {
+        return Ok(request);
+    }
     let Ok(Some(id)) = session_header(request.headers()) else {
         return Ok(request);
     };
@@ -370,7 +373,7 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
             "GET /mcp stream disabled by operator (MCP_GET_STREAM_ENABLED=False).",
         );
     }
-    let session = match session_from_request(
+    let (session_id, session) = match session_from_request(
         sessions,
         request.headers(),
         request.extensions(),
@@ -378,7 +381,7 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
     )
     .await
     {
-        Ok(session) => session,
+        Ok(owned) => owned,
         Err(SessionError::Missing) => {
             return get_not_allowed(
                 "Passive SSE stream requires an Mcp-Session-Id from a prior initialize.",
@@ -426,8 +429,22 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
             Err(error) => return event_permission_error(error),
         }
     };
-    let Some(listener) = session.listen() else {
-        return stream_conflict("Another GET /mcp stream is already open for this session.");
+    let listener = match sessions.listen(&session_id, session).await {
+        Ok(Some(listener)) => listener,
+        Ok(None) => {
+            return stream_conflict("Another GET /mcp stream is already open for this session.");
+        }
+        Err(SessionError::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(RETRY_AFTER, "1")],
+                Json(Detail {
+                    detail: "Listener-claim storage unavailable; retry shortly.",
+                }),
+            )
+                .into_response();
+        }
+        Err(error) => return session_error(error),
     };
     let events = stream::unfold((listener, replay), |(listener, mut replay)| async move {
         let Some(reader) = &mut replay else {
@@ -552,12 +569,12 @@ async fn session_from_request(
     headers: &HeaderMap,
     extensions: &Extensions,
     access: SessionAccess,
-) -> Result<Arc<Session>, SessionError> {
+) -> Result<(HeaderValue, Arc<Session>), SessionError> {
     let owner = extensions.get::<Principal>().map(|p| p.email.as_str());
     let server = extensions.get::<CatalogServer>().map(|s| s.id.as_str());
-    sessions
-        .access(session_header(headers)?, owner, server, access)
-        .await
+    let id = session_header(headers)?.ok_or(SessionError::Missing)?;
+    let session = sessions.access(Some(id), owner, server, access).await?;
+    Ok((id.clone(), session))
 }
 
 async fn handle_post(state: &Arc<McpState>, request: Request) -> Response {

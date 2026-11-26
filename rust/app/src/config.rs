@@ -6,7 +6,7 @@ use crate::{
     gateway::{CatalogRefresh, Pagination},
     jwt::{JwtConfig, JwtVerifier},
     mcp::{HttpOptions, IngressPolicy, ProtocolMode, RedisSessionDirectory, SessionSettings},
-    redis_sessions::DEFAULT_AFFINITY_TTL,
+    redis_sessions::{DEFAULT_AFFINITY_TTL, DEFAULT_LISTENER_TTL},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 
@@ -157,19 +157,29 @@ impl Settings {
         if event_capacity == 0 || event_ttl == 0 {
             return Err("MCP event history settings must be positive".into());
         }
-        let redis = if flag("MCPGATEWAY_SESSION_AFFINITY_ENABLED")?.unwrap_or(false)
-            && let Some(redis) = &self.redis
-        {
-            let seconds = parse(
-                "MCPGATEWAY_SESSION_AFFINITY_TTL",
-                DEFAULT_AFFINITY_TTL.as_secs(),
+        let redis = if let Some(redis) = &self.redis {
+            let affinity = if flag("MCPGATEWAY_SESSION_AFFINITY_ENABLED")?.unwrap_or(false) {
+                let seconds = parse(
+                    "MCPGATEWAY_SESSION_AFFINITY_TTL",
+                    DEFAULT_AFFINITY_TTL.as_secs(),
+                )?;
+                if seconds == 0 {
+                    return Err("MCPGATEWAY_SESSION_AFFINITY_TTL must be positive".into());
+                }
+                Some(Duration::from_secs(seconds))
+            } else {
+                None
+            };
+            let listener = parse(
+                "MCP_GET_STREAM_LISTENER_TTL_SECONDS",
+                DEFAULT_LISTENER_TTL.as_secs(),
             )?;
-            if seconds == 0 {
-                return Err("MCPGATEWAY_SESSION_AFFINITY_TTL must be positive".into());
+            if listener == 0 {
+                return Err("MCP_GET_STREAM_LISTENER_TTL_SECONDS must be positive".into());
             }
             let directory = RedisSessionDirectory::new(redis)
                 .map_err(|_| "invalid REDIS_URL")?
-                .with_affinity_ttl(Duration::from_secs(seconds));
+                .with_leases(affinity, Duration::from_secs(listener));
             Some(std::sync::Arc::new(directory))
         } else {
             None

@@ -60,13 +60,15 @@ The Rust gateway answers these requests on upstream POST SSE replies and persist
 
 The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion.
 
-Set `CACHE_TYPE=redis`, `REDIS_URL`, and `MCPGATEWAY_SESSION_AFFINITY_ENABLED=true` to store ownership and expiry in Redis. Redis validates the principal and virtual-server binding before allowing a lookup, renewal, or deletion. `MCPGATEWAY_SESSION_AFFINITY_TTL` sets how long a peer can forward POST requests and defaults to 300 seconds. A POST on the owning worker renews this lease. Passive GET can use the session until it expires under `SESSION_TTL`. The gateway returns HTTP `503` when the directory is unavailable. A live run against Valkey verified registration, renewal, deletion, and recovery after a cache restart.
+Set `CACHE_TYPE=redis` and `REDIS_URL` to store session ownership and expiry in Redis. Redis validates the principal and virtual-server binding before allowing a lookup, renewal, or deletion. Set `MCPGATEWAY_SESSION_AFFINITY_ENABLED=true` for cross-worker POST and DELETE. `MCPGATEWAY_SESSION_AFFINITY_TTL` sets how long a peer can forward POST requests and defaults to 300 seconds. A POST on the owning worker renews this lease. The gateway returns HTTP `503` when the directory is unavailable. A live run against Valkey verified registration, renewal, deletion, and recovery after a cache restart.
+
+Redis makes passive GET available on any worker with or without POST affinity. The pinned gateway renewed the listener lease after its configured three-second lifetime and removed it when the connection ended. Rust uses `MCP_GET_STREAM_LISTENER_TTL_SECONDS`, which defaults to 30 seconds, and closes the stream after two missed renewals. A two-process Rust run verified that remote POST stayed disabled, a competing GET returned `409`, a lost lease ended SSE, and release preserved a replacement lease.
 
 Requests can reach any worker with access to the same Redis cache. The owning worker authenticates the relayed request and serves POST, passive GET, or DELETE. Redis Pub/Sub carries response chunks. Credits bound the relay to one pending chunk per request. A live test used two native processes for POST and DELETE. The Rust integration test also covers forwarded POST SSE, concurrent passive GET, recovery after a client disconnect, authorization, and stream closure after deletion.
 
 ```sh
 REDIS_URL=redis://127.0.0.1:6379/0 \
-  cargo test --locked --lib shared_directory_scopes -- --ignored
+  cargo test --locked --lib redis_sessions::tests -- --ignored
 REDIS_URL=redis://127.0.0.1:6379/0 \
   cargo test --locked --test gateway redis_affinity_relays -- --ignored
 ```

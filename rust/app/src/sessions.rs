@@ -19,6 +19,7 @@ use crate::{
     access::Principal,
     events::{HISTORY_BUDGET, Journal, JournalMode, Replay, parse_cursor},
     mcp::{RedisSessionDirectory, SessionSettings},
+    redis_sessions::RedisListener,
     upstream::UpstreamAssociation,
 };
 
@@ -243,6 +244,34 @@ impl Sessions {
         session
     }
 
+    pub(crate) async fn listen(
+        &self,
+        id: &HeaderValue,
+        session: Arc<Session>,
+    ) -> Result<Option<Listener>, SessionError> {
+        if session
+            .listener_open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let mut listener = Listener {
+            session,
+            shared: None,
+        };
+        if let Some(redis) = &self.settings.redis {
+            let Some(shared) = redis
+                .claim_listener(id, &listener.session.lifetime.shutdown)
+                .await?
+            else {
+                return Ok(None);
+            };
+            listener.shared = Some(shared);
+        }
+        Ok(Some(listener))
+    }
+
     fn access_local(
         &self,
         id: &HeaderValue,
@@ -367,13 +396,6 @@ impl Session {
         Some(stream)
     }
 
-    pub(crate) fn listen(self: Arc<Self>) -> Option<Listener> {
-        self.listener_open
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Listener(self))
-    }
-
     pub(crate) fn track(self: Arc<Self>, id: RequestId) -> Result<PendingRequest, PendingError> {
         let mut pending = self.pending.lock().expect("pending request map lock");
         if pending.len() >= MAX_PENDING_REQUESTS {
@@ -450,16 +472,27 @@ impl Drop for PendingRequest {
     }
 }
 
-pub(crate) struct Listener(Arc<Session>);
+pub(crate) struct Listener {
+    session: Arc<Session>,
+    shared: Option<RedisListener>,
+}
 
 impl Listener {
     pub(crate) async fn wait_until_closed(&self) {
-        self.0.lifetime.wait_until_closed().await;
+        let session_closed = self.session.lifetime.wait_until_closed();
+        if let Some(shared) = &self.shared {
+            tokio::select! {
+                () = session_closed => {},
+                () = shared.wait_until_lost() => {},
+            }
+        } else {
+            session_closed.await;
+        }
     }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.0.listener_open.store(false, Ordering::Release);
+        self.session.listener_open.store(false, Ordering::Release);
     }
 }

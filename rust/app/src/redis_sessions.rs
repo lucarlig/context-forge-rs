@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::http::HeaderValue;
 use redis::{
     AsyncConnectionConfig, FromRedisValue,
     aio::{MultiplexedConnection, PubSubStream},
 };
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{
+    sync::Mutex,
+    time::{Instant, interval_at, timeout},
+};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -17,6 +21,7 @@ use crate::{
 
 const SESSION_KEY_PREFIX: &str = "context-forge-rs:mcp:session:";
 pub(crate) const DEFAULT_AFFINITY_TTL: Duration = Duration::from_secs(300);
+pub(crate) const DEFAULT_LISTENER_TTL: Duration = Duration::from_secs(30);
 
 const REGISTER: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
@@ -53,12 +58,30 @@ end
 return {3, record[1]}
 "#;
 
+const CLAIM_LISTENER: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then return 2 end
+if redis.call('SET', KEYS[2], ARGV[1], 'NX', 'PX', ARGV[2]) then return 1 end
+return 0
+"#;
+
+const RENEW_LISTENER: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+return redis.call('PEXPIRE', KEYS[2], ARGV[2])
+"#;
+
+const RELEASE_LISTENER: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])
+"#;
+
 /// Records ownership of process-local MCP sessions in the shared Redis cache.
 pub struct RedisSessionDirectory {
     client: redis::Client,
     config: AsyncConnectionConfig,
     worker: String,
-    affinity_ttl: Duration,
+    affinity_ttl: Option<Duration>,
+    listener_ttl: Duration,
     connection: Mutex<Option<(Uuid, MultiplexedConnection)>>,
     socket_timeout: Duration,
 }
@@ -73,7 +96,8 @@ impl RedisSessionDirectory {
             client,
             config,
             worker: Uuid::new_v4().simple().to_string(),
-            affinity_ttl: DEFAULT_AFFINITY_TTL,
+            affinity_ttl: Some(DEFAULT_AFFINITY_TTL),
+            listener_ttl: DEFAULT_LISTENER_TTL,
             connection: Mutex::new(None),
             socket_timeout: settings
                 .connect_timeout
@@ -81,9 +105,14 @@ impl RedisSessionDirectory {
         })
     }
 
-    pub(crate) fn with_affinity_ttl(mut self, ttl: Duration) -> Self {
-        self.affinity_ttl = ttl;
+    pub(crate) fn with_leases(mut self, affinity: Option<Duration>, listener: Duration) -> Self {
+        self.affinity_ttl = affinity;
+        self.listener_ttl = listener;
         self
+    }
+
+    pub(crate) fn affinity_enabled(&self) -> bool {
+        self.affinity_ttl.is_some()
     }
 
     pub(crate) async fn register(
@@ -103,7 +132,7 @@ impl RedisSessionDirectory {
             .arg(owner.unwrap_or_default())
             .arg(server.unwrap_or_default())
             .arg(ttl_millis(ttl))
-            .arg(ttl_millis(self.affinity_ttl));
+            .arg(ttl_millis(self.affinity_ttl.unwrap_or_default()));
         match self.query::<u8>(&command).await {
             Ok(1) => Ok(()),
             Ok(_) => Err(SessionError::Unavailable),
@@ -125,8 +154,8 @@ impl RedisSessionDirectory {
             server,
             ttl,
             match access {
-                SessionAccess::Get => "touch",
-                SessionAccess::Post => "renew",
+                SessionAccess::Post if self.affinity_enabled() => "renew",
+                SessionAccess::Get | SessionAccess::Post => "touch",
                 SessionAccess::Delete => "delete",
             },
         )
@@ -164,7 +193,7 @@ impl RedisSessionDirectory {
             .arg(server.unwrap_or_default())
             .arg(ttl_millis(ttl))
             .arg(operation)
-            .arg(ttl_millis(self.affinity_ttl));
+            .arg(ttl_millis(self.affinity_ttl.unwrap_or_default()));
         let (status, worker): (u8, String) = self.query(&command).await.map_err(unavailable)?;
         match status {
             0 => Err(SessionError::NotFound),
@@ -175,6 +204,101 @@ impl RedisSessionDirectory {
             3 => Ok(()),
             _ => Err(SessionError::Unavailable),
         }
+    }
+
+    pub(crate) async fn claim_listener(
+        self: &Arc<Self>,
+        id: &HeaderValue,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<RedisListener>, SessionError> {
+        let session = session_key(id)?;
+        let key = format!("{session}:listener");
+        let token = Uuid::new_v4().simple().to_string();
+        let acquired = self
+            .query::<u8>(
+                redis::cmd("EVAL")
+                    .arg(CLAIM_LISTENER)
+                    .arg(2)
+                    .arg(&session)
+                    .arg(&key)
+                    .arg(&token)
+                    .arg(ttl_millis(self.listener_ttl)),
+            )
+            .await
+            .map_err(unavailable)?;
+        match acquired {
+            0 => return Ok(None),
+            1 => {}
+            2 => return Err(SessionError::NotFound),
+            _ => return Err(SessionError::Unavailable),
+        }
+
+        let listener = RedisListener {
+            stop: shutdown.child_token(),
+            lost: CancellationToken::new(),
+        };
+        let directory = self.clone();
+        let stop = listener.stop.clone();
+        let lost = listener.lost.clone();
+        tokio::spawn(async move {
+            directory
+                .keep_listener(session, key, token, stop, lost)
+                .await;
+        });
+        Ok(Some(listener))
+    }
+
+    async fn keep_listener(
+        &self,
+        session: String,
+        key: String,
+        token: String,
+        stop: CancellationToken,
+        lost: CancellationToken,
+    ) {
+        let period = (self.listener_ttl / 3).max(Duration::from_secs(1));
+        let mut interval = interval_at(Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut failures = 0;
+        let mut renew = redis::cmd("EVAL");
+        renew
+            .arg(RENEW_LISTENER)
+            .arg(2)
+            .arg(session)
+            .arg(&key)
+            .arg(&token)
+            .arg(ttl_millis(self.listener_ttl));
+        loop {
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+            let result = tokio::select! {
+                biased;
+                () = stop.cancelled() => break,
+                result = self.query::<u8>(&renew) => result,
+            };
+            match result {
+                Ok(1) => failures = 0,
+                _ => {
+                    failures += 1;
+                    if failures == 2 {
+                        lost.cancel();
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = self
+            .query::<u8>(
+                redis::cmd("EVAL")
+                    .arg(RELEASE_LISTENER)
+                    .arg(1)
+                    .arg(key)
+                    .arg(token),
+            )
+            .await;
     }
 
     pub(crate) fn worker_id(&self) -> &str {
@@ -227,6 +351,23 @@ impl RedisSessionDirectory {
             }
         }
         result
+    }
+}
+
+pub(crate) struct RedisListener {
+    stop: CancellationToken,
+    lost: CancellationToken,
+}
+
+impl RedisListener {
+    pub(crate) async fn wait_until_lost(&self) {
+        self.lost.cancelled().await;
+    }
+}
+
+impl Drop for RedisListener {
+    fn drop(&mut self) {
+        self.stop.cancel();
     }
 }
 
@@ -343,5 +484,75 @@ mod tests {
                 .await,
             Err(SessionError::NotFound),
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable Redis or Valkey database in REDIS_URL"]
+    async fn listener_renews_and_releases_only_its_own_claim() {
+        let settings = RedisSettings {
+            url: std::env::var("REDIS_URL").unwrap(),
+            connect_timeout: Duration::from_secs(2),
+            response_timeout: Duration::from_secs(2),
+        };
+        let first = Arc::new(
+            RedisSessionDirectory::new(&settings)
+                .unwrap()
+                .with_leases(None, Duration::from_secs(3)),
+        );
+        let second = Arc::new(RedisSessionDirectory::new(&settings).unwrap());
+        let id = HeaderValue::from_str(&Uuid::new_v4().simple().to_string()).unwrap();
+        let shutdown = CancellationToken::new();
+        let ttl = Duration::from_secs(30);
+        first.register(&id, None, None, ttl).await.unwrap();
+        let listener = first.claim_listener(&id, &shutdown).await.unwrap().unwrap();
+        assert!(
+            second
+                .claim_listener(&id, &shutdown)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let key = format!("{}:listener", session_key(&id).unwrap());
+        tokio::time::sleep(Duration::from_millis(3300)).await;
+        let remaining: i64 = first.query(redis::cmd("PTTL").arg(&key)).await.unwrap();
+        assert!((1..=3000).contains(&remaining));
+
+        second
+            .query::<()>(
+                redis::cmd("SET")
+                    .arg(&key)
+                    .arg("replacement")
+                    .arg("PX")
+                    .arg(10_000),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(4), listener.wait_until_lost())
+            .await
+            .unwrap();
+        drop(listener);
+        let current: String = second.query(redis::cmd("GET").arg(&key)).await.unwrap();
+        assert_eq!(current, "replacement");
+        second
+            .query::<u8>(redis::cmd("DEL").arg(&key))
+            .await
+            .unwrap();
+        let listener = first.claim_listener(&id, &shutdown).await.unwrap().unwrap();
+        drop(listener);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let exists: bool = first.query(redis::cmd("EXISTS").arg(&key)).await.unwrap();
+                if !exists {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("listener lease should be removed on disconnect");
+        first
+            .access(&id, None, None, ttl, SessionAccess::Delete)
+            .await
+            .unwrap();
     }
 }
