@@ -22,7 +22,7 @@ use context_forge_rs::{
     database::Database,
     gateway::{CatalogRefresh, GatewayService, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::{HttpOptions, ProtocolMode, SessionSettings},
+    mcp::{HttpOptions, ListenSettings, ProtocolMode, SessionSettings},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 use jiff::Timestamp;
@@ -35,6 +35,116 @@ const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
+
+#[tokio::test]
+async fn modern_catalog_subscription_streams_registration_and_tears_down() {
+    const METHOD: &str = "subscriptions/listen";
+    const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let upstream = Running::start(Router::new().route("/mcp", post(catalog_fixture))).await;
+    let database = database().await;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let service = Arc::new(
+        GatewayService::new(
+            database.clone(),
+            authorizer(database),
+            UpstreamClient::new(
+                EgressPolicy {
+                    allow_localhost: true,
+                    ..EgressPolicy::default()
+                },
+                Duration::from_secs(5),
+            )
+            .with_connect_mode(ConnectMode::Legacy),
+            Pagination::new(100, 900, None),
+            CatalogRefresh::default(),
+        )
+        .with_listen_settings(ListenSettings {
+            max_anonymous: 1,
+            shutdown: shutdown.clone(),
+            ..ListenSettings::default()
+        }),
+    );
+    let gateway = Running::start(
+        service
+            .registration_router()
+            .merge(service.mcp_router(false, ProtocolMode::Auto)),
+    )
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let listen = |accept: &str| {
+        client.post(gateway.url("/mcp/"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, accept)
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", METHOD)
+            .body(modern_request(METHOD, 31, json!({"notifications":{
+                "toolsListChanged":true,"resourcesListChanged":true,"promptsListChanged":true,
+                "resourceSubscriptions":["fixture://absent"],"unknownNotification":true
+            }})).to_string())
+    };
+    assert_eq!(
+        listen("application/json").send().await.unwrap().status(),
+        StatusCode::NOT_ACCEPTABLE
+    );
+    let mut stream = listen("application/json, text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert_eq!(stream.headers()[header::CONTENT_TYPE], "text/event-stream");
+    let mut buffered = Vec::new();
+    let (_, ack) = next_sse_message(&mut stream, &mut buffered).await;
+    assert_eq!(ack["method"], "notifications/subscriptions/acknowledged");
+    assert_eq!(ack["params"]["_meta"][SUBSCRIPTION_ID], 31);
+    assert_eq!(
+        ack["params"]["notifications"],
+        json!({
+            "toolsListChanged":true,"resourcesListChanged":true,"promptsListChanged":true
+        })
+    );
+
+    let limited = listen("application/json, text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::OK);
+    let reply: Value = serde_json::from_slice(&limited.bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        reply["error"],
+        json!({"code":-32603,"message":"Subscription limit reached"})
+    );
+
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registration) = send(&client, gateway.url("/gateways"), json!({
+        "name":"catalog","url":upstream.url("/mcp"),"visibility":"public","transport":"STREAMABLEHTTP"
+    }), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{registration}");
+    for method in [
+        "notifications/prompts/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/tools/list_changed",
+    ] {
+        let (_, change) = next_sse_message(&mut stream, &mut buffered).await;
+        assert_eq!(change["method"], method);
+        assert_eq!(change["params"]["_meta"][SUBSCRIPTION_ID], 31);
+    }
+
+    shutdown.cancel();
+    let (_, cancelled) = next_sse_message(&mut stream, &mut buffered).await;
+    assert_eq!(cancelled["method"], "notifications/cancelled");
+    assert_eq!(cancelled["params"]["requestId"], 31);
+    assert_eq!(cancelled["params"]["_meta"][SUBSCRIPTION_ID], 31);
+    let (_, completed) = next_sse_message(&mut stream, &mut buffered).await;
+    assert_eq!(completed["id"], 31);
+    assert_eq!(completed["result"]["resultType"], "complete");
+    assert_eq!(completed["result"]["_meta"][SUBSCRIPTION_ID], 31);
+    assert!(stream.chunk().await.unwrap().is_none());
+}
 
 #[tokio::test]
 async fn legacy_logging_changes_the_process_filter_with_scoped_permission() {

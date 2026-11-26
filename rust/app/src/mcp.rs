@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 pub use crate::redis_sessions::RedisSessionDirectory;
+pub use crate::subscriptions::ListenSettings;
 
 use crate::{
     access::{self, Principal},

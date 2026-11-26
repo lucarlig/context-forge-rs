@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         verifier,
         Settings::invalidate_sessions_on_password_change()?,
     ));
+    let shutdown = CancellationToken::new();
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
@@ -45,9 +46,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Settings::mcp_pagination()?,
             Settings::catalog_refresh()?,
         )
-        .with_logging_filter(handle),
+        .with_logging_filter(handle)
+        .with_listen_settings(Settings::mcp_listen_settings(shutdown.clone())?),
     );
-    let shutdown = CancellationToken::new();
     let mut http_options = settings.mcp_http_options()?;
     if let Some(settings) = &mut http_options.sessions {
         settings.shutdown = shutdown.clone();

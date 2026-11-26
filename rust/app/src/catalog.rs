@@ -24,7 +24,12 @@ impl CatalogScope<'_> {
         self.email.is_some() && self.visibility != &TeamVisibility::Public
     }
 
-    fn visible(&self, visibility: &str, team_id: Option<&str>, owner_email: Option<&str>) -> bool {
+    pub(crate) fn visible(
+        &self,
+        visibility: &str,
+        team_id: Option<&str>,
+        owner_email: Option<&str>,
+    ) -> bool {
         match visibility {
             "public" => true,
             "team" => match self.visibility {

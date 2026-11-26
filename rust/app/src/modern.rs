@@ -29,9 +29,10 @@ use rmcp::{
         InitializeResult, InputRequest, InputRequiredResult, JsonRpcError, ListPromptsResult,
         ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, MetaObject,
         PaginatedRequestParams, ProgressNotification, ProgressNotificationParam, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResponse, ResultType, ServerConfig, Tool,
+        ReadResourceRequestParams, ReadResourceResponse, ResultType, ServerConfig,
+        SubscriptionFilter, Tool,
     },
-    service::RequestContext,
+    service::{RequestContext, SubscriptionContext},
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
     },
@@ -48,6 +49,7 @@ use crate::{
         accepts_post_stream, catalog_capabilities, rpc_error,
     },
     modern_validation::reject_invalid_request,
+    subscriptions::AcceptedSubscription,
     upstream::{ToolContext, ToolProgress},
 };
 
@@ -96,7 +98,7 @@ impl Modern {
             .with_max_request_body_bytes(MAX_REQUEST_BODY_BYTES)
             .disable_allowed_hosts();
         Self {
-            transport: transport(gateway.clone(), None, config),
+            transport: transport(gateway.clone(), None, None, config),
             gateway,
             json_response,
         }
@@ -156,6 +158,38 @@ impl Modern {
         if let Some(response) = reject_invalid_request(&parts.headers, &body) {
             return response;
         }
+        if body["method"] == "subscriptions/listen"
+            && let Ok(ClientJsonRpcMessage::Request(message)) =
+                ClientJsonRpcMessage::deserialize(&body)
+            && let ClientRequest::SubscriptionsListenRequest(listen) = message.request
+        {
+            if parts.extensions.get::<AcceptsProgress>().is_none() {
+                return StatusCode::NOT_ACCEPTABLE.into_response();
+            }
+            let subscription = match self.gateway.subscriptions.prepare(
+                listen.params.notifications,
+                parts.extensions.get::<Principal>(),
+                parts.extensions.get::<CatalogServer>().is_some(),
+            ) {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    return rpc_error(
+                        StatusCode::OK,
+                        &body["id"],
+                        error.code.0,
+                        &error.message,
+                        error.data,
+                    );
+                }
+            };
+            let transport = transport(
+                self.gateway.clone(),
+                None,
+                Some(subscription),
+                self.transport.config.clone(),
+            );
+            return handle(&transport, Request::from_parts(parts, Body::from(bytes))).await;
+        }
         if matches!(
             body["method"].as_str(),
             Some("resources/read" | "prompts/get" | "completion/complete")
@@ -181,6 +215,7 @@ impl Modern {
         let transport = transport(
             self.gateway.clone(),
             Some(tool),
+            None,
             self.transport.config.clone(),
         );
         handle(&transport, request).await
@@ -265,6 +300,7 @@ async fn handle(transport: &Transport, request: Request) -> Response {
 fn transport(
     gateway: Arc<GatewayService>,
     scoped_tool: Option<Tool>,
+    subscription: Option<AcceptedSubscription>,
     config: StreamableHttpServerConfig,
 ) -> Transport {
     StreamableHttpService::new(
@@ -272,6 +308,7 @@ fn transport(
             Ok(GatewayHandler {
                 gateway: gateway.clone(),
                 scoped_tool: scoped_tool.clone(),
+                subscription: subscription.clone(),
             })
         },
         Arc::new(NeverSessionManager::default()),
@@ -282,6 +319,7 @@ fn transport(
 struct GatewayHandler {
     gateway: Arc<GatewayService>,
     scoped_tool: Option<Tool>,
+    subscription: Option<AcceptedSubscription>,
 }
 
 impl GatewayHandler {
@@ -318,9 +356,35 @@ impl GatewayHandler {
 
 impl ServerHandler for GatewayHandler {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(catalog_capabilities())
+        let mut capabilities = catalog_capabilities();
+        if let Some(tools) = &mut capabilities.tools {
+            tools.list_changed = Some(true);
+        }
+        if let Some(prompts) = &mut capabilities.prompts {
+            prompts.list_changed = Some(true);
+        }
+        if let Some(resources) = &mut capabilities.resources {
+            resources.list_changed = Some(true);
+        }
+        ServerConfig::new(capabilities)
             .with_server_info(implementation())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        self.subscription
+            .as_ref()
+            .map(|subscription| subscription.filter.clone())
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let Some(subscription) = &self.subscription else {
+            return Err(method_not_found("subscriptions/listen"));
+        };
+        subscription.listen(context).await
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -824,7 +888,7 @@ mod tests {
         assert_eq!(result["supportedVersions"], json!(["2026-07-28"]));
         assert_eq!(result["cacheScope"], "private");
         assert_eq!(result["ttlMs"], 300_000);
-        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
 
         let mut req = request("tools/list", json!({"_meta":metadata()}));
         req.headers_mut()

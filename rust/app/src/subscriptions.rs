@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use jiff::Timestamp;
+use rmcp::{
+    model::{
+        CancelledNotification, CancelledNotificationParam, ErrorData, NotificationMetaObject,
+        SubscriptionFilter,
+    },
+    service::{SubscriptionContext, SubscriptionSendError},
+};
+use tokio::{
+    sync::broadcast,
+    time::{Instant, sleep_until, timeout},
+};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    access::{self, Principal},
+    catalog::GatewayRegistration,
+};
+
+pub struct ListenSettings {
+    pub max_lifetime: Duration,
+    pub max_per_principal: usize,
+    pub max_anonymous: usize,
+    pub shutdown: CancellationToken,
+}
+
+impl Default for ListenSettings {
+    fn default() -> Self {
+        Self {
+            max_lifetime: Duration::from_secs(3600),
+            max_per_principal: 32,
+            max_anonymous: 256,
+            shutdown: CancellationToken::new(),
+        }
+    }
+}
+
+pub(crate) struct CatalogSubscriptions {
+    settings: ListenSettings,
+    active: Arc<Mutex<HashMap<Option<String>, usize>>>,
+    registrations: broadcast::Sender<RegistrationChange>,
+}
+
+#[derive(Clone)]
+struct RegistrationChange {
+    visibility: String,
+    team_id: Option<String>,
+    owner: String,
+}
+
+impl CatalogSubscriptions {
+    pub(crate) fn new(settings: ListenSettings) -> Self {
+        Self {
+            settings,
+            active: Arc::default(),
+            registrations: broadcast::channel(256).0,
+        }
+    }
+
+    pub(crate) fn registered(&self, registration: &GatewayRegistration<'_>) {
+        let _ = self.registrations.send(RegistrationChange {
+            visibility: registration.visibility.to_owned(),
+            team_id: registration.team_id.map(str::to_owned),
+            owner: registration.owner_email.to_owned(),
+        });
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        requested: SubscriptionFilter,
+        principal: Option<&Principal>,
+        server_scoped: bool,
+    ) -> Result<AcceptedSubscription, ErrorData> {
+        let allowed =
+            |permission| principal.is_none_or(|principal| principal.token_allows(permission));
+        let mut filter = SubscriptionFilter::new();
+        filter.tools_list_changed =
+            (requested.tools_list_changed == Some(true) && allowed("tools.read")).then_some(true);
+        filter.prompts_list_changed = (requested.prompts_list_changed == Some(true)
+            && allowed("prompts.read"))
+        .then_some(true);
+        filter.resources_list_changed = (requested.resources_list_changed == Some(true)
+            && allowed("resources.read"))
+        .then_some(true);
+        let any_requested = wants_list_changes(&requested)
+            || requested
+                .resource_subscriptions
+                .as_ref()
+                .is_some_and(|uris| !uris.is_empty());
+        let permitted_resources = requested
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| !uris.is_empty())
+            && allowed("resources.read");
+        if any_requested && !wants_list_changes(&filter) && !permitted_resources {
+            return Err(ErrorData::internal_error("Internal server error", None));
+        }
+
+        let key = principal.map(|principal| principal.email.clone());
+        let limit = if key.is_some() {
+            self.settings.max_per_principal
+        } else {
+            self.settings.max_anonymous
+        };
+        {
+            let mut active = self.active.lock().expect("subscription slots");
+            if active.get(&key).copied().unwrap_or_default() >= limit {
+                return Err(ErrorData::internal_error(
+                    "Subscription limit reached",
+                    None,
+                ));
+            }
+            *active.entry(key.clone()).or_default() += 1;
+        }
+        let lifetime = principal
+            .and_then(|principal| principal.expires_at)
+            .map_or(self.settings.max_lifetime, |expiry| {
+                let remaining = expiry
+                    .saturating_mul(1000)
+                    .saturating_sub(Timestamp::now().as_millisecond());
+                self.settings
+                    .max_lifetime
+                    .min(Duration::from_millis(remaining.max(0) as u64))
+            })
+            .max(Duration::from_secs(5));
+        Ok(AcceptedSubscription {
+            filter,
+            stream: Arc::new(Mutex::new(Some(SubscriptionStream {
+                _slot: Slot {
+                    key,
+                    active: self.active.clone(),
+                },
+                registrations: self.registrations.subscribe(),
+                principal: principal.cloned(),
+                server_scoped,
+                expires: Instant::now() + lifetime,
+                shutdown: self.settings.shutdown.clone(),
+            }))),
+        })
+    }
+}
+
+fn wants_list_changes(filter: &SubscriptionFilter) -> bool {
+    [
+        filter.tools_list_changed,
+        filter.prompts_list_changed,
+        filter.resources_list_changed,
+    ]
+    .contains(&Some(true))
+}
+
+struct Slot {
+    key: Option<String>,
+    active: Arc<Mutex<HashMap<Option<String>, usize>>>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut active = self.active.lock().expect("subscription slots");
+        if let Some(count) = active.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.key);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AcceptedSubscription {
+    pub(crate) filter: SubscriptionFilter,
+    stream: Arc<Mutex<Option<SubscriptionStream>>>,
+}
+
+impl AcceptedSubscription {
+    pub(crate) async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let stream = self
+            .stream
+            .lock()
+            .expect("subscription stream")
+            .take()
+            .ok_or_else(|| ErrorData::internal_error("Subscription already consumed", None))?;
+        stream.run(context).await;
+        Ok(())
+    }
+}
+
+struct SubscriptionStream {
+    _slot: Slot,
+    registrations: broadcast::Receiver<RegistrationChange>,
+    principal: Option<Principal>,
+    server_scoped: bool,
+    expires: Instant,
+    shutdown: CancellationToken,
+}
+
+impl SubscriptionStream {
+    async fn run(mut self, context: SubscriptionContext) {
+        let shutdown = self.shutdown.clone();
+        let receives_catalog_changes =
+            !self.server_scoped && wants_list_changes(context.accepted());
+        tokio::select! {
+            biased;
+            () = context.cancelled() => return,
+            () = sleep_until(self.expires) => {},
+            () = shutdown.cancelled() => {},
+            _ = self.publish_changes(&context), if receives_catalog_changes => return,
+        }
+        let request = context.request_context();
+        let mut meta = NotificationMetaObject::new();
+        meta.set_subscription_id(request.id.clone());
+        let mut params = CancelledNotificationParam::new(
+            Some(request.id.clone()),
+            Some("Subscription closed by server".into()),
+        );
+        params.meta = Some(meta);
+        let _ = timeout(
+            Duration::from_secs(5),
+            request
+                .peer
+                .send_notification(CancelledNotification::new(params).into()),
+        )
+        .await;
+    }
+
+    async fn publish_changes(
+        &mut self,
+        context: &SubscriptionContext,
+    ) -> Result<(), SubscriptionSendError> {
+        let scope = access::catalog_scope(self.principal.as_ref());
+        let filter = context.accepted();
+        let sink = context.sink();
+        loop {
+            let change = match self.registrations.recv().await {
+                Ok(change) => change,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            };
+            if !scope.visible(
+                &change.visibility,
+                change.team_id.as_deref(),
+                Some(&change.owner),
+            ) {
+                continue;
+            }
+            if filter.prompts_list_changed == Some(true) {
+                sink.notify_prompt_list_changed().await?;
+            }
+            if filter.resources_list_changed == Some(true) {
+                sink.notify_resource_list_changed().await?;
+            }
+            if filter.tools_list_changed == Some(true) {
+                sink.notify_tool_list_changed().await?;
+            }
+        }
+    }
+}

@@ -33,6 +33,7 @@ use crate::{
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings},
     sessions::Session,
+    subscriptions::{CatalogSubscriptions, ListenSettings},
     upstream::{ToolContext, UpstreamClient, UpstreamError},
 };
 
@@ -43,6 +44,7 @@ pub struct GatewayService {
     pagination: Pagination,
     refresh: CatalogRefresh,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
+    pub(crate) subscriptions: CatalogSubscriptions,
 }
 
 pub struct CatalogRefresh {
@@ -104,11 +106,17 @@ impl GatewayService {
             pagination,
             refresh,
             logging_filter: None,
+            subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
         }
     }
 
     pub fn with_logging_filter(mut self, filter: reload::Handle<LevelFilter, Registry>) -> Self {
         self.logging_filter = Some(filter);
+        self
+    }
+
+    pub fn with_listen_settings(mut self, settings: ListenSettings) -> Self {
+        self.subscriptions = CatalogSubscriptions::new(settings);
         self
     }
 
@@ -624,6 +632,7 @@ async fn register(
         .database
         .register_discovered_gateway(&registration, &registered_tools, &metadata)
         .await?;
+    service.subscriptions.registered(&registration);
     let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
     let agent = headers
         .get(header::USER_AGENT)

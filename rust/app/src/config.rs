@@ -2,10 +2,15 @@
 
 use std::{collections::HashSet, env, error::Error, str::FromStr, time::Duration};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     gateway::{CatalogRefresh, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::{HttpOptions, IngressPolicy, ProtocolMode, RedisSessionDirectory, SessionSettings},
+    mcp::{
+        HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
+        SessionSettings,
+    },
     redis_sessions::{DEFAULT_AFFINITY_TTL, DEFAULT_LISTENER_TTL},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
@@ -137,6 +142,36 @@ impl Settings {
         Ok(HttpOptions {
             json_response: flag("JSON_RESPONSE_ENABLED")?.unwrap_or(true),
             sessions: self.mcp_sessions()?,
+        })
+    }
+
+    pub fn mcp_listen_settings(
+        shutdown: CancellationToken,
+    ) -> Result<ListenSettings, Box<dyn Error + Send + Sync>> {
+        let defaults = ListenSettings::default();
+        let lifetime = parse(
+            "MCP_LISTEN_MAX_LIFETIME_SECONDS",
+            defaults.max_lifetime.as_secs(),
+        )?;
+        let max_per_principal = parse(
+            "MCP_LISTEN_MAX_STREAMS_PER_PRINCIPAL",
+            defaults.max_per_principal,
+        )?;
+        let max_anonymous = parse("MCP_LISTEN_MAX_ANONYMOUS_STREAMS", defaults.max_anonymous)?;
+        if !(60..=86400).contains(&lifetime) {
+            return Err("invalid MCP_LISTEN_MAX_LIFETIME_SECONDS".into());
+        }
+        if !(1..=1024).contains(&max_per_principal) {
+            return Err("invalid MCP_LISTEN_MAX_STREAMS_PER_PRINCIPAL".into());
+        }
+        if max_anonymous > 1024 {
+            return Err("invalid MCP_LISTEN_MAX_ANONYMOUS_STREAMS".into());
+        }
+        Ok(ListenSettings {
+            max_lifetime: Duration::from_secs(lifetime),
+            max_per_principal,
+            max_anonymous,
+            shutdown,
         })
     }
 

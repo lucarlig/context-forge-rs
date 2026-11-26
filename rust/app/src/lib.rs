@@ -17,4 +17,5 @@ pub mod probes;
 mod redis_events;
 mod redis_sessions;
 mod sessions;
+mod subscriptions;
 pub mod upstream;

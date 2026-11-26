@@ -7,6 +7,7 @@ use axum::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rmcp::model::{
     ClientCapabilities, CompleteRequestParams, GetPromptRequestParams, Implementation,
+    SubscriptionsListenRequestParams,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -76,6 +77,7 @@ pub(crate) fn reject_invalid_request(headers: &HeaderMap, body: &Value) -> Optio
     let method_parameters_valid = match method {
         "completion/complete" => CompleteRequestParams::deserialize(params).is_ok(),
         "prompts/get" => GetPromptRequestParams::deserialize(params).is_ok(),
+        "subscriptions/listen" => SubscriptionsListenRequestParams::deserialize(params).is_ok(),
         _ => true,
     };
     if !method_parameters_valid
