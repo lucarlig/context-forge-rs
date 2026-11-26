@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod environment;
 mod http;
 mod remote;
 mod stdio;
 
-use std::{error::Error, time::Duration};
+use std::{error::Error, sync::Arc, time::Duration};
 
 use clap::{ArgGroup, Parser};
 use context_forge_rs::config::Settings;
@@ -50,6 +51,10 @@ struct Arguments {
     _stateless: bool,
     #[arg(long = "jsonResponse")]
     _json_response: bool,
+    #[arg(long)]
+    enable_dynamic_env: bool,
+    #[arg(long, value_name = "HEADER=ENV_VAR")]
+    header_to_env: Vec<String>,
 }
 
 #[tokio::main]
@@ -90,6 +95,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if let (Some(_), Some(seconds)) = (settings.keepalive, args.keepalive) {
         settings.keepalive = (seconds > 0).then(|| Duration::from_secs(seconds));
     }
+    let command = args.stdio.as_deref().expect("stdio source selected");
+    let environment = (args.enable_dynamic_env && !args.header_to_env.is_empty())
+        .then(|| environment::DynamicEnvironment::parse(command.to_owned(), &args.header_to_env))
+        .transpose()?
+        .map(Arc::new);
+    let empty = environment::EnvironmentValues::new();
     let routes = http::Expose {
         sse: args.expose_sse || !args.expose_streamable_http,
         streamable_http: args.expose_streamable_http,
@@ -97,10 +108,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         message_path: args.message_path,
         cors: args.cors,
         settings,
+        environment: environment.clone(),
     };
     let listener = TcpListener::bind((args.host.as_str(), args.port)).await?;
-    let command = args.stdio.as_deref().expect("stdio source selected");
-    let (process, bridge) = stdio::StdioProcess::start(command, &shutdown)?;
+    let (process, bridge) = stdio::StdioProcess::start(
+        command,
+        &shutdown,
+        environment
+            .as_deref()
+            .map(|environment| (environment, &empty)),
+    )?;
     let app = routes.router(bridge)?;
     tracing::info!(address = %listener.local_addr()?, "stdio translation server listening");
     let stopped = shutdown.clone();

@@ -110,21 +110,7 @@ async fn translator_correlates_stdio_replies_across_http_and_sse_clients() {
         .build()
         .unwrap();
     let root = format!("http://{address}");
-    timeout(Duration::from_secs(3), async {
-        loop {
-            if client
-                .get(format!("{root}/healthz"))
-                .send()
-                .await
-                .is_ok_and(|reply| reply.status().is_success())
-            {
-                break;
-            }
-            sleep(Duration::from_millis(15)).await;
-        }
-    })
-    .await
-    .expect("translator starts");
+    wait_for_translator(&client, &root).await;
 
     let call = |method: &str| json!({"jsonrpc":"2.0","id":"shared-id","method":method});
     let post = |url: &str, method: &str| {
@@ -168,6 +154,118 @@ async fn translator_correlates_stdio_replies_across_http_and_sse_clients() {
         );
     }
     translator.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn translator_isolates_dynamic_environment_across_sse_clients() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    drop(socket);
+    let child = r#"awk 'match($0, /"id":[0-9]+/) {
+        id = substr($0, RSTART + 5, RLENGTH - 5);
+        value = ("FIXTURE_HEADER" in ENVIRON) ? ENVIRON["FIXTURE_HEADER"] : "unset";
+        printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"value\":\"%s\"}}\n", id, value);
+        fflush();
+    }'"#;
+    let mut translator = Command::new(env!("CARGO_BIN_EXE_context-forge-translate"))
+        .args([
+            "--stdio",
+            child,
+            "--expose-sse",
+            "--expose-streamable-http",
+            "--keepAlive",
+            "0",
+            "--port",
+            &address.port().to_string(),
+            "--enable-dynamic-env",
+            "--header-to-env",
+            "X-Fixture=FIXTURE_HEADER",
+        ])
+        .env("FIXTURE_HEADER", "ambient")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let root = format!("http://{address}");
+    wait_for_translator(&client, &root).await;
+    let feed = format!("{root}/sse");
+    let mut first = client
+        .get(&feed)
+        .header("x-fixture", "first")
+        .send()
+        .await
+        .unwrap();
+    let mut second = client
+        .get(&feed)
+        .header("x-fixture", "second")
+        .send()
+        .await
+        .unwrap();
+    let mut first_buffer = Vec::new();
+    let mut second_buffer = Vec::new();
+    let first_url = next_data(&mut first, &mut first_buffer).await;
+    let second_url = next_data(&mut second, &mut second_buffer).await;
+
+    let send = |url: &str| {
+        client
+            .post(url)
+            .body(json!({"jsonrpc":"2.0","id":1,"method":"ping"}).to_string())
+    };
+    let (a, b) = tokio::join!(send(&first_url).send(), send(&second_url).send());
+    for reply in [a.unwrap(), b.unwrap()] {
+        assert_eq!(reply.status(), StatusCode::ACCEPTED);
+    }
+    let first_value: Value =
+        serde_json::from_str(&next_data(&mut first, &mut first_buffer).await).unwrap();
+    let second_value: Value =
+        serde_json::from_str(&next_data(&mut second, &mut second_buffer).await).unwrap();
+    assert_eq!(first_value["result"]["value"], "first");
+    assert_eq!(second_value["result"]["value"], "second");
+
+    let (a, b) = tokio::join!(
+        send(&first_url).header("x-fixture", "changed").send(),
+        send(&second_url).send(),
+    );
+    for reply in [a.unwrap(), b.unwrap()] {
+        assert_eq!(reply.status(), StatusCode::ACCEPTED);
+    }
+    let first_value: Value =
+        serde_json::from_str(&next_data(&mut first, &mut first_buffer).await).unwrap();
+    let second_value: Value =
+        serde_json::from_str(&next_data(&mut second, &mut second_buffer).await).unwrap();
+    assert_eq!(first_value["result"]["value"], "changed");
+    assert_eq!(second_value["result"]["value"], "second");
+
+    let reply = send(&format!("{root}/mcp")).send().await.unwrap();
+    let reply: Value = serde_json::from_slice(&reply.bytes().await.unwrap()).unwrap();
+    assert_eq!(reply["result"]["value"], "unset");
+    translator.kill().await.unwrap();
+}
+
+async fn wait_for_translator(client: &Client, root: &str) {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if client
+                .get(format!("{root}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|reply| reply.status().is_success())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("translator starts");
 }
 
 async fn next_data(reply: &mut Response, buffer: &mut Vec<u8>) -> String {

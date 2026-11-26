@@ -20,4 +20,4 @@ The pinned translator's exposed `POST /mcp` waits for a correlated JSON response
 
 Both translators also passed four live remote connection cases. Each of `--connect-sse` and `--connect-streamable-http` printed an incoming notification to stdout and, with `--stdioCommand`, sent the child's request upstream and delivered the reply to its stdin. The fixture required a bearer token, which both translators forwarded with `--oauth2Bearer`. The Rust test also verifies that the remote Streamable HTTP bridge uses the session ID and protocol version negotiated by the child process.
 
-Dynamic header-to-environment mapping remains open.
+With `--enable-dynamic-env --header-to-env X-Fixture=FIXTURE_HEADER`, the translator maps the configured header into the SSE session's child environment. A mapped POST header can replace that session's child with one using the new value. Both translators returned the same values in four live cases covering absent headers, inherited values, and replacement. The Rust integration test also opens two SSE sessions at once, changes the value for one, and verifies that the other session and Streamable HTTP remain isolated.

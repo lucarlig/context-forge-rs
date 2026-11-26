@@ -19,13 +19,17 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::environment::{DynamicEnvironment, EnvironmentValues};
+
 pub(super) const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING: usize = 128;
 type PendingReplies = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+type Environment<'a> = Option<(&'a DynamicEnvironment, &'a EnvironmentValues)>;
 
 pub(super) struct StdioProcess {
     child: Child,
     tasks: [JoinHandle<()>; 2],
+    stop: CancellationToken,
 }
 
 pub(super) struct StdioBridge {
@@ -40,8 +44,9 @@ impl StdioProcess {
     pub(super) fn start(
         command: &str,
         shutdown: &CancellationToken,
+        environment: Environment<'_>,
     ) -> io::Result<(Self, Arc<StdioBridge>)> {
-        let (child, mut stdin, stdout) = spawn(command)?;
+        let (child, mut stdin, stdout) = spawn(command, environment)?;
         let (input, mut messages) = mpsc::channel::<Vec<u8>>(16);
         let bridge = Arc::new(StdioBridge {
             input,
@@ -105,12 +110,14 @@ impl StdioProcess {
             Self {
                 child,
                 tasks: [writer, reader],
+                stop: bridge.stop.clone(),
             },
             bridge,
         ))
     }
 
     pub(super) async fn stop(mut self) {
+        self.stop.cancel();
         let _ = self.child.kill().await;
         for task in self.tasks {
             let _ = task.await;
@@ -118,18 +125,25 @@ impl StdioProcess {
     }
 }
 
-pub(super) fn spawn(command: &str) -> io::Result<(Child, ChildStdin, ChildStdout)> {
+pub(super) fn spawn(
+    command: &str,
+    environment: Environment<'_>,
+) -> io::Result<(Child, ChildStdin, ChildStdout)> {
     let arguments = shell_words::split(command).map_err(io::Error::other)?;
     let (program, arguments) = arguments
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stdio command is empty"))?;
-    let mut child = Command::new(program)
+    let mut child_command = Command::new(program);
+    child_command
         .args(arguments)
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    if let Some((environment, values)) = environment {
+        environment.apply(&mut child_command, values);
+    }
+    let mut child = child_command.spawn()?;
     let stdin = child.stdin.take().expect("piped child stdin");
     let stdout = child.stdout.take().expect("piped child stdout");
     Ok((child, stdin, stdout))

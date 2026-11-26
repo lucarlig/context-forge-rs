@@ -21,14 +21,17 @@ use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
-use super::stdio::{MAX_MESSAGE_BYTES, StdioBridge};
+use super::{
+    environment::{DynamicEnvironment, EnvironmentRequest},
+    stdio::{MAX_MESSAGE_BYTES, StdioBridge},
+};
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 1024;
@@ -40,6 +43,7 @@ pub(super) struct Expose {
     pub(super) message_path: String,
     pub(super) cors: Vec<String>,
     pub(super) settings: SseSettings,
+    pub(super) environment: Option<Arc<DynamicEnvironment>>,
 }
 
 impl Expose {
@@ -97,6 +101,7 @@ impl Expose {
                 sessions: Mutex::default(),
                 message_path: self.message_path,
                 settings: self.settings,
+                environment: self.environment,
             })))
     }
 }
@@ -106,12 +111,14 @@ struct StateData {
     sessions: Mutex<HashMap<Uuid, Connection>>,
     message_path: String,
     settings: SseSettings,
+    environment: Option<Arc<DynamicEnvironment>>,
 }
 
 #[derive(Clone)]
 struct Connection {
     send: mpsc::Sender<Value>,
     close: CancellationToken,
+    scoped: Option<mpsc::Sender<EnvironmentRequest>>,
 }
 
 #[derive(Deserialize)]
@@ -151,19 +158,32 @@ async fn sse_open(State(state): State<Arc<StateData>>, request: Request) -> Resp
     let id = Uuid::new_v4();
     let (send, receive) = mpsc::channel(64);
     let close = state.settings.shutdown.child_token();
-    {
+    let active = {
         let mut sessions = state.sessions.lock().expect("stdio SSE sessions");
         if sessions.len() >= MAX_CONNECTIONS {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+        let (scoped, active) = match &state.environment {
+            Some(environment) => match environment.start_session(
+                environment.values(request.headers()),
+                close.clone(),
+                send.clone(),
+            ) {
+                Ok(connection) => (Some(connection.incoming), Some(connection.active)),
+                Err(error) => return bridge_error(error),
+            },
+            None => (None, None),
+        };
         sessions.insert(
             id,
             Connection {
                 send,
                 close: close.clone(),
+                scoped,
             },
         );
-    }
+        active
+    };
     let keepalive = state.settings.keepalive;
     let retry = keepalive.unwrap_or(Duration::from_secs(30));
     let mut initial = vec![Ok::<_, Infallible>(
@@ -182,7 +202,10 @@ async fn sse_open(State(state): State<Arc<StateData>>, request: Request) -> Resp
             .data("{}")
             .retry(retry)));
     }
-    let events = state.bridge.events.subscribe();
+    let events = match &active {
+        Some(active) => active.borrow().events.subscribe(),
+        None => state.bridge.events.subscribe(),
+    };
     let stream = stream::unfold(
         StreamState {
             state,
@@ -190,6 +213,7 @@ async fn sse_open(State(state): State<Arc<StateData>>, request: Request) -> Resp
             close,
             receive,
             events,
+            active,
             keepalive,
         },
         |mut stream| async move {
@@ -213,6 +237,11 @@ async fn sse_post(
     Query(query): Query<MessageQuery>,
     request: Request,
 ) -> Response {
+    let values = state
+        .environment
+        .as_ref()
+        .map(|environment| environment.values(request.headers()))
+        .unwrap_or_default();
     let message = match read_message(request).await {
         Ok(message) => message,
         Err(error) => return *error,
@@ -233,6 +262,23 @@ async fn sse_post(
     } else {
         None
     };
+    if let Some(scoped) = connection
+        .as_ref()
+        .and_then(|connection| connection.scoped.as_ref())
+    {
+        return match scoped.try_send(EnvironmentRequest { message, values }) {
+            Ok(()) => (StatusCode::ACCEPTED, "forwarded").into_response(),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                (StatusCode::NOT_FOUND, "Session not found").into_response()
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                StatusCode::TOO_MANY_REQUESTS.into_response()
+            }
+        };
+    }
+    if !values.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Missing session_id").into_response();
+    }
     match state.bridge.submit(message).await {
         Ok(reply) => {
             if let (Some(reply), Some(connection)) = (reply, connection) {
@@ -259,6 +305,7 @@ struct StreamState {
     close: CancellationToken,
     receive: mpsc::Receiver<Value>,
     events: broadcast::Receiver<Value>,
+    active: Option<watch::Receiver<Arc<StdioBridge>>>,
     keepalive: Option<Duration>,
 }
 
@@ -271,9 +318,15 @@ impl StreamState {
                     None => std::future::pending().await,
                 }
             };
+            let scoped = self.active.is_some();
             let message = tokio::select! {
                 biased;
                 () = self.close.cancelled() => return None,
+                changed = async { self.active.as_mut().expect("scoped bridge").changed().await }, if scoped => {
+                    changed.ok()?;
+                    self.events = self.active.as_mut().expect("scoped bridge").borrow_and_update().events.subscribe();
+                    continue;
+                },
                 reply = self.receive.recv() => reply?,
                 event = self.events.recv() => match event {
                     Ok(event) => event,

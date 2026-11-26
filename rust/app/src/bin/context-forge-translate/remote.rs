@@ -91,7 +91,7 @@ pub(super) async fn run(
             () = super::shutdown_signal() => Ok(()),
         };
     };
-    let (mut child, stdin, stdout) = stdio::spawn(command)?;
+    let (mut child, stdin, stdout) = stdio::spawn(command, None)?;
     let input = Arc::new(Mutex::new(stdin));
     let result = tokio::select! {
         result = remote.pump_events(&connection, input.clone()) => result,
