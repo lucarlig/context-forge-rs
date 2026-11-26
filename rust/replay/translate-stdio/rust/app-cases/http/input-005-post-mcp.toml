@@ -1,0 +1,13 @@
+[request]
+method = "POST"
+path = "/mcp"
+body = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+[request.headers]
+Content-Type = "application/json"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

@@ -1,0 +1,13 @@
+[request]
+method = "POST"
+path = "/mcp"
+body = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"message":"hello through stdio"}}}'
+
+[request.headers]
+Content-Type = "application/json"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

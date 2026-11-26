@@ -1,0 +1,10 @@
+[request]
+method = "GET"
+path = "/mcp"
+
+[response]
+status = 405
+
+[response.headers]
+allow = "POST"
+content-type = "application/json"

@@ -1,0 +1,13 @@
+[request]
+method = "POST"
+path = "/mcp"
+body = "{"
+
+[request.headers]
+Content-Type = "application/json"
+
+[response]
+status = 400
+
+[response.headers]
+content-type = "text/plain; charset=utf-8"

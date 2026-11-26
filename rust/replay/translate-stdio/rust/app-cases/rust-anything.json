@@ -1,0 +1,22 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-translate",
+  "run": [
+    "reference-translate-stdio"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "input-001-get-healthz",
+    "input-002-get-mcp",
+    "input-003-post-mcp",
+    "input-004-post-mcp",
+    "input-005-post-mcp",
+    "input-006-post-mcp",
+    "input-007-post-mcp",
+    "input-008-post-message"
+  ]
+}
