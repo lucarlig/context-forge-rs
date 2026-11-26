@@ -211,6 +211,8 @@ pub enum UpstreamError {
     LimitExceeded,
     #[error("upstream returned an invalid MCP response")]
     InvalidResponse,
+    #[error("upstream does not advertise MCP completions")]
+    CompletionUnsupported,
     #[error("upstream returned JSON-RPC error {code}")]
     Rpc {
         code: i64,
@@ -492,6 +494,11 @@ impl UpstreamClient {
             biased;
             () = cancellation.cancelled() => Err(UpstreamError::Cancelled),
             result = timeout_at(deadline, async {
+                if matches!(request, ClientRequest::CompleteRequest(_))
+                    && !session.capabilities["completions"].is_object()
+                {
+                    return Err(UpstreamError::CompletionUnsupported);
+                }
                 started = true;
                 session.request_with_id(request, id, Some(&context)).await
             }) => {

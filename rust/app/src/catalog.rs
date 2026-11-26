@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+use futures_util::TryStreamExt;
+use rmcp::model::CompletionInfo;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -379,7 +381,9 @@ macro_rules! resource_content_query {
             concat!("item.uri_template, item.mime_type, CASE WHEN item.gateway_id IS NULL THEN item.text_content END,
             CASE WHEN item.gateway_id IS NULL THEN item.binary_content END, ", content_gateway_columns!()),
             "resources", "server_resource_association", "resource_id",
-            "((CAST($8 AS TEXT) IS NOT NULL AND item.uri = $8) OR (CAST($8 AS TEXT) IS NULL AND item.uri_template IS NOT NULL))")
+            "((CAST($8 AS TEXT) IS NOT NULL AND item.uri = $8)
+                OR (CAST($9 AS TEXT) IS NOT NULL AND item.uri_template = $9)
+                OR (CAST($8 AS TEXT) IS NULL AND CAST($9 AS TEXT) IS NULL AND item.uri_template IS NOT NULL))")
     };
 }
 
@@ -394,7 +398,7 @@ macro_rules! prompt_content_query {
             "prompts",
             "server_prompt_association",
             "prompt_id",
-            "(item.name = $8 OR item.id = $8)"
+            "(item.name = $8 OR (NOT CAST($9 AS BOOLEAN) AND item.id = $8))"
         )
     };
 }
@@ -683,7 +687,7 @@ impl Database {
         uri: &str,
     ) -> Result<Option<ResourceContentRecord>, sqlx::Error> {
         let mut exact = self
-            .resource_content_rows(scope, server, Some(uri), None, 2)
+            .resource_content_rows(scope, server, Some(uri), None, None, 2)
             .await?;
         if exact.len() > 1 {
             return Err(sqlx::Error::Protocol(
@@ -696,7 +700,7 @@ impl Database {
         let mut after = None;
         loop {
             let rows = self
-                .resource_content_rows(scope, server, None, after.as_deref(), 64)
+                .resource_content_rows(scope, server, None, None, after.as_deref(), 64)
                 .await?;
             let remaining = rows.len() == 64;
             for row in rows {
@@ -715,11 +719,74 @@ impl Database {
         }
     }
 
+    pub(crate) async fn resource_template_content(
+        &self,
+        scope: CatalogScope<'_>,
+        server: Option<&str>,
+        template: &str,
+    ) -> Result<Option<ResourceContentRecord>, sqlx::Error> {
+        let mut rows = self
+            .resource_content_rows(scope, server, None, Some(template), None, 1)
+            .await?;
+        Ok(rows.pop().map(resource_content_record))
+    }
+
+    pub(crate) async fn resource_completions(
+        &self,
+        scope: CatalogScope<'_>,
+        server: Option<&str>,
+        input: &str,
+    ) -> Result<CompletionInfo, sqlx::Error> {
+        let teams = visible_team_ids(scope)?;
+        let needle = input.to_lowercase();
+        let mut values = Vec::new();
+        let mut total = 0_u32;
+        macro_rules! collect {
+            ($pool:ident, $teams:literal) => {{
+                let query = metadata_query!(
+                    $teams,
+                    "item.uri, CAST(NULL AS TEXT), CAST(NULL AS BIGINT)",
+                    "resources",
+                    "server_resource_association",
+                    "resource_id",
+                    "TRUE"
+                );
+                let mut rows = sqlx::query_as::<_, MetadataRow>(query)
+                    .bind(server)
+                    .bind(i64::MAX)
+                    .bind(None::<&str>)
+                    .bind(scope.email)
+                    .bind(scope.visibility == &TeamVisibility::Admin)
+                    .bind(scope.can_own())
+                    .bind(teams)
+                    .fetch($pool);
+                while let Some((_, _, _, _, Some(uri), _, _)) = rows.try_next().await? {
+                    if uri.to_lowercase().contains(&needle) {
+                        total = total.saturating_add(1);
+                        if values.len() < CompletionInfo::MAX_VALUES {
+                            values.push(uri);
+                        }
+                    }
+                }
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => collect!(pool, "SELECT value FROM json_each($7)"),
+            Self::Postgres(pool) => {
+                collect!(pool, "SELECT json_array_elements_text(CAST($7 AS JSON))")
+            }
+        }
+        let has_more = total as usize > values.len();
+        CompletionInfo::with_pagination(values, Some(total), has_more)
+            .map_err(sqlx::Error::Protocol)
+    }
+
     async fn resource_content_rows(
         &self,
         scope: CatalogScope<'_>,
         server: Option<&str>,
         uri: Option<&str>,
+        template: Option<&str>,
         after: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ResourceContentRow>, sqlx::Error> {
@@ -735,6 +802,7 @@ impl Database {
                     .bind(scope.can_own())
                     .bind(teams)
                     .bind(uri)
+                    .bind(template)
                     .fetch_all($pool)
                     .await
             };
@@ -752,6 +820,7 @@ impl Database {
         scope: CatalogScope<'_>,
         server: Option<&str>,
         name: &str,
+        name_only: bool,
     ) -> Result<Option<PromptContentRecord>, sqlx::Error> {
         let teams = visible_team_ids(scope)?;
         macro_rules! select {
@@ -765,6 +834,7 @@ impl Database {
                     .bind(scope.can_own())
                     .bind(teams)
                     .bind(name)
+                    .bind(name_only)
                     .fetch_all($pool)
                     .await?
             };

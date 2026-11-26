@@ -133,7 +133,7 @@ async fn catalog_fixture(Json(request): Json<Value>) -> Response {
     let params = &request["params"];
     let result = match request["method"].as_str().unwrap() {
         "initialize" => json!({"protocolVersion":PROTOCOL,
-            "capabilities":{"resources":{},"prompts":{}}, "serverInfo":{"name":"catalog fixture","version":"1"}
+            "capabilities":{"resources":{},"prompts":{},"completions":{}}, "serverInfo":{"name":"catalog fixture","version":"1"}
         }),
         "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
         "tools/list" => {
@@ -173,6 +173,11 @@ async fn catalog_fixture(Json(request): Json<Value>) -> Response {
             assert_eq!(params["name"], "greet");
             let who = params["arguments"]["who"].as_str().unwrap();
             json!({"messages":[{"role":"user","content":{"type":"text","text":format!("Hello {who}")}}]})
+        }
+        "completion/complete" => {
+            assert_eq!(params["ref"], json!({"type":"ref/prompt","name":"greet"}));
+            assert_eq!(params["context"]["arguments"]["conversation"], "example");
+            json!({"completion":{"values":["World"],"total":2}})
         }
         unknown => panic!("unexpected upstream method {unknown}"),
     };
@@ -285,6 +290,57 @@ async fn registration_discovers_and_serves_federated_resources_and_prompts() {
         json!({"code":-32602,"message":"Unknown prompt: greet"})
     );
 
+    let (status, reply) = send_with_headers(
+        &client,
+        gateway.url("/mcp/"),
+        modern_request(
+            "completion/complete",
+            5,
+            json!({
+                "ref":{"type":"ref/prompt","name":"fixture-greet"},
+                "argument":{"name":"who","value":"Wo"},
+                "context":{"arguments":{"conversation":"example"}}
+            }),
+        ),
+        None,
+        &[
+            ("mcp-protocol-version", "2026-07-28"),
+            ("mcp-method", "completion/complete"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["result"]["resultType"], "complete");
+    assert_eq!(
+        reply["result"]["completion"],
+        json!({"values":["World"],"total":2,"hasMore":true})
+    );
+
+    let (status, reply) = send_with_headers(
+        &client,
+        gateway.url("/mcp/"),
+        modern_request(
+            "completion/complete",
+            6,
+            json!({
+                "ref":{"type":"ref/prompt","name":"fixture-greet"},
+                "argument":{"name":"who","value":"Wo"},
+                "context":{"arguments":{"conversation":1}}
+            }),
+        ),
+        None,
+        &[
+            ("mcp-protocol-version", "2026-07-28"),
+            ("mcp-method", "completion/complete"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply["error"],
+        json!({"code":-32602,"message":"Invalid request parameters","data":""})
+    );
+
     let ask = "fixture://notes/ask";
     let read = async |mut body: Value, elicitation| {
         if elicitation {
@@ -341,7 +397,7 @@ async fn catalog_metadata_lists_scoped_resources_templates_and_prompts() {
         INSERT INTO server_resource_association (server_id, resource_id) VALUES ('v', 'r3');
         UPDATE resources SET binary_content = x'0001ff' WHERE id = 'r3';
         INSERT INTO prompts (id,name,original_name,custom_name,custom_name_slug,argument_schema,template)
-            VALUES ('p1','greet','greet','greet','greet','{"properties":{"who":{"type":"string"}},"required":["who"]}',
+            VALUES ('p1','greet','greet','greet','greet','{"properties":{"who":{"name":"who","type":"string","enum":["World","Else"]}},"required":["who"]}',
                 '# User:
 Hello {{ who }}
 # Assistant:
@@ -439,6 +495,27 @@ Greetings');
     );
     let (_, reply) = legacy("/mcp/", "prompts/get", json!({"name":"greet"})).await;
     assert_eq!(reply["error"]["message"], "Missing required arguments: who");
+
+    let (_, reply) = legacy(
+        "/mcp/",
+        "completion/complete",
+        json!({"ref":{"type":"ref/prompt","name":"greet"},"argument":{"name":"who","value":"w"}}),
+    )
+    .await;
+    assert_eq!(
+        reply["result"]["completion"],
+        json!({"values":["World"],"total":1,"hasMore":false})
+    );
+    let (_, reply) = legacy(
+        "/mcp/",
+        "completion/complete",
+        json!({"ref":{"type":"ref/resource","uri":"fixture://notes/{name}"},"argument":{"name":"name","value":"notes/"}}),
+    )
+    .await;
+    assert_eq!(
+        reply["result"]["completion"],
+        json!({"values":["fixture://notes/first","fixture://notes/last","fixture://notes/{name}"],"total":3,"hasMore":false})
+    );
 }
 
 struct Running {

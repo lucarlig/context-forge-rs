@@ -5,7 +5,7 @@ use axum::{
     response::Response,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
-use rmcp::model::{ClientCapabilities, Implementation};
+use rmcp::model::{ClientCapabilities, CompleteRequestParams, Implementation};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -70,7 +70,9 @@ pub(crate) fn reject_invalid_request(headers: &HeaderMap, body: &Value) -> Optio
         )));
     }
 
-    if !meta[CAPABILITIES].is_object()
+    if (method == "completion/complete"
+        && CompleteRequestParams::deserialize(&body["params"]).is_err())
+        || !meta[CAPABILITIES].is_object()
         || ClientCapabilities::deserialize(&meta[CAPABILITIES]).is_err()
         || meta.get(CLIENT_INFO).is_some_and(|info| {
             !info.is_null() && (!info.is_object() || Implementation::deserialize(info).is_err())

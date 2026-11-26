@@ -5,7 +5,7 @@ use std::{
     borrow::Cow,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU16, Ordering},
     },
 };
 
@@ -23,12 +23,12 @@ use rmcp::{
     RoleServer, ServerHandler,
     model::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities,
-        ClientJsonRpcMessage, ClientRequest, ContentBlock, CustomRequest, CustomResult,
-        DiscoverResult, ElicitRequestParams, ErrorCode, ErrorData, GetPromptRequestParams,
-        GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult, InputRequest,
-        InputRequiredResult, JsonRpcError, ListPromptsResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
-        ProgressNotification, ProgressNotificationParam, ProtocolVersion,
+        ClientJsonRpcMessage, ClientRequest, CompleteRequestParams, CompleteResult, ContentBlock,
+        CustomRequest, CustomResult, DiscoverResult, ElicitRequestParams, ErrorCode, ErrorData,
+        GetPromptRequestParams, GetPromptResponse, Implementation, InitializeRequestParams,
+        InitializeResult, InputRequest, InputRequiredResult, JsonRpcError, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, MetaObject,
+        PaginatedRequestParams, ProgressNotification, ProgressNotificationParam, ProtocolVersion,
         ReadResourceRequestParams, ReadResourceResponse, ResultType, ServerConfig, Tool,
     },
     service::RequestContext,
@@ -62,15 +62,19 @@ type Transport = StreamableHttpService<GatewayHandler, NeverSessionManager>;
 struct AcceptsProgress;
 
 #[derive(Clone, Default)]
-struct ContentBadRequest(Arc<AtomicBool>);
+struct HandlerErrorStatus(Arc<AtomicU16>);
 
-impl ContentBadRequest {
+impl HandlerErrorStatus {
     fn record<T>(parts: &Parts, reply: &Result<T, ErrorData>) {
         if let Err(error) = reply
-            && error.code == ErrorCode::INVALID_PARAMS
             && let Some(marker) = parts.extensions.get::<Self>()
         {
-            marker.0.store(true, Ordering::Release);
+            let status = match error.code {
+                ErrorCode::INVALID_PARAMS => StatusCode::BAD_REQUEST,
+                ErrorCode::METHOD_NOT_FOUND => StatusCode::NOT_FOUND,
+                _ => return,
+            };
+            marker.0.store(status.as_u16(), Ordering::Release);
         }
     }
 }
@@ -154,9 +158,9 @@ impl Modern {
         }
         if matches!(
             body["method"].as_str(),
-            Some("resources/read" | "prompts/get")
+            Some("resources/read" | "prompts/get" | "completion/complete")
         ) {
-            parts.extensions.insert(ContentBadRequest::default());
+            parts.extensions.insert(HandlerErrorStatus::default());
         }
         let scoped_tool =
             if parts.headers.get("mcp-method") == Some(&HeaderValue::from_static("tools/call")) {
@@ -216,13 +220,17 @@ impl Modern {
 }
 
 async fn handle(transport: &Transport, request: Request) -> Response {
-    let content_status = request.extensions().get::<ContentBadRequest>().cloned();
+    let handler_status = request.extensions().get::<HandlerErrorStatus>().cloned();
     let mut response = transport.handle(request).await.into_response();
-    if response.status() == StatusCode::OK
-        && response.headers().get(CONTENT_TYPE) == Some(&HeaderValue::from_static(JSON_MEDIA_TYPE))
-        && content_status.is_some_and(|marker| marker.0.load(Ordering::Acquire))
+    if response.headers().get(CONTENT_TYPE) == Some(&HeaderValue::from_static(JSON_MEDIA_TYPE))
+        && let Some(status) = handler_status
+            .and_then(|marker| StatusCode::from_u16(marker.0.load(Ordering::Acquire)).ok())
+        && matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+        )
     {
-        *response.status_mut() = StatusCode::BAD_REQUEST;
+        *response.status_mut() = status;
         return response;
     }
     if !matches!(
@@ -460,7 +468,7 @@ impl ServerHandler for GatewayHandler {
             None,
         );
         let reply = with_progress(invocation, updates, &context).await;
-        ContentBadRequest::record(parts, &reply);
+        HandlerErrorStatus::record(parts, &reply);
         match reply? {
             ReadResourceResponse::Complete(mut result) => {
                 result.result_type = Some(ResultType::COMPLETE);
@@ -504,7 +512,7 @@ impl ServerHandler for GatewayHandler {
             None,
         );
         let reply = with_progress(invocation, updates, &context).await;
-        ContentBadRequest::record(parts, &reply);
+        HandlerErrorStatus::record(parts, &reply);
         match reply? {
             GetPromptResponse::Complete(mut result) => {
                 result.result_type = Some(ResultType::COMPLETE);
@@ -518,6 +526,33 @@ impl ServerHandler for GatewayHandler {
             }
             _ => Err(ErrorData::internal_error("Invalid prompt result", None)),
         }
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, ErrorData> {
+        let parts = request_parts(&context)?;
+        let capabilities = upstream_client_capabilities(&context);
+        let (relay, updates) = progress_relay(parts, &context);
+        let invocation = self.gateway.complete(
+            request,
+            parts.extensions.get::<Principal>(),
+            parts.extensions.get::<CatalogServer>(),
+            ToolContext {
+                cancellation: &context.ct,
+                progress: relay.as_ref(),
+                notifications: None,
+                client_capabilities: Some(&capabilities),
+            },
+            None,
+        );
+        let reply = with_progress(invocation, updates, &context).await;
+        HandlerErrorStatus::record(parts, &reply);
+        let mut result = reply?;
+        stamp_server_info(&mut result.meta);
+        Ok(result)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

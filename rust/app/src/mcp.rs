@@ -21,11 +21,12 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt, stream};
 use rmcp::model::{
-    CallToolRequestParams, CancelledNotificationParam, ErrorData, GetPromptRequestParams,
-    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
-    PaginatedRequestParams, ProgressNotification, ProgressNotificationParam, ProgressToken,
-    PromptsCapability, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, RequestId,
-    ResourcesCapability, ServerCapabilities, ServerJsonRpcMessage, ToolsCapability,
+    CallToolRequestParams, CancelledNotificationParam, CompleteRequestParams, ErrorData,
+    GetPromptRequestParams, GetPromptResponse, Implementation, InitializeRequestParams,
+    InitializeResult, PaginatedRequestParams, ProgressNotification, ProgressNotificationParam,
+    ProgressToken, PromptsCapability, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, RequestId, ResourcesCapability, ServerCapabilities, ServerJsonRpcMessage,
+    ToolsCapability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -908,6 +909,7 @@ async fn dispatch(
             "tools/call" => Some("tools.execute"),
             "resources/read" => Some("resources.read"),
             "prompts/get" => Some("prompts.read"),
+            "completion/complete" => Some("tools.read"),
             "logging/setLevel" => Some("admin.system_config"),
             _ => None,
         };
@@ -1062,6 +1064,38 @@ async fn dispatch(
                             &id,
                             ErrorData::internal_error("Elicitation not supported", None),
                         ),
+                        Err(error) => content_error(&id, error),
+                    }
+                }
+                "completion/complete" => {
+                    let Some(Ok(params)) = params.map(CompleteRequestParams::deserialize) else {
+                        return invalid_params(&id);
+                    };
+                    let pending = match track_request(session.as_ref(), &id) {
+                        Ok(pending) => pending,
+                        Err(reply) => return *reply,
+                    };
+                    let cancellation = pending
+                        .as_ref()
+                        .map(|pending| pending.token.clone())
+                        .unwrap_or_default();
+                    let context = ToolContext {
+                        cancellation: &cancellation,
+                        progress: progress.as_ref(),
+                        notifications: None,
+                        client_capabilities: None,
+                    };
+                    let result = service
+                        .complete(params, principal, server, context, session.as_deref())
+                        .await;
+                    if cancellation.is_cancelled() {
+                        return tool_error(&id, ToolError::Cancelled);
+                    }
+                    match result {
+                        Ok(mut result) => {
+                            result.result_type = None;
+                            rpc_success(&id, result)
+                        }
                         Err(error) => content_error(&id, error),
                     }
                 }
@@ -1464,6 +1498,7 @@ fn initialize(params: Option<&Value>, server: Option<&CatalogServer>) -> Option<
 
 pub(crate) fn catalog_capabilities() -> ServerCapabilities {
     let mut capabilities = ServerCapabilities::default();
+    capabilities.completions = Some(Default::default());
     let mut tools = ToolsCapability::default();
     tools.list_changed = Some(false);
     capabilities.tools = Some(tools);
@@ -1751,7 +1786,7 @@ mod tests {
                     "id": "initialize-1",
                     "result": {
                         "protocolVersion": expected,
-                        "capabilities": {"logging": {}, "tools": {"listChanged": false}, "prompts": {"listChanged": false},
+                        "capabilities": {"completions": {}, "logging": {}, "tools": {"listChanged": false}, "prompts": {"listChanged": false},
                             "resources": {"listChanged": false, "subscribe": false}},
                         "serverInfo": { "name": "ContextForge", "version": env!("CARGO_PKG_VERSION") }
                     }
