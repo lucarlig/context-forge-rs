@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! MCP Streamable HTTP ingress.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -21,16 +21,18 @@ use rmcp::model::{
     PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ToolsCapability,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     access::Principal,
     catalog::CatalogServer,
     gateway::{GatewayService, ToolError},
     modern::Modern,
+    sessions::{SessionError, Sessions},
 };
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+const SESSION_HEADER: &str = "mcp-session-id";
 const RUNTIME_HEADER: &str = "x-contextforge-mcp-runtime";
 const LEGACY_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const MODERN_VERSION: &str = "2026-07-28";
@@ -60,10 +62,15 @@ pub enum ProtocolMode {
 struct McpState {
     service: Arc<GatewayService>,
     modern: Option<Modern>,
+    sessions: Option<Sessions>,
 }
 
 /// Build the Streamable HTTP routes for mounting behind gateway access checks.
-pub(crate) fn router(service: Arc<GatewayService>, mode: ProtocolMode) -> Router {
+pub(crate) fn router(
+    service: Arc<GatewayService>,
+    mode: ProtocolMode,
+    session_ttl: Option<Duration>,
+) -> Router {
     Router::new()
         .route("/mcp", any(handle_request))
         .route("/mcp/", any(handle_request))
@@ -74,6 +81,7 @@ pub(crate) fn router(service: Arc<GatewayService>, mode: ProtocolMode) -> Router
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(Arc::new(McpState {
             modern: (mode == ProtocolMode::Auto).then(|| Modern::new(service.clone())),
+            sessions: session_ttl.map(Sessions::new),
             service,
         }))
 }
@@ -196,11 +204,8 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
             }),
         )
             .into_response(),
-        Method::POST => handle_post(&state.service, request).await,
-        Method::DELETE => transport_error(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "Method Not Allowed: Session termination not supported",
-        ),
+        Method::POST => handle_post(&state, request).await,
+        Method::DELETE => delete_session(state.sessions.as_ref(), &request),
         _ => {
             let mut response =
                 transport_error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
@@ -222,7 +227,32 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
     response
 }
 
-async fn handle_post(service: &GatewayService, mut request: Request) -> Response {
+fn delete_session(sessions: Option<&Sessions>, request: &Request) -> Response {
+    let Some(sessions) = sessions else {
+        return transport_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Method Not Allowed: Session termination not supported",
+        );
+    };
+    let owner = request
+        .extensions()
+        .get::<Principal>()
+        .map(|p| p.email.as_str());
+    let server = request
+        .extensions()
+        .get::<CatalogServer>()
+        .map(|s| s.id.as_str());
+    let id = match session_header(request.headers()) {
+        Ok(id) => id,
+        Err(error) => return session_error(error),
+    };
+    match sessions.access(id, owner, server, true) {
+        Ok(()) => Json(json!({"jsonrpc": "2.0", "result": {}})).into_response(),
+        Err(error) => session_error(error),
+    }
+}
+
+async fn handle_post(state: &McpState, request: Request) -> Response {
     let content_type = request
         .headers()
         .get(CONTENT_TYPE)
@@ -257,9 +287,18 @@ async fn handle_post(service: &GatewayService, mut request: Request) -> Response
         );
     }
 
-    let principal = request.extensions_mut().remove::<Principal>();
-    let server = request.extensions_mut().remove::<CatalogServer>();
-    let bytes = match Bytes::from_request(request, &()).await {
+    let session_id = if state.sessions.is_some() {
+        match session_header(request.headers()) {
+            Ok(id) => id.cloned(),
+            Err(error) => return session_error(error),
+        }
+    } else {
+        None
+    };
+    let (mut parts, body) = request.into_parts();
+    let principal = parts.extensions.remove::<Principal>();
+    let server = parts.extensions.remove::<CatalogServer>();
+    let bytes = match Bytes::from_request(Request::from_parts(parts, body), &()).await {
         Ok(bytes) => bytes,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
             return (
@@ -272,7 +311,16 @@ async fn handle_post(service: &GatewayService, mut request: Request) -> Response
     };
 
     match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => dispatch(service, principal.as_ref(), server.as_ref(), &value).await,
+        Ok(value) => {
+            dispatch(
+                state,
+                principal.as_ref(),
+                server.as_ref(),
+                session_id.as_ref(),
+                &value,
+            )
+            .await
+        }
         Err(error) => rpc_error(
             StatusCode::BAD_REQUEST,
             &Value::Null,
@@ -299,9 +347,10 @@ pub(crate) fn accepts_json(headers: &HeaderMap) -> bool {
 }
 
 async fn dispatch(
-    service: &GatewayService,
+    state: &McpState,
     principal: Option<&Principal>,
     server: Option<&CatalogServer>,
+    session_id: Option<&HeaderValue>,
     value: &Value,
 ) -> Response {
     let Some(message) = value.as_object() else {
@@ -324,12 +373,34 @@ async fn dispatch(
             Some(params @ Value::Object(_)) => Some(params),
             Some(_) => return invalid_envelope(),
         };
-        return match (id, method) {
+        let owner = principal.map(|p| p.email.as_str());
+        let server_id = server.map(|s| s.id.as_str());
+        if let (Some(id), "initialize") = (id, method) {
+            let Some(result) = initialize(params, server) else {
+                return invalid_params(id);
+            };
+            return match &state.sessions {
+                Some(sessions) => match sessions.create(owner, server_id) {
+                    Ok(session_id) => with_session(rpc_success(id, result), Some(&session_id)),
+                    Err(error) => session_error(error),
+                },
+                None => rpc_success(id, result),
+            };
+        }
+        if let Some(sessions) = &state.sessions
+            && let Err(error) = sessions.access(session_id, owner, server_id, false)
+        {
+            return post_session_error(error);
+        }
+        let response = match (id, method) {
             (None, _) => accepted(),
-            (Some(id), "initialize") => initialize(id, params, server),
             (Some(id), "ping") => rpc_success(id, Empty {}),
-            (Some(id), "tools/list") => list_tools(service, principal, server, id, params).await,
-            (Some(id), "tools/call") => call_tool(service, principal, server, id, params).await,
+            (Some(id), "tools/list") => {
+                list_tools(&state.service, principal, server, id, params).await
+            }
+            (Some(id), "tools/call") => {
+                call_tool(&state.service, principal, server, id, params).await
+            }
             (Some(id), method) => rpc_error(
                 StatusCode::OK,
                 id,
@@ -338,6 +409,7 @@ async fn dispatch(
                 Some(method),
             ),
         };
+        return with_session(response, session_id);
     }
 
     let result = message.get("result");
@@ -351,7 +423,17 @@ async fn dispatch(
         _ => false,
     };
     if id.is_some() && valid_response {
-        return accepted();
+        if let Some(sessions) = &state.sessions
+            && let Err(error) = sessions.access(
+                session_id,
+                principal.map(|p| p.email.as_str()),
+                server.map(|s| s.id.as_str()),
+                false,
+            )
+        {
+            return post_session_error(error);
+        }
+        return with_session(accepted(), session_id);
     }
 
     invalid_envelope()
@@ -425,10 +507,8 @@ fn tool_error(id: &Value, error: ToolError) -> Response {
     rpc_error(StatusCode::OK, id, code, message, None::<()>)
 }
 
-fn initialize(id: &Value, params: Option<&Value>, server: Option<&CatalogServer>) -> Response {
-    let Some(Ok(params)) = params.map(InitializeRequestParams::deserialize) else {
-        return invalid_params(id);
-    };
+fn initialize(params: Option<&Value>, server: Option<&CatalogServer>) -> Option<InitializeResult> {
+    let params = InitializeRequestParams::deserialize(params?).ok()?;
     let protocol_version = if LEGACY_VERSIONS.contains(&params.protocol_version.as_str()) {
         params.protocol_version
     } else {
@@ -445,7 +525,45 @@ fn initialize(id: &Value, params: Option<&Value>, server: Option<&CatalogServer>
             env!("CARGO_PKG_VERSION"),
         ));
     result.instructions = server.and_then(|server| server.instructions.clone());
-    rpc_success(id, result)
+    Some(result)
+}
+
+fn with_session(mut response: Response, id: Option<&HeaderValue>) -> Response {
+    if let Some(id) = id {
+        response.headers_mut().insert(SESSION_HEADER, id.clone());
+    }
+    response
+}
+
+fn session_header(headers: &HeaderMap) -> Result<Option<&HeaderValue>, SessionError> {
+    let mut values = headers.get_all(SESSION_HEADER).iter();
+    let id = values.next();
+    if values.next().is_some() {
+        return Err(SessionError::InvalidHeader);
+    }
+    Ok(id.filter(|value| !value.is_empty()))
+}
+
+fn post_session_error(error: SessionError) -> Response {
+    if error == SessionError::NotFound {
+        return transport_error(StatusCode::NOT_FOUND, "Session not found");
+    }
+    session_error(error)
+}
+
+fn session_error(error: SessionError) -> Response {
+    let (status, detail) = match error {
+        SessionError::Missing => {
+            return transport_error(StatusCode::BAD_REQUEST, "Bad Request: Missing session ID");
+        }
+        SessionError::InvalidHeader => {
+            return transport_error(StatusCode::BAD_REQUEST, "Bad Request: Invalid session ID");
+        }
+        SessionError::NotFound => (StatusCode::NOT_FOUND, "Session not found"),
+        SessionError::Forbidden => (StatusCode::FORBIDDEN, "Session access denied"),
+        SessionError::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "Session capacity reached"),
+    };
+    (status, Json(Detail { detail })).into_response()
 }
 
 #[derive(Serialize)]
@@ -555,7 +673,7 @@ mod tests {
         })
         .unwrap();
         let auth = Authorizer::new(database.clone(), None, true);
-        router(test_service(database, auth), ProtocolMode::Legacy)
+        router(test_service(database, auth), ProtocolMode::Legacy, None)
     }
 
     async fn request(

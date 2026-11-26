@@ -1,6 +1,6 @@
 # Stateful MCP reference findings
 
-These observations come from black-box runs against the [pinned v1.1.2 gateway](../../MAP.md). The Rust stateful transport is pending.
+These observations come from black-box runs against the [pinned v1.1.2 gateway](../../MAP.md).
 
 The reference runs used isolated SQLite databases and generated test credentials. Each run required authentication and enabled JSON responses. The strict ownership profile also set `CACHE_TYPE=redis` and `MCPGATEWAY_SESSION_AFFINITY_ENABLED=true` with a disposable Redis instance.
 
@@ -34,3 +34,15 @@ The reference fixture published synthetic `notifications/message` events to the 
 | Send an unknown `Last-Event-ID` and publish a fresh event | `D` |
 
 Bind session access to the authorized principal and virtual server on every request. Apply the ownership check regardless of the cache backend. DELETE must invalidate the session for both POST and GET and close active streams. Verify those rules, cross-session cursor isolation, and cancellation through a live Rust gateway before checking off the milestone. [Legacy MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
+
+## Rust lifecycle replay
+
+The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Modern requests still use the stateless transport. The live Rust gateway test covers owner access after token renewal, principal and virtual-server isolation, notification acknowledgement, and POST and DELETE after termination. Passive GET, streaming, cancellation, and event resumption remain open.
+
+The public legacy JSON profile produced four recordings with rust-anything v5.0.1. The original matched all four. Rust matched the unknown-session response. Initialization advertises the Rust version and the implemented capabilities. Both missing-session error responses omit the generated session ID that v1.1.2 sends even though initialization never occurred.
+
+```sh
+USE_STATEFUL_SESSIONS=true MCP_REQUIRE_AUTH=false MCP_INBOUND_PROTOCOL_MODE=legacy \
+  DATABASE_URL=sqlite:///:memory: rust-anything app replay rust/replay/mcp-stateful \
+  --build "$PWD/target/debug/context-forge-rs"
+```

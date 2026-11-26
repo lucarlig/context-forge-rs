@@ -144,6 +144,20 @@ async fn database() -> Database {
     database
 }
 
+fn authorizer(database: Database) -> Arc<Authorizer> {
+    Arc::new(Authorizer::new(
+        database,
+        Some(
+            JwtVerifier::new(JwtConfig {
+                key: KEY,
+                ..JwtConfig::default()
+            })
+            .unwrap(),
+        ),
+        true,
+    ))
+}
+
 fn token(subject: &str, teams: Value, scopes: Value) -> String {
     let now = Timestamp::now().as_second();
     let claims = json!({
@@ -213,17 +227,7 @@ async fn registration_discovery_invocation_and_team_gates_work_over_http() {
             .with_state(stats.clone()),
     )
     .await;
-    let authorizer = Arc::new(Authorizer::new(
-        database.clone(),
-        Some(
-            JwtVerifier::new(JwtConfig {
-                key: KEY,
-                ..JwtConfig::default()
-            })
-            .unwrap(),
-        ),
-        true,
-    ));
+    let authorizer = authorizer(database.clone());
     let service = Arc::new(GatewayService::new(
         database.clone(),
         authorizer,
@@ -524,5 +528,164 @@ async fn registration_discovery_invocation_and_team_gates_work_over_http() {
     assert_eq!(
         refusal["detail"],
         "Authentication required for MCP endpoints"
+    );
+}
+
+#[tokio::test]
+async fn legacy_session_lifecycle_binds_owner_and_virtual_server() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!();
+    };
+    sqlx::query(
+        "INSERT INTO servers (id, name, visibility) VALUES ('fixture', 'Fixture', 'public')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(EgressPolicy::default(), Duration::from_secs(5)),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.mcp_router_with_sessions(
+        true,
+        ProtocolMode::Auto,
+        Some(Duration::from_secs(3600)),
+    ))
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let owner = token("member", json!(["alpha"]), json!({}));
+    let renewed = token("member", json!(["alpha"]), json!({}));
+    let outsider = token("outsider", json!(["beta"]), json!({}));
+    let post = |path, credential: Option<&str>, session: Option<&str>, body: Value| {
+        let mut request = client
+            .post(gateway.url(path))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .header("mcp-protocol-version", PROTOCOL)
+            .body(body.to_string());
+        if let Some(credential) = credential {
+            request = request.bearer_auth(credential);
+        }
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        request
+    };
+    let response = post(
+        "/mcp/",
+        Some(&owner),
+        None,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = response.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(uuid::Uuid::parse_str(&session).is_ok());
+    let notification = post(
+        "/mcp/",
+        Some(&owner),
+        Some(&session),
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(notification.status(), StatusCode::ACCEPTED);
+    assert!(notification.bytes().await.unwrap().is_empty());
+
+    let ping = |path, credential, session| {
+        post(
+            path,
+            credential,
+            session,
+            json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+        )
+    };
+    let owner_reply = ping("/mcp", Some(&renewed), Some(&session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(owner_reply.status(), StatusCode::OK);
+    assert_eq!(owner_reply.headers()["mcp-session-id"], session);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&owner_reply.bytes().await.unwrap()).unwrap(),
+        json!({"jsonrpc":"2.0","id":2,"result":{}})
+    );
+
+    for (path, credential, session, status) in [
+        (
+            "/mcp/",
+            Some(&outsider),
+            Some(&session),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/servers/fixture/mcp/",
+            Some(&renewed),
+            Some(&session),
+            StatusCode::FORBIDDEN,
+        ),
+        ("/mcp/", None, Some(&session), StatusCode::UNAUTHORIZED),
+        ("/mcp/", Some(&renewed), None, StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(
+            ping(
+                path,
+                credential.map(String::as_str),
+                session.map(String::as_str)
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            status,
+        );
+    }
+
+    let delete = |credential| {
+        client
+            .delete(gateway.url("/mcp/"))
+            .bearer_auth(credential)
+            .header("mcp-session-id", &session)
+    };
+    assert_eq!(
+        delete(&outsider).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = delete(&renewed).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.bytes().await.unwrap()).unwrap(),
+        json!({"jsonrpc":"2.0","result":{}})
+    );
+    assert_eq!(
+        ping("/mcp/", Some(&renewed), Some(&session))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
+    assert_eq!(
+        delete(&owner).send().await.unwrap().status(),
+        StatusCode::NOT_FOUND
     );
 }

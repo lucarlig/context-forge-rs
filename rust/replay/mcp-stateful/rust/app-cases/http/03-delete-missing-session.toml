@@ -1,0 +1,12 @@
+[request]
+method = "DELETE"
+path = "/mcp/"
+
+[response]
+status = 400
+
+[response.headers]
+content-type = "application/json"
+mcp-session-id = "[..]"
+vary = "Origin"
+x-contextforge-mcp-runtime = "[..]"

@@ -1,0 +1,22 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-reference-server",
+  "run": [
+    "context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "normalizers": {
+    "runtime": "^(python|rust)$",
+    "session": "[a-f0-9]{32}"
+  },
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "01-initialize",
+    "02-post-missing-session",
+    "03-delete-missing-session",
+    "04-post-unknown-session"
+  ]
+}

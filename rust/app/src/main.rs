@@ -38,7 +38,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Settings::mcp_pagination()?,
         Settings::catalog_refresh()?,
     ));
-    let mcp = service.mcp_router(require_mcp_auth, Settings::mcp_inbound_protocol_mode()?);
+    let mcp = service.mcp_router_with_sessions(
+        require_mcp_auth,
+        Settings::mcp_inbound_protocol_mode()?,
+        Settings::mcp_session_ttl()?,
+    );
     let app = probes::router(database, redis)
         .merge(Settings::mcp_ingress_policy()?.apply(mcp))
         .merge(service.registration_router());

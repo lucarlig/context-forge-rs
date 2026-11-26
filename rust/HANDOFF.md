@@ -16,4 +16,4 @@ The Rust binary matched eight of ten legacy cases, including tool listing and in
 
 The pinned gateway matched all 37 [modern MCP recordings](replay/mcp-modern/README.md). The Rust binary matched 27. Eight cases report the Rust version in server metadata. Two of those cases also differ in `Vary` because compression remains pending. The other two cases are legacy initialization responses with a smaller advertised capability set. The live Rust test covers virtual-server discovery, catalog TTL, tool argument headers, and request authorization.
 
-The next milestone covers stateful sessions, streaming, cancellation, and event resumption. See the [stateful MCP reference findings](replay/mcp-stateful/README.md) for captured lifecycle and replay behavior.
+The stateful MCP milestone is in progress. The Rust gateway handles legacy session initialization, ownership, and deletion. The next slice covers passive streams, followed by POST streaming, cancellation, and resumption. See the [stateful MCP reference findings](replay/mcp-stateful/README.md) for captured lifecycle behavior and replay results.

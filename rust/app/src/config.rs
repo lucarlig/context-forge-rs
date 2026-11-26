@@ -132,6 +132,17 @@ impl Settings {
         }
     }
 
+    pub fn mcp_session_ttl() -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
+        if !flag("USE_STATEFUL_SESSIONS")?.unwrap_or(false) {
+            return Ok(None);
+        }
+        let ttl = parse("SESSION_TTL", 3600)?;
+        if ttl == 0 {
+            return Err("SESSION_TTL must be positive".into());
+        }
+        Ok(Some(Duration::from_secs(ttl)))
+    }
+
     pub fn upstream_client() -> Result<UpstreamClient, Box<dyn Error + Send + Sync>> {
         let policy = EgressPolicy {
             allow_localhost: flag("SSRF_ALLOW_LOCALHOST")?.unwrap_or(false),

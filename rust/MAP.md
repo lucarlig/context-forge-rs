@@ -13,7 +13,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] SQLite and PostgreSQL storage for gateway, tool, and virtual-server associations, with scoped pagination
 - [x] Legacy stateless MCP registration, listing, and invocation for unauthenticated Streamable HTTP upstreams
 - [x] Modern MCP negotiation, discovery, and standard routing headers
-- [ ] Stateful sessions, streaming, cancellation, and event resumption
+- [ ] Stateful sessions, streaming, cancellation, and event resumption (in progress)
 - [ ] Resources, prompts, completions, logging, and subscriptions
 - [ ] Legacy SSE, WebSocket, and stdio transports and translation
 - [ ] Authenticated MCP upstreams, identity forwarding, and direct proxy mode

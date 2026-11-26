@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
@@ -111,8 +111,17 @@ impl GatewayService {
     }
 
     pub fn mcp_router(self: &Arc<Self>, require_auth: bool, mode: ProtocolMode) -> Router {
+        self.mcp_router_with_sessions(require_auth, mode, None)
+    }
+
+    pub fn mcp_router_with_sessions(
+        self: &Arc<Self>,
+        require_auth: bool,
+        mode: ProtocolMode,
+        ttl: Option<Duration>,
+    ) -> Router {
         self.access
-            .protect_mcp(crate::mcp::router(self.clone(), mode), require_auth)
+            .protect_mcp(crate::mcp::router(self.clone(), mode, ttl), require_auth)
     }
 
     pub(crate) async fn catalog_ttl_ms(&self, server: Option<&CatalogServer>) -> u64 {
