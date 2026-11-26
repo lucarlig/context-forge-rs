@@ -1606,3 +1606,185 @@ async fn passive_stream_follows_upstream_get_reconnects_and_replays_notification
     .await
     .expect("downstream DELETE should close the upstream session");
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable Redis or Valkey database in REDIS_URL"]
+async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
+    use context_forge_rs::{config::RedisSettings, mcp::RedisSessionDirectory};
+    use tokio_util::sync::CancellationToken;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let fixture = Arc::new(PassiveFixture::default());
+    let upstream = Running::start(
+        Router::new()
+            .route(
+                "/mcp",
+                post(passive_fixture)
+                    .get(upstream_passive)
+                    .delete(end_passive_fixture),
+            )
+            .with_state(fixture),
+    )
+    .await;
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(4),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let redis_settings = RedisSettings {
+        url: std::env::var("REDIS_URL").unwrap(),
+        connect_timeout: Duration::from_secs(2),
+        response_timeout: Duration::from_secs(2),
+    };
+    let shutdown = CancellationToken::new();
+    let _stop = shutdown.clone().drop_guard();
+    let router = || {
+        service.mcp_router_with_options(
+            true,
+            ProtocolMode::Legacy,
+            HttpOptions {
+                json_response: false,
+                sessions: Some(SessionSettings {
+                    redis: Some(Arc::new(
+                        RedisSessionDirectory::new(&redis_settings).unwrap(),
+                    )),
+                    shutdown: shutdown.clone(),
+                    affinity_forward_timeout: Duration::from_secs(4),
+                    affinity_forward_concurrency: 1,
+                    ..SessionSettings::default()
+                }),
+            },
+        )
+    };
+    let first = Running::start(service.registration_router().merge(router())).await;
+    let second = Running::start(router()).await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, result) = send(&client, first.url("/gateways"), json!({
+        "name":"passive","url":upstream.url("/mcp"),"visibility":"public","transport":"STREAMABLEHTTP"
+    }), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let owner = token("member", json!(["alpha"]), json!({}));
+    let other = token("outsider", json!(["beta"]), json!({}));
+    let post = |gateway: &Running, message: Value| {
+        client
+            .post(gateway.url("/mcp/"))
+            .bearer_auth(&owner)
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-protocol-version", PROTOCOL)
+            .body(message.to_string())
+    };
+    let initialized = post(&first, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }})).send().await.unwrap();
+    assert_eq!(initialized.status(), StatusCode::OK);
+    let session = initialized.headers()["mcp-session-id"].clone();
+
+    let mut ping = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let response = post(&second, json!({"jsonrpc":"2.0","id":2,"method":"ping"}))
+                .header("mcp-session-id", &session)
+                .send()
+                .await
+                .unwrap();
+            if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ping.status(), StatusCode::OK);
+    assert_eq!(ping.headers()[header::CONTENT_TYPE], "text/event-stream");
+    let mut buffered = Vec::new();
+    let (_, result) = next_sse_message(&mut ping, &mut buffered).await;
+    assert_eq!(result, json!({"jsonrpc":"2.0","id":2,"result":{}}));
+
+    let get = |credential: &str| {
+        client
+            .get(second.url("/mcp/"))
+            .bearer_auth(credential)
+            .header(header::ACCEPT, "text/event-stream")
+            .header("mcp-session-id", &session)
+    };
+    assert_eq!(
+        get(&other).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut passive = get(&owner).send().await.unwrap();
+    assert_eq!(passive.status(), StatusCode::OK);
+    let tool = post(
+        &second,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"passive-log","arguments":{"messages":["A","B"]}
+        }}),
+    )
+    .header("mcp-session-id", &session)
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(tool.status(), StatusCode::OK);
+    assert!(tool.text().await.unwrap().contains("\"id\":3"));
+    buffered.clear();
+    let (cursor, first_frame) = next_sse_message(&mut passive, &mut buffered).await;
+    let (_, second_frame) = next_sse_message(&mut passive, &mut buffered).await;
+    assert_eq!(first_frame["params"]["data"], "A");
+    assert_eq!(second_frame["params"]["data"], "B");
+    let cursor = cursor.unwrap();
+    drop(passive);
+
+    let mut passive = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let response = get(&owner)
+                .header("last-event-id", &cursor)
+                .send()
+                .await
+                .unwrap();
+            if response.status() != StatusCode::CONFLICT {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(passive.status(), StatusCode::OK);
+    buffered.clear();
+    let (_, event) = next_sse_message(&mut passive, &mut buffered).await;
+    assert_eq!(event["params"]["data"], "B");
+    let deleted = client
+        .delete(second.url("/mcp/"))
+        .bearer_auth(&owner)
+        .header("mcp-session-id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&deleted.text().await.unwrap()).unwrap()["result"],
+        json!({})
+    );
+    assert!(passive.chunk().await.unwrap().is_none());
+    let response = post(&first, json!({"jsonrpc":"2.0","id":4,"method":"ping"}))
+        .header("mcp-session-id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

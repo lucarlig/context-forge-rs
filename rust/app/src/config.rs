@@ -162,9 +162,29 @@ impl Settings {
                 .map(RedisSessionDirectory::new)
                 .transpose()
                 .map_err(|_| "invalid REDIS_URL")?
+                .map(std::sync::Arc::new)
         } else {
             None
         };
+        let affinity_forward_timeout = if redis.is_some() {
+            positive_seconds(
+                "MCPGATEWAY_POOL_RPC_FORWARD_TIMEOUT",
+                defaults.affinity_forward_timeout.as_secs_f64(),
+            )?
+        } else {
+            defaults.affinity_forward_timeout
+        };
+        let affinity_forward_concurrency = if redis.is_some() {
+            parse(
+                "MCPGATEWAY_AFFINITY_FORWARD_CONCURRENCY",
+                defaults.affinity_forward_concurrency,
+            )?
+        } else {
+            defaults.affinity_forward_concurrency
+        };
+        if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&affinity_forward_concurrency) {
+            return Err("invalid MCPGATEWAY_AFFINITY_FORWARD_CONCURRENCY".into());
+        }
         Ok(Some(SessionSettings {
             ttl: Duration::from_secs(ttl),
             get_stream_enabled: flag("MCP_GET_STREAM_ENABLED")?
@@ -172,6 +192,8 @@ impl Settings {
             event_capacity,
             event_ttl: Duration::from_secs(event_ttl),
             redis,
+            affinity_forward_timeout,
+            affinity_forward_concurrency,
             ..defaults
         }))
     }

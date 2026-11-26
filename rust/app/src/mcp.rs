@@ -34,6 +34,7 @@ pub use crate::redis_sessions::RedisSessionDirectory;
 
 use crate::{
     access::{self, Principal},
+    affinity::{self, Forwarded},
     catalog::CatalogServer,
     events::Journal,
     gateway::{GatewayService, ToolError},
@@ -78,7 +79,9 @@ pub struct SessionSettings {
     pub shutdown: CancellationToken,
     pub event_capacity: usize,
     pub event_ttl: Duration,
-    pub redis: Option<RedisSessionDirectory>,
+    pub redis: Option<Arc<RedisSessionDirectory>>,
+    pub affinity_forward_timeout: Duration,
+    pub affinity_forward_concurrency: usize,
 }
 
 impl Default for SessionSettings {
@@ -90,6 +93,8 @@ impl Default for SessionSettings {
             event_capacity: 100,
             event_ttl: Duration::from_secs(3600),
             redis: None,
+            affinity_forward_timeout: Duration::from_secs(30),
+            affinity_forward_concurrency: 32,
         }
     }
 }
@@ -120,8 +125,18 @@ pub(crate) fn router(
     service: Arc<GatewayService>,
     mode: ProtocolMode,
     options: HttpOptions,
+    require_auth: bool,
 ) -> Router {
-    Router::new()
+    let relay = options.sessions.as_ref().and_then(|sessions| {
+        Some((
+            sessions.redis.as_ref()?.clone(),
+            sessions.affinity_forward_timeout,
+            sessions.affinity_forward_concurrency,
+            sessions.shutdown.clone(),
+        ))
+    });
+    let gateway = service.clone();
+    let router = Router::new()
         .route("/mcp", any(handle_request))
         .route("/mcp/", any(handle_request))
         .route("/servers/{server_id}/mcp", any(handle_request))
@@ -135,7 +150,12 @@ pub(crate) fn router(
             sessions: options.sessions.map(Sessions::new),
             json_response: options.json_response,
             service,
-        }))
+        }));
+    let router = gateway.access.protect_mcp(router, require_auth);
+    if let Some((redis, timeout, concurrency, shutdown)) = relay {
+        affinity::spawn(redis, router.clone(), timeout, concurrency, shutdown);
+    }
+    router
 }
 
 #[derive(Default)]
@@ -246,6 +266,10 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
         return response;
     }
 
+    let request = match forward_remote(&state, request).await {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
     let is_head = request.method() == Method::HEAD;
     let mut response = match *request.method() {
         Method::GET => handle_get(&state, request).await,
@@ -270,6 +294,66 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
         *response.body_mut() = Body::empty();
     }
     response
+}
+
+async fn forward_remote(state: &McpState, request: Request) -> Result<Request, Box<Response>> {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::POST | Method::DELETE
+    ) || request.extensions().get::<Forwarded>().is_some()
+    {
+        return Ok(request);
+    }
+    let Some(sessions) = &state.sessions else {
+        return Ok(request);
+    };
+    let Some(redis) = sessions.redis() else {
+        return Ok(request);
+    };
+    let Ok(Some(id)) = session_header(request.headers()) else {
+        return Ok(request);
+    };
+    if sessions.local_exists(id) {
+        return Ok(request);
+    }
+    let owner = request
+        .extensions()
+        .get::<Principal>()
+        .map(|principal| principal.email.as_str());
+    let server = request
+        .extensions()
+        .get::<CatalogServer>()
+        .map(|server| server.id.as_str());
+    let worker = match redis.locate(id, owner, server).await {
+        Err(SessionError::Remote(worker)) => worker,
+        // The local route applies endpoint-specific validation and error formatting.
+        _ => return Ok(request),
+    };
+    let request = if *request.method() == Method::POST {
+        let (parts, body) = request.into_parts();
+        let body = Bytes::from_request(Request::from_parts(parts.clone(), body), &())
+            .await
+            .map_err(|rejection| Box::new(rejection.into_response()))?;
+        let is_utf8 = std::str::from_utf8(&body).is_ok();
+        let is_initializer = serde_json::from_slice::<Value>(&body)
+            .is_ok_and(|message| message.get("id").is_some() && message["method"] == "initialize");
+        let request = Request::from_parts(parts, Body::from(body));
+        if is_initializer || !is_utf8 {
+            return Ok(request);
+        }
+        request
+    } else {
+        request
+    };
+    Err(Box::new(
+        affinity::forward(
+            redis.clone(),
+            worker,
+            request,
+            sessions.affinity_forward_timeout(),
+        )
+        .await,
+    ))
 }
 
 async fn handle_get(state: &McpState, request: Request) -> Response {
@@ -1200,6 +1284,7 @@ mod tests {
             test_service(database, auth),
             ProtocolMode::Legacy,
             HttpOptions::default(),
+            false,
         )
     }
 

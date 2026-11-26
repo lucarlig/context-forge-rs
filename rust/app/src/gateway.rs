@@ -137,10 +137,7 @@ impl GatewayService {
         mode: ProtocolMode,
         options: HttpOptions,
     ) -> Router {
-        self.access.protect_mcp(
-            crate::mcp::router(self.clone(), mode, options),
-            require_auth,
-        )
+        crate::mcp::router(self.clone(), mode, options, require_auth)
     }
 
     pub(crate) async fn catalog_ttl_ms(&self, server: Option<&CatalogServer>) -> u64 {

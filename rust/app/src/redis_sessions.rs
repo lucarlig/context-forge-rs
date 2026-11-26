@@ -3,8 +3,11 @@
 use std::time::Duration;
 
 use axum::http::HeaderValue;
-use redis::{AsyncConnectionConfig, FromRedisValue, aio::MultiplexedConnection};
-use tokio::sync::Mutex;
+use redis::{
+    AsyncConnectionConfig, FromRedisValue,
+    aio::{MultiplexedConnection, PubSubStream},
+};
+use tokio::{sync::Mutex, time::timeout};
 use uuid::Uuid;
 
 use crate::{config::RedisSettings, sessions::SessionError};
@@ -25,7 +28,7 @@ if record[2] ~= ARGV[2] or record[3] ~= ARGV[3] then return {1, ''} end
 if record[1] ~= ARGV[1] then return {2, record[1]} end
 if ARGV[5] == 'delete' then
   redis.call('DEL', KEYS[1])
-else
+elseif ARGV[5] == 'touch' then
   redis.call('PEXPIRE', KEYS[1], ARGV[4])
 end
 return {3, record[1]}
@@ -37,6 +40,7 @@ pub struct RedisSessionDirectory {
     config: AsyncConnectionConfig,
     worker: String,
     connection: Mutex<Option<(Uuid, MultiplexedConnection)>>,
+    socket_timeout: Duration,
 }
 
 impl RedisSessionDirectory {
@@ -50,6 +54,9 @@ impl RedisSessionDirectory {
             config,
             worker: Uuid::new_v4().simple().to_string(),
             connection: Mutex::new(None),
+            socket_timeout: settings
+                .connect_timeout
+                .saturating_add(settings.response_timeout),
         })
     }
 
@@ -85,6 +92,34 @@ impl RedisSessionDirectory {
         ttl: Duration,
         delete: bool,
     ) -> Result<(), SessionError> {
+        self.lookup(
+            id,
+            owner,
+            server,
+            ttl,
+            if delete { "delete" } else { "touch" },
+        )
+        .await
+    }
+
+    pub(crate) async fn locate(
+        &self,
+        id: &HeaderValue,
+        owner: Option<&str>,
+        server: Option<&str>,
+    ) -> Result<(), SessionError> {
+        self.lookup(id, owner, server, Duration::ZERO, "lookup")
+            .await
+    }
+
+    async fn lookup(
+        &self,
+        id: &HeaderValue,
+        owner: Option<&str>,
+        server: Option<&str>,
+        ttl: Duration,
+        operation: &str,
+    ) -> Result<(), SessionError> {
         let key = session_key(id)?;
         let mut command = redis::cmd("EVAL");
         command
@@ -95,7 +130,7 @@ impl RedisSessionDirectory {
             .arg(owner.unwrap_or_default())
             .arg(server.unwrap_or_default())
             .arg(ttl_millis(ttl))
-            .arg(if delete { "delete" } else { "touch" });
+            .arg(operation);
         let (status, worker): (u8, String) = self.query(&command).await.map_err(unavailable)?;
         match status {
             0 => Err(SessionError::NotFound),
@@ -106,6 +141,30 @@ impl RedisSessionDirectory {
             3 => Ok(()),
             _ => Err(SessionError::Unavailable),
         }
+    }
+
+    pub(crate) fn worker_id(&self) -> &str {
+        &self.worker
+    }
+
+    pub(crate) async fn subscribe(&self, channel: &str) -> redis::RedisResult<PubSubStream> {
+        timeout(self.socket_timeout, async {
+            let mut subscription = self.client.get_async_pubsub().await?;
+            subscription.subscribe(channel).await?;
+            Ok(subscription.into_on_message())
+        })
+        .await
+        .map_err(|_| {
+            redis::RedisError::from(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Redis subscription timed out",
+            ))
+        })?
+    }
+
+    pub(crate) async fn publish(&self, channel: &str, payload: &[u8]) -> redis::RedisResult<usize> {
+        self.query(redis::cmd("PUBLISH").arg(channel).arg(payload))
+            .await
     }
 
     async fn query<T: FromRedisValue>(&self, command: &redis::Cmd) -> redis::RedisResult<T> {

@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::{
     access::Principal,
     events::{HISTORY_BUDGET, Journal, JournalMode, Replay, parse_cursor},
-    mcp::SessionSettings,
+    mcp::{RedisSessionDirectory, SessionSettings},
     upstream::UpstreamAssociation,
 };
 
@@ -98,6 +98,22 @@ impl Sessions {
 
     pub(crate) fn get_stream_enabled(&self) -> bool {
         self.settings.get_stream_enabled
+    }
+
+    pub(crate) fn redis(&self) -> Option<&Arc<RedisSessionDirectory>> {
+        self.settings.redis.as_ref()
+    }
+
+    pub(crate) fn local_exists(&self, id: &HeaderValue) -> bool {
+        self.registry
+            .lock()
+            .expect("session map lock")
+            .entries
+            .contains_key(id)
+    }
+
+    pub(crate) fn affinity_forward_timeout(&self) -> Duration {
+        self.settings.affinity_forward_timeout
     }
 
     fn sweep(&self, registry: &mut Registry) {
