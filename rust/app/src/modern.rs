@@ -337,6 +337,7 @@ impl ServerHandler for GatewayHandler {
                 progress: relay.as_ref(),
                 notifications: None,
             },
+            None,
         );
         let mut result = match with_progress(invocation, updates, &context).await {
             Ok(value) => serde_json::from_value::<CallToolResult>(value)

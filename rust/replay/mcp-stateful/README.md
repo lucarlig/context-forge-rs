@@ -39,7 +39,7 @@ In the Redis affinity profile, two pinned gateway processes shared an isolated S
 
 Bind session access to the authorized principal and virtual server on every request. Apply the ownership check regardless of the cache backend. DELETE must invalidate the session for both POST and GET and close active streams. Verify those rules, cross-session cursor isolation, and cancellation through a live Rust gateway before checking off the milestone. [Legacy MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
 
-Rust forwards typed logging and catalog notifications from an upstream tool's POST response to the passive GET stream. Its live test replays after a known cursor, follows fresh events after an unknown cursor, and rejects replay with a narrowed bearer token. The gateway retains these events by session and authorization scope. Persistent upstream GET streams and server-initiated requests remain open.
+Rust forwards typed logging and catalog notifications from upstream POST responses and persistent GET streams. It associates upstream sessions with the downstream session, gateway endpoint, and authorization scope. Its live test confirms upstream session reuse, notification delivery after a tool returns, upstream reconnection with `Last-Event-ID`, and upstream closure after downstream DELETE. It also verifies replay and rejection with a narrowed bearer token. Server-initiated requests and shared session affinity remain open.
 
 ## Rust lifecycle replay
 

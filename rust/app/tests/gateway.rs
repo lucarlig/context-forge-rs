@@ -1320,28 +1320,57 @@ async fn stream_resumption_never_reads_another_session_or_authorization_scope() 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
-async fn passive_fixture(Json(body): Json<Value>) -> Response {
+#[derive(Default)]
+struct PassiveFixture {
+    initialized: AtomicUsize,
+    gets: AtomicUsize,
+    called: std::sync::Mutex<Vec<(String, Value)>>,
+    deleted: std::sync::Mutex<Vec<String>>,
+    release_get: tokio::sync::Notify,
+    ended: tokio::sync::Notify,
+}
+
+fn passive_log(data: &Value) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .json_data(json!({
+            "jsonrpc":"2.0","method":"notifications/message",
+            "params":{"level":"info","logger":"passive","data":data}
+        }))
+        .unwrap()
+}
+
+async fn passive_fixture(
+    State(fixture): State<Arc<PassiveFixture>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let id = &body["id"];
     let result = match body["method"].as_str().unwrap() {
-        "initialize" => json!({
-            "protocolVersion":PROTOCOL,"capabilities":{"tools":{}},
-            "serverInfo":{"name":"passive fixture","version":"1"}
-        }),
+        "initialize" => {
+            let generation = fixture.initialized.fetch_add(1, Ordering::Relaxed) + 1;
+            return (
+                [("mcp-session-id", format!("upstream-{generation}"))],
+                Json(json!({"jsonrpc":"2.0", "id":id, "result":{
+                    "protocolVersion":PROTOCOL, "capabilities":{"tools":{}},
+                    "serverInfo":{"name":"passive fixture","version":"1"}
+                }})),
+            )
+                .into_response();
+        }
         "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
         "tools/list" => json!({"tools":[{"name":"log","inputSchema":{"type":"object"}}]}),
         "tools/call" => {
+            let upstream_id = headers["mcp-session-id"].to_str().unwrap().to_owned();
+            fixture
+                .called
+                .lock()
+                .unwrap()
+                .push((upstream_id, id.clone()));
             let mut events: Vec<_> = body["params"]["arguments"]["messages"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|text| {
-                    axum::response::sse::Event::default()
-                        .json_data(json!({
-                            "jsonrpc":"2.0","method":"notifications/message",
-                            "params":{"level":"info","logger":"passive","data": text}
-                        }))
-                        .unwrap()
-                })
+                .map(passive_log)
                 .collect();
             events.push(
                 axum::response::sse::Event::default()
@@ -1360,10 +1389,60 @@ async fn passive_fixture(Json(body): Json<Value>) -> Response {
     Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
 }
 
+async fn upstream_passive(
+    State(fixture): State<Arc<PassiveFixture>>,
+    headers: HeaderMap,
+) -> Response {
+    use futures_util::{StreamExt, stream};
+    assert_eq!(headers["mcp-session-id"], "upstream-2");
+    assert_eq!(headers["mcp-protocol-version"], PROTOCOL);
+    assert_eq!(headers[header::ACCEPT], "text/event-stream");
+    let number = fixture.gets.fetch_add(1, Ordering::Relaxed);
+    if number == 0 {
+        assert!(!headers.contains_key("last-event-id"));
+        return axum::response::Sse::new(stream::once(async move {
+            fixture.release_get.notified().await;
+            Ok::<_, std::convert::Infallible>(passive_log(&json!("G")).id("upstream-G"))
+        }))
+        .into_response();
+    }
+    assert_eq!(number, 1);
+    assert_eq!(headers["last-event-id"], "upstream-G");
+    let response = stream::iter([Ok::<_, std::convert::Infallible>(
+        passive_log(&json!("H")).id("upstream-H"),
+    )])
+    .chain(stream::pending());
+    axum::response::Sse::new(response).into_response()
+}
+
+async fn end_passive_fixture(
+    State(fixture): State<Arc<PassiveFixture>>,
+    headers: HeaderMap,
+) -> StatusCode {
+    fixture
+        .deleted
+        .lock()
+        .unwrap()
+        .push(headers["mcp-session-id"].to_str().unwrap().to_owned());
+    fixture.ended.notify_one();
+    StatusCode::OK
+}
+
 #[tokio::test]
-async fn passive_stream_replays_upstream_notifications_and_tails_unknown_cursors() {
+async fn passive_stream_follows_upstream_get_reconnects_and_replays_notifications() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let upstream = Running::start(Router::new().route("/mcp", post(passive_fixture))).await;
+    let fixture = Arc::new(PassiveFixture::default());
+    let upstream = Running::start(
+        Router::new()
+            .route(
+                "/mcp",
+                post(passive_fixture)
+                    .get(upstream_passive)
+                    .delete(end_passive_fixture),
+            )
+            .with_state(fixture.clone()),
+    )
+    .await;
     let database = database().await;
     let service = Arc::new(GatewayService::new(
         database.clone(),
@@ -1449,6 +1528,12 @@ async fn passive_stream_replays_upstream_notifications_and_tails_unknown_cursors
     assert_eq!(first["method"], "notifications/message");
     assert_eq!(first["params"]["data"], "A");
     assert_eq!(second["params"]["data"], "B");
+    // The upstream GET remains active after the tool has returned.
+    fixture.release_get.notify_one();
+    for expected in ["G", "H"] {
+        let (_, event) = next_sse_message(&mut listener, &mut buffered).await;
+        assert_eq!(event["params"]["data"], expected);
+    }
     let cursor = cursor.unwrap();
     assert_eq!(
         get(&restricted, Some(&cursor))
@@ -1483,4 +1568,41 @@ async fn passive_stream_replays_upstream_notifications_and_tails_unknown_cursors
         let (_, event) = next_sse_message(&mut listener, &mut buffered).await;
         assert_eq!(event["params"]["data"], expected);
     }
+    assert_eq!(
+        fixture.initialized.load(Ordering::Relaxed),
+        2,
+        "discovery and one associated session"
+    );
+    let calls = fixture.called.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        [
+            ("upstream-2".to_owned(), json!(2)),
+            ("upstream-2".to_owned(), json!(3))
+        ]
+    );
+    let deleted = client
+        .delete(gateway.url("/mcp/"))
+        .bearer_auth(&owner)
+        .header("mcp-session-id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if fixture
+                .deleted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == "upstream-2")
+            {
+                break;
+            }
+            fixture.ended.notified().await;
+        }
+    })
+    .await
+    .expect("downstream DELETE should close the upstream session");
 }

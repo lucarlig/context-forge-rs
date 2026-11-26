@@ -19,12 +19,14 @@ use crate::{
     access::Principal,
     events::{HISTORY_BUDGET, Journal, JournalMode, Replay, parse_cursor},
     mcp::SessionSettings,
+    upstream::UpstreamAssociation,
 };
 
 const MAX_SESSIONS: usize = 4096;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_JOURNALS: usize = 128;
 const MAX_NOTIFICATION_SCOPES: usize = 32;
+const MAX_UPSTREAM_ASSOCIATIONS: usize = 128;
 
 pub(crate) struct Sessions {
     settings: SessionSettings,
@@ -40,9 +42,7 @@ struct Registry {
 pub(crate) struct Session {
     owner: Option<String>,
     server: Option<String>,
-    ttl: Duration,
-    last_seen: Mutex<Instant>,
-    shutdown: CancellationToken,
+    lifetime: Arc<SessionLifetime>,
     listener_open: AtomicBool,
     pending: Mutex<HashMap<RequestId, CancellationToken>>,
     journals: Mutex<VecDeque<Arc<Journal>>>,
@@ -51,6 +51,20 @@ pub(crate) struct Session {
     event_budget: Arc<Semaphore>,
     event_capacity: usize,
     event_ttl: Duration,
+    upstreams: Mutex<HashMap<UpstreamKey, Arc<UpstreamAssociation>>>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct UpstreamKey {
+    gateway: String,
+    endpoint: String,
+    authorization: Option<[u8; 32]>,
+}
+
+pub(crate) struct SessionLifetime {
+    ttl: Duration,
+    last_seen: Mutex<Instant>,
+    shutdown: CancellationToken,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,7 +104,7 @@ impl Sessions {
             .min(self.settings.ttl);
         if registry.last_sweep.elapsed() >= interval {
             registry.entries.retain(|_, session| {
-                if !session.active(false) {
+                if !session.lifetime.active(false) {
                     return false;
                 }
                 session
@@ -121,7 +135,7 @@ impl Sessions {
         self.sweep(&mut registry);
         let entries = &mut registry.entries;
         if entries.len() == MAX_SESSIONS {
-            entries.retain(|_, session| session.active(false));
+            entries.retain(|_, session| session.lifetime.active(false));
             if entries.len() == MAX_SESSIONS {
                 return Err(SessionError::Capacity);
             }
@@ -133,9 +147,11 @@ impl Sessions {
                 let session = Arc::new(Session {
                     owner: owner.map(str::to_owned),
                     server: server.map(str::to_owned),
-                    ttl: self.settings.ttl,
-                    last_seen: Mutex::new(Instant::now()),
-                    shutdown: self.settings.shutdown.child_token(),
+                    lifetime: Arc::new(SessionLifetime {
+                        ttl: self.settings.ttl,
+                        last_seen: Mutex::new(Instant::now()),
+                        shutdown: self.settings.shutdown.child_token(),
+                    }),
                     listener_open: AtomicBool::new(false),
                     pending: Mutex::new(HashMap::new()),
                     journals: Mutex::new(VecDeque::new()),
@@ -144,6 +160,7 @@ impl Sessions {
                     event_budget: self.event_budget.clone(),
                     event_capacity: self.settings.event_capacity,
                     event_ttl: self.settings.event_ttl,
+                    upstreams: Mutex::new(HashMap::new()),
                 });
                 entry.insert(session.clone());
                 return Ok((id, session));
@@ -164,7 +181,7 @@ impl Sessions {
         let entries = &mut registry.entries;
         let session = entries.get(id).cloned().ok_or(SessionError::NotFound)?;
         let authorized = session.owner.as_deref() == owner && session.server.as_deref() == server;
-        if !session.active(authorized && !delete) {
+        if !session.lifetime.active(authorized && !delete) {
             entries.remove(id);
             return Err(SessionError::NotFound);
         }
@@ -172,7 +189,7 @@ impl Sessions {
             return Err(SessionError::Forbidden);
         }
         if delete {
-            session.shutdown.cancel();
+            session.lifetime.shutdown.cancel();
             entries.remove(id);
         }
         Ok(session)
@@ -180,6 +197,32 @@ impl Sessions {
 }
 
 impl Session {
+    pub(crate) fn upstream(
+        &self,
+        gateway: &str,
+        endpoint: &str,
+        authorization: Option<[u8; 32]>,
+    ) -> Option<Arc<UpstreamAssociation>> {
+        let key = UpstreamKey {
+            gateway: gateway.to_owned(),
+            endpoint: endpoint.to_owned(),
+            authorization,
+        };
+        let mut upstreams = self
+            .upstreams
+            .lock()
+            .expect("upstream session registry lock");
+        if let Some(upstream) = upstreams.get(&key) {
+            return Some(upstream.clone());
+        }
+        if upstreams.len() >= MAX_UPSTREAM_ASSOCIATIONS {
+            return None;
+        }
+        let association = Arc::new(UpstreamAssociation::new(self.lifetime.clone()));
+        upstreams.insert(key, association.clone());
+        Some(association)
+    }
+
     pub(crate) fn start_journal(
         &self,
         principal: Option<&Principal>,
@@ -250,20 +293,6 @@ impl Session {
         Some(stream)
     }
 
-    fn active(&self, touch: bool) -> bool {
-        let mut last_seen = self.last_seen.lock().expect("session timestamp lock");
-        if last_seen.elapsed() >= self.ttl {
-            self.shutdown.cancel();
-        }
-        if self.shutdown.is_cancelled() {
-            return false;
-        }
-        if touch {
-            *last_seen = Instant::now();
-        }
-        true
-    }
-
     pub(crate) fn listen(self: Arc<Self>) -> Option<Listener> {
         self.listener_open
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -279,7 +308,7 @@ impl Session {
         let std::collections::hash_map::Entry::Vacant(entry) = pending.entry(id.clone()) else {
             return Err(PendingError::DuplicateId);
         };
-        let token = entry.insert(self.shutdown.child_token()).clone();
+        let token = entry.insert(self.lifetime.shutdown.child_token()).clone();
         drop(pending);
         Ok(PendingRequest {
             session: self,
@@ -297,6 +326,22 @@ impl Session {
         {
             token.cancel();
         }
+    }
+}
+
+impl SessionLifetime {
+    fn active(&self, touch: bool) -> bool {
+        let mut last_seen = self.last_seen.lock().expect("session timestamp lock");
+        if last_seen.elapsed() >= self.ttl {
+            self.shutdown.cancel();
+        }
+        if self.shutdown.is_cancelled() {
+            return false;
+        }
+        if touch {
+            *last_seen = Instant::now();
+        }
+        true
     }
 
     pub(crate) async fn wait_until_closed(&self) {
@@ -335,7 +380,7 @@ pub(crate) struct Listener(Arc<Session>);
 
 impl Listener {
     pub(crate) async fn wait_until_closed(&self) {
-        self.0.wait_until_closed().await;
+        self.0.lifetime.wait_until_closed().await;
     }
 }
 

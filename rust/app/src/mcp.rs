@@ -921,14 +921,11 @@ async fn call_tool(
     if params.input_responses.is_some() || params.request_state.is_some() {
         return invalid_params(id);
     }
-    let notifications = session.as_ref().and_then(|session| {
-        session.passive_journal(principal.map(Principal::authorization_fingerprint))
-    });
-    let pending = if let Some(session) = session {
+    let pending = if let Some(session) = &session {
         let Ok(request_id) = RequestId::deserialize(id) else {
             return invalid_envelope();
         };
-        match session.track(request_id) {
+        match session.clone().track(request_id) {
             Ok(pending) => Some(pending),
             Err(PendingError::DuplicateId) => {
                 return rpc_error(
@@ -966,8 +963,9 @@ async fn call_tool(
             ToolContext {
                 cancellation: &cancellation,
                 progress,
-                notifications: notifications.as_deref(),
+                notifications: None,
             },
+            session.as_deref(),
         )
         .await;
     if cancellation.is_cancelled() {

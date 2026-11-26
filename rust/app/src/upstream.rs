@@ -5,7 +5,10 @@ use std::{
     collections::HashSet,
     io,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
     time::Duration,
 };
 
@@ -31,13 +34,13 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     net::lookup_host,
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     time::{Instant, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use crate::events::Journal;
+use crate::{events::Journal, sessions::SessionLifetime};
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
 const MODERN_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
@@ -59,7 +62,7 @@ const PROGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct ToolContext<'a> {
     pub(crate) cancellation: &'a CancellationToken,
     pub(crate) progress: Option<&'a ToolProgress>,
-    pub(crate) notifications: Option<&'a Journal>,
+    pub(crate) notifications: Option<Arc<Journal>>,
 }
 
 pub(crate) struct ToolProgress {
@@ -196,6 +199,8 @@ pub enum UpstreamError {
     Timeout,
     #[error("upstream request cancelled")]
     Cancelled,
+    #[error("upstream MCP session expired")]
+    SessionExpired,
     #[error("upstream transport failed")]
     Transport,
     #[error("upstream returned HTTP {0}")]
@@ -241,6 +246,86 @@ pub struct DiscoveredCatalog {
     pub tools: Vec<Value>,
 }
 
+pub(crate) struct UpstreamAssociation {
+    lifetime: Arc<SessionLifetime>,
+    connection: Mutex<Option<AssociatedConnection>>,
+}
+
+struct AssociatedConnection {
+    session: Arc<Session>,
+    stop: CancellationToken,
+}
+
+impl Drop for AssociatedConnection {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+impl UpstreamAssociation {
+    pub(crate) fn new(lifetime: Arc<SessionLifetime>) -> Self {
+        Self {
+            lifetime,
+            connection: Mutex::new(None),
+        }
+    }
+
+    async fn session(
+        &self,
+        upstream: &UpstreamClient,
+        endpoint: &str,
+        deadline: Instant,
+        context: &ToolContext<'_>,
+    ) -> Result<Arc<Session>, UpstreamError> {
+        let mut connection = tokio::select! {
+            biased;
+            () = context.cancellation.cancelled() => return Err(UpstreamError::Cancelled),
+            lock = timeout_at(deadline, self.connection.lock()) => lock.map_err(|_| UpstreamError::Timeout)?,
+        };
+        if let Some(connection) = connection.as_ref() {
+            return Ok(connection.session.clone());
+        }
+        let session = Arc::new(upstream.open_session(endpoint, deadline).await?);
+        let stop = CancellationToken::new();
+        if session.session_id.is_some() {
+            let session = session.clone();
+            let stop = stop.clone();
+            let lifetime = self.lifetime.clone();
+            let notifications = context.notifications.clone();
+            tokio::spawn(async move {
+                let listener = async {
+                    if let Some(journal) = notifications.as_deref() {
+                        session.follow_notifications(journal).await;
+                    }
+                    std::future::pending::<()>().await;
+                };
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => {},
+                    () = lifetime.wait_until_closed() => {},
+                    () = listener => {},
+                }
+                session.close().await;
+            });
+        }
+        *connection = Some(AssociatedConnection {
+            session: session.clone(),
+            stop,
+        });
+        Ok(session)
+    }
+
+    async fn invalidate(&self, expired: &Arc<Session>) {
+        let mut connection = self.connection.lock().await;
+        if connection
+            .as_ref()
+            .is_some_and(|connection| Arc::ptr_eq(&connection.session, expired))
+        {
+            connection.take();
+        }
+    }
+}
+
 impl UpstreamClient {
     pub fn new(policy: EgressPolicy, timeout: Duration) -> Self {
         Self {
@@ -256,7 +341,8 @@ impl UpstreamClient {
     }
 
     pub async fn list_tools(&self, url: &str) -> Result<DiscoveredCatalog, UpstreamError> {
-        let (mut session, deadline) = self.open_session(url).await?;
+        let deadline = self.deadline()?;
+        let session = self.open_session(url, deadline).await?;
         let result = timeout_at(deadline, session.list_tools()).await;
         session.close().await;
         result.map_err(|_| UpstreamError::Timeout)?
@@ -277,6 +363,7 @@ impl UpstreamClient {
                 progress: None,
                 notifications: None,
             },
+            None,
         )
         .await
     }
@@ -287,6 +374,7 @@ impl UpstreamClient {
         name: &str,
         arguments: Value,
         context: ToolContext<'_>,
+        association: Option<&UpstreamAssociation>,
     ) -> Result<Value, UpstreamError> {
         let cancellation = context.cancellation;
         if cancellation.is_cancelled() {
@@ -298,32 +386,58 @@ impl UpstreamClient {
         let request = CallToolRequest::new(
             CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
         );
-        let (mut session, deadline) = self.open_session(url).await?;
+        let deadline = self.deadline()?;
+        let session = match association {
+            Some(association) => association.session(self, url, deadline, &context).await?,
+            None => Arc::new(self.open_session(url, deadline).await?),
+        };
         if cancellation.is_cancelled() {
-            session.close().await;
+            if association.is_none() {
+                session.close().await;
+            }
             return Err(UpstreamError::Cancelled);
         }
-        let id = session.next_id;
+        let id = session.next_request_id();
+        let mut started = false;
         let result = tokio::select! {
             biased;
-            () = cancellation.cancelled() => {
-                if session.next_id != id {
-                    session.cancel(id).await;
-                }
-                Err(UpstreamError::Cancelled)
-            }
-            result = timeout_at(deadline, session.request(request.into(), context.progress, context.notifications)) => {
+            () = cancellation.cancelled() => Err(UpstreamError::Cancelled),
+            result = timeout_at(deadline, async {
+                started = true;
+                session.request_with_id(request.into(), id, context.progress, context.notifications.as_deref()).await
+            }) => {
                 result.unwrap_or(Err(UpstreamError::Timeout)).map(|reply| reply.result)
             }
         };
-        session.close().await;
+        if started
+            && matches!(
+                result,
+                Err(UpstreamError::Cancelled | UpstreamError::Timeout)
+            )
+        {
+            session.cancel(id).await;
+        }
+        match association {
+            Some(association) if matches!(result, Err(UpstreamError::SessionExpired)) => {
+                association.invalidate(&session).await;
+            }
+            None => session.close().await,
+            _ => {}
+        }
         result
     }
 
-    async fn open_session(&self, endpoint: &str) -> Result<(Session, Instant), UpstreamError> {
-        let deadline = Instant::now()
+    fn deadline(&self) -> Result<Instant, UpstreamError> {
+        Instant::now()
             .checked_add(self.timeout)
-            .ok_or(UpstreamError::Timeout)?;
+            .ok_or(UpstreamError::Timeout)
+    }
+
+    async fn open_session(
+        &self,
+        endpoint: &str,
+        deadline: Instant,
+    ) -> Result<Session, UpstreamError> {
         let mut session = timeout_at(deadline, self.connect(endpoint))
             .await
             .map_err(|_| UpstreamError::Timeout)??;
@@ -339,7 +453,7 @@ impl UpstreamClient {
             session.close().await;
             return Err(error);
         }
-        Ok((session, deadline))
+        Ok(session)
     }
 
     async fn connect(&self, endpoint: &str) -> Result<Session, UpstreamError> {
@@ -350,7 +464,6 @@ impl UpstreamClient {
             .retry(reqwest::retry::never())
             .pool_max_idle_per_host(0)
             .connect_timeout(CONNECT_TIMEOUT.min(self.timeout))
-            .timeout(self.timeout)
             .dns_resolver(Arc::new(DenyDns))
             .tls_backend_preconfigured(tls_config()?);
         if let Some(domain) = url.domain() {
@@ -369,7 +482,7 @@ impl UpstreamClient {
             capabilities: Value::Null,
             protocol_version: None,
             session_id: None,
-            next_id: 1,
+            next_id: AtomicI64::new(1),
         })
     }
 }
@@ -421,7 +534,7 @@ struct Session {
     capabilities: Value,
     protocol_version: Option<ProtocolVersion>,
     session_id: Option<HeaderValue>,
-    next_id: i64,
+    next_id: AtomicI64,
 }
 
 impl Session {
@@ -534,7 +647,7 @@ impl Session {
         Ok(())
     }
 
-    async fn list_tools(&mut self) -> Result<DiscoveredCatalog, UpstreamError> {
+    async fn list_tools(&self) -> Result<DiscoveredCatalog, UpstreamError> {
         let mut listed = Vec::new();
         let mut cursors = HashSet::new();
         let mut cursor = None;
@@ -582,26 +695,57 @@ impl Session {
     }
 
     async fn request(
-        &mut self,
+        &self,
         request: ClientRequest,
         progress: Option<&ToolProgress>,
         notifications: Option<&Journal>,
     ) -> Result<Reply, UpstreamError> {
-        let version = self.protocol_version.clone();
-        let (response, id) = self
-            .send_request(request, version.as_ref(), progress.is_some())
+        self.request_with_id(request, self.next_request_id(), progress, notifications)
+            .await
+    }
+
+    async fn request_with_id(
+        &self,
+        request: ClientRequest,
+        id: i64,
+        progress: Option<&ToolProgress>,
+        notifications: Option<&Journal>,
+    ) -> Result<Reply, UpstreamError> {
+        let response = self
+            .post_request(
+                request,
+                id,
+                self.protocol_version.as_ref(),
+                progress.is_some(),
+            )
             .await?;
         read_reply(response, id, progress, notifications).await
     }
 
+    fn next_request_id(&self) -> i64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     async fn send_request(
-        &mut self,
-        mut request: ClientRequest,
+        &self,
+        request: ClientRequest,
         version: Option<&ProtocolVersion>,
         report_progress: bool,
     ) -> Result<(Response, i64), UpstreamError> {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_request_id();
+        let response = self
+            .post_request(request, id, version, report_progress)
+            .await?;
+        Ok((response, id))
+    }
+
+    async fn post_request(
+        &self,
+        mut request: ClientRequest,
+        id: i64,
+        version: Option<&ProtocolVersion>,
+        report_progress: bool,
+    ) -> Result<Response, UpstreamError> {
         if let Some(version) = version.filter(|version| !version.has_initialize()) {
             request
                 .extensions_mut()
@@ -616,13 +760,11 @@ impl Session {
                 .get_meta_mut()
                 .set_progress_token(ProgressToken(RequestId::Number(id)));
         }
-        let response = self
-            .post(
-                &ClientJsonRpcMessage::request(request, RequestId::Number(id)),
-                version,
-            )
-            .await?;
-        Ok((response, id))
+        self.post(
+            &ClientJsonRpcMessage::request(request, RequestId::Number(id)),
+            version,
+        )
+        .await
     }
 
     fn request_builder(
@@ -632,8 +774,15 @@ impl Session {
     ) -> reqwest::RequestBuilder {
         let mut request = self
             .client
-            .request(method, self.url.clone())
-            .header(ACCEPT, ACCEPT_VALUE);
+            .request(method.clone(), self.url.clone())
+            .header(
+                ACCEPT,
+                if method == Method::GET {
+                    "text/event-stream"
+                } else {
+                    ACCEPT_VALUE
+                },
+            );
         if let Some(version) = version {
             request = request.header(PROTOCOL_HEADER, version.as_str());
         }
@@ -670,6 +819,11 @@ impl Session {
             .await?;
         if response.status().is_success() {
             Ok(response)
+        } else if response.status() == reqwest::StatusCode::NOT_FOUND
+            && self.session_id.is_some()
+            && version.is_some_and(ProtocolVersion::has_initialize)
+        {
+            Err(UpstreamError::SessionExpired)
         } else {
             Err(http_error(response).await)
         }
@@ -695,6 +849,71 @@ impl Session {
             let request = self.request_builder(Method::DELETE, self.protocol_version.as_ref());
             let _ = timeout(TERMINATION_TIMEOUT, request.send()).await;
         }
+    }
+
+    async fn follow_notifications(&self, journal: &Journal) {
+        let mut cursor = None;
+        loop {
+            match self.notification_stream(journal, &mut cursor).await {
+                Ok(())
+                | Err(
+                    UpstreamError::Transport
+                    | UpstreamError::Timeout
+                    | UpstreamError::Status(429 | 500..=599),
+                ) => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "upstream passive MCP stream ended");
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn notification_stream(
+        &self,
+        journal: &Journal,
+        cursor: &mut Option<HeaderValue>,
+    ) -> Result<(), UpstreamError> {
+        let mut request = self.request_builder(Method::GET, self.protocol_version.as_ref());
+        if let Some(id) = cursor {
+            request = request.header("last-event-id", id.clone());
+        }
+        let mut response = timeout(CONNECT_TIMEOUT, request.send())
+            .await
+            .map_err(|_| UpstreamError::Timeout)??;
+        if !response.status().is_success() {
+            return Err(UpstreamError::Status(response.status().as_u16()));
+        }
+        if !response_media_type(&response)
+            .is_some_and(|media| media.eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(UpstreamError::InvalidResponse);
+        }
+        let mut stream = SseDecoder {
+            last_event_id: cursor.clone(),
+            ..SseDecoder::default()
+        };
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > MAX_MESSAGE_BYTES {
+                return Err(UpstreamError::LimitExceeded);
+            }
+            let mut bytes = chunk.as_ref();
+            while let Some(frame) = stream.next_frame(&mut bytes) {
+                if frame.len() > MAX_MESSAGE_BYTES {
+                    return Err(UpstreamError::LimitExceeded);
+                }
+                if let Ok(JsonRpcMessage::Notification(notification)) = decode_message(&frame) {
+                    publish_notification(journal, &notification.notification);
+                }
+            }
+            if stream.line.len() + stream.event.len() > MAX_MESSAGE_BYTES {
+                return Err(UpstreamError::LimitExceeded);
+            }
+            *cursor = stream.last_event_id.clone();
+        }
+        Ok(())
     }
 }
 
@@ -939,6 +1158,8 @@ struct SseDecoder {
     event: Vec<u8>,
     after_cr: bool,
     read_first_line: bool,
+    pending_id: Option<HeaderValue>,
+    last_event_id: Option<HeaderValue>,
 }
 
 impl SseDecoder {
@@ -960,15 +1181,22 @@ impl SseDecoder {
             } else {
                 &self.line
             };
-            if line.is_empty() && !self.event.is_empty() {
-                self.line.clear();
-                return Some(std::mem::take(&mut self.event));
+            if line.is_empty() {
+                if let Some(id) = self.pending_id.take() {
+                    self.last_event_id = (!id.is_empty()).then_some(id);
+                }
+                if !self.event.is_empty() {
+                    self.line.clear();
+                    return Some(std::mem::take(&mut self.event));
+                }
             } else if let Some(data) = line.strip_prefix(b"data:") {
                 if !self.event.is_empty() {
                     self.event.push(b'\n');
                 }
                 self.event
                     .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
+            } else if let Some(id) = line.strip_prefix(b"id:") {
+                self.pending_id = HeaderValue::from_bytes(id.strip_prefix(b" ").unwrap_or(id)).ok();
             }
             self.line.clear();
         }

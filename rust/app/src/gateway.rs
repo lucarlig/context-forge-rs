@@ -26,6 +26,7 @@ use crate::{
     },
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings},
+    sessions::Session,
     upstream::{ToolContext, UpstreamClient, UpstreamError},
 };
 
@@ -216,7 +217,8 @@ impl GatewayService {
         server: Option<&CatalogServer>,
         name: &str,
         arguments: Value,
-        context: ToolContext<'_>,
+        mut context: ToolContext<'_>,
+        downstream: Option<&Session>,
     ) -> Result<Value, ToolError> {
         let tool = tokio::select! {
             biased;
@@ -231,8 +233,19 @@ impl GatewayService {
         {
             return Err(ToolError::Unavailable);
         }
+        let association = downstream.and_then(|session| {
+            let authorization = principal.map(Principal::authorization_fingerprint);
+            context.notifications = session.passive_journal(authorization);
+            session.upstream(&tool.gateway_id, &tool.gateway_url, authorization)
+        });
         self.upstream
-            .call_tool_with_context(&tool.gateway_url, &tool.original_name, arguments, context)
+            .call_tool_with_context(
+                &tool.gateway_url,
+                &tool.original_name,
+                arguments,
+                context,
+                association.as_deref(),
+            )
             .await
             .map_err(|error| {
                 if matches!(error, UpstreamError::Cancelled) {
