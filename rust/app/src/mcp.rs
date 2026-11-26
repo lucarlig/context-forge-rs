@@ -37,7 +37,7 @@ use crate::{
     gateway::{GatewayService, ToolError},
     modern::Modern,
     sessions::{PendingError, Session, SessionError, Sessions},
-    upstream::ToolProgress,
+    upstream::{ToolContext, ToolProgress},
 };
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -297,37 +297,22 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         )
             .into_response();
     }
-    let replay = if let Some((journal, replay)) = request
-        .headers()
-        .get(LAST_EVENT_ID)
+    let principal = request.extensions().get::<Principal>();
+    let authorization = principal.map(Principal::authorization_fingerprint);
+    let server = request.extensions().get::<CatalogServer>();
+    let cursor = request.headers().get(LAST_EVENT_ID);
+    let replay = if let Some((journal, replay)) = cursor
         .and_then(|value| value.to_str().ok())
         .and_then(|cursor| session.replay(cursor))
     {
-        let principal = request.extensions().get::<Principal>();
-        if journal.authorization != principal.map(Principal::authorization_fingerprint) {
+        if journal.authorization != authorization {
             return session_error(SessionError::Forbidden);
         }
-        if journal.needs_tool_execution
-            && let Some(principal) = principal
-        {
-            let server = request.extensions().get::<CatalogServer>();
-            match state
-                .service
-                .access
-                .allows(
-                    principal,
-                    "tools.execute",
-                    access::role_context(server),
-                    true,
-                )
-                .await
-            {
+        if journal.needs_tool_execution() {
+            match allows_tool_events(state, principal, server).await {
                 Ok(true) => {}
                 Ok(false) => return session_error(SessionError::Forbidden),
-                Err(error) => {
-                    tracing::error!(%error, "MCP stream replay permission lookup failed");
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                }
+                Err(error) => return event_permission_error(error),
             }
         }
         if journal.is_post_open() {
@@ -335,7 +320,13 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         }
         Some(replay)
     } else {
-        None
+        match allows_tool_events(state, principal, server).await {
+            Ok(true) => session
+                .passive_journal(authorization)
+                .map(|journal| journal.listen(cursor.is_none())),
+            Ok(false) => None,
+            Err(error) => return event_permission_error(error),
+        }
     };
     let Some(listener) = session.listen() else {
         return stream_conflict("Another GET /mcp stream is already open for this session.");
@@ -368,6 +359,31 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         ),
     )
         .into_response()
+}
+
+async fn allows_tool_events(
+    state: &McpState,
+    principal: Option<&Principal>,
+    server: Option<&CatalogServer>,
+) -> Result<bool, sqlx::Error> {
+    let Some(principal) = principal else {
+        return Ok(true);
+    };
+    state
+        .service
+        .access
+        .allows(
+            principal,
+            "tools.execute",
+            access::role_context(server),
+            true,
+        )
+        .await
+}
+
+fn event_permission_error(error: sqlx::Error) -> Response {
+    tracing::error!(%error, "MCP stream permission lookup failed");
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
 }
 
 fn stream_conflict(detail: &'static str) -> Response {
@@ -905,6 +921,9 @@ async fn call_tool(
     if params.input_responses.is_some() || params.request_state.is_some() {
         return invalid_params(id);
     }
+    let notifications = session.as_ref().and_then(|session| {
+        session.passive_journal(principal.map(Principal::authorization_fingerprint))
+    });
     let pending = if let Some(session) = session {
         let Ok(request_id) = RequestId::deserialize(id) else {
             return invalid_envelope();
@@ -944,8 +963,11 @@ async fn call_tool(
             server,
             &params.name,
             arguments,
-            &cancellation,
-            progress,
+            ToolContext {
+                cancellation: &cancellation,
+                progress,
+                notifications: notifications.as_deref(),
+            },
         )
         .await;
     if cancellation.is_cancelled() {

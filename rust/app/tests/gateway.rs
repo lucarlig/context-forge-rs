@@ -1319,3 +1319,168 @@ async fn stream_resumption_never_reads_another_session_or_authorization_scope() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+async fn passive_fixture(Json(body): Json<Value>) -> Response {
+    let id = &body["id"];
+    let result = match body["method"].as_str().unwrap() {
+        "initialize" => json!({
+            "protocolVersion":PROTOCOL,"capabilities":{"tools":{}},
+            "serverInfo":{"name":"passive fixture","version":"1"}
+        }),
+        "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+        "tools/list" => json!({"tools":[{"name":"log","inputSchema":{"type":"object"}}]}),
+        "tools/call" => {
+            let mut events: Vec<_> = body["params"]["arguments"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|text| {
+                    axum::response::sse::Event::default()
+                        .json_data(json!({
+                            "jsonrpc":"2.0","method":"notifications/message",
+                            "params":{"level":"info","logger":"passive","data": text}
+                        }))
+                        .unwrap()
+                })
+                .collect();
+            events.push(
+                axum::response::sse::Event::default()
+                    .json_data(json!({
+                        "jsonrpc":"2.0","id":id,"result":{"content":[],"isError":false}
+                    }))
+                    .unwrap(),
+            );
+            return axum::response::Sse::new(futures_util::stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+            .into_response();
+        }
+        unexpected => panic!("unexpected upstream method {unexpected}"),
+    };
+    Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+}
+
+#[tokio::test]
+async fn passive_stream_replays_upstream_notifications_and_tails_unknown_cursors() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let upstream = Running::start(Router::new().route("/mcp", post(passive_fixture))).await;
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(4),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.registration_router().merge(
+        service.mcp_router_with_sessions(
+            true,
+            ProtocolMode::Legacy,
+            Some(SessionSettings::default()),
+        ),
+    ))
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, result) = send(&client, gateway.url("/gateways"), json!({
+        "name":"passive","url":upstream.url("/mcp"),"visibility":"public","transport":"STREAMABLEHTTP"
+    }), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+
+    let owner = token("member", json!(["alpha"]), json!({}));
+    let restricted = token(
+        "member",
+        json!(["alpha"]),
+        json!({"permissions":["servers.use"]}),
+    );
+    let post = |message: Value| {
+        client
+            .post(gateway.url("/mcp/"))
+            .bearer_auth(&owner)
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-protocol-version", PROTOCOL)
+            .body(message.to_string())
+    };
+    let initialized = post(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }})).send().await.unwrap();
+    assert_eq!(initialized.status(), StatusCode::OK);
+    let session = initialized.headers()["mcp-session-id"].clone();
+    let notify = |id, messages: &[&str]| {
+        post(json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":"passive-log","arguments":{"messages":messages}}
+        }))
+        .header("mcp-session-id", &session)
+    };
+    let get = |credential, cursor: Option<&str>| {
+        let mut request = client
+            .get(gateway.url("/mcp/"))
+            .bearer_auth(credential)
+            .header(header::ACCEPT, "text/event-stream")
+            .header("mcp-session-id", &session);
+        if let Some(cursor) = cursor {
+            request = request.header("last-event-id", cursor);
+        }
+        request
+    };
+
+    let mut listener = get(&owner, None).send().await.unwrap();
+    assert_eq!(listener.status(), StatusCode::OK);
+    assert_eq!(
+        notify(2, &["A", "B"]).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+    let mut buffered = Vec::new();
+    let (cursor, first) = next_sse_message(&mut listener, &mut buffered).await;
+    let (_, second) = next_sse_message(&mut listener, &mut buffered).await;
+    assert_eq!(first["method"], "notifications/message");
+    assert_eq!(first["params"]["data"], "A");
+    assert_eq!(second["params"]["data"], "B");
+    let cursor = cursor.unwrap();
+    assert_eq!(
+        get(&restricted, Some(&cursor))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
+    );
+    drop(listener);
+
+    for (cursor, expected) in [(Some(cursor.as_str()), "B"), (Some("unknown"), "C")] {
+        let mut listener = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = get(&owner, cursor).send().await.unwrap();
+                if response.status() != StatusCode::CONFLICT {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(listener.status(), StatusCode::OK);
+        if cursor == Some("unknown") {
+            assert_eq!(
+                notify(3, &["C"]).send().await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        buffered.clear();
+        let (_, event) = next_sse_message(&mut listener, &mut buffered).await;
+        assert_eq!(event["params"]["data"], expected);
+    }
+}

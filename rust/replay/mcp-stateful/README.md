@@ -39,9 +39,11 @@ In the Redis affinity profile, two pinned gateway processes shared an isolated S
 
 Bind session access to the authorized principal and virtual server on every request. Apply the ownership check regardless of the cache backend. DELETE must invalidate the session for both POST and GET and close active streams. Verify those rules, cross-session cursor isolation, and cancellation through a live Rust gateway before checking off the milestone. [Legacy MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
 
+Rust forwards typed logging and catalog notifications from an upstream tool's POST response to the passive GET stream. Its live test replays after a known cursor, follows fresh events after an unknown cursor, and rejects replay with a narrowed bearer token. The gateway retains these events by session and authorization scope. Persistent upstream GET streams and server-initiated requests remain open.
+
 ## Rust lifecycle replay
 
-The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Passive server-initiated event delivery and resumption, and shared session affinity, remain open.
+The native gateway creates legacy sessions when `USE_STATEFUL_SESSIONS=true`. The process-local registry uses a sliding `SESSION_TTL` of one hour by default and caps the active set at 4,096 sessions. Set `MCP_GET_STREAM_ENABLED=false` to disable passive GET. The live Rust gateway test covers token renewal, principal and virtual-server isolation, notification acknowledgement, passive stream negotiation, listener conflict, and closure and invalidation after deletion. Shared session affinity remains open.
 
 The public legacy JSON profile produced five recordings with rust-anything v5.0.1. The original matched all five. Rust matched the unknown-session POST and missing-session GET. Initialization advertises the Rust version and the implemented capabilities. Missing-session POST and DELETE errors omit the generated session ID that v1.1.2 sends before initialization.
 
@@ -80,4 +82,4 @@ The Rust gateway retains event history per stateful POST stream. The client can 
 
 `STREAMABLE_HTTP_MAX_EVENTS_PER_STREAM` defaults to 100. `STREAMABLE_HTTP_EVENT_TTL` defaults to one hour after the stream finishes. The process retains at most 128 POST streams per session and budgets 64 MiB for retained events.
 
-The pinned gateway accepted the resume GET in the same progress fixture and delivered no events in the 1.5-second observation window. Rust implements POST resumption by stream ID as described by the transport specification. The reference's separate passive event-bus replay is still open in Rust. [MCP resumability specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery)
+The pinned gateway accepted the resume GET in the same progress fixture and delivered no events in the 1.5-second observation window. Rust implements POST resumption by stream ID as described by the transport specification. [MCP resumability specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery)

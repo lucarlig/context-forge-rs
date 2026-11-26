@@ -15,7 +15,6 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -27,7 +26,7 @@ use crate::{
     },
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings},
-    upstream::{ToolProgress, UpstreamClient, UpstreamError},
+    upstream::{ToolContext, UpstreamClient, UpstreamError},
 };
 
 pub struct GatewayService {
@@ -217,12 +216,11 @@ impl GatewayService {
         server: Option<&CatalogServer>,
         name: &str,
         arguments: Value,
-        cancellation: &CancellationToken,
-        progress: Option<&ToolProgress>,
+        context: ToolContext<'_>,
     ) -> Result<Value, ToolError> {
         let tool = tokio::select! {
             biased;
-            () = cancellation.cancelled() => return Err(ToolError::Cancelled),
+            () = context.cancellation.cancelled() => return Err(ToolError::Cancelled),
             result = self.lookup_invokable_tool(principal, server, name) => result?,
         }
         .ok_or(ToolError::NotFound)?;
@@ -234,13 +232,7 @@ impl GatewayService {
             return Err(ToolError::Unavailable);
         }
         self.upstream
-            .call_tool_with_context(
-                &tool.gateway_url,
-                &tool.original_name,
-                arguments,
-                cancellation,
-                progress,
-            )
+            .call_tool_with_context(&tool.gateway_url, &tool.original_name, arguments, context)
             .await
             .map_err(|error| {
                 if matches!(error, UpstreamError::Cancelled) {

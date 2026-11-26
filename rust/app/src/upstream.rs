@@ -22,7 +22,8 @@ use rmcp::model::{
     DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetExtensions, GetMeta,
     Implementation, InitializeRequest, InitializeRequestParams, InitializedNotification,
     JsonRpcMessage, ListToolsRequest, PaginatedRequestParams, ProgressNotificationParam,
-    ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
+    ProgressToken, ProtocolVersion, RequestId, RequestMetaObject, ServerJsonRpcMessage,
+    ServerNotification,
 };
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
@@ -35,6 +36,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
+
+use crate::events::Journal;
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
 const MODERN_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
@@ -52,6 +55,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATION_TIMEOUT: Duration = Duration::from_millis(250);
 const PROGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) struct ToolContext<'a> {
+    pub(crate) cancellation: &'a CancellationToken,
+    pub(crate) progress: Option<&'a ToolProgress>,
+    pub(crate) notifications: Option<&'a Journal>,
+}
 
 pub(crate) struct ToolProgress {
     token: ProgressToken,
@@ -259,8 +268,17 @@ impl UpstreamClient {
         name: &str,
         arguments: Value,
     ) -> Result<Value, UpstreamError> {
-        self.call_tool_with_context(url, name, arguments, &CancellationToken::new(), None)
-            .await
+        self.call_tool_with_context(
+            url,
+            name,
+            arguments,
+            ToolContext {
+                cancellation: &CancellationToken::new(),
+                progress: None,
+                notifications: None,
+            },
+        )
+        .await
     }
 
     pub(crate) async fn call_tool_with_context(
@@ -268,9 +286,9 @@ impl UpstreamClient {
         url: &str,
         name: &str,
         arguments: Value,
-        cancellation: &CancellationToken,
-        progress: Option<&ToolProgress>,
+        context: ToolContext<'_>,
     ) -> Result<Value, UpstreamError> {
+        let cancellation = context.cancellation;
         if cancellation.is_cancelled() {
             return Err(UpstreamError::Cancelled);
         }
@@ -294,7 +312,7 @@ impl UpstreamClient {
                 }
                 Err(UpstreamError::Cancelled)
             }
-            result = timeout_at(deadline, session.request(request.into(), progress)) => {
+            result = timeout_at(deadline, session.request(request.into(), context.progress, context.notifications)) => {
                 result.unwrap_or(Err(UpstreamError::Timeout)).map(|reply| reply.result)
             }
         };
@@ -459,7 +477,7 @@ impl Session {
                 false,
             )
             .await?;
-        let mut reply = read_reply(response, id, None).await?;
+        let mut reply = read_reply(response, id, None, None).await?;
         let Some(fields) = reply.result.as_object_mut() else {
             return Ok(false);
         };
@@ -495,7 +513,7 @@ impl Session {
         let (response, id) = self.send_request(request.into(), None, false).await?;
 
         self.session_id = read_session_id(&response)?;
-        let reply = read_reply(response, id, None).await?;
+        let reply = read_reply(response, id, None, None).await?;
         let requested = reply.result.get("protocolVersion").and_then(Value::as_str);
         let version = ProtocolVersion::KNOWN_VERSIONS
             .iter()
@@ -524,7 +542,7 @@ impl Session {
         for _ in 0..MAX_TOOL_PAGES {
             let params = PaginatedRequestParams::default().with_cursor(cursor.take());
             let reply = self
-                .request(ListToolsRequest::with_param(params).into(), None)
+                .request(ListToolsRequest::with_param(params).into(), None, None)
                 .await?;
             received += reply.bytes;
             let Value::Object(mut result) = reply.result else {
@@ -567,12 +585,13 @@ impl Session {
         &mut self,
         request: ClientRequest,
         progress: Option<&ToolProgress>,
+        notifications: Option<&Journal>,
     ) -> Result<Reply, UpstreamError> {
         let version = self.protocol_version.clone();
         let (response, id) = self
             .send_request(request, version.as_ref(), progress.is_some())
             .await?;
-        read_reply(response, id, progress).await
+        read_reply(response, id, progress, notifications).await
     }
 
     async fn send_request(
@@ -801,6 +820,7 @@ async fn read_reply(
     mut response: Response,
     id: i64,
     mut progress: Option<&ToolProgress>,
+    notifications: Option<&Journal>,
 ) -> Result<Reply, UpstreamError> {
     check_message_length(&response)?;
     match response_media_type(&response) {
@@ -827,15 +847,20 @@ async fn read_reply(
         let mut bytes = chunk.as_ref();
         while let Some(frame) = stream.next_frame(&mut bytes) {
             let message = decode_message(&frame)?;
-            if let (Some(relay), JsonRpcMessage::Notification(notification)) = (progress, &message)
-                && let Some(params) =
-                    matching_progress(&notification.notification, id, &relay.token)
-                && !matches!(
-                    timeout(PROGRESS_SEND_TIMEOUT, relay.sender.send(params)).await,
-                    Ok(Ok(()))
-                )
-            {
-                progress = None;
+            if let JsonRpcMessage::Notification(notification) = &message {
+                if let Some(relay) = progress
+                    && let Some(params) =
+                        matching_progress(&notification.notification, id, &relay.token)
+                    && !matches!(
+                        timeout(PROGRESS_SEND_TIMEOUT, relay.sender.send(params)).await,
+                        Ok(Ok(()))
+                    )
+                {
+                    progress = None;
+                }
+                if let Some(journal) = notifications {
+                    publish_notification(journal, &notification.notification);
+                }
             }
             if let Some(result) = take_result(message, id)? {
                 return Ok(Reply {
@@ -846,6 +871,25 @@ async fn read_reply(
         }
     }
     Err(UpstreamError::InvalidResponse)
+}
+
+fn publish_notification(journal: &Journal, payload: &Value) {
+    let Ok(notification) = ServerNotification::deserialize(payload) else {
+        return;
+    };
+    if !matches!(
+        notification,
+        ServerNotification::LoggingMessageNotification(_)
+            | ServerNotification::ToolListChangedNotification(_)
+            | ServerNotification::ResourceListChangedNotification(_)
+            | ServerNotification::ResourceUpdatedNotification(_)
+            | ServerNotification::PromptListChangedNotification(_)
+    ) {
+        return;
+    }
+    if let Ok(encoded) = serde_json::to_string(&ServerJsonRpcMessage::notification(notification)) {
+        journal.publish(Some(Arc::from(encoded)));
+    }
 }
 
 fn decode_message(body: &[u8]) -> Result<WireMessage, UpstreamError> {

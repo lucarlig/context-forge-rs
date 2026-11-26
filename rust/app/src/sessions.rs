@@ -17,13 +17,14 @@ use uuid::Uuid;
 
 use crate::{
     access::Principal,
-    events::{HISTORY_BUDGET, Journal, Replay, parse_cursor},
+    events::{HISTORY_BUDGET, Journal, JournalMode, Replay, parse_cursor},
     mcp::SessionSettings,
 };
 
 const MAX_SESSIONS: usize = 4096;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_JOURNALS: usize = 128;
+const MAX_NOTIFICATION_SCOPES: usize = 32;
 
 pub(crate) struct Sessions {
     settings: SessionSettings,
@@ -45,6 +46,8 @@ pub(crate) struct Session {
     listener_open: AtomicBool,
     pending: Mutex<HashMap<RequestId, CancellationToken>>,
     journals: Mutex<VecDeque<Arc<Journal>>>,
+    passive: Mutex<HashMap<Option<[u8; 32]>, Arc<Journal>>>,
+    get_stream_enabled: bool,
     event_budget: Arc<Semaphore>,
     event_capacity: usize,
     event_ttl: Duration,
@@ -95,6 +98,14 @@ impl Sessions {
                     .lock()
                     .expect("journal registry lock")
                     .retain(|journal| !journal.is_expired());
+                for journal in session
+                    .passive
+                    .lock()
+                    .expect("passive events lock")
+                    .values()
+                {
+                    journal.prune();
+                }
                 true
             });
             registry.last_sweep = Instant::now();
@@ -128,6 +139,8 @@ impl Sessions {
                     listener_open: AtomicBool::new(false),
                     pending: Mutex::new(HashMap::new()),
                     journals: Mutex::new(VecDeque::new()),
+                    passive: Mutex::new(HashMap::new()),
+                    get_stream_enabled: self.settings.get_stream_enabled,
                     event_budget: self.event_budget.clone(),
                     event_capacity: self.settings.event_capacity,
                     event_ttl: self.settings.event_ttl,
@@ -183,7 +196,9 @@ impl Session {
         }
         let journal = Arc::new(Journal::new(
             principal.map(Principal::authorization_fingerprint),
-            needs_tool_execution,
+            JournalMode::Response {
+                needs_tool_execution,
+            },
             self.event_capacity,
             self.event_ttl,
             self.event_budget.clone(),
@@ -194,11 +209,45 @@ impl Session {
 
     pub(crate) fn replay(&self, cursor: &str) -> Option<(Arc<Journal>, Replay)> {
         let (key, sequence) = parse_cursor(cursor)?;
-        let journals = self.journals.lock().expect("journal registry lock");
-        let journal = journals
+        let journal = self
+            .journals
+            .lock()
+            .expect("journal registry lock")
             .iter()
-            .find(|journal| journal.key == key && !journal.is_expired())?;
-        Some((journal.clone(), journal.resume(sequence)?))
+            .find(|journal| journal.key == key && !journal.is_expired())
+            .cloned();
+        let journal = journal.or_else(|| {
+            self.passive
+                .lock()
+                .expect("passive events lock")
+                .values()
+                .find(|journal| journal.key == key)
+                .cloned()
+        })?;
+        let reader = journal.resume(sequence)?;
+        Some((journal, reader))
+    }
+
+    pub(crate) fn passive_journal(&self, authorization: Option<[u8; 32]>) -> Option<Arc<Journal>> {
+        if !self.get_stream_enabled || self.event_capacity == 0 {
+            return None;
+        }
+        let mut streams = self.passive.lock().expect("passive events lock");
+        if let Some(stream) = streams.get(&authorization) {
+            return Some(stream.clone());
+        }
+        if streams.len() >= MAX_NOTIFICATION_SCOPES {
+            return None;
+        }
+        let stream = Arc::new(Journal::new(
+            authorization,
+            JournalMode::Passive,
+            self.event_capacity,
+            self.event_ttl,
+            self.event_budget.clone(),
+        ));
+        streams.insert(authorization, stream.clone());
+        Some(stream)
     }
 
     fn active(&self, touch: bool) -> bool {

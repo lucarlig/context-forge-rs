@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Bounded history for reconnecting to a legacy MCP response stream.
+//! Bounded history for reconnecting to legacy MCP streams.
 
 use std::{
     collections::VecDeque,
@@ -40,6 +40,7 @@ impl Frame {
 
 struct StoredFrame {
     frame: Frame,
+    published: Instant,
     _memory: OwnedSemaphorePermit,
 }
 
@@ -50,10 +51,16 @@ struct History {
     finished_at: Option<Instant>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalMode {
+    Response { needs_tool_execution: bool },
+    Passive,
+}
+
 pub(crate) struct Journal {
     pub(crate) key: Uuid,
     pub(crate) authorization: Option<[u8; 32]>,
-    pub(crate) needs_tool_execution: bool,
+    mode: JournalMode,
     capacity: usize,
     retention: Duration,
     budget: Arc<Semaphore>,
@@ -65,7 +72,7 @@ pub(crate) struct Journal {
 impl Journal {
     pub(crate) fn new(
         authorization: Option<[u8; 32]>,
-        needs_tool_execution: bool,
+        mode: JournalMode,
         capacity: usize,
         retention: Duration,
         budget: Arc<Semaphore>,
@@ -73,14 +80,39 @@ impl Journal {
         Self {
             key: Uuid::new_v4(),
             authorization,
-            needs_tool_execution,
+            mode,
             capacity,
             retention,
             budget,
             history: Mutex::new(History::default()),
             changed: watch::Sender::new(()),
-            post_open: AtomicBool::new(true),
+            post_open: AtomicBool::new(matches!(mode, JournalMode::Response { .. })),
         }
+    }
+
+    pub(crate) fn needs_tool_execution(&self) -> bool {
+        !matches!(
+            self.mode,
+            JournalMode::Response {
+                needs_tool_execution: false
+            }
+        )
+    }
+
+    fn prune_old_frames(&self, history: &mut History) {
+        if self.mode == JournalMode::Passive {
+            while history
+                .frames
+                .front()
+                .is_some_and(|frame| frame.published.elapsed() >= self.retention)
+            {
+                history.frames.pop_front();
+            }
+        }
+    }
+
+    pub(crate) fn prune(&self) {
+        self.prune_old_frames(&mut self.history.lock().expect("event history lock"));
     }
 
     pub(crate) fn is_post_open(&self) -> bool {
@@ -105,6 +137,7 @@ impl Journal {
 
     pub(crate) fn publish(&self, data: Option<Arc<str>>) -> Frame {
         let mut history = self.history.lock().expect("event history lock");
+        self.prune_old_frames(&mut history);
         let frame = Frame {
             stream: self.key,
             sequence: history.next,
@@ -121,6 +154,7 @@ impl Journal {
         if let Some(memory) = memory {
             history.frames.push_back(StoredFrame {
                 frame: frame.clone(),
+                published: Instant::now(),
                 _memory: memory,
             });
         } else {
@@ -150,7 +184,8 @@ impl Journal {
 
     pub(crate) fn resume(self: &Arc<Self>, sequence: u64) -> Option<Replay> {
         let changed = self.changed.subscribe();
-        let history = self.history.lock().expect("event history lock");
+        let mut history = self.history.lock().expect("event history lock");
+        self.prune_old_frames(&mut history);
         if !history
             .frames
             .iter()
@@ -163,6 +198,25 @@ impl Journal {
             next: sequence + 1,
             changed,
         })
+    }
+
+    pub(crate) fn listen(self: &Arc<Self>, include_backlog: bool) -> Replay {
+        let changed = self.changed.subscribe();
+        let mut history = self.history.lock().expect("event history lock");
+        self.prune_old_frames(&mut history);
+        let next = if include_backlog {
+            history
+                .frames
+                .front()
+                .map_or(history.next, |frame| frame.frame.sequence)
+        } else {
+            history.next
+        };
+        Replay {
+            journal: self.clone(),
+            next,
+            changed,
+        }
     }
 }
 
@@ -216,7 +270,9 @@ mod tests {
     async fn replay_stops_at_an_evicted_cursor_and_drains_a_retained_stream() {
         let journal = Arc::new(Journal::new(
             None,
-            false,
+            JournalMode::Response {
+                needs_tool_execution: false,
+            },
             2,
             Duration::from_secs(60),
             Arc::new(Semaphore::new(4096)),

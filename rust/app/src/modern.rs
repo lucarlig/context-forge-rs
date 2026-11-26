@@ -40,7 +40,7 @@ use crate::{
         accepts_post_stream, rpc_error,
     },
     modern_validation::reject_invalid_request,
-    upstream::ToolProgress,
+    upstream::{ToolContext, ToolProgress},
 };
 
 const ROOT_INSTRUCTIONS: &str =
@@ -332,8 +332,11 @@ impl ServerHandler for GatewayHandler {
             parts.extensions.get::<CatalogServer>(),
             &request.name,
             Value::Object(request.arguments.unwrap_or_default()),
-            &context.ct,
-            relay.as_ref(),
+            ToolContext {
+                cancellation: &context.ct,
+                progress: relay.as_ref(),
+                notifications: None,
+            },
         );
         let mut result = match with_progress(invocation, updates, &context).await {
             Ok(value) => serde_json::from_value::<CallToolResult>(value)
