@@ -190,7 +190,7 @@ impl GatewayService {
         require_auth: bool,
         settings: SseSettings,
     ) -> Router {
-        crate::legacy_sse::router(self.clone(), require_auth, settings)
+        crate::legacy_sse::router(self.clone(), self.database.clone(), require_auth, settings)
     }
 
     pub fn mcp_router_with_sessions(

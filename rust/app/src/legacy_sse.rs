@@ -19,15 +19,20 @@ use axum::{
 use futures_util::stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    time::sleep,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     access::{self, Principal},
     catalog::CatalogServer,
+    database::Database,
     gateway::GatewayService,
-    legacy_sse_cache::{Access, RedisQueue, Scope},
+    legacy_sse_cache::{Access, CacheResult, RedisQueue, Scope, SharedQueue},
+    legacy_sse_database::DatabaseQueue,
     mcp::{MAX_REQUEST_BODY_BYTES, legacy_transport_reply},
     redis_sessions::RedisSessionDirectory,
 };
@@ -47,6 +52,8 @@ pub struct SseSettings {
 pub enum SseBackend {
     Memory,
     Redis(Arc<RedisSessionDirectory>),
+    Database,
+    Disabled,
 }
 
 impl Default for SseSettings {
@@ -64,6 +71,8 @@ impl Default for SseSettings {
 
 struct SseState {
     gateway: Arc<GatewayService>,
+    database: Database,
+    capacity: Arc<Semaphore>,
     connections: Mutex<HashMap<Uuid, Connection>>,
     settings: SseSettings,
 }
@@ -76,20 +85,28 @@ struct Connection {
 
 enum Inbox {
     Local(mpsc::Receiver<Value>),
-    Redis(RedisQueue),
+    Shared(SharedQueue),
+    Disabled,
 }
 
 impl SseState {
-    fn shared_queue(&self, id: Uuid) -> Option<RedisQueue> {
+    fn shared_queue(&self, id: Uuid) -> Option<SharedQueue> {
         match &self.settings.backend {
-            SseBackend::Memory => None,
-            SseBackend::Redis(redis) => Some(RedisQueue::new(redis.clone(), id)),
+            SseBackend::Memory | SseBackend::Disabled => None,
+            SseBackend::Redis(redis) => {
+                Some(SharedQueue::Redis(RedisQueue::new(redis.clone(), id)))
+            }
+            SseBackend::Database => Some(SharedQueue::Database(DatabaseQueue::new(
+                self.database.clone(),
+                id,
+            ))),
         }
     }
 }
 
 pub(crate) fn router(
     gateway: Arc<GatewayService>,
+    database: Database,
     require_auth: bool,
     settings: SseSettings,
 ) -> Router {
@@ -102,6 +119,8 @@ pub(crate) fn router(
         .route("/v1/virtual-servers/{server_id}/message", post(enqueue))
         .with_state(Arc::new(SseState {
             gateway: gateway.clone(),
+            database,
+            capacity: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             connections: Mutex::default(),
             settings,
         }));
@@ -139,24 +158,17 @@ async fn open(State(state): State<Arc<SseState>>, request: Request) -> Response 
     };
     let id = Uuid::new_v4();
     let endpoint = format!("{scheme}://{authority}{path}?session_id={id}");
-    let (incoming, inbox) = mpsc::channel(QUEUE_LENGTH);
+    let Ok(permit) = state.capacity.clone().try_acquire_owned() else {
+        return detail(StatusCode::SERVICE_UNAVAILABLE, "SSE connection failed");
+    };
     let (outbox, outgoing) = mpsc::channel(QUEUE_LENGTH);
-    {
-        let mut connections = state.connections.lock().expect("SSE connections");
-        if connections.len() >= MAX_CONNECTIONS {
-            return detail(StatusCode::SERVICE_UNAVAILABLE, "SSE connection failed");
-        }
-        connections.insert(
-            id,
-            Connection {
-                owner: principal.as_ref().map(|user| user.email.clone()),
-                server: server.as_ref().map(|server| server.id.clone()),
-                incoming,
-            },
-        );
-    }
     let cancel = state.settings.shutdown.child_token();
-    let connection = StreamConnection { state, id, cancel };
+    let connection = StreamConnection {
+        state,
+        id,
+        cancel,
+        _permit: permit,
+    };
     let inbox = if let Some(queue) = connection.state.shared_queue(id) {
         let scope = session_scope(principal.as_ref(), server.as_ref());
         if let Err(error) = queue
@@ -166,8 +178,24 @@ async fn open(State(state): State<Arc<SseState>>, request: Request) -> Response 
             tracing::warn!(%error, "legacy SSE session registration failed");
             return detail(StatusCode::SERVICE_UNAVAILABLE, "SSE connection failed");
         }
-        Inbox::Redis(queue)
+        Inbox::Shared(queue)
+    } else if matches!(connection.state.settings.backend, SseBackend::Disabled) {
+        Inbox::Disabled
     } else {
+        let (incoming, inbox) = mpsc::channel(QUEUE_LENGTH);
+        connection
+            .state
+            .connections
+            .lock()
+            .expect("SSE connections")
+            .insert(
+                id,
+                Connection {
+                    owner: principal.as_ref().map(|user| user.email.clone()),
+                    server: server.as_ref().map(|server| server.id.clone()),
+                    incoming,
+                },
+            );
         Inbox::Local(inbox)
     };
     tokio::spawn(respond(
@@ -316,9 +344,7 @@ fn session_scope<'a>(
     }
 }
 
-fn check_cache_access(
-    result: Result<Access, Box<dyn std::error::Error + Send + Sync>>,
-) -> Result<(), Box<Response>> {
+fn check_cache_access(result: CacheResult<Access>) -> Result<(), Box<Response>> {
     let response = match result {
         Ok(Access::Allowed) => return Ok(()),
         Ok(Access::Missing) => detail(StatusCode::NOT_FOUND, "Session not found"),
@@ -343,6 +369,7 @@ struct StreamConnection {
     state: Arc<SseState>,
     id: Uuid,
     cancel: CancellationToken,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl Drop for StreamConnection {
@@ -440,7 +467,7 @@ async fn respond(
         () = run => {},
     }
     cancel.cancel();
-    if let Inbox::Redis(queue) = incoming {
+    if let Inbox::Shared(queue) = incoming {
         queue.remove().await;
     }
 }
@@ -449,7 +476,8 @@ impl Inbox {
     async fn receive(&mut self) -> Option<Value> {
         match self {
             Self::Local(inbox) => inbox.recv().await,
-            Self::Redis(queue) => match queue.receive().await {
+            Self::Disabled => std::future::pending().await,
+            Self::Shared(queue) => match queue.receive().await {
                 Ok(message) => message,
                 Err(error) => {
                     tracing::warn!(%error, "legacy SSE session receive failed");

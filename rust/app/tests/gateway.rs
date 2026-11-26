@@ -354,6 +354,11 @@ async fn legacy_sse_routes_messages_to_the_bound_virtual_server_and_owner() {
 }
 
 #[tokio::test]
+async fn legacy_sse_workers_share_database_sessions() {
+    verify_shared_legacy_sse(|| SseBackend::Database).await;
+}
+
+#[tokio::test]
 #[ignore = "requires a disposable Redis or Valkey database in REDIS_URL"]
 async fn legacy_sse_workers_share_redis_sessions() {
     let redis = RedisSettings {
@@ -370,6 +375,7 @@ async fn legacy_sse_workers_share_redis_sessions() {
 async fn verify_shared_legacy_sse(backend: impl Fn() -> SseBackend) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let database = database().await;
+    database.migrate_legacy_sse().await.unwrap();
     let Database::Sqlite(pool) = &database else {
         unreachable!()
     };

@@ -12,6 +12,7 @@ mod identity;
 pub mod jwt;
 mod legacy_sse;
 mod legacy_sse_cache;
+mod legacy_sse_database;
 pub mod mcp;
 mod modern;
 mod modern_validation;

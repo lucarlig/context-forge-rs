@@ -7,6 +7,7 @@ use context_forge_rs::{
     config::Settings,
     database::Database,
     gateway::GatewayService,
+    mcp::SseBackend,
     probes::{self, RedisProbe},
 };
 use tokio::net::TcpListener;
@@ -29,16 +30,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let verifier = Settings::jwt_verifier()?;
     let require_mcp_auth = Settings::mcp_requires_auth()?;
     let require_api_auth = Settings::api_requires_auth()?;
+    let shutdown = CancellationToken::new();
+    let sse = settings.gateway_sse_settings(shutdown.clone())?;
     if verifier.is_some() || !require_mcp_auth {
         database.migrate_identity().await?;
         database.migrate_catalog().await?;
+        if matches!(sse.backend, SseBackend::Database) {
+            database.migrate_legacy_sse().await?;
+        }
     }
     let access = Arc::new(Authorizer::new(
         database.clone(),
         verifier,
         Settings::invalidate_sessions_on_password_change()?,
     ));
-    let shutdown = CancellationToken::new();
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
@@ -59,10 +64,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Settings::mcp_inbound_protocol_mode()?,
         http_options,
     );
-    let legacy_sse = service.legacy_sse_router(
-        require_api_auth,
-        settings.gateway_sse_settings(shutdown.clone())?,
-    );
+    let legacy_sse = service.legacy_sse_router(require_api_auth, sse);
     let websocket = service.websocket_router(Settings::websocket_settings(shutdown.clone())?);
     let app = probes::router(database, redis)
         .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse).merge(websocket)))

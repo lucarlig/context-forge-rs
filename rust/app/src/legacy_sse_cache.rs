@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::redis_sessions::RedisSessionDirectory;
+use crate::{legacy_sse_database::DatabaseQueue, redis_sessions::RedisSessionDirectory};
 
 const REGISTER: &str = r#"
 if redis.call('EXISTS', KEYS[1]) ~= 0 then return 0 end
@@ -47,10 +47,10 @@ while true do
 end
 "#;
 
-const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_MESSAGES: usize = 128;
-const IDLE_POLL: Duration = Duration::from_millis(250);
-type CacheResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+pub(crate) const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_MESSAGES: usize = 128;
+pub(crate) const IDLE_POLL: Duration = Duration::from_millis(250);
+pub(crate) type CacheResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 pub(crate) struct Scope<'a> {
     pub(crate) owner: Option<&'a str>,
@@ -63,6 +63,46 @@ pub(crate) enum Access {
     Denied,
     Allowed,
     Full,
+}
+
+pub(crate) enum SharedQueue {
+    Redis(RedisQueue),
+    Database(DatabaseQueue),
+}
+
+impl SharedQueue {
+    pub(crate) async fn register(&self, scope: Scope<'_>, ttl: Duration) -> CacheResult<()> {
+        match self {
+            Self::Redis(queue) => queue.register(scope, ttl).await,
+            Self::Database(queue) => queue.register(scope, ttl).await,
+        }
+    }
+
+    pub(crate) async fn access(
+        &self,
+        scope: Scope<'_>,
+        message: Option<&Value>,
+        ttl: Duration,
+    ) -> CacheResult<Access> {
+        match self {
+            Self::Redis(queue) => queue.access(scope, message, ttl).await,
+            Self::Database(queue) => queue.access(scope, message, ttl).await,
+        }
+    }
+
+    pub(crate) async fn receive(&self) -> CacheResult<Option<Value>> {
+        match self {
+            Self::Redis(queue) => queue.receive().await,
+            Self::Database(queue) => queue.receive().await,
+        }
+    }
+
+    pub(crate) async fn remove(&self) {
+        match self {
+            Self::Redis(queue) => queue.remove().await,
+            Self::Database(queue) => queue.remove().await,
+        }
+    }
 }
 
 fn access_code(code: u8) -> CacheResult<Access> {

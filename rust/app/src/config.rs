@@ -159,9 +159,20 @@ impl Settings {
         shutdown: CancellationToken,
     ) -> Result<SseSettings, Box<dyn Error + Send + Sync>> {
         let mut settings = Self::sse_settings(shutdown)?;
-        if let Some(redis) = &self.redis {
-            let directory = RedisSessionDirectory::new(redis).map_err(|_| "invalid REDIS_URL")?;
-            settings.backend = SseBackend::Redis(std::sync::Arc::new(directory));
+        settings.backend = match (value("CACHE_TYPE", "database")?.as_str(), &self.redis) {
+            ("redis", Some(redis)) => {
+                let directory =
+                    RedisSessionDirectory::new(redis).map_err(|_| "invalid REDIS_URL")?;
+                SseBackend::Redis(std::sync::Arc::new(directory))
+            }
+            ("database", _) => SseBackend::Database,
+            ("none", _) => SseBackend::Disabled,
+            _ => SseBackend::Memory,
+        };
+        if matches!(
+            settings.backend,
+            SseBackend::Redis(_) | SseBackend::Database
+        ) {
             settings.session_ttl = positive_seconds("SESSION_TTL", 3600.0)?;
             settings.message_ttl = positive_seconds("MESSAGE_TTL", 600.0)?;
         }
