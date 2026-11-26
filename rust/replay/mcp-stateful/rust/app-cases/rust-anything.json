@@ -18,6 +18,9 @@
     "02-post-missing-session",
     "03-delete-missing-session",
     "04-post-unknown-session",
-    "05-get-missing-session"
+    "05-get-missing-session",
+    "06-stateful-notification-without-session",
+    "07-stateful-notification-with-unknown-session",
+    "08-stateful-notification-accepts-event-stream-only"
   ]
 }

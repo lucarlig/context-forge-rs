@@ -576,19 +576,22 @@ async fn handle_post(state: &Arc<McpState>, request: Request) -> Response {
         )
             .into_response();
     }
+    let accept_error = |message| {
+        let response = transport_error(StatusCode::NOT_ACCEPTABLE, message);
+        if state.sessions.is_some() && matches!(session_header(request.headers()), Ok(None)) {
+            return with_session(response, Some(&new_session_id()));
+        }
+        response
+    };
     if !state.json_response
         && !(accepts_json(request.headers()) && accepts_post_stream(request.headers()))
     {
-        return transport_error(
-            StatusCode::NOT_ACCEPTABLE,
+        return accept_error(
             "Not Acceptable: Client must accept both application/json and text/event-stream",
         );
     }
     if state.json_response && !accepts_json(request.headers()) {
-        return transport_error(
-            StatusCode::NOT_ACCEPTABLE,
-            "Not Acceptable: Client must accept application/json",
-        );
+        return accept_error("Not Acceptable: Client must accept application/json");
     }
     if !content_type
         .split(';')
