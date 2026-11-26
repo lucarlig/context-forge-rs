@@ -23,7 +23,7 @@ use crate::{
     auth::TeamVisibility,
     catalog::{
         CatalogList, CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool,
-        RegistrationError, ToolDefinition,
+        RegistrationError, ToolDefinition, slugify,
     },
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings},
@@ -526,18 +526,24 @@ async fn register(
     }
 
     let url = input.url.trim();
-    let discovery = service.upstream.list_tools(url).await.map_err(|error| {
-        tracing::warn!(%error, "upstream gateway discovery failed");
-        match error {
-            UpstreamError::InvalidUrl | UpstreamError::BlockedDestination => {
-                RegistrationResponse::new(
-                    StatusCode::BAD_REQUEST,
-                    "Gateway URL is invalid or disallowed",
-                )
+    let (discovery, metadata) = service
+        .upstream
+        .discover_catalog(url)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "upstream gateway discovery failed");
+            match error {
+                UpstreamError::InvalidUrl | UpstreamError::BlockedDestination => {
+                    RegistrationResponse::new(
+                        StatusCode::BAD_REQUEST,
+                        "Gateway URL is invalid or disallowed",
+                    )
+                }
+                _ => {
+                    RegistrationResponse::new(StatusCode::BAD_GATEWAY, "Failed to discover gateway")
+                }
             }
-            _ => RegistrationResponse::new(StatusCode::BAD_GATEWAY, "Failed to discover gateway"),
-        }
-    })?;
+        })?;
     let tools: Vec<ToolDefinition> = discovery
         .tools
         .into_iter()
@@ -580,7 +586,7 @@ async fn register(
         .collect();
     service
         .database
-        .register_gateway(&registration, &registered_tools)
+        .register_discovered_gateway(&registration, &registered_tools, &metadata)
         .await?;
     let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
     let agent = headers
@@ -631,23 +637,6 @@ async fn registration_team(
             Ok(team.map(str::to_owned))
         }
     }
-}
-
-fn slugify(value: &str) -> String {
-    let mut result = String::new();
-    let mut separator = false;
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'_' {
-            if separator && !result.is_empty() {
-                result.push('-');
-            }
-            result.push(char::from(byte.to_ascii_lowercase()));
-            separator = false;
-        } else if byte == b'-' || byte.is_ascii_whitespace() {
-            separator = true;
-        }
-    }
-    result.trim_matches('_').to_owned()
 }
 
 fn registration_response(

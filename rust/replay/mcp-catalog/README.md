@@ -13,4 +13,6 @@ USE_STATEFUL_SESSIONS=false MCP_INBOUND_PROTOCOL_MODE=auto MCP_REQUIRE_AUTH=fals
   rust-anything app replay rust/replay/mcp-catalog --build "$PWD/target/debug/context-forge-rs"
 ```
 
-Resource reads and prompt retrieval remain open. The reference routed a resource URI matching a stored template even when the exact URI was absent. It resolved `fixture-welcome` to the upstream prompt `welcome` and rejected an unprefixed downstream prompt lookup. New native registrations still populate the tool catalog only.
+Native registration discovers resources, URI templates, and prompts and stores them in the same transaction as the gateway and tools. Native registrations of the live fixture produced the recorded list results on SQLite and PostgreSQL. The registration response preserves the reference's zero component counts. A Rust integration test also covers discovery across resource pages and upstreams that omit the tools capability.
+
+Resource reads and prompt retrieval remain open. The reference routed a resource URI matching a stored template even when the exact URI was absent. It resolved `fixture-welcome` to the upstream prompt `welcome` and rejected an unprefixed downstream prompt lookup.

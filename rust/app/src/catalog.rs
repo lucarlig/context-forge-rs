@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::{auth::TeamVisibility, database::Database};
+use crate::{auth::TeamVisibility, database::Database, upstream::DiscoveredMetadata};
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
 const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
@@ -150,6 +150,16 @@ pub struct RegisteredTool<'a> {
     pub slug: &'a str,
     pub name: &'a str,
     pub definition: &'a ToolDefinition,
+}
+
+struct ResourceRegistration<'a> {
+    uri: &'a str,
+    template: Option<&'a str>,
+    name: &'a str,
+    title: Option<&'a str>,
+    description: Option<&'a str>,
+    mime: &'a str,
+    size: Option<i32>,
 }
 
 #[derive(Debug, Error)]
@@ -625,6 +635,16 @@ impl Database {
         gateway: &GatewayRegistration<'_>,
         tools: &[RegisteredTool<'_>],
     ) -> Result<(), RegistrationError> {
+        self.register_discovered_gateway(gateway, tools, &DiscoveredMetadata::default())
+            .await
+    }
+
+    pub(crate) async fn register_discovered_gateway(
+        &self,
+        gateway: &GatewayRegistration<'_>,
+        tools: &[RegisteredTool<'_>],
+        metadata: &DiscoveredMetadata,
+    ) -> Result<(), RegistrationError> {
         validate_registration(gateway, tools)?;
         let capabilities = gateway.capabilities.to_string();
         let tags = serde_json::to_string(gateway.tags)
@@ -638,7 +658,7 @@ impl Database {
 
         // The duplicate check and all inserts share a write transaction, including on SQLite.
         macro_rules! register {
-            ($tx:ident, $tool_conflicts:expr, $gateway_insert:expr, $tool_insert:expr) => {{
+            ($tx:ident, $tool_conflicts:expr, $gateway_insert:expr, $tool_insert:expr, $schema:literal) => {{
                 let conflict = sqlx::query_scalar::<_, Option<String>>(CONFLICT_QUERY)
                     .bind(gateway.slug)
                     .bind(gateway.url)
@@ -702,6 +722,50 @@ impl Database {
                         .execute(&mut *$tx)
                         .await?;
                 }
+                let resources = metadata.resources.iter().map(|item| ResourceRegistration {
+                    uri: &item.uri, template: None, name: &item.name, title: item.title.as_deref(),
+                    description: item.description.as_deref(), mime: item.mime_type.as_deref().unwrap_or("text/plain"),
+                    size: item.size.and_then(|size| i32::try_from(size).ok()),
+                });
+                let templates = metadata.templates.iter().map(|item| ResourceRegistration {
+                    uri: &item.uri_template, template: Some(&item.uri_template), name: &item.name,
+                    title: item.title.as_deref(), description: item.description.as_deref(),
+                    mime: item.mime_type.as_deref().unwrap_or("text/plain"), size: None,
+                });
+                let mut uris = HashSet::new();
+                for resource in resources.chain(templates) {
+                    if !uris.insert((resource.uri, resource.template.is_some())) { continue; }
+                    let slug = slugify(resource.name);
+                    let name = format!("{}-{slug}", gateway.slug);
+                    if slug.is_empty() || name.len() > 255 || resource.uri.is_empty() || resource.uri.len() > 767 {
+                        return Err(RegistrationError::Invalid("Invalid upstream resource"));
+                    }
+                    sqlx::query("INSERT INTO resources (id, uri, uri_template, name, original_name, custom_name_slug,
+                        title, description, mime_type, size, gateway_id, owner_email, team_id, visibility)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)")
+                        .bind(uuid::Uuid::new_v4().simple().to_string())
+                        .bind(resource.uri).bind(resource.template).bind(name).bind(resource.name).bind(slug)
+                        .bind(resource.title).bind(resource.description).bind(resource.mime).bind(resource.size)
+                        .bind(gateway.id).bind(gateway.owner_email).bind(gateway.team_id).bind(gateway.visibility)
+                        .execute(&mut *$tx).await?;
+                }
+                let mut prompts = HashSet::new();
+                for prompt in &metadata.prompts {
+                    if !prompts.insert(prompt.name.as_str()) { continue; }
+                    let slug = slugify(&prompt.name);
+                    let name = format!("{}-{slug}", gateway.slug);
+                    if slug.is_empty() || name.len() > 255 || prompt.name.len() > 255 {
+                        return Err(RegistrationError::Invalid("Invalid upstream prompt"));
+                    }
+                    sqlx::query(concat!("INSERT INTO prompts (id, name, original_name, custom_name, custom_name_slug,
+                        title, description, argument_schema, gateway_id, owner_email, team_id, visibility)
+                        VALUES ($1,$2,$3,$3,$4,$5,$6,", $schema, ",$8,$9,$10,$11)"))
+                        .bind(uuid::Uuid::new_v4().simple().to_string())
+                        .bind(name).bind(&prompt.name).bind(slug).bind(&prompt.title).bind(&prompt.description)
+                        .bind(prompt_argument_schema(prompt).to_string())
+                        .bind(gateway.id).bind(gateway.owner_email).bind(gateway.team_id).bind(gateway.visibility)
+                        .execute(&mut *$tx).await?;
+                }
                 $tx.commit().await?;
             }};
         }
@@ -713,7 +777,8 @@ impl Database {
                     transaction,
                     tool_conflict_query!("SELECT value FROM json_each($1)"),
                     insert_gateway!("json($6)", "json($7)"),
-                    insert_tool!("json($8)", "json($9)", "json($10)")
+                    insert_tool!("json($8)", "json($9)", "json($10)"),
+                    "json($7)"
                 );
             }
             Self::Postgres(pool) => {
@@ -723,12 +788,46 @@ impl Database {
                     transaction,
                     tool_conflict_query!("SELECT json_array_elements_text(CAST($1 AS JSON))"),
                     insert_gateway!("CAST($6 AS JSON)", "CAST($7 AS JSON)"),
-                    insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)")
+                    insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)"),
+                    "CAST($7 AS JSON)"
                 );
             }
         }
         Ok(())
     }
+}
+
+fn prompt_argument_schema(prompt: &rmcp::model::Prompt) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for argument in prompt.arguments.iter().flatten() {
+        let mut property = json!({"type":"string"});
+        if let Some(description) = &argument.description {
+            property["description"] = json!(description);
+        }
+        properties.insert(argument.name.clone(), property);
+        if argument.required == Some(true) {
+            required.push(&argument.name);
+        }
+    }
+    json!({"type":"object","properties":properties,"required":required})
+}
+
+pub(crate) fn slugify(value: &str) -> String {
+    let mut result = String::new();
+    let mut separator = false;
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'_' {
+            if separator && !result.is_empty() {
+                result.push('-');
+            }
+            result.push(char::from(byte.to_ascii_lowercase()));
+            separator = false;
+        } else if byte == b'-' || byte.is_ascii_whitespace() {
+            separator = true;
+        }
+    }
+    result.trim_matches('_').to_owned()
 }
 
 fn metadata_item(list: CatalogList, row: MetadataRow) -> Result<(String, Value), sqlx::Error> {

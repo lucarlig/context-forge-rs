@@ -24,9 +24,10 @@ use rmcp::model::{
     ClientCapabilities, ClientJsonRpcMessage, ClientRequest, ClientResult, DiscoverRequest,
     DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetExtensions, GetMeta,
     Implementation, InitializeRequest, InitializeRequestParams, InitializedNotification,
-    JsonRpcMessage, JsonRpcRequest, ListToolsRequest, PaginatedRequestParams,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
-    ServerJsonRpcMessage, ServerNotification, ServerRequest,
+    JsonRpcMessage, JsonRpcRequest, ListPromptsRequest, ListResourceTemplatesRequest,
+    ListResourcesRequest, ListToolsRequest, PaginatedRequestParams, ProgressNotificationParam,
+    ProgressToken, Prompt, ProtocolVersion, RequestId, RequestMetaObject, Resource,
+    ResourceTemplate, ServerJsonRpcMessage, ServerNotification, ServerRequest,
 };
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
@@ -228,6 +229,10 @@ impl From<reqwest::Error> for UpstreamError {
     }
 }
 
+fn method_unavailable(error: &UpstreamError) -> bool {
+    matches!(error, UpstreamError::Rpc { code, .. } if *code == i64::from(ErrorCode::METHOD_NOT_FOUND.0))
+}
+
 #[derive(Clone)]
 pub struct UpstreamClient {
     policy: EgressPolicy,
@@ -245,6 +250,13 @@ pub enum ConnectMode {
 pub struct DiscoveredCatalog {
     pub capabilities: Value,
     pub tools: Vec<Value>,
+}
+
+#[derive(Default)]
+pub(crate) struct DiscoveredMetadata {
+    pub(crate) resources: Vec<Resource>,
+    pub(crate) templates: Vec<ResourceTemplate>,
+    pub(crate) prompts: Vec<Prompt>,
 }
 
 pub(crate) struct UpstreamAssociation {
@@ -347,6 +359,55 @@ impl UpstreamClient {
         let deadline = self.deadline()?;
         let session = self.open_session(url, deadline).await?;
         let result = timeout_at(deadline, session.list_tools()).await;
+        session.close().await;
+        result.map_err(|_| UpstreamError::Timeout)?
+    }
+
+    pub(crate) async fn discover_catalog(
+        &self,
+        url: &str,
+    ) -> Result<(DiscoveredCatalog, DiscoveredMetadata), UpstreamError> {
+        let deadline = self.deadline()?;
+        let session = self.open_session(url, deadline).await?;
+        let result = timeout_at(deadline, async {
+            let catalog = match session.list_tools().await {
+                Err(error)
+                    if session.capabilities["tools"].is_null() && method_unavailable(&error) =>
+                {
+                    DiscoveredCatalog {
+                        capabilities: session.capabilities.clone(),
+                        tools: Vec::new(),
+                    }
+                }
+                result => result?,
+            };
+            let mut metadata = DiscoveredMetadata::default();
+            if session.capabilities["resources"].is_object() {
+                metadata.resources = session
+                    .list_metadata("resources", |params| {
+                        ListResourcesRequest::with_param(params).into()
+                    })
+                    .await?;
+                metadata.templates = match session
+                    .list_metadata("resourceTemplates", |params| {
+                        ListResourceTemplatesRequest::with_param(params).into()
+                    })
+                    .await
+                {
+                    Err(error) if method_unavailable(&error) => Vec::new(),
+                    result => result?,
+                };
+            }
+            if session.capabilities["prompts"].is_object() {
+                metadata.prompts = session
+                    .list_metadata("prompts", |params| {
+                        ListPromptsRequest::with_param(params).into()
+                    })
+                    .await?;
+            }
+            Ok((catalog, metadata))
+        })
+        .await;
         session.close().await;
         result.map_err(|_| UpstreamError::Timeout)?
     }
@@ -661,6 +722,34 @@ impl Session {
     }
 
     async fn list_tools(&self) -> Result<DiscoveredCatalog, UpstreamError> {
+        let tools = self
+            .list_items("tools", |params| {
+                ListToolsRequest::with_param(params).into()
+            })
+            .await?;
+        Ok(DiscoveredCatalog {
+            capabilities: self.capabilities.clone(),
+            tools,
+        })
+    }
+
+    async fn list_metadata<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+        request: impl Fn(PaginatedRequestParams) -> ClientRequest,
+    ) -> Result<Vec<T>, UpstreamError> {
+        self.list_items(key, request)
+            .await?
+            .into_iter()
+            .map(|item| serde_json::from_value(item).map_err(|_| UpstreamError::InvalidResponse))
+            .collect()
+    }
+
+    async fn list_items(
+        &self,
+        key: &str,
+        request: impl Fn(PaginatedRequestParams) -> ClientRequest,
+    ) -> Result<Vec<Value>, UpstreamError> {
         let mut listed = Vec::new();
         let mut cursors = HashSet::new();
         let mut cursor = None;
@@ -668,30 +757,26 @@ impl Session {
         for _ in 0..MAX_TOOL_PAGES {
             let params = PaginatedRequestParams::default().with_cursor(cursor.take());
             let reply = self
-                .request_with_id(
-                    ListToolsRequest::with_param(params).into(),
-                    self.next_request_id(),
-                    None,
-                )
+                .request_with_id(request(params), self.next_request_id(), None)
                 .await?;
             received += reply.bytes;
             let Value::Object(mut result) = reply.result else {
                 return Err(UpstreamError::InvalidResponse);
             };
-            let Some(Value::Array(tools)) = result.remove("tools") else {
+            let Some(Value::Array(items)) = result.remove(key) else {
                 return Err(UpstreamError::InvalidResponse);
             };
-            if received > MAX_CATALOG_BYTES || listed.len() + tools.len() > MAX_TOOLS {
+            if received > MAX_CATALOG_BYTES || listed.len() + items.len() > MAX_TOOLS {
                 return Err(UpstreamError::LimitExceeded);
             }
-            if tools.iter().any(|tool| {
-                tool.get("name")
+            if items.iter().any(|item| {
+                item.get("name")
                     .and_then(Value::as_str)
                     .is_none_or(str::is_empty)
             }) {
                 return Err(UpstreamError::InvalidResponse);
             }
-            listed.extend(tools);
+            listed.extend(items);
             match result.remove("nextCursor") {
                 Some(Value::String(next_cursor)) if !next_cursor.is_empty() => {
                     if !cursors.insert(next_cursor.clone()) {
@@ -700,10 +785,7 @@ impl Session {
                     cursor = Some(next_cursor);
                 }
                 None | Some(Value::Null | Value::String(_)) => {
-                    return Ok(DiscoveredCatalog {
-                        capabilities: self.capabilities.clone(),
-                        tools: listed,
-                    });
+                    return Ok(listed);
                 }
                 _ => return Err(UpstreamError::InvalidResponse),
             }

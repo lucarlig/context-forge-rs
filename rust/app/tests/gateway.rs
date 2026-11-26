@@ -36,6 +36,102 @@ const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
 
+async fn catalog_fixture(Json(request): Json<Value>) -> Response {
+    let params = &request["params"];
+    let result = match request["method"].as_str().unwrap() {
+        "initialize" => json!({"protocolVersion":PROTOCOL,
+            "capabilities":{"resources":{},"prompts":{}}, "serverInfo":{"name":"catalog fixture","version":"1"}
+        }),
+        "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+        "tools/list" => {
+            return Json(json!({"jsonrpc":"2.0","id":request["id"],
+            "error":{"code":-32601,"message":"Method not found"}}))
+            .into_response();
+        }
+        "resources/list" if params["cursor"] == "next" => json!({"resources":[
+            {"name":"second","uri":"fixture://notes/second"}
+        ]}),
+        "resources/list" => json!({"resources":[
+            {"name":"first","uri":"fixture://notes/first","mimeType":"text/plain"}
+        ],"nextCursor":"next"}),
+        "resources/templates/list" => json!({"resourceTemplates":[
+            {"name":"note","uriTemplate":"fixture://notes/{name}"}
+        ]}),
+        "prompts/list" => json!({"prompts":[{"name":"greet","arguments":[
+            {"name":"who","required":true}
+        ]}]}),
+        unknown => panic!("unexpected upstream method {unknown}"),
+    };
+    Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+}
+
+#[tokio::test]
+async fn registration_discovers_all_resource_pages_and_prompt_metadata() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let upstream = Running::start(Router::new().route("/mcp", post(catalog_fixture))).await;
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(
+        service
+            .registration_router()
+            .merge(service.mcp_router(false, ProtocolMode::Auto)),
+    )
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registration) = send(&client, gateway.url("/gateways"), json!({
+        "name":"fixture","url":upstream.url("/mcp"),"visibility":"public","transport":"STREAMABLEHTTP"
+    }), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{registration}");
+    for (method, key, expected) in [
+        (
+            "resources/list",
+            "resources",
+            vec!["fixture-first", "fixture-second"],
+        ),
+        (
+            "resources/templates/list",
+            "resourceTemplates",
+            vec!["fixture-note"],
+        ),
+        ("prompts/list", "prompts", vec!["fixture-greet"]),
+    ] {
+        let (status, reply) = send(
+            &client,
+            gateway.url("/mcp/"),
+            json!({"jsonrpc":"2.0","id":1,"method":method}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let mut names = reply["result"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, expected);
+    }
+}
+
 #[tokio::test]
 async fn catalog_metadata_lists_scoped_resources_templates_and_prompts() {
     let _ = rustls::crypto::ring::default_provider().install_default();
