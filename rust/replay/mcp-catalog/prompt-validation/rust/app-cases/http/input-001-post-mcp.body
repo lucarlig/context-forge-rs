@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":0,"result":{"messages":[{"content":{"text":"Start\n  Hello &lt;&gt;/&amp;&#34;&#39;\nEnd","type":"text"},"role":"user"}]}}

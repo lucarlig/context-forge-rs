@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{self, Write};
+use std::{
+    fmt,
+    io::{self, Write},
+};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rmcp::model::{
@@ -102,6 +105,17 @@ impl GatewayService {
         context: ToolContext<'_>,
         downstream: Option<&Session>,
     ) -> Result<GetPromptResponse, ErrorData> {
+        if params
+            .arguments
+            .iter()
+            .flat_map(|arguments| arguments.values())
+            .any(|value| !value.is_string())
+        {
+            return Err(ErrorData::invalid_params(
+                "Invalid request parameters",
+                Some(Value::String(String::new())),
+            ));
+        }
         self.check_mcp_permission(principal, server, "prompts.read")
             .await?;
         let prompt = self
@@ -117,22 +131,17 @@ impl GatewayService {
             .ok_or_else(|| {
                 ErrorData::invalid_params(format!("Unknown prompt: {}", params.name), None)
             })?;
-        if params
-            .arguments
-            .iter()
-            .flat_map(|arguments| arguments.values())
-            .any(|value| !value.is_string())
-        {
-            return Err(ErrorData::invalid_params(
-                "Prompt arguments must be strings",
-                None,
-            ));
-        }
         let Some(gateway) = prompt.gateway.as_ref() else {
-            return render_prompt(prompt, params.arguments.unwrap_or_default()).map(Into::into);
+            return render_prompt(
+                prompt,
+                params.arguments.unwrap_or_default(),
+                context.client_capabilities.is_some(),
+            )
+            .map(Into::into);
         };
         params.name = prompt.original_name;
         params.meta = None;
+        params.arguments.get_or_insert_default();
         let result = self
             .request_content(
                 gateway,
@@ -374,7 +383,19 @@ fn local_resource(record: ResourceContentRecord, uri: String) -> ResourceContent
 fn render_prompt(
     record: PromptContentRecord,
     arguments: JsonObject,
+    modern: bool,
 ) -> Result<GetPromptResult, ErrorData> {
+    let processing_error = || {
+        if modern {
+            ErrorData::internal_error("Internal server error", None)
+        } else {
+            ErrorData::new(
+                ErrorCode(0),
+                "Failed to process prompt: An unexpected error occurred",
+                None,
+            )
+        }
+    };
     let mut missing: Vec<_> = record
         .argument_schema
         .as_ref()
@@ -391,8 +412,35 @@ fn render_prompt(
             None,
         ));
     }
+    let schema = record
+        .argument_schema
+        .as_ref()
+        .ok_or_else(processing_error)?;
+    let validator = jsonschema::options()
+        .offline()
+        .build(schema)
+        .map_err(|_| processing_error())?;
+    let arguments = Value::Object(arguments);
+    if !validator.is_valid(&arguments) {
+        return Err(processing_error());
+    }
     let mut environment = minijinja::Environment::new();
     environment.set_fuel(Some(50_000));
+    environment.set_trim_blocks(true);
+    environment.set_lstrip_blocks(true);
+    environment.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
+    environment.set_formatter(|output, state, value| {
+        if state.auto_escape() == minijinja::AutoEscape::Html && !value.is_safe() {
+            if let Some(text) = value.as_str() {
+                write_prompt_escaped(output, text)?;
+            } else {
+                write_prompt_escaped(output, &value.to_string())?;
+            }
+            Ok(())
+        } else {
+            minijinja::escape_formatter(output, state, value)
+        }
+    });
     let template = record.template.as_deref().unwrap_or_default();
     let mut output = PromptOutput::default();
     environment
@@ -402,7 +450,7 @@ fn render_prompt(
                 .render_captured_to(&arguments, &mut output)
                 .map(|_| ())
         })
-        .map_err(|_| ErrorData::invalid_params("Failed to render prompt template", None))?;
+        .map_err(|_| processing_error())?;
     let text = String::from_utf8(output.0)
         .map_err(|_| ErrorData::internal_error("Invalid rendered prompt", None))?;
     let mut messages = Vec::new();
@@ -429,6 +477,22 @@ fn render_prompt(
     let mut result = GetPromptResult::new(messages);
     result.description = record.description;
     Ok(result)
+}
+
+fn write_prompt_escaped(output: &mut impl fmt::Write, text: &str) -> fmt::Result {
+    let mut start = 0;
+    for (index, character) in text.match_indices(['&', '<', '>', '"', '\'']) {
+        output.write_str(&text[start..index])?;
+        output.write_str(match character {
+            "&" => "&amp;",
+            "<" => "&lt;",
+            ">" => "&gt;",
+            "\"" => "&#34;",
+            _ => "&#39;",
+        })?;
+        start = index + character.len();
+    }
+    output.write_str(&text[start..])
 }
 
 #[derive(Default)]

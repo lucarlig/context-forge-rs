@@ -1,0 +1,31 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-rs",
+  "run": [
+    "context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "input-001-post-mcp",
+    "input-002-post-mcp",
+    "input-003-post-mcp",
+    "input-004-post-mcp",
+    "input-005-post-mcp",
+    "input-006-post-mcp",
+    "input-007-post-mcp",
+    "input-008-post-mcp",
+    "input-009-post-mcp",
+    "input-010-post-mcp",
+    "input-011-post-mcp",
+    "input-012-post-mcp",
+    "input-013-post-mcp",
+    "input-014-post-mcp"
+  ],
+  "normalizers": {
+    "runtime": "^(python|rust)$"
+  }
+}

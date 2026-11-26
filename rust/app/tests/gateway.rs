@@ -495,6 +495,16 @@ Greetings');
     );
     let (_, reply) = legacy("/mcp/", "prompts/get", json!({"name":"greet"})).await;
     assert_eq!(reply["error"]["message"], "Missing required arguments: who");
+    let (_, reply) = legacy(
+        "/mcp/",
+        "prompts/get",
+        json!({"name":"greet","arguments":{"who":"Neither"}}),
+    )
+    .await;
+    assert_eq!(
+        reply["error"],
+        json!({"code":0,"message":"Failed to process prompt: An unexpected error occurred"})
+    );
 
     let (_, reply) = legacy(
         "/mcp/",
