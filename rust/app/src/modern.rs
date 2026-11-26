@@ -16,9 +16,10 @@ use axum::{
 use rmcp::{
     RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage,
-        ClientRequest, ContentBlock, CustomRequest, CustomResult, DiscoverResult, ErrorCode,
-        ErrorData, Implementation, InitializeRequestParams, InitializeResult, JsonRpcError,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities,
+        ClientJsonRpcMessage, ClientRequest, ContentBlock, CustomRequest, CustomResult,
+        DiscoverResult, ElicitRequestParams, ErrorCode, ErrorData, Implementation,
+        InitializeRequestParams, InitializeResult, InputRequest, InputRequiredResult, JsonRpcError,
         ListToolsResult, MetaObject, PaginatedRequestParams, ProgressNotification,
         ProgressNotificationParam, ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
         Tool, ToolsCapability,
@@ -312,12 +313,11 @@ impl ServerHandler for GatewayHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let parts = request_parts(&context)?;
-        if request.input_responses.is_some() || request.request_state.is_some() {
-            return Err(ErrorData::invalid_params(
-                "Tool input responses are unsupported",
-                None,
-            ));
-        }
+        let mut capabilities = context.client_capabilities().unwrap_or_default();
+        capabilities.experimental = None;
+        capabilities.extensions = None;
+        capabilities.extra.clear();
+        let name = request.name.clone();
         let progress = parts
             .extensions
             .get::<AcceptsProgress>()
@@ -330,22 +330,28 @@ impl ServerHandler for GatewayHandler {
         let invocation = self.gateway.call_tool(
             parts.extensions.get::<Principal>(),
             parts.extensions.get::<CatalogServer>(),
-            &request.name,
-            Value::Object(request.arguments.unwrap_or_default()),
+            request,
             ToolContext {
                 cancellation: &context.ct,
                 progress: relay.as_ref(),
                 notifications: None,
+                client_capabilities: Some(&capabilities),
             },
             None,
         );
         let mut result = match with_progress(invocation, updates, &context).await {
+            Ok(value) if value["resultType"] == "input_required" => {
+                let mut result: InputRequiredResult = serde_json::from_value(value)
+                    .map_err(|_| ErrorData::internal_error("Invalid upstream tool result", None))?;
+                check_tool_input(&result, &capabilities, &name)?;
+                stamp_server_info(&mut result.meta);
+                return Ok(result.into());
+            }
             Ok(value) => serde_json::from_value::<CallToolResult>(value)
                 .map_err(|_| ErrorData::internal_error("Invalid upstream tool result", None))?,
-            Err(ToolError::NotFound) => CallToolResult::error(vec![ContentBlock::text(format!(
-                "Unknown tool: {}",
-                request.name
-            ))]),
+            Err(ToolError::NotFound) => {
+                CallToolResult::error(vec![ContentBlock::text(format!("Unknown tool: {name}"))])
+            }
             Err(error) => return Err(tool_error(error)),
         };
         result.result_type = Some(ResultType::COMPLETE);
@@ -367,6 +373,61 @@ impl ServerHandler for GatewayHandler {
     ) -> Result<CustomResult, ErrorData> {
         Err(method_not_found(request.method))
     }
+}
+
+#[allow(deprecated)]
+fn check_tool_input(
+    result: &InputRequiredResult,
+    capabilities: &ClientCapabilities,
+    tool: &str,
+) -> Result<(), ErrorData> {
+    let Some(requests) = &result.input_requests else {
+        return Ok(());
+    };
+    let elicitation = capabilities.elicitation.as_ref();
+    for request in requests.values() {
+        let (capability, required) = match request {
+            InputRequest::Elicitation(request) => match &request.params {
+                ElicitRequestParams::UrlElicitationParams { .. }
+                    if !elicitation.is_some_and(|c| c.url.is_some()) =>
+                {
+                    ("url elicitation", json!({"elicitation":{"url":{}}}))
+                }
+                ElicitRequestParams::FormElicitationParams { .. }
+                    if !elicitation.is_some_and(|c| c.form.is_some() || c.url.is_none()) =>
+                {
+                    ("form elicitation", json!({"elicitation":{"form":{}}}))
+                }
+                _ => continue,
+            },
+            InputRequest::CreateMessage(request) => {
+                let sampling = capabilities.sampling.as_ref();
+                let needs_tools = request.params.tool_choice.is_some()
+                    || request
+                        .params
+                        .tools
+                        .as_ref()
+                        .is_some_and(|tools| !tools.is_empty());
+                if needs_tools && !sampling.is_some_and(|c| c.tools.is_some()) {
+                    ("sampling.tools", json!({"sampling":{"tools":{}}}))
+                } else if sampling.is_none() {
+                    ("sampling", json!({"sampling":{}}))
+                } else {
+                    continue;
+                }
+            }
+            InputRequest::ListRoots(_) if capabilities.roots.is_none() => {
+                ("roots", json!({"roots":{}}))
+            }
+            _ => continue,
+        };
+        return Err(ErrorData::new(
+            ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY,
+            format!("Client did not declare the {capability} capability required by tool '{tool}'"),
+            Some(json!({"requiredCapabilities":required})),
+        ));
+    }
+    Ok(())
 }
 
 async fn with_progress(

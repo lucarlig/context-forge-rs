@@ -63,6 +63,7 @@ pub(crate) struct ToolContext<'a> {
     pub(crate) cancellation: &'a CancellationToken,
     pub(crate) progress: Option<&'a ToolProgress>,
     pub(crate) notifications: Option<Arc<Journal>>,
+    pub(crate) client_capabilities: Option<&'a ClientCapabilities>,
 }
 
 pub(crate) struct ToolProgress {
@@ -354,14 +355,17 @@ impl UpstreamClient {
         name: &str,
         arguments: Value,
     ) -> Result<Value, UpstreamError> {
+        let Value::Object(arguments) = arguments else {
+            return Err(UpstreamError::InvalidResponse);
+        };
         self.call_tool_with_context(
             url,
-            name,
-            arguments,
+            CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
             ToolContext {
                 cancellation: &CancellationToken::new(),
                 progress: None,
                 notifications: None,
+                client_capabilities: None,
             },
             None,
         )
@@ -371,8 +375,7 @@ impl UpstreamClient {
     pub(crate) async fn call_tool_with_context(
         &self,
         url: &str,
-        name: &str,
-        arguments: Value,
+        mut params: CallToolRequestParams,
         context: ToolContext<'_>,
         association: Option<&UpstreamAssociation>,
     ) -> Result<Value, UpstreamError> {
@@ -380,12 +383,9 @@ impl UpstreamClient {
         if cancellation.is_cancelled() {
             return Err(UpstreamError::Cancelled);
         }
-        let Value::Object(arguments) = arguments else {
-            return Err(UpstreamError::InvalidResponse);
-        };
-        let request = CallToolRequest::new(
-            CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
-        );
+        params.meta = None;
+        params.arguments.get_or_insert_default();
+        let request = CallToolRequest::new(params);
         let deadline = self.deadline()?;
         let session = match association {
             Some(association) => association.session(self, url, deadline, &context).await?,
@@ -404,7 +404,7 @@ impl UpstreamClient {
             () = cancellation.cancelled() => Err(UpstreamError::Cancelled),
             result = timeout_at(deadline, async {
                 started = true;
-                session.request_with_id(request.into(), id, context.progress, context.notifications.as_deref()).await
+                session.request_with_id(request.into(), id, Some(&context)).await
             }) => {
                 result.unwrap_or(Err(UpstreamError::Timeout)).map(|reply| reply.result)
             }
@@ -655,7 +655,11 @@ impl Session {
         for _ in 0..MAX_TOOL_PAGES {
             let params = PaginatedRequestParams::default().with_cursor(cursor.take());
             let reply = self
-                .request(ListToolsRequest::with_param(params).into(), None, None)
+                .request_with_id(
+                    ListToolsRequest::with_param(params).into(),
+                    self.next_request_id(),
+                    None,
+                )
                 .await?;
             received += reply.bytes;
             let Value::Object(mut result) = reply.result else {
@@ -694,31 +698,23 @@ impl Session {
         Err(UpstreamError::LimitExceeded)
     }
 
-    async fn request(
-        &self,
-        request: ClientRequest,
-        progress: Option<&ToolProgress>,
-        notifications: Option<&Journal>,
-    ) -> Result<Reply, UpstreamError> {
-        self.request_with_id(request, self.next_request_id(), progress, notifications)
-            .await
-    }
-
     async fn request_with_id(
         &self,
         request: ClientRequest,
         id: i64,
-        progress: Option<&ToolProgress>,
-        notifications: Option<&Journal>,
+        context: Option<&ToolContext<'_>>,
     ) -> Result<Reply, UpstreamError> {
+        let progress = context.and_then(|context| context.progress);
         let response = self
             .post_request(
                 request,
                 id,
                 self.protocol_version.as_ref(),
                 progress.is_some(),
+                context.and_then(|context| context.client_capabilities),
             )
             .await?;
+        let notifications = context.and_then(|context| context.notifications.as_deref());
         read_reply(self, response, id, progress, notifications).await
     }
 
@@ -734,7 +730,7 @@ impl Session {
     ) -> Result<(Response, i64), UpstreamError> {
         let id = self.next_request_id();
         let response = self
-            .post_request(request, id, version, report_progress)
+            .post_request(request, id, version, report_progress, None)
             .await?;
         Ok((response, id))
     }
@@ -745,6 +741,7 @@ impl Session {
         id: i64,
         version: Option<&ProtocolVersion>,
         report_progress: bool,
+        client_capabilities: Option<&ClientCapabilities>,
     ) -> Result<Response, UpstreamError> {
         if let Some(version) = version.filter(|version| !version.has_initialize()) {
             request
@@ -752,7 +749,7 @@ impl Session {
                 .insert(RequestMetaObject::with_client_context(
                     version.clone(),
                     client_info(),
-                    ClientCapabilities::default(),
+                    client_capabilities.cloned().unwrap_or_default(),
                 ));
         }
         if report_progress {

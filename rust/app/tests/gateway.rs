@@ -1196,6 +1196,182 @@ async fn tool_progress_streams_before_completion_on_legacy_and_modern_mcp() {
 }
 
 #[tokio::test]
+async fn modern_tool_input_round_trips_preserve_capabilities_and_request_state() {
+    const MODERN: &str = "2026-07-28";
+    const CLIENT_CAPS: &str = "io.modelcontextprotocol/clientCapabilities";
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let question = json!({"method":"elicitation/create","params":{
+        "mode":"form","message":"What color?",
+        "requestedSchema":{"type":"object","properties":{"color":{"type":"string"}}}
+    }});
+    let reply_question = question.clone();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream_calls = calls.clone();
+    let upstream = Running::start(Router::new().route("/mcp", post(
+        async move |headers: HeaderMap, Json(body): Json<Value>| {
+            assert_eq!(headers["mcp-protocol-version"], MODERN);
+            let params = &body["params"];
+            let result = match body["method"].as_str().unwrap() {
+                "server/discover" => json!({"supportedVersions":[MODERN],"capabilities":{"tools":{}}}),
+                "tools/list" => json!({"tools":[{"name":"color","inputSchema":{"type":"object"}}]}),
+                "tools/call" => {
+                    assert_eq!(headers["mcp-name"], "color");
+                    assert_eq!(params["name"], "color");
+                    upstream_calls.lock().unwrap().push(params.clone());
+                    if params["arguments"]["strict"] == true {
+                        return (StatusCode::BAD_REQUEST, Json(json!({
+                            "jsonrpc":"2.0","id":body["id"],"error":{
+                                "code":-32021,"message":"Fixture requires form support",
+                                "data":{"requiredCapabilities":{"elicitation":{"form":{}}}}
+                            }
+                        }))).into_response();
+                    }
+                    if params["requestState"] == "sealed" {
+                        let color = &params["inputResponses"]["color"]["content"]["color"];
+                        json!({"resultType":"complete","content":[{"type":"text","text":color}],"isError":false})
+                    } else {
+                        json!({"resultType":"input_required","inputRequests":{"color":reply_question},"requestState":"sealed"})
+                    }
+                }
+                unknown => panic!("unexpected upstream method {unknown}"),
+            };
+            Json(json!({"jsonrpc":"2.0","id":body["id"],"result":result})).into_response()
+        }
+    ))).await;
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(4),
+        ),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(
+        service
+            .registration_router()
+            .merge(service.mcp_router(false, ProtocolMode::Auto)),
+    )
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registration) = send(&client, gateway.url("/gateways"), json!({
+        "name":"fixture","url":upstream.url("/mcp"),"visibility":"public","transport":"STREAMABLEHTTP"
+    }), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{registration}");
+    let modern = |id: &str, capabilities: Value, state: Option<&Value>| {
+        let mut params = json!({"name":"fixture-color","arguments":{"strict":id == "strict"},"_meta":{
+            "io.modelcontextprotocol/protocolVersion":MODERN, CLIENT_CAPS:capabilities
+        }});
+        if let Some(state) = state {
+            params["requestState"] = json!("sealed");
+            params["inputResponses"] = state.clone();
+        }
+        client
+            .post(gateway.url("/mcp/"))
+            .header("mcp-protocol-version", MODERN)
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "fixture-color")
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":params}).to_string(),
+            )
+    };
+    let reply_body = async |reply: reqwest::Response| {
+        serde_json::from_slice::<Value>(&reply.bytes().await.unwrap()).unwrap()
+    };
+    for caps in [json!({}), json!({"elicitation":{"url":{}}})] {
+        let reply = modern("undeclared", caps, None).send().await.unwrap();
+        assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            reply_body(reply).await["error"],
+            json!({
+                "code":-32021,"message":"Client did not declare the form elicitation capability required by tool 'fixture-color'",
+                "data":{"requiredCapabilities":{"elicitation":{"form":{}}}}
+            })
+        );
+    }
+    let reply = modern(
+        "declared",
+        json!({"elicitation":{},"extensions":{"fixture":{}}}),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    let response = reply_body(reply).await;
+    let result = &response["result"];
+    assert_eq!(result["resultType"], "input_required");
+    assert_eq!(result["inputRequests"]["color"], question);
+    assert_eq!(result["requestState"], "sealed");
+    let responses = json!({"color":{"action":"accept","content":{"color":"blue"}}});
+    let reply = modern(
+        "continue",
+        json!({"elicitation":{"form":{}}}),
+        Some(&responses),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    let response = reply_body(reply).await;
+    let result = &response["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["content"][0]["text"], "blue");
+
+    let reply = client.post(gateway.url("/mcp/"))
+        .header("mcp-protocol-version", PROTOCOL)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"jsonrpc":"2.0","id":"legacy","method":"tools/call","params":{"name":"fixture-color"}}).to_string())
+        .send().await.unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    assert_eq!(
+        reply_body(reply).await["result"],
+        json!({
+            "content":[{"type":"text","text":"MCP server error: Elicitation not supported"}],"isError":true
+        })
+    );
+    let reply = modern("strict", json!({}), None).send().await.unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    let response = reply_body(reply).await;
+    let result = &response["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["_meta"]["io.contextforge/errorCode"]["code"], -32021);
+    assert_eq!(
+        result["content"][0]["text"],
+        "MCP server error: Fixture requires form support"
+    );
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 6);
+    assert_eq!(calls[0]["_meta"][CLIENT_CAPS], json!({}));
+    assert_eq!(
+        calls[1]["_meta"][CLIENT_CAPS],
+        json!({"elicitation":{"url":{}}})
+    );
+    assert_eq!(calls[2]["_meta"][CLIENT_CAPS], json!({"elicitation":{}}));
+    assert_eq!(
+        calls[3]["_meta"][CLIENT_CAPS],
+        json!({"elicitation":{"form":{}}})
+    );
+    assert_eq!(calls[3]["requestState"], "sealed");
+    assert_eq!(calls[3]["inputResponses"], responses);
+    assert_eq!(calls[4]["_meta"][CLIENT_CAPS], json!({}));
+}
+
+#[tokio::test]
 async fn stream_resumption_never_reads_another_session_or_authorization_scope() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let database = database().await;

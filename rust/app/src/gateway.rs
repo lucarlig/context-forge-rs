@@ -12,6 +12,7 @@ use axum::{
 use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, MetaObject};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -212,15 +213,14 @@ impl GatewayService {
         &self,
         principal: Option<&Principal>,
         server: Option<&CatalogServer>,
-        name: &str,
-        arguments: Value,
+        mut request: CallToolRequestParams,
         mut context: ToolContext<'_>,
         downstream: Option<&Session>,
     ) -> Result<Value, ToolError> {
         let tool = tokio::select! {
             biased;
             () = context.cancellation.cancelled() => return Err(ToolError::Cancelled),
-            result = self.lookup_invokable_tool(principal, server, name) => result?,
+            result = self.lookup_invokable_tool(principal, server, &request.name) => result?,
         }
         .ok_or(ToolError::NotFound)?;
         if tool.gateway_transport != "STREAMABLEHTTP"
@@ -235,22 +235,28 @@ impl GatewayService {
             context.notifications = session.passive_journal(authorization);
             session.upstream(&tool.gateway_id, &tool.gateway_url, authorization)
         });
-        self.upstream
-            .call_tool_with_context(
-                &tool.gateway_url,
-                &tool.original_name,
-                arguments,
-                context,
-                association.as_deref(),
-            )
-            .await
-            .map_err(|error| {
-                if matches!(error, UpstreamError::Cancelled) {
-                    return ToolError::Cancelled;
-                }
+        request.name = tool.original_name.into();
+        let legacy_caller = context.client_capabilities.is_none();
+        let result = self
+            .upstream
+            .call_tool_with_context(&tool.gateway_url, request, context, association.as_deref())
+            .await;
+        match result {
+            Ok(result) if legacy_caller && result["resultType"] == "input_required" => {
+                input_error_result("Elicitation not supported", None)
+            }
+            Ok(result) => Ok(result),
+            Err(UpstreamError::Cancelled) => Err(ToolError::Cancelled),
+            Err(UpstreamError::Rpc { code, message, .. })
+                if code == i64::from(ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY.0) =>
+            {
+                input_error_result(&message, Some(code))
+            }
+            Err(error) => {
                 tracing::warn!(%error, gateway = %tool.gateway_id, "upstream tool call failed");
-                ToolError::Unavailable
-            })
+                Err(ToolError::Unavailable)
+            }
+        }
     }
 
     pub(crate) async fn tool_definition(
@@ -294,6 +300,20 @@ impl GatewayService {
             )
             .await?)
     }
+}
+
+fn input_error_result(message: &str, code: Option<i64>) -> Result<Value, ToolError> {
+    let mut result = CallToolResult::error(vec![ContentBlock::text(format!(
+        "MCP server error: {message}"
+    ))]);
+    result.result_type = None;
+    if let Some(code) = code {
+        let mut meta = MetaObject::new();
+        meta.0
+            .insert("io.contextforge/errorCode".to_owned(), json!({"code":code}));
+        result.meta = Some(meta);
+    }
+    serde_json::to_value(result).map_err(|_| ToolError::Unavailable)
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -1050,17 +1050,16 @@ async fn call_tool(
         .as_ref()
         .map(|pending| pending.token.clone())
         .unwrap_or_default();
-    let arguments = Value::Object(params.arguments.unwrap_or_default());
     let result = service
         .call_tool(
             principal,
             server,
-            &params.name,
-            arguments,
+            params,
             ToolContext {
                 cancellation: &cancellation,
                 progress,
                 notifications: None,
+                client_capabilities: None,
             },
             session.as_deref(),
         )

@@ -52,7 +52,7 @@ An upstream fixture sent each request while the client held an active stateful G
 | `sampling/createMessage` | `-32600`, `Sampling not supported` |
 | `elicitation/create` | `-32600`, `Elicitation not supported` |
 
-The Rust gateway answers these requests on upstream POST SSE replies and persistent GET streams. The live test checks both channels, including the upstream session and protocol headers and preservation of string and numeric request IDs. Modern multi-round-trip input remains open.
+The Rust gateway answers these requests on upstream POST SSE replies and persistent GET streams. The live test checks both channels, including the upstream session and protocol headers and preservation of string and numeric request IDs.
 
 ## Rust lifecycle replay
 
@@ -95,6 +95,12 @@ JSON_RESPONSE_ENABLED=false USE_STATEFUL_SESSIONS=false MCP_REQUIRE_AUTH=false \
   rust-anything app replay rust/replay/mcp-stateful/sse-stateless \
   --build "$PWD/target/debug/context-forge-rs"
 ```
+
+## Modern tool input round trips
+
+A synthetic upstream returned `input_required` with a form elicitation request and an opaque `requestState`. The pinned gateway returned HTTP `400` and JSON-RPC error `-32021` when the caller had omitted form elicitation. It returned the question when the caller declared `elicitation: {}`. Retrying with `inputResponses` and the saved state returned the completed tool result. On the upstream leg, the gateway forwarded the caller's elicitation capability and removed unrelated extensions. A legacy call received a tool error result instead of the question.
+
+Both gateways return a tool error result with `io.contextforge/errorCode` when the upstream rejects the request with `-32021`. The live Rust test covers both rejection paths, successful continuation, the capabilities forwarded on each request, and the legacy result. Prompts and resources have separate handlers and remain part of the next milestone.
 
 ## Progress during tool calls
 
