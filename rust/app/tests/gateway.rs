@@ -1325,6 +1325,7 @@ struct PassiveFixture {
     initialized: AtomicUsize,
     gets: AtomicUsize,
     called: std::sync::Mutex<Vec<(String, Value)>>,
+    callbacks: std::sync::Mutex<Vec<Value>>,
     deleted: std::sync::Mutex<Vec<String>>,
     release_get: tokio::sync::Notify,
     ended: tokio::sync::Notify,
@@ -1345,8 +1346,14 @@ async fn passive_fixture(
     Json(body): Json<Value>,
 ) -> Response {
     let id = &body["id"];
-    let result = match body["method"].as_str().unwrap() {
-        "initialize" => {
+    let result = match body["method"].as_str() {
+        None => {
+            assert_eq!(headers["mcp-session-id"], "upstream-2");
+            assert_eq!(headers["mcp-protocol-version"], PROTOCOL);
+            fixture.callbacks.lock().unwrap().push(body);
+            return StatusCode::ACCEPTED.into_response();
+        }
+        Some("initialize") => {
             let generation = fixture.initialized.fetch_add(1, Ordering::Relaxed) + 1;
             return (
                 [("mcp-session-id", format!("upstream-{generation}"))],
@@ -1357,9 +1364,9 @@ async fn passive_fixture(
             )
                 .into_response();
         }
-        "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
-        "tools/list" => json!({"tools":[{"name":"log","inputSchema":{"type":"object"}}]}),
-        "tools/call" => {
+        Some("notifications/initialized") => return StatusCode::ACCEPTED.into_response(),
+        Some("tools/list") => json!({"tools":[{"name":"log","inputSchema":{"type":"object"}}]}),
+        Some("tools/call") => {
             let upstream_id = headers["mcp-session-id"].to_str().unwrap().to_owned();
             fixture
                 .called
@@ -1372,6 +1379,21 @@ async fn passive_fixture(
                 .iter()
                 .map(passive_log)
                 .collect();
+            if body["params"]["arguments"]["callbacks"] == true {
+                for request in [
+                    json!({"jsonrpc":"2.0","id":"roots","method":"roots/list"}),
+                    json!({"jsonrpc":"2.0","id":"sample","method":"sampling/createMessage",
+                        "params":{"messages":[],"maxTokens":100}}),
+                    json!({"jsonrpc":"2.0","id":"elicit","method":"elicitation/create",
+                        "params":{"message":"Fixture","requestedSchema":{"type":"object","properties":{}}}}),
+                ] {
+                    events.push(
+                        axum::response::sse::Event::default()
+                            .json_data(request)
+                            .unwrap(),
+                    );
+                }
+            }
             events.push(
                 axum::response::sse::Event::default()
                     .json_data(json!({
@@ -1384,7 +1406,7 @@ async fn passive_fixture(
             ))
             .into_response();
         }
-        unexpected => panic!("unexpected upstream method {unexpected}"),
+        unexpected => panic!("unexpected upstream method {unexpected:?}"),
     };
     Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
 }
@@ -1400,11 +1422,18 @@ async fn upstream_passive(
     let number = fixture.gets.fetch_add(1, Ordering::Relaxed);
     if number == 0 {
         assert!(!headers.contains_key("last-event-id"));
-        return axum::response::Sse::new(stream::once(async move {
+        let frames = stream::once(async move {
             fixture.release_get.notified().await;
-            Ok::<_, std::convert::Infallible>(passive_log(&json!("G")).id("upstream-G"))
-        }))
-        .into_response();
+            Ok::<_, std::convert::Infallible>(
+                axum::response::sse::Event::default()
+                    .json_data(json!({"jsonrpc":"2.0","id":57,"method":"ping"}))
+                    .unwrap(),
+            )
+        })
+        .chain(stream::iter([
+            Ok(passive_log(&json!("G")).id("upstream-G")),
+        ]));
+        return axum::response::Sse::new(frames).into_response();
     }
     assert_eq!(number, 1);
     assert_eq!(headers["last-event-id"], "upstream-G");
@@ -1500,7 +1529,7 @@ async fn passive_stream_follows_upstream_get_reconnects_and_replays_notification
     let notify = |id, messages: &[&str]| {
         post(json!({
             "jsonrpc":"2.0","id":id,"method":"tools/call",
-            "params":{"name":"passive-log","arguments":{"messages":messages}}
+            "params":{"name":"passive-log","arguments":{"messages":messages,"callbacks":id == 2}}
         }))
         .header("mcp-session-id", &session)
     };
@@ -1534,6 +1563,15 @@ async fn passive_stream_follows_upstream_get_reconnects_and_replays_notification
         let (_, event) = next_sse_message(&mut listener, &mut buffered).await;
         assert_eq!(event["params"]["data"], expected);
     }
+    assert_eq!(
+        *fixture.callbacks.lock().unwrap(),
+        [
+            json!({"jsonrpc":"2.0","id":"roots","error":{"code":-32600,"message":"List roots not supported"}}),
+            json!({"jsonrpc":"2.0","id":"sample","error":{"code":-32600,"message":"Sampling not supported"}}),
+            json!({"jsonrpc":"2.0","id":"elicit","error":{"code":-32600,"message":"Elicitation not supported"}}),
+            json!({"jsonrpc":"2.0","id":57,"result":{}}),
+        ]
+    );
     let cursor = cursor.unwrap();
     assert_eq!(
         get(&restricted, Some(&cursor))

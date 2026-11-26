@@ -21,12 +21,12 @@ use reqwest::{
 };
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
-    ClientCapabilities, ClientJsonRpcMessage, ClientRequest, DiscoverRequest,
+    ClientCapabilities, ClientJsonRpcMessage, ClientRequest, ClientResult, DiscoverRequest,
     DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetExtensions, GetMeta,
     Implementation, InitializeRequest, InitializeRequestParams, InitializedNotification,
-    JsonRpcMessage, ListToolsRequest, PaginatedRequestParams, ProgressNotificationParam,
-    ProgressToken, ProtocolVersion, RequestId, RequestMetaObject, ServerJsonRpcMessage,
-    ServerNotification,
+    JsonRpcMessage, JsonRpcRequest, ListToolsRequest, PaginatedRequestParams,
+    ProgressNotificationParam, ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
+    ServerJsonRpcMessage, ServerNotification, ServerRequest,
 };
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
@@ -590,7 +590,7 @@ impl Session {
                 false,
             )
             .await?;
-        let mut reply = read_reply(response, id, None, None).await?;
+        let mut reply = read_reply(self, response, id, None, None).await?;
         let Some(fields) = reply.result.as_object_mut() else {
             return Ok(false);
         };
@@ -626,7 +626,7 @@ impl Session {
         let (response, id) = self.send_request(request.into(), None, false).await?;
 
         self.session_id = read_session_id(&response)?;
-        let reply = read_reply(response, id, None, None).await?;
+        let reply = read_reply(self, response, id, None, None).await?;
         let requested = reply.result.get("protocolVersion").and_then(Value::as_str);
         let version = ProtocolVersion::KNOWN_VERSIONS
             .iter()
@@ -719,7 +719,7 @@ impl Session {
                 progress.is_some(),
             )
             .await?;
-        read_reply(response, id, progress, notifications).await
+        read_reply(self, response, id, progress, notifications).await
     }
 
     fn next_request_id(&self) -> i64 {
@@ -851,6 +851,39 @@ impl Session {
         }
     }
 
+    async fn answer_server_request(&self, request: JsonRpcRequest<Value>) {
+        let Some(version) = self
+            .protocol_version
+            .as_ref()
+            .filter(|version| version.has_initialize())
+        else {
+            return;
+        };
+        let Ok(method) = ServerRequest::deserialize(&request.request) else {
+            return;
+        };
+        let unavailable = match method {
+            ServerRequest::PingRequest(_) => None,
+            ServerRequest::ListRootsRequest(_) => Some("List roots not supported"),
+            ServerRequest::CreateMessageRequest(_) => Some("Sampling not supported"),
+            ServerRequest::ElicitRequest(_) => Some("Elicitation not supported"),
+            _ => return,
+        };
+        let reply = match unavailable {
+            Some(message) => ClientJsonRpcMessage::error(
+                ErrorData::invalid_request(message, None),
+                Some(request.id),
+            ),
+            None => ClientJsonRpcMessage::response(ClientResult::empty(()), request.id),
+        };
+        if !matches!(
+            timeout(CONNECT_TIMEOUT, self.post(&reply, Some(version))).await,
+            Ok(Ok(_))
+        ) {
+            tracing::debug!("upstream MCP server request reply failed");
+        }
+    }
+
     async fn follow_notifications(&self, journal: &Journal) {
         let mut cursor = None;
         loop {
@@ -904,8 +937,14 @@ impl Session {
                 if frame.len() > MAX_MESSAGE_BYTES {
                     return Err(UpstreamError::LimitExceeded);
                 }
-                if let Ok(JsonRpcMessage::Notification(notification)) = decode_message(&frame) {
-                    publish_notification(journal, &notification.notification);
+                match decode_message(&frame) {
+                    Ok(JsonRpcMessage::Notification(notification)) => {
+                        publish_notification(journal, &notification.notification);
+                    }
+                    Ok(JsonRpcMessage::Request(request)) => {
+                        self.answer_server_request(request).await
+                    }
+                    _ => {}
                 }
             }
             if stream.line.len() + stream.event.len() > MAX_MESSAGE_BYTES {
@@ -1036,6 +1075,7 @@ async fn http_error(response: Response) -> UpstreamError {
 type WireMessage = JsonRpcMessage<Value, Value, Value>;
 
 async fn read_reply(
+    session: &Session,
     mut response: Response,
     id: i64,
     mut progress: Option<&ToolProgress>,
@@ -1066,6 +1106,10 @@ async fn read_reply(
         let mut bytes = chunk.as_ref();
         while let Some(frame) = stream.next_frame(&mut bytes) {
             let message = decode_message(&frame)?;
+            if let JsonRpcMessage::Request(request) = message {
+                session.answer_server_request(request).await;
+                continue;
+            }
             if let JsonRpcMessage::Notification(notification) = &message {
                 if let Some(relay) = progress
                     && let Some(params) =

@@ -39,7 +39,20 @@ In the Redis affinity profile, two pinned gateway processes shared an isolated S
 
 Bind session access to the authorized principal and virtual server on every request. Apply the ownership check regardless of the cache backend. DELETE must invalidate the session for both POST and GET and close active streams. Verify those rules, cross-session cursor isolation, and cancellation through a live Rust gateway before checking off the milestone. [Legacy MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
 
-Rust forwards typed logging and catalog notifications from upstream POST responses and persistent GET streams. It associates upstream sessions with the downstream session, gateway endpoint, and authorization scope. Its live test confirms upstream session reuse, notification delivery after a tool returns, upstream reconnection with `Last-Event-ID`, and upstream closure after downstream DELETE. It also verifies replay and rejection with a narrowed bearer token. Server-initiated requests remain open.
+Rust forwards typed logging and catalog notifications from upstream POST responses and persistent GET streams. It associates upstream sessions with the downstream session, gateway endpoint, and authorization scope. Its live test confirms upstream session reuse, notification delivery after a tool returns, upstream reconnection with `Last-Event-ID`, and upstream closure after downstream DELETE. It also verifies replay and rejection with a narrowed bearer token.
+
+## Server-initiated legacy requests
+
+An upstream fixture sent each request while the client held an active stateful GET. The pinned gateway answered the upstream directly and the downstream GET carried no request in the four-second observation window. The `roots/list` run advertised the `roots` capability in the downstream initialize request.
+
+| Upstream request | Reference reply |
+| --- | --- |
+| `ping` | Empty result |
+| `roots/list` | `-32600`, `List roots not supported` |
+| `sampling/createMessage` | `-32600`, `Sampling not supported` |
+| `elicitation/create` | `-32600`, `Elicitation not supported` |
+
+The Rust gateway answers these requests on upstream POST SSE replies and persistent GET streams. The live test checks both channels, including the upstream session and protocol headers and preservation of string and numeric request IDs. Modern multi-round-trip input remains open.
 
 ## Rust lifecycle replay
 
