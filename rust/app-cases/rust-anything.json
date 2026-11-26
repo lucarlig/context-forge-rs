@@ -1,0 +1,15 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-reference-server",
+  "run": [
+    "context-forge-reference-server"
+  ],
+  "timeout_secs": 30,
+  "http": {
+    "ready_secs": 25
+  },
+  "recorded": [
+    "health",
+    "ready"
+  ]
+}

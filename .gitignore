@@ -1,0 +1,5 @@
+/target/
+/mcp.db
+/mcp.db-*
+/.env
+/rust/app-cases/replay-report.md
