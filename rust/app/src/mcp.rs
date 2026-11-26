@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Legacy stateless MCP Streamable HTTP.
+//! MCP Streamable HTTP ingress.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -27,13 +27,22 @@ use crate::{
     access::Principal,
     catalog::CatalogServer,
     gateway::{GatewayService, ToolError},
+    modern::Modern,
 };
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const RUNTIME_HEADER: &str = "x-contextforge-mcp-runtime";
 const LEGACY_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
-const JSON_MEDIA_TYPE: &str = "application/json";
-const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MODERN_VERSION: &str = "2026-07-28";
+const SUPPORTED_VERSIONS: [&str; 5] = [
+    LEGACY_VERSIONS[0],
+    LEGACY_VERSIONS[1],
+    LEGACY_VERSIONS[2],
+    LEGACY_VERSIONS[3],
+    MODERN_VERSION,
+];
+pub(crate) const JSON_MEDIA_TYPE: &str = "application/json";
+pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
@@ -41,15 +50,32 @@ const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
 const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
 
-/// Build the root Streamable HTTP routes for mounting behind gateway access checks.
-pub fn router(service: Arc<GatewayService>) -> Router {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProtocolMode {
+    #[default]
+    Auto,
+    Legacy,
+}
+
+struct McpState {
+    service: Arc<GatewayService>,
+    modern: Option<Modern>,
+}
+
+/// Build the Streamable HTTP routes for mounting behind gateway access checks.
+pub(crate) fn router(service: Arc<GatewayService>, mode: ProtocolMode) -> Router {
     Router::new()
         .route("/mcp", any(handle_request))
         .route("/mcp/", any(handle_request))
         .route("/servers/{server_id}/mcp", any(handle_request))
         .route("/servers/{server_id}/mcp/", any(handle_request))
+        .route("/v1/virtual-servers/{server_id}/mcp", any(handle_request))
+        .route("/v1/virtual-servers/{server_id}/mcp/", any(handle_request))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .with_state(service)
+        .with_state(Arc::new(McpState {
+            modern: (mode == ProtocolMode::Auto).then(|| Modern::new(service.clone())),
+            service,
+        }))
 }
 
 #[derive(Default)]
@@ -120,11 +146,17 @@ fn is_loopback_host(value: &str) -> bool {
         })
 }
 
-async fn handle_request(State(service): State<Arc<GatewayService>>, request: Request) -> Response {
-    if let Some(version) = request.headers().get(PROTOCOL_VERSION_HEADER)
+async fn handle_request(State(state): State<Arc<McpState>>, request: Request) -> Response {
+    let supported: &'static [&str] = if state.modern.is_some() {
+        &SUPPORTED_VERSIONS
+    } else {
+        &LEGACY_VERSIONS
+    };
+    let version = request.headers().get(PROTOCOL_VERSION_HEADER);
+    if let Some(version) = version
         && !version
             .to_str()
-            .is_ok_and(|version| LEGACY_VERSIONS.contains(&version))
+            .is_ok_and(|version| supported.contains(&version))
     {
         let requested: String = version.as_bytes().iter().copied().map(char::from).collect();
         return rpc_error(
@@ -133,10 +165,25 @@ async fn handle_request(State(service): State<Arc<GatewayService>>, request: Req
             UNSUPPORTED_PROTOCOL_VERSION,
             "Unsupported protocol version",
             Some(VersionError {
-                supported: LEGACY_VERSIONS,
+                supported,
                 requested: &requested,
             }),
         );
+    }
+
+    if request.method() != Method::GET
+        && version.is_some_and(|version| version == MODERN_VERSION)
+        && let Some(modern) = &state.modern
+    {
+        let mut response = modern.handle(request).await;
+        response
+            .headers_mut()
+            .insert(RUNTIME_HEADER, HeaderValue::from_static("rust"));
+        response
+            .headers_mut()
+            .entry(VARY)
+            .or_insert(HeaderValue::from_static("Origin"));
+        return response;
     }
 
     let is_head = request.method() == Method::HEAD;
@@ -149,7 +196,7 @@ async fn handle_request(State(service): State<Arc<GatewayService>>, request: Req
             }),
         )
             .into_response(),
-        Method::POST => handle_post(&service, request).await,
+        Method::POST => handle_post(&state.service, request).await,
         Method::DELETE => transport_error(
             StatusCode::METHOD_NOT_ALLOWED,
             "Method Not Allowed: Session termination not supported",
@@ -236,7 +283,7 @@ async fn handle_post(service: &GatewayService, mut request: Request) -> Response
     }
 }
 
-fn accepts_json(headers: &HeaderMap) -> bool {
+pub(crate) fn accepts_json(headers: &HeaderMap) -> bool {
     headers
         .get_all(ACCEPT)
         .iter()
@@ -279,7 +326,7 @@ async fn dispatch(
         };
         return match (id, method) {
             (None, _) => accepted(),
-            (Some(id), "initialize") => initialize(id, params),
+            (Some(id), "initialize") => initialize(id, params, server),
             (Some(id), "ping") => rpc_success(id, Empty {}),
             (Some(id), "tools/list") => list_tools(service, principal, server, id, params).await,
             (Some(id), "tools/call") => call_tool(service, principal, server, id, params).await,
@@ -378,7 +425,7 @@ fn tool_error(id: &Value, error: ToolError) -> Response {
     rpc_error(StatusCode::OK, id, code, message, None::<()>)
 }
 
-fn initialize(id: &Value, params: Option<&Value>) -> Response {
+fn initialize(id: &Value, params: Option<&Value>, server: Option<&CatalogServer>) -> Response {
     let Some(Ok(params)) = params.map(InitializeRequestParams::deserialize) else {
         return invalid_params(id);
     };
@@ -391,15 +438,14 @@ fn initialize(id: &Value, params: Option<&Value>) -> Response {
     let mut tools = ToolsCapability::default();
     tools.list_changed = Some(false);
     capabilities.tools = Some(tools);
-    rpc_success(
-        id,
-        InitializeResult::new(capabilities)
-            .with_protocol_version(protocol_version)
-            .with_server_info(Implementation::new(
-                "ContextForge",
-                env!("CARGO_PKG_VERSION"),
-            )),
-    )
+    let mut result = InitializeResult::new(capabilities)
+        .with_protocol_version(protocol_version)
+        .with_server_info(Implementation::new(
+            "ContextForge",
+            env!("CARGO_PKG_VERSION"),
+        ));
+    result.instructions = server.and_then(|server| server.instructions.clone());
+    rpc_success(id, result)
 }
 
 #[derive(Serialize)]
@@ -412,7 +458,7 @@ struct Detail {
 
 #[derive(Serialize)]
 struct VersionError<'a> {
-    supported: [&'static str; 4],
+    supported: &'static [&'static str],
     requested: &'a str,
 }
 
@@ -465,7 +511,7 @@ struct RpcErrorDetails<'a, T> {
     data: Option<T>,
 }
 
-fn rpc_error(
+pub(crate) fn rpc_error(
     status: StatusCode,
     id: &Value,
     code: i32,
@@ -509,7 +555,7 @@ mod tests {
         })
         .unwrap();
         let auth = Authorizer::new(database.clone(), None, true);
-        router(test_service(database, auth))
+        router(test_service(database, auth), ProtocolMode::Legacy)
     }
 
     async fn request(

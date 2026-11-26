@@ -16,6 +16,6 @@ Delegate JWT signature verification to jsonwebtoken with RustCrypto. Use Jiff's 
 
 The server reports its Rust version and advertises implemented MCP capabilities. The replay normalizes the runtime header and JSON key order. Keep the original tool and initialization responses in the fixtures.
 
-Use `rmcp` 3.12 protocol models for legacy MCP requests, negotiation, and upstream messages. Keep Axum ingress policy and use pinned DNS resolution with bounded upstream HTTP response reads. Evaluate the SDK's Streamable HTTP server for modern MCP against the protocol replay cases. [rmcp release](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.12.0)
+Use `rmcp` 3.12 protocol models and its stateless Streamable HTTP server. Authorize requests in Axum before dispatch. Resolve the schema for tool argument headers within the caller's visibility and permissions. Use pinned DNS resolution and bounded HTTP reads for upstream requests. Try modern discovery before legacy initialization in automatic mode. Send each tool call once. [rmcp release](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.12.0)
 
 Bind MCP list cursors to caller, team scope, method, and virtual server. Derive the signing key from the configured gateway secret or generate it at startup for an unconfigured process.

@@ -3,10 +3,10 @@
 use std::{collections::HashSet, env, error::Error, str::FromStr, time::Duration};
 
 use crate::{
-    gateway::Pagination,
+    gateway::{CatalogRefresh, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    mcp::IngressPolicy,
-    upstream::{EgressPolicy, UpstreamClient},
+    mcp::{IngressPolicy, ProtocolMode},
+    upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 
 pub struct Settings {
@@ -124,6 +124,14 @@ impl Settings {
         })
     }
 
+    pub fn mcp_inbound_protocol_mode() -> Result<ProtocolMode, Box<dyn Error + Send + Sync>> {
+        match value("MCP_INBOUND_PROTOCOL_MODE", "auto")?.as_str() {
+            "auto" => Ok(ProtocolMode::Auto),
+            "legacy" => Ok(ProtocolMode::Legacy),
+            _ => Err("invalid MCP_INBOUND_PROTOCOL_MODE".into()),
+        }
+    }
+
     pub fn upstream_client() -> Result<UpstreamClient, Box<dyn Error + Send + Sync>> {
         let policy = EgressPolicy {
             allow_localhost: flag("SSRF_ALLOW_LOCALHOST")?.unwrap_or(false),
@@ -132,10 +140,16 @@ impl Settings {
             blocked_networks: parse_networks("SSRF_BLOCKED_NETWORKS")?,
             blocked_hosts: allowlist("SSRF_BLOCKED_HOSTS")?.into_iter().collect(),
         };
+        let connect_mode = match value("MCP_CLIENT_CONNECT_MODE", "auto")?.as_str() {
+            "auto" => ConnectMode::Auto,
+            "legacy" => ConnectMode::Legacy,
+            _ => return Err("invalid MCP_CLIENT_CONNECT_MODE".into()),
+        };
         Ok(UpstreamClient::new(
             policy,
             positive_seconds("GATEWAY_HEALTH_CHECK_TIMEOUT", 30.0)?,
-        ))
+        )
+        .with_connect_mode(connect_mode))
     }
 
     pub fn mcp_pagination() -> Result<Pagination, Box<dyn Error + Send + Sync>> {
@@ -155,6 +169,19 @@ impl Settings {
             lifetime,
             (!secret.is_empty()).then_some(&secret),
         ))
+    }
+
+    pub fn catalog_refresh() -> Result<CatalogRefresh, Box<dyn Error + Send + Sync>> {
+        let defaults = CatalogRefresh::default();
+        let default_seconds = parse("GATEWAY_AUTO_REFRESH_INTERVAL", defaults.default_seconds)?;
+        let minimum_seconds = parse("HEALTH_CHECK_INTERVAL", defaults.minimum_seconds)?;
+        if default_seconds < 60 || minimum_seconds <= 0 {
+            return Err("invalid catalog refresh or health check interval".into());
+        }
+        Ok(CatalogRefresh {
+            default_seconds,
+            minimum_seconds,
+        })
     }
 
     pub fn invalidate_sessions_on_password_change() -> Result<bool, Box<dyn Error + Send + Sync>> {

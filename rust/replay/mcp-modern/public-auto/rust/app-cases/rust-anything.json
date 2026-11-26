@@ -1,0 +1,52 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-modern-reference-server",
+  "run": [
+    "context-forge-modern-reference-server",
+    "public-auto"
+  ],
+  "timeout_secs": 30,
+  "http": {
+    "ready_secs": 25
+  },
+  "recorded": [
+    "01-discover",
+    "02-tools-list",
+    "03-tools-call",
+    "04-ping",
+    "05-tools-list-with-session-id",
+    "06-missing-mcp-method",
+    "07-mismatch-method",
+    "08-missing-mcp-name",
+    "09-mismatch-name",
+    "10-missing-protocol-header",
+    "11-missing-meta",
+    "12-empty-meta",
+    "13-missing-client-capabilities",
+    "14-missing-meta-version",
+    "15-payload-version-mismatch",
+    "16-unsupported-version",
+    "17-head-sessionless",
+    "18-get-sessionless",
+    "19-delete-sessionless",
+    "20-json-only-accept",
+    "21-sse-only-accept",
+    "22-unsupported-content-type",
+    "23-malformed-json",
+    "24-unknown-method",
+    "25-undeclared-mcp-param",
+    "26-legacy-initialize-with-modern-meta",
+    "27-bad-client-capabilities",
+    "28-nonscalar-meta-client-info",
+    "29-unknown-tool",
+    "30-no-trailing-slash",
+    "33-modern-notification",
+    "34-data-on-notification"
+  ],
+  "normalizers": {
+    "runtime": "^(python|rust)$"
+  },
+  "normalize": [
+    "key-order"
+  ]
+}

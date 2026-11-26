@@ -87,7 +87,7 @@ async fn postgres_authorizes_against_the_native_identity_schema() {
     );
     assert_eq!(
         request(
-            test_service(database, auth).mcp_router(true),
+            test_service(database, auth).mcp_router(true, crate::mcp::ProtocolMode::Legacy),
             Some(&credential)
         )
         .await
@@ -164,7 +164,8 @@ async fn request(app: Router, credential: Option<&str>) -> (StatusCode, HeaderMa
 #[tokio::test]
 async fn mcp_requires_authentication_and_permissions_before_initialization() {
     let database = database().await;
-    let app = test_service(database.clone(), authorizer(&database)).mcp_router(true);
+    let app = test_service(database.clone(), authorizer(&database))
+        .mcp_router(true, crate::mcp::ProtocolMode::Legacy);
 
     let (status, headers, body) = request(app.clone(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -203,7 +204,8 @@ async fn mcp_requires_authentication_and_permissions_before_initialization() {
 #[tokio::test]
 async fn explicit_public_mode_grants_only_anonymous_requests_without_credentials() {
     let database = database().await;
-    let app = test_service(database.clone(), authorizer(&database)).mcp_router(false);
+    let app = test_service(database.clone(), authorizer(&database))
+        .mcp_router(false, crate::mcp::ProtocolMode::Legacy);
     assert_eq!(request(app.clone(), None).await.0, StatusCode::OK);
     assert_eq!(
         request(app, Some("invalid")).await.0,

@@ -12,7 +12,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] First-party bearer verification, database roles and team scopes, and MCP ingress gates
 - [x] SQLite and PostgreSQL storage for gateway, tool, and virtual-server associations, with scoped pagination
 - [x] Legacy stateless MCP registration, listing, and invocation for unauthenticated Streamable HTTP upstreams
-- [ ] Modern MCP negotiation, discovery, and standard routing headers
+- [x] Modern MCP negotiation, discovery, and standard routing headers
 - [ ] Stateful sessions, streaming, cancellation, and event resumption
 - [ ] Resources, prompts, completions, logging, and subscriptions
 - [ ] Legacy SSE, WebSocket, and stdio transports and translation

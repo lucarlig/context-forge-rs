@@ -1,0 +1,22 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-modern-reference-server",
+  "run": [
+    "context-forge-modern-reference-server",
+    "required-auto"
+  ],
+  "timeout_secs": 30,
+  "http": {
+    "ready_secs": 25
+  },
+  "recorded": [
+    "01-require-auth",
+    "04-auth-vs-version-precedence"
+  ],
+  "normalizers": {
+    "runtime": "^(python|rust)$"
+  },
+  "normalize": [
+    "key-order"
+  ]
+}

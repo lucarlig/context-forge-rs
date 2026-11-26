@@ -1,0 +1,18 @@
+[request]
+method = "POST"
+path = "/mcp/"
+body = '{"jsonrpc":"2.0","method":"tools/list","id":2,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+
+[request.headers]
+Accept = "application/json, text/event-stream"
+Content-Type = "application/json"
+MCP-Protocol-Version = "2026-07-28"
+Mcp-Method = "tools/list"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin, Accept-Encoding"
+x-contextforge-mcp-runtime = "python"

@@ -20,9 +20,10 @@ use context_forge_rs::{
     access::Authorizer,
     config::Settings,
     database::Database,
-    gateway::{GatewayService, Pagination},
+    gateway::{CatalogRefresh, GatewayService, Pagination},
     jwt::{JwtConfig, JwtVerifier},
-    upstream::{EgressPolicy, UpstreamClient},
+    mcp::ProtocolMode,
+    upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 use jiff::Timestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -164,6 +165,16 @@ async fn send(
     payload: Value,
     credential: Option<&str>,
 ) -> (StatusCode, Value) {
+    send_with_headers(client, url, payload, credential, &[]).await
+}
+
+async fn send_with_headers(
+    client: &Client,
+    url: String,
+    payload: Value,
+    credential: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
     let mut request = client
         .post(url)
         .header(header::CONTENT_TYPE, "application/json")
@@ -172,6 +183,9 @@ async fn send(
     if let Some(credential) = credential {
         request = request.bearer_auth(credential);
     }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = request.send().await.unwrap();
     let status = response.status();
     let body = response.bytes().await.unwrap();
@@ -179,6 +193,14 @@ async fn send(
         panic!("HTTP {status}: {error}: {}", String::from_utf8_lossy(&body))
     });
     (status, parsed)
+}
+
+fn modern_request(method: &str, id: u32, mut params: Value) -> Value {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }
 
 #[tokio::test]
@@ -211,13 +233,15 @@ async fn registration_discovery_invocation_and_team_gates_work_over_http() {
                 ..Default::default()
             },
             Duration::from_secs(5),
-        ),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
         Pagination::new(1, 900, None),
+        CatalogRefresh::default(),
     ));
     let gateway = Running::start(
         service
             .registration_router()
-            .merge(service.mcp_router(false)),
+            .merge(service.mcp_router(false, ProtocolMode::Auto)),
     )
     .await;
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -340,8 +364,165 @@ async fn registration_discovery_invocation_and_team_gates_work_over_http() {
     let (_, denied) = send(&client, virtual_url.clone(), call.clone(), Some(&read_only)).await;
     assert_eq!(denied["error"], json!({"code":0,"message":"Access denied"}));
     assert_eq!(
-        send(&client, virtual_url, call, Some(&member)).await,
+        send(&client, virtual_url.clone(), call, Some(&member)).await,
         (StatusCode::OK, serde_json::from_str::<Value>(CALL).unwrap())
     );
     assert_eq!(stats.calls.load(Ordering::Relaxed), 2);
+
+    sqlx::raw_sql(
+        r#"UPDATE gateways SET refresh_interval_seconds = 120 WHERE name = 'team-fixture';
+           UPDATE servers SET instructions = 'Use the alpha echo tool.' WHERE id = 'alpha-server';
+           UPDATE tools SET input_schema = json_set(
+               input_schema, '$.properties.message."x-mcp-header"', 'Message'
+           ) WHERE name = 'team-fixture-echo';"#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let modern = [("mcp-protocol-version", "2026-07-28")];
+    let discover_headers = [modern[0], ("mcp-method", "server/discover")];
+    let discover = modern_request("server/discover", 10, json!({}));
+    let (status, response) = send_with_headers(
+        &client,
+        gateway.url("/v1/virtual-servers/alpha-server/mcp"),
+        discover.clone(),
+        Some(&member),
+        &discover_headers,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["result"]["supportedVersions"],
+        json!(["2026-07-28"])
+    );
+    assert_eq!(response["result"]["cacheScope"], "private");
+    assert_eq!(response["result"]["ttlMs"], 120_000);
+    assert_eq!(
+        response["result"]["instructions"],
+        "Use the alpha echo tool."
+    );
+
+    let (status, refused) = send_with_headers(
+        &client,
+        gateway.url("/mcp/"),
+        discover.clone(),
+        None,
+        &[
+            discover_headers[0],
+            discover_headers[1],
+            ("mcp-method", "tools/list"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"]["code"], -32020);
+
+    let response = client
+        .get(gateway.url("/mcp/"))
+        .header(modern[0].0, modern[0].1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers()[header::ALLOW], "POST, DELETE");
+
+    let scoped_list = modern_request("tools/list", 11, json!({}));
+    let list_headers = [modern[0], ("mcp-method", "tools/list")];
+    let (_, response) = send_with_headers(
+        &client,
+        virtual_url.clone(),
+        scoped_list.clone(),
+        Some(&member),
+        &list_headers,
+    )
+    .await;
+    assert_eq!(response["result"]["tools"][0]["name"], "team-fixture-echo");
+    assert_eq!(response["result"]["ttlMs"], 120_000);
+    assert_eq!(
+        send_with_headers(
+            &client,
+            virtual_url.clone(),
+            scoped_list,
+            Some(&outsider),
+            &list_headers,
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+
+    let call = modern_request(
+        "tools/call",
+        12,
+        json!({
+            "name":"team-fixture-echo","arguments":{"message":"hello"}
+        }),
+    );
+    let call_headers = [
+        modern[0],
+        ("mcp-method", "tools/call"),
+        ("mcp-name", "team-fixture-echo"),
+        ("mcp-param-message", "hello"),
+    ];
+    let (status, response) = send_with_headers(
+        &client,
+        virtual_url.clone(),
+        call.clone(),
+        Some(&member),
+        &call_headers,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"],
+        json!({"result":"echo: hello"})
+    );
+    assert_eq!(response["result"]["resultType"], "complete");
+
+    let (status, response) = send_with_headers(
+        &client,
+        virtual_url.clone(),
+        call.clone(),
+        Some(&member),
+        &call_headers[..3],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(response["error"]["code"], -32020);
+    let (_, denied) =
+        send_with_headers(&client, virtual_url, call, Some(&read_only), &call_headers).await;
+    assert_eq!(denied["error"], json!({"code":0,"message":"Access denied"}));
+    assert_eq!(stats.calls.load(Ordering::Relaxed), 3);
+
+    let legacy = Running::start(service.mcp_router(false, ProtocolMode::Legacy)).await;
+    let (status, refusal) = send_with_headers(
+        &client,
+        legacy.url("/mcp"),
+        discover.clone(),
+        None,
+        &discover_headers,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refusal["error"]["code"], -32022);
+    assert_eq!(
+        refusal["error"]["data"]["supported"],
+        json!(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"])
+    );
+
+    let secure = Running::start(service.mcp_router(true, ProtocolMode::Auto)).await;
+    let (status, refusal) = send_with_headers(
+        &client,
+        secure.url("/mcp/"),
+        discover,
+        None,
+        &discover_headers,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        refusal["detail"],
+        "Authentication required for MCP endpoints"
+    );
 }

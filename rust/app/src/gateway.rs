@@ -21,9 +21,11 @@ use crate::{
     access::{self, Authorizer, Principal, RoleContext},
     auth::TeamVisibility,
     catalog::{
-        CatalogServer, GatewayRegistration, RegisteredTool, RegistrationError, ToolDefinition,
+        CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool, RegistrationError,
+        ToolDefinition,
     },
     database::Database,
+    mcp::ProtocolMode,
     upstream::{UpstreamClient, UpstreamError},
 };
 
@@ -32,6 +34,21 @@ pub struct GatewayService {
     database: Database,
     upstream: UpstreamClient,
     pagination: Pagination,
+    refresh: CatalogRefresh,
+}
+
+pub struct CatalogRefresh {
+    pub default_seconds: i32,
+    pub minimum_seconds: i32,
+}
+
+impl Default for CatalogRefresh {
+    fn default() -> Self {
+        Self {
+            default_seconds: 300,
+            minimum_seconds: 60,
+        }
+    }
 }
 
 pub struct Pagination {
@@ -70,12 +87,14 @@ impl GatewayService {
         access: Arc<Authorizer>,
         upstream: UpstreamClient,
         pagination: Pagination,
+        refresh: CatalogRefresh,
     ) -> Self {
         Self {
             access,
             database,
             upstream,
             pagination,
+            refresh,
         }
     }
 
@@ -91,9 +110,29 @@ impl GatewayService {
         self.access.protect_api(router)
     }
 
-    pub fn mcp_router(self: &Arc<Self>, require_auth: bool) -> Router {
+    pub fn mcp_router(self: &Arc<Self>, require_auth: bool, mode: ProtocolMode) -> Router {
         self.access
-            .protect_mcp(crate::mcp::router(self.clone()), require_auth)
+            .protect_mcp(crate::mcp::router(self.clone(), mode), require_auth)
+    }
+
+    pub(crate) async fn catalog_ttl_ms(&self, server: Option<&CatalogServer>) -> u64 {
+        let default = self.refresh.default_seconds;
+        let seconds = if let Some(server) = server {
+            match self
+                .database
+                .tool_refresh_interval(&server.id, default)
+                .await
+            {
+                Ok(interval) => interval.unwrap_or(default),
+                Err(error) => {
+                    tracing::warn!(%error, "could not determine MCP catalog refresh interval");
+                    return 0;
+                }
+            }
+        } else {
+            default
+        };
+        u64::try_from(seconds.max(self.refresh.minimum_seconds)).unwrap_or_default() * 1000
     }
 
     pub(crate) async fn list_tools(
@@ -151,6 +190,44 @@ impl GatewayService {
         name: &str,
         arguments: Value,
     ) -> Result<Value, ToolError> {
+        let tool = self
+            .lookup_invokable_tool(principal, server, name)
+            .await?
+            .ok_or(ToolError::NotFound)?;
+        if tool.gateway_transport != "STREAMABLEHTTP"
+            || tool.gateway_mode != "cache"
+            || tool.request_type != "STREAMABLEHTTP"
+            || tool.requires_gateway_policy
+        {
+            return Err(ToolError::Unavailable);
+        }
+        self.upstream
+            .call_tool(&tool.gateway_url, &tool.original_name, arguments)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, gateway = %tool.gateway_id, "upstream tool call failed");
+                ToolError::Unavailable
+            })
+    }
+
+    pub(crate) async fn tool_definition(
+        &self,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        name: &str,
+    ) -> Result<Option<ToolDefinition>, ToolError> {
+        Ok(self
+            .lookup_invokable_tool(principal, server, name)
+            .await?
+            .map(|tool| tool.definition))
+    }
+
+    async fn lookup_invokable_tool(
+        &self,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        name: &str,
+    ) -> Result<Option<CatalogTool>, ToolError> {
         if let Some(principal) = principal
             && !self
                 .access
@@ -165,31 +242,14 @@ impl GatewayService {
             return Err(ToolError::Denied);
         }
 
-        let tool = self
+        Ok(self
             .database
             .find_mcp_tool(
                 access::catalog_scope(principal),
                 server.map(|server| server.id.as_str()),
                 name,
             )
-            .await?
-            .ok_or(ToolError::NotFound)?;
-
-        if tool.gateway_transport != "STREAMABLEHTTP"
-            || tool.gateway_mode != "cache"
-            || tool.request_type != "STREAMABLEHTTP"
-            || tool.requires_gateway_policy
-        {
-            return Err(ToolError::Unavailable);
-        }
-
-        self.upstream
-            .call_tool(&tool.gateway_url, &tool.original_name, arguments)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, gateway = %tool.gateway_id, "upstream tool call failed");
-                ToolError::Unavailable
-            })
+            .await?)
     }
 }
 
@@ -210,9 +270,9 @@ pub(crate) enum ToolError {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ToolPage {
-    tools: Vec<ToolDefinition>,
+    pub(crate) tools: Vec<ToolDefinition>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<String>,
+    pub(crate) next_cursor: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -595,5 +655,6 @@ pub(crate) fn test_service(database: Database, authorizer: Authorizer) -> Arc<Ga
         Arc::new(authorizer),
         UpstreamClient::new(Default::default(), std::time::Duration::from_secs(1)),
         Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
     ))
 }

@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"echo: hello","type":"text"}],"isError":false,"resultType":"complete","structuredContent":{"result":"echo: hello"},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"ContextForge","version":"1.1.2"}}}}

@@ -45,6 +45,7 @@ pub struct CatalogServer {
     pub team_id: Option<String>,
     pub enabled: bool,
     pub oauth_enabled: bool,
+    pub instructions: Option<String>,
     owner_email: Option<String>,
     visibility: String,
 }
@@ -141,6 +142,7 @@ type ServerRow = (
     bool,
     Option<String>,
     String,
+    Option<String>,
 );
 type ToolRow = (
     String,
@@ -241,7 +243,7 @@ macro_rules! tool_query {
 }
 
 const SERVER_QUERY: &str = "
-    SELECT id, name, team_id, enabled, oauth_enabled, owner_email, visibility
+    SELECT id, name, team_id, enabled, oauth_enabled, owner_email, visibility, instructions
     FROM servers WHERE id = $1";
 
 const CONFLICT_QUERY: &str = concat!(
@@ -347,16 +349,48 @@ impl Database {
             }
         };
         Ok(row.map(
-            |(id, name, team_id, enabled, oauth_enabled, owner_email, visibility)| CatalogServer {
-                id,
-                name,
-                team_id,
-                enabled,
-                oauth_enabled,
-                owner_email,
-                visibility,
+            |(id, name, team_id, enabled, oauth_enabled, owner_email, visibility, instructions)| {
+                CatalogServer {
+                    id,
+                    name,
+                    team_id,
+                    enabled,
+                    oauth_enabled,
+                    instructions,
+                    owner_email,
+                    visibility,
+                }
             },
         ))
+    }
+
+    pub(crate) async fn tool_refresh_interval(
+        &self,
+        server_id: &str,
+        default_seconds: i32,
+    ) -> Result<Option<i32>, sqlx::Error> {
+        const QUERY: &str = "
+            SELECT MIN(COALESCE(g.refresh_interval_seconds, $2))
+            FROM server_tool_association a
+            JOIN tools t ON t.id = a.tool_id
+            JOIN gateways g ON g.id = t.gateway_id
+            WHERE a.server_id = $1";
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar(QUERY)
+                    .bind(server_id)
+                    .bind(default_seconds)
+                    .fetch_one(pool)
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar(QUERY)
+                    .bind(server_id)
+                    .bind(default_seconds)
+                    .fetch_one(pool)
+                    .await
+            }
+        }
     }
 
     pub async fn active_team(&self, id: &str) -> Result<bool, sqlx::Error> {

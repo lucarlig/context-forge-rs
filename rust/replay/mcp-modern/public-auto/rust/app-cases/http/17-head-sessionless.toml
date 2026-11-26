@@ -1,0 +1,16 @@
+[request]
+method = "HEAD"
+path = "/mcp/"
+
+[request.headers]
+Accept = "application/json, text/event-stream"
+Content-Type = "application/json"
+MCP-Protocol-Version = "2026-07-28"
+
+[response]
+status = 405
+
+[response.headers]
+allow = "POST"
+vary = "Origin"
+x-contextforge-mcp-runtime = "python"

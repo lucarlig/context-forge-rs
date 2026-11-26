@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine, prelude::BASE64_STANDARD};
 use ipnet::IpNet;
 use reqwest::{
     Client, Method, Response,
@@ -17,11 +18,13 @@ use reqwest::{
 };
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, ClientCapabilities, ClientJsonRpcMessage,
-    ClientRequest, Implementation, InitializeRequest, InitializeRequestParams,
+    ClientRequest, DiscoverRequest, DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData,
+    GetExtensions, Implementation, InitializeRequest, InitializeRequestParams,
     InitializedNotification, JsonRpcMessage, ListToolsRequest, PaginatedRequestParams,
-    ProtocolVersion, RequestId,
+    ProtocolVersion, RequestId, RequestMetaObject,
 };
 use rustls_platform_verifier::BuilderVerifierExt;
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
@@ -31,8 +34,11 @@ use tokio::{
 use url::{Host, Url};
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
+const MODERN_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 const SESSION_HEADER: &str = "mcp-session-id";
+const METHOD_HEADER: &str = "mcp-method";
+const NAME_HEADER: &str = "mcp-name";
 const ACCEPT_VALUE: &str = "application/json, text/event-stream";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
@@ -40,6 +46,7 @@ const MAX_TOOL_PAGES: usize = 100;
 const MAX_TOOLS: usize = 10_000;
 const MAX_SESSION_ID_BYTES: usize = 512;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATION_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Default)]
@@ -190,6 +197,14 @@ impl From<reqwest::Error> for UpstreamError {
 pub struct UpstreamClient {
     policy: EgressPolicy,
     timeout: Duration,
+    mode: ConnectMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConnectMode {
+    #[default]
+    Auto,
+    Legacy,
 }
 
 pub struct DiscoveredCatalog {
@@ -199,7 +214,16 @@ pub struct DiscoveredCatalog {
 
 impl UpstreamClient {
     pub fn new(policy: EgressPolicy, timeout: Duration) -> Self {
-        Self { policy, timeout }
+        Self {
+            policy,
+            timeout,
+            mode: ConnectMode::default(),
+        }
+    }
+
+    pub fn with_connect_mode(mut self, mode: ConnectMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub async fn list_tools(&self, url: &str) -> Result<DiscoveredCatalog, UpstreamError> {
@@ -236,9 +260,14 @@ impl UpstreamClient {
         let mut session = timeout_at(deadline, self.connect(endpoint))
             .await
             .map_err(|_| UpstreamError::Timeout)??;
-        let result = timeout_at(deadline, session.initialize())
-            .await
-            .unwrap_or(Err(UpstreamError::Timeout));
+        let result = timeout_at(deadline, async {
+            match self.mode {
+                ConnectMode::Auto => session.negotiate().await,
+                ConnectMode::Legacy => session.initialize().await,
+            }
+        })
+        .await
+        .unwrap_or(Err(UpstreamError::Timeout));
         if let Err(error) = result {
             session.close().await;
             return Err(error);
@@ -323,34 +352,104 @@ struct Session {
     client: Client,
     url: Url,
     capabilities: Value,
-    protocol_version: Option<HeaderValue>,
+    protocol_version: Option<ProtocolVersion>,
     session_id: Option<HeaderValue>,
     next_id: i64,
 }
 
 impl Session {
-    async fn initialize(&mut self) -> Result<(), UpstreamError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let params = InitializeRequestParams::new(
-            ClientCapabilities::default(),
-            Implementation::new("context-forge-rs", env!("CARGO_PKG_VERSION")),
-        )
-        .with_protocol_version(PROTOCOL_VERSION);
-        let request = InitializeRequest::new(params);
-        let response = self
-            .post(&ClientJsonRpcMessage::request(
-                request.into(),
-                RequestId::Number(id),
-            ))
+    async fn negotiate(&mut self) -> Result<(), UpstreamError> {
+        for first_attempt in [true, false] {
+            match timeout(DISCOVERY_TIMEOUT, self.discover()).await {
+                Ok(Ok(true)) => return Ok(()),
+                Ok(Ok(false)) => return self.initialize().await,
+                Ok(Err(error)) => {
+                    if let Some(supported) = supported_versions(&error) {
+                        if first_attempt && supported.contains(&MODERN_VERSION) {
+                            continue;
+                        }
+                        if !supported.iter().any(is_handshake_version) {
+                            return Err(error);
+                        }
+                    }
+                    if !matches!(
+                        error,
+                        UpstreamError::Rpc { .. }
+                            | UpstreamError::Status(300..=599)
+                            | UpstreamError::InvalidResponse
+                    ) {
+                        return Err(error);
+                    }
+                }
+                Err(_) => {}
+            }
+
+            let result = self.initialize().await;
+            if first_attempt
+                && result
+                    .as_ref()
+                    .err()
+                    .and_then(supported_versions)
+                    .is_some_and(|supported| supported.contains(&MODERN_VERSION))
+            {
+                self.close().await;
+                self.session_id = None;
+                self.protocol_version = None;
+            } else {
+                return result;
+            }
+        }
+        Err(UpstreamError::InvalidResponse)
+    }
+
+    async fn discover(&mut self) -> Result<bool, UpstreamError> {
+        let (response, id) = self
+            .send_request(
+                DiscoverRequest::new(DiscoverRequestParams {}).into(),
+                Some(&MODERN_VERSION),
+            )
             .await?;
+        let mut reply = read_reply(response, id).await?;
+        let Some(fields) = reply.result.as_object_mut() else {
+            return Ok(false);
+        };
+        fields
+            .entry("resultType")
+            .or_insert_with(|| "complete".into());
+        fields
+            .entry("cacheScope")
+            .or_insert_with(|| "private".into());
+        let ttl = fields.entry("ttlMs").or_insert_with(|| 0.into());
+        if ttl.as_f64().is_some_and(|ttl| ttl < 0.) {
+            *ttl = 0.into();
+        }
+        let Ok(discovery) = DiscoverResult::deserialize(&reply.result) else {
+            return Ok(false);
+        };
+        if !discovery.supported_versions.contains(&MODERN_VERSION) {
+            return Ok(false);
+        }
+        self.capabilities = reply
+            .result
+            .get("capabilities")
+            .cloned()
+            .ok_or(UpstreamError::InvalidResponse)?;
+        self.protocol_version = Some(MODERN_VERSION);
+        Ok(true)
+    }
+
+    async fn initialize(&mut self) -> Result<(), UpstreamError> {
+        let params = InitializeRequestParams::new(ClientCapabilities::default(), client_info())
+            .with_protocol_version(PROTOCOL_VERSION);
+        let request = InitializeRequest::new(params);
+        let (response, id) = self.send_request(request.into(), None).await?;
 
         self.session_id = read_session_id(&response)?;
         let reply = read_reply(response, id).await?;
         let requested = reply.result.get("protocolVersion").and_then(Value::as_str);
         let version = ProtocolVersion::KNOWN_VERSIONS
             .iter()
-            .find(|known| known.has_initialize() && Some(known.as_str()) == requested)
+            .find(|known| is_handshake_version(known) && Some(known.as_str()) == requested)
             .ok_or(UpstreamError::InvalidResponse)?;
         self.capabilities = reply
             .result
@@ -358,10 +457,11 @@ impl Session {
             .filter(|capabilities| capabilities.is_object())
             .ok_or(UpstreamError::InvalidResponse)?
             .clone();
-        self.protocol_version = Some(HeaderValue::from_static(version.as_str()));
-        self.post(&ClientJsonRpcMessage::notification(
-            InitializedNotification::default().into(),
-        ))
+        self.protocol_version = Some(version.clone());
+        self.post(
+            &ClientJsonRpcMessage::notification(InitializedNotification::default().into()),
+            Some(version),
+        )
         .await?;
         Ok(())
     }
@@ -414,56 +514,135 @@ impl Session {
     }
 
     async fn request(&mut self, request: ClientRequest) -> Result<Reply, UpstreamError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let response = self
-            .post(&ClientJsonRpcMessage::request(
-                request,
-                RequestId::Number(id),
-            ))
-            .await?;
+        let version = self.protocol_version.clone();
+        let (response, id) = self.send_request(request, version.as_ref()).await?;
         read_reply(response, id).await
     }
 
-    fn request_builder(&self, method: Method) -> reqwest::RequestBuilder {
+    async fn send_request(
+        &mut self,
+        mut request: ClientRequest,
+        version: Option<&ProtocolVersion>,
+    ) -> Result<(Response, i64), UpstreamError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        if let Some(version) = version.filter(|version| !version.has_initialize()) {
+            request
+                .extensions_mut()
+                .insert(RequestMetaObject::with_client_context(
+                    version.clone(),
+                    client_info(),
+                    ClientCapabilities::default(),
+                ));
+        }
+        let response = self
+            .post(
+                &ClientJsonRpcMessage::request(request, RequestId::Number(id)),
+                version,
+            )
+            .await?;
+        Ok((response, id))
+    }
+
+    fn request_builder(
+        &self,
+        method: Method,
+        version: Option<&ProtocolVersion>,
+    ) -> reqwest::RequestBuilder {
         let mut request = self
             .client
             .request(method, self.url.clone())
             .header(ACCEPT, ACCEPT_VALUE);
-        if let Some(version) = &self.protocol_version {
-            request = request.header(PROTOCOL_HEADER, version);
+        if let Some(version) = version {
+            request = request.header(PROTOCOL_HEADER, version.as_str());
         }
-        if let Some(id) = &self.session_id {
+        if version.is_none_or(ProtocolVersion::has_initialize)
+            && let Some(id) = &self.session_id
+        {
             request = request.header(SESSION_HEADER, id);
         }
         request
     }
 
-    async fn post(&self, message: &ClientJsonRpcMessage) -> Result<Response, UpstreamError> {
+    async fn post(
+        &self,
+        message: &ClientJsonRpcMessage,
+        version: Option<&ProtocolVersion>,
+    ) -> Result<Response, UpstreamError> {
         let bytes = serde_json::to_vec(message).map_err(|_| UpstreamError::InvalidResponse)?;
         if bytes.len() > MAX_MESSAGE_BYTES {
             return Err(UpstreamError::LimitExceeded);
         }
-        let response = self
-            .request_builder(Method::POST)
+        let mut request = self.request_builder(Method::POST, version);
+        if version.is_some_and(|version| !version.has_initialize())
+            && let ClientJsonRpcMessage::Request(message) = message
+        {
+            request = request.header(METHOD_HEADER, message.request.method());
+            if let ClientRequest::CallToolRequest(call) = &message.request {
+                request = request.header(NAME_HEADER, scoped_name_header(&call.params.name)?);
+            }
+        }
+        let response = request
             .header(CONTENT_TYPE, "application/json")
             .body(bytes)
             .send()
             .await?;
-        if !response.status().is_success() {
-            return Err(UpstreamError::Status(response.status().as_u16()));
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(http_error(response).await)
         }
-        Ok(response)
     }
 
-    async fn close(self) {
+    async fn close(&self) {
         if self.session_id.is_some() {
-            let _ = timeout(
-                TERMINATION_TIMEOUT,
-                self.request_builder(Method::DELETE).send(),
-            )
-            .await;
+            let request = self.request_builder(Method::DELETE, self.protocol_version.as_ref());
+            let _ = timeout(TERMINATION_TIMEOUT, request.send()).await;
         }
+    }
+}
+
+fn client_info() -> Implementation {
+    Implementation::new("context-forge-rs", env!("CARGO_PKG_VERSION"))
+}
+
+fn is_handshake_version(version: &ProtocolVersion) -> bool {
+    version.has_initialize() && ProtocolVersion::KNOWN_VERSIONS.contains(version)
+}
+
+#[derive(Deserialize)]
+struct UnsupportedVersion {
+    supported: Vec<ProtocolVersion>,
+    #[serde(rename = "requested")]
+    _requested: String,
+}
+
+fn supported_versions(error: &UpstreamError) -> Option<Vec<ProtocolVersion>> {
+    let UpstreamError::Rpc {
+        code,
+        data: Some(data),
+        ..
+    } = error
+    else {
+        return None;
+    };
+    if *code == i64::from(ErrorCode::UNSUPPORTED_PROTOCOL_VERSION.0) {
+        return UnsupportedVersion::deserialize(data)
+            .ok()
+            .map(|error| error.supported);
+    }
+    None
+}
+
+fn scoped_name_header(name: &str) -> Result<HeaderValue, UpstreamError> {
+    if name == name.trim()
+        && name.bytes().all(|value| (0x20..=0x7e).contains(&value))
+        && !(name.starts_with("=?base64?") && name.ends_with("?="))
+    {
+        HeaderValue::from_str(name).map_err(|_| UpstreamError::InvalidResponse)
+    } else {
+        let encoded = format!("=?base64?{}?=", BASE64_STANDARD.encode(name));
+        HeaderValue::from_str(&encoded).map_err(|_| UpstreamError::InvalidResponse)
     }
 }
 
@@ -488,57 +667,87 @@ struct Reply {
     bytes: usize,
 }
 
-async fn read_reply(mut response: Response, id: i64) -> Result<Reply, UpstreamError> {
+fn check_message_length(response: &Response) -> Result<(), UpstreamError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MESSAGE_BYTES as u64)
     {
         return Err(UpstreamError::LimitExceeded);
     }
+    Ok(())
+}
+
+fn response_media_type(response: &Response) -> Option<&str> {
     let mut media_types = response.headers().get_all(CONTENT_TYPE).iter();
     let media_type = media_types
         .next()
         .and_then(|header| header.to_str().ok())
         .and_then(|header| header.split(';').next())
         .map(str::trim);
-    if media_types.next().is_some() {
-        return Err(UpstreamError::InvalidResponse);
+    media_type.filter(|_| media_types.next().is_none())
+}
+
+async fn read_json_body(mut response: Response) -> Result<Vec<u8>, UpstreamError> {
+    check_message_length(&response)?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_MESSAGE_BYTES {
+            return Err(UpstreamError::LimitExceeded);
+        }
+        body.extend_from_slice(&chunk);
     }
-    let sse = match media_type {
-        Some(media) if media.eq_ignore_ascii_case("application/json") => false,
-        Some(media) if media.eq_ignore_ascii_case("text/event-stream") => true,
+    Ok(body)
+}
+
+async fn http_error(response: Response) -> UpstreamError {
+    let status = response.status();
+    if (status.is_client_error() || status.is_server_error())
+        && response_media_type(&response)
+            .is_some_and(|media| media.eq_ignore_ascii_case("application/json"))
+    {
+        let body = match read_json_body(response).await {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
+        if let Ok(JsonRpcMessage::Error(response)) =
+            serde_json::from_slice::<JsonRpcMessage<Value, Value, Value>>(&body)
+        {
+            return rpc_error(response.error);
+        }
+    }
+    UpstreamError::Status(status.as_u16())
+}
+
+async fn read_reply(mut response: Response, id: i64) -> Result<Reply, UpstreamError> {
+    check_message_length(&response)?;
+    match response_media_type(&response) {
+        Some(media) if media.eq_ignore_ascii_case("application/json") => {
+            let body = read_json_body(response).await?;
+            let result = take_result(&body, id)?.ok_or(UpstreamError::InvalidResponse)?;
+            return Ok(Reply {
+                result,
+                bytes: body.len(),
+            });
+        }
+        Some(media) if media.eq_ignore_ascii_case("text/event-stream") => {}
         _ => return Err(UpstreamError::InvalidResponse),
-    };
+    }
 
     let mut received = 0;
-    let mut body = Vec::new();
     let mut stream = SseDecoder::default();
     while let Some(chunk) = response.chunk().await? {
         received += chunk.len();
         if received > MAX_MESSAGE_BYTES {
             return Err(UpstreamError::LimitExceeded);
         }
-        if sse {
-            if let Some(result) = stream.feed(&chunk, id)? {
-                return Ok(Reply {
-                    result,
-                    bytes: received,
-                });
-            }
-        } else {
-            body.extend_from_slice(&chunk);
+        if let Some(result) = stream.feed(&chunk, id)? {
+            return Ok(Reply {
+                result,
+                bytes: received,
+            });
         }
     }
-
-    let result = if sse {
-        return Err(UpstreamError::InvalidResponse);
-    } else {
-        take_result(&body, id)?.ok_or(UpstreamError::InvalidResponse)?
-    };
-    Ok(Reply {
-        result,
-        bytes: received,
-    })
+    Err(UpstreamError::InvalidResponse)
 }
 
 fn take_result(body: &[u8], id: i64) -> Result<Option<Value>, UpstreamError> {
@@ -548,13 +757,17 @@ fn take_result(body: &[u8], id: i64) -> Result<Option<Value>, UpstreamError> {
     match message {
         JsonRpcMessage::Response(response) if response.id == expected => Ok(Some(response.result)),
         JsonRpcMessage::Error(response) if response.id.as_ref() == Some(&expected) => {
-            Err(UpstreamError::Rpc {
-                code: i64::from(response.error.code.0),
-                message: response.error.message.into_owned(),
-                data: response.error.data,
-            })
+            Err(rpc_error(response.error))
         }
         _ => Ok(None),
+    }
+}
+
+fn rpc_error(error: ErrorData) -> UpstreamError {
+    UpstreamError::Rpc {
+        code: i64::from(error.code.0),
+        message: error.message.into_owned(),
+        data: error.data,
     }
 }
 
@@ -614,7 +827,10 @@ mod tests {
         routing::post,
     };
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tokio::{net::TcpListener, task::JoinHandle};
 
     async fn serve(router: Router, host: &str) -> (String, JoinHandle<()>) {
@@ -703,14 +919,259 @@ mod tests {
         StatusCode::NO_CONTENT
     }
 
+    fn check_modern_request(headers: &HeaderMap, request: &Value) {
+        assert_eq!(headers[METHOD_HEADER], request["method"].as_str().unwrap());
+        assert_eq!(headers[PROTOCOL_HEADER], MODERN_VERSION.as_str());
+        assert!(headers.get(SESSION_HEADER).is_none());
+        let meta = &request["params"]["_meta"];
+        assert_eq!(
+            meta["io.modelcontextprotocol/protocolVersion"],
+            MODERN_VERSION.as_str()
+        );
+        assert_eq!(
+            meta["io.modelcontextprotocol/clientCapabilities"],
+            json!({})
+        );
+        assert_eq!(
+            meta["io.modelcontextprotocol/clientInfo"]["name"],
+            "context-forge-rs"
+        );
+    }
+
+    fn discovery_result(version: &str) -> Value {
+        json!({"supportedVersions":["2025-11-25",version],
+            "capabilities":{"tools":{},"custom":{"visible":true}}, "ttlMs":-100})
+    }
+
+    fn result(id: &Value, result: Value) -> AxumResponse {
+        Json(json!({"jsonrpc":"2.0", "id":id, "result":result})).into_response()
+    }
+
+    fn version_error(supported: &str) -> AxumResponse {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"jsonrpc":"2.0", "id":null,
+            "error":{"code":-32022,"message":"unsupported","data":{
+                "supported":[supported], "requested":MODERN_VERSION.as_str()
+            }}})),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn discovers_modern_catalog_and_stamps_each_tool_call() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let requests = events.clone();
+        let deletions = events.clone();
+        let app = Router::new().route(
+            "/mcp",
+            post(
+                async move |headers: HeaderMap, Json(request): Json<Value>| {
+                    check_modern_request(&headers, &request);
+                    let method = request["method"].as_str().unwrap();
+                    requests.lock().unwrap().push(method.to_owned());
+                    let id = &request["id"];
+                    match method {
+                        "server/discover" => {
+                            assert!(!headers.contains_key(NAME_HEADER));
+                            (
+                                [(SESSION_HEADER, "unused-session")],
+                                result(id, discovery_result(MODERN_VERSION.as_str())),
+                            )
+                                .into_response()
+                        }
+                        "tools/list" => {
+                            assert!(!headers.contains_key(NAME_HEADER));
+                            let page = if request["params"]["cursor"] == "tail" {
+                                json!({"tools":[{"name":"second"}]})
+                            } else {
+                                json!({"tools":[{"name":"first"}],"nextCursor":"tail"})
+                            };
+                            result(id, page)
+                        }
+                        "tools/call" => {
+                            let name = request["params"]["name"].as_str().unwrap();
+                            if name == "café" {
+                                assert_eq!(headers[NAME_HEADER], "=?base64?Y2Fmw6k=?=");
+                            } else {
+                                assert_eq!(headers[NAME_HEADER], name);
+                            }
+                            if name == "mismatch" {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(json!({"jsonrpc":"2.0", "id":null,
+                           "error":{"code":-32020,"message":"header mismatch"}})),
+                                )
+                                    .into_response();
+                            }
+                            result(id, json!({"content":[],"raw":true}))
+                        }
+                        other => panic!("unexpected modern request {other}"),
+                    }
+                },
+            )
+            .delete(async move || {
+                deletions.lock().unwrap().push("delete".to_owned());
+                StatusCode::NO_CONTENT
+            }),
+        );
+        let (url, server) = serve(app, "127.0.0.1").await;
+        let client = local_client();
+        let catalog = client.list_tools(&url).await.unwrap();
+        assert_eq!(
+            catalog.capabilities,
+            json!({"tools":{},"custom":{"visible":true}})
+        );
+        assert_eq!(catalog.tools.len(), 2);
+        assert_eq!(
+            client.call_tool(&url, "café", json!({})).await.unwrap(),
+            json!({"content":[],"raw":true})
+        );
+        assert!(matches!(
+            client.call_tool(&url, "mismatch", json!({})).await,
+            Err(UpstreamError::Rpc { code: -32020, .. })
+        ));
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "server/discover",
+                "tools/list",
+                "tools/list",
+                "server/discover",
+                "tools/call",
+                "server/discover",
+                "tools/call"
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connects_to_legacy_peers_after_discovery_rejection() {
+        for probe in ["http", "rpc", "version", "legacy-only", "invalid-result"] {
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let requests = paths.clone();
+            let app = Router::new().route(
+                "/mcp",
+                post(async move |headers, Json(request): Json<Value>| {
+                    let method = request["method"].as_str().unwrap();
+                    requests.lock().unwrap().push(method.to_owned());
+                    if method != "server/discover" {
+                        return fixture(headers, Json(request)).await;
+                    }
+                    check_modern_request(&headers, &request);
+                    let id = &request["id"];
+                    match probe {
+                        "http" => StatusCode::NOT_FOUND.into_response(),
+                        "rpc" => (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"jsonrpc":"2.0", "id":null,
+                        "error":{"code":-32601,"message":"method not found"}})),
+                        )
+                            .into_response(),
+                        "version" => version_error("2025-11-25"),
+                        "legacy-only" => result(id, discovery_result("2025-06-18")),
+                        _ => result(id, json!({})),
+                    }
+                })
+                .delete(end_fixture_session),
+            );
+            let (url, server) = serve(app, "127.0.0.1").await;
+            assert_eq!(
+                local_client().list_tools(&url).await.unwrap().tools.len(),
+                2
+            );
+            assert_eq!(
+                *paths.lock().unwrap(),
+                [
+                    "server/discover",
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/list"
+                ],
+                "{probe}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn probes_again_only_for_a_mutual_modern_version() {
+        for mode in ["direct", "corrective", "disjoint"] {
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let requests = paths.clone();
+            let app = Router::new().route(
+                "/mcp",
+                post(
+                    async move |headers: HeaderMap, Json(request): Json<Value>| {
+                        let method = request["method"].as_str().unwrap();
+                        let count = {
+                            let mut requests = requests.lock().unwrap();
+                            requests.push(method.to_owned());
+                            requests.len()
+                        };
+                        let id = &request["id"];
+                        if method == "server/discover" && count > 1 {
+                            check_modern_request(&headers, &request);
+                            return result(id, discovery_result(MODERN_VERSION.as_str()));
+                        }
+                        if method == "tools/list" {
+                            check_modern_request(&headers, &request);
+                            return result(id, json!({"tools":[]}));
+                        }
+                        if mode == "corrective" && method == "server/discover" {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        version_error(if mode == "disjoint" {
+                            "2027-01-01"
+                        } else {
+                            MODERN_VERSION.as_str()
+                        })
+                    },
+                ),
+            );
+            let (url, server) = serve(app, "127.0.0.1").await;
+            let discovered = local_client().list_tools(&url).await;
+            let expected = match mode {
+                "direct" => &["server/discover", "server/discover", "tools/list"][..],
+                "corrective" => &[
+                    "server/discover",
+                    "initialize",
+                    "server/discover",
+                    "tools/list",
+                ],
+                _ => &["server/discover"],
+            };
+            if mode == "disjoint" {
+                assert!(matches!(
+                    discovered,
+                    Err(UpstreamError::Rpc { code: -32022, .. })
+                ));
+            } else {
+                assert!(discovered.is_ok(), "{mode}: {:?}", discovered.err());
+            }
+            assert_eq!(paths.lock().unwrap().as_slice(), expected, "{mode}");
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn legacy_catalog_and_invocation_follow_pinned_session() {
         let terminated = Arc::new(AtomicUsize::new(0));
         let terminated_sessions = terminated.clone();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe_count = probes.clone();
         let (url, server) = serve(
             Router::new().route(
                 "/mcp",
-                post(fixture).delete(async move |headers| {
+                post(async move |headers, Json(request): Json<Value>| {
+                    if request["method"] == "server/discover" {
+                        probe_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    fixture(headers, Json(request)).await
+                })
+                .delete(async move |headers| {
                     terminated_sessions.fetch_add(1, Ordering::Relaxed);
                     end_fixture_session(headers).await
                 }),
@@ -724,7 +1185,7 @@ mod tests {
             Err(UpstreamError::BlockedDestination)
         ));
 
-        let client = local_client();
+        let client = local_client().with_connect_mode(ConnectMode::Legacy);
         let catalog = client.list_tools(&url).await.unwrap();
         assert_eq!(catalog.capabilities, json!({"tools":{"listChanged":true}}));
         assert_eq!(
@@ -746,6 +1207,7 @@ mod tests {
                 if message == "unknown tool" && data == json!({"field": "name"})
         ));
         assert_eq!(terminated.load(Ordering::Relaxed), 3);
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
         server.abort();
     }
 

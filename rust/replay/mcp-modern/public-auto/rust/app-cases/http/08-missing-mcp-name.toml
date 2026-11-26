@@ -1,0 +1,18 @@
+[request]
+method = "POST"
+path = "/mcp/"
+body = '{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"fixture-echo-echo","arguments":{"message":"hello"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+
+[request.headers]
+Accept = "application/json, text/event-stream"
+Content-Type = "application/json"
+MCP-Protocol-Version = "2026-07-28"
+Mcp-Method = "tools/call"
+
+[response]
+status = 400
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin"
+x-contextforge-mcp-runtime = "python"

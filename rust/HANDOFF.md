@@ -7,10 +7,13 @@ The Rust workspace lives in `rust/app`. The probe and authentication-required ca
 Legacy MCP fixtures live under `rust/replay/mcp-legacy`. Enable legacy inbound mode and stateless JSON responses in the original launcher. Disable MCP authentication for the fixture. Register a deterministic public MCP gateway named `fixture-echo` with an `echo` tool that returns `echo: <message>`. Replay against a Rust gateway with the same fixture database and live upstream.
 
 ```sh
-MCP_REQUIRE_AUTH=false SSRF_ALLOW_LOCALHOST=true DATABASE_URL="$FIXTURE_DATABASE_URL" \
+MCP_INBOUND_PROTOCOL_MODE=legacy MCP_REQUIRE_AUTH=false SSRF_ALLOW_LOCALHOST=true \
+  DATABASE_URL="$FIXTURE_DATABASE_URL" \
   rust-anything app replay rust/replay/mcp-legacy --build "$PWD/target/debug/context-forge-rs"
 ```
 
 The Rust binary matched eight of ten legacy cases, including tool listing and invocation. Both initialization cases differ in the advertised capabilities, instructions, and version. All three probe and authentication-required cases matched.
 
-Next, wire modern MCP discovery and routing to the scoped catalog and test the status, headers, and metadata against the pinned gateway.
+The pinned gateway matched all 37 [modern MCP recordings](replay/mcp-modern/README.md). The Rust binary matched 27. Eight cases report the Rust version in server metadata. Two of those cases also differ in `Vary` because compression remains pending. The other two cases are legacy initialization responses with a smaller advertised capability set. The live Rust test covers virtual-server discovery, catalog TTL, tool argument headers, and request authorization.
+
+The next milestone covers stateful sessions, streaming, cancellation, and event resumption.
