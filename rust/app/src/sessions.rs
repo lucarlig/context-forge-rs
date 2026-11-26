@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use crate::{
     access::Principal,
-    events::{HISTORY_BUDGET, Journal, JournalMode, Replay, parse_cursor},
+    events::{HISTORY_BUDGET, Journal, JournalMode, PassiveEvents, Replay, parse_cursor},
     mcp::{RedisSessionDirectory, SessionSettings},
+    redis_events::RedisEventJournal,
     redis_sessions::RedisListener,
     upstream::UpstreamAssociation,
 };
@@ -47,7 +48,8 @@ pub(crate) struct Session {
     listener_open: AtomicBool,
     pending: Mutex<HashMap<RequestId, CancellationToken>>,
     journals: Mutex<VecDeque<Arc<Journal>>>,
-    passive: Mutex<HashMap<Option<[u8; 32]>, Arc<Journal>>>,
+    passive: Mutex<HashMap<Option<[u8; 32]>, Arc<PassiveEvents>>>,
+    redis: Option<(Arc<RedisSessionDirectory>, HeaderValue)>,
     get_stream_enabled: bool,
     event_budget: Arc<Semaphore>,
     event_capacity: usize,
@@ -148,6 +150,7 @@ impl Sessions {
                     .lock()
                     .expect("passive events lock")
                     .values()
+                    .filter_map(|journal| journal.local())
                 {
                     journal.prune();
                 }
@@ -206,6 +209,11 @@ impl Sessions {
                     pending: Mutex::new(HashMap::new()),
                     journals: Mutex::new(VecDeque::new()),
                     passive: Mutex::new(HashMap::new()),
+                    redis: self
+                        .settings
+                        .redis
+                        .as_ref()
+                        .map(|redis| (redis.clone(), id.clone())),
                     get_stream_enabled: self.settings.get_stream_enabled,
                     event_budget: self.event_budget.clone(),
                     event_capacity: self.settings.event_capacity,
@@ -270,6 +278,29 @@ impl Sessions {
             listener.shared = Some(shared);
         }
         Ok(Some(listener))
+    }
+
+    pub(crate) fn shared_events(
+        &self,
+        redis: &Arc<RedisSessionDirectory>,
+        id: &HeaderValue,
+        authorization: Option<[u8; 32]>,
+    ) -> Result<RedisEventJournal, SessionError> {
+        RedisEventJournal::new(
+            redis.clone(),
+            id,
+            authorization,
+            self.settings.event_ttl,
+            self.settings.event_capacity,
+        )
+    }
+
+    pub(crate) async fn listen_shared(
+        &self,
+        redis: &Arc<RedisSessionDirectory>,
+        id: &HeaderValue,
+    ) -> Result<Option<RedisListener>, SessionError> {
+        redis.claim_listener(id, &self.settings.shutdown).await
     }
 
     fn access_local(
@@ -367,6 +398,7 @@ impl Session {
                 .lock()
                 .expect("passive events lock")
                 .values()
+                .filter_map(|journal| journal.local())
                 .find(|journal| journal.key == key)
                 .cloned()
         })?;
@@ -374,7 +406,10 @@ impl Session {
         Some((journal, reader))
     }
 
-    pub(crate) fn passive_journal(&self, authorization: Option<[u8; 32]>) -> Option<Arc<Journal>> {
+    pub(crate) fn passive_journal(
+        &self,
+        authorization: Option<[u8; 32]>,
+    ) -> Option<Arc<PassiveEvents>> {
         if !self.get_stream_enabled || self.event_capacity == 0 {
             return None;
         }
@@ -385,13 +420,27 @@ impl Session {
         if streams.len() >= MAX_NOTIFICATION_SCOPES {
             return None;
         }
-        let stream = Arc::new(Journal::new(
-            authorization,
-            JournalMode::Passive,
-            self.event_capacity,
-            self.event_ttl,
-            self.event_budget.clone(),
-        ));
+        let stream = if let Some((redis, id)) = &self.redis {
+            PassiveEvents::Redis(
+                RedisEventJournal::new(
+                    redis.clone(),
+                    id,
+                    authorization,
+                    self.event_ttl,
+                    self.event_capacity,
+                )
+                .ok()?,
+            )
+        } else {
+            PassiveEvents::Local(Arc::new(Journal::new(
+                authorization,
+                JournalMode::Passive,
+                self.event_capacity,
+                self.event_ttl,
+                self.event_budget.clone(),
+            )))
+        };
+        let stream = Arc::new(stream);
         streams.insert(authorization, stream.clone());
         Some(stream)
     }

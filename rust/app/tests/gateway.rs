@@ -12,7 +12,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -1839,7 +1839,7 @@ async fn passive_stream_follows_upstream_get_reconnects_and_replays_notification
 
 #[tokio::test]
 #[ignore = "requires a disposable Redis or Valkey database in REDIS_URL"]
-async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
+async fn redis_affinity_relays_posts_and_replays_passive_events_after_worker_loss() {
     use context_forge_rs::{config::RedisSettings, mcp::RedisSessionDirectory};
     use tokio_util::sync::CancellationToken;
 
@@ -1878,7 +1878,8 @@ async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
     };
     let shutdown = CancellationToken::new();
     let _stop = shutdown.clone().drop_guard();
-    let router = || {
+    let owner_shutdown = shutdown.child_token();
+    let router = |worker_shutdown: CancellationToken| {
         service.mcp_router_with_options(
             true,
             ProtocolMode::Legacy,
@@ -1888,7 +1889,7 @@ async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
                     redis: Some(Arc::new(
                         RedisSessionDirectory::new(&redis_settings).unwrap(),
                     )),
-                    shutdown: shutdown.clone(),
+                    shutdown: worker_shutdown,
                     affinity_forward_timeout: Duration::from_secs(4),
                     affinity_forward_concurrency: 1,
                     ..SessionSettings::default()
@@ -1896,8 +1897,13 @@ async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
             },
         )
     };
-    let first = Running::start(service.registration_router().merge(router())).await;
-    let second = Running::start(router()).await;
+    let first = Running::start(
+        service
+            .registration_router()
+            .merge(router(owner_shutdown.clone())),
+    )
+    .await;
+    let second = Running::start(router(shutdown.clone())).await;
     let client = Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
@@ -1919,9 +1925,15 @@ async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
             .header("mcp-protocol-version", PROTOCOL)
             .body(message.to_string())
     };
-    let initialized = post(&first, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-        "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
-    }})).send().await.unwrap();
+    let initialize = || {
+        post(
+            &first,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+            }}),
+        )
+    };
+    let initialized = initialize().send().await.unwrap();
     assert_eq!(initialized.status(), StatusCode::OK);
     let session = initialized.headers()["mcp-session-id"].clone();
 
@@ -1946,18 +1958,18 @@ async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
     let (_, result) = next_sse_message(&mut ping, &mut buffered).await;
     assert_eq!(result, json!({"jsonrpc":"2.0","id":2,"result":{}}));
 
-    let get = |credential: &str| {
+    let get = |credential: &str, id: &HeaderValue| {
         client
             .get(second.url("/mcp/"))
             .bearer_auth(credential)
             .header(header::ACCEPT, "text/event-stream")
-            .header("mcp-session-id", &session)
+            .header("mcp-session-id", id)
     };
     assert_eq!(
-        get(&other).send().await.unwrap().status(),
+        get(&other, &session).send().await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
-    let mut passive = get(&owner).send().await.unwrap();
+    let mut passive = get(&owner, &session).send().await.unwrap();
     assert_eq!(passive.status(), StatusCode::OK);
     let tool = post(
         &second,
@@ -1979,29 +1991,60 @@ async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
     let cursor = cursor.unwrap();
     drop(passive);
 
-    let mut passive = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let response = get(&owner)
-                .header("last-event-id", &cursor)
-                .send()
-                .await
-                .unwrap();
-            if response.status() != StatusCode::CONFLICT {
-                break response;
+    let resume = || {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let response = get(&owner, &session)
+                    .header("last-event-id", &cursor)
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status() != StatusCode::CONFLICT {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+        })
+    };
+    let mut passive = resume().await.unwrap();
     assert_eq!(passive.status(), StatusCode::OK);
     buffered.clear();
     let (_, event) = next_sse_message(&mut passive, &mut buffered).await;
     assert_eq!(event["params"]["data"], "B");
+    drop(passive);
+    let restricted = token(
+        "member",
+        json!(["alpha"]),
+        json!({"permissions":["servers.use"]}),
+    );
+    assert_eq!(
+        get(&restricted, &session)
+            .header("last-event-id", &cursor)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let initialized = initialize().send().await.unwrap();
+    assert_eq!(initialized.status(), StatusCode::OK);
+    let disposable = initialized.headers()["mcp-session-id"].clone();
+    let mut passive = get(&owner, &disposable)
+        .header("last-event-id", &cursor)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(passive.status(), StatusCode::OK);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), passive.chunk())
+            .await
+            .is_err()
+    );
     let deleted = client
         .delete(second.url("/mcp/"))
         .bearer_auth(&owner)
-        .header("mcp-session-id", &session)
+        .header("mcp-session-id", &disposable)
         .send()
         .await
         .unwrap();
@@ -2012,11 +2055,19 @@ async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
     );
     assert!(passive.chunk().await.unwrap().is_none());
     let response = post(&first, json!({"jsonrpc":"2.0","id":4,"method":"ping"}))
-        .header("mcp-session-id", &session)
+        .header("mcp-session-id", &disposable)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    owner_shutdown.cancel();
+    drop(first);
+    let mut passive = resume().await.unwrap();
+    assert_eq!(passive.status(), StatusCode::OK);
+    buffered.clear();
+    let (_, event) = next_sse_message(&mut passive, &mut buffered).await;
+    assert_eq!(event["params"]["data"], "B");
 }
 
 #[tokio::test]

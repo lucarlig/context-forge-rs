@@ -19,7 +19,7 @@ use axum::{
     },
     routing::any,
 };
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use rmcp::model::{
     CallToolRequestParams, CancelledNotificationParam, Implementation, InitializeRequestParams,
     InitializeResult, PaginatedRequestParams, ProgressNotification, ProgressNotificationParam,
@@ -36,7 +36,7 @@ use crate::{
     access::{self, Principal},
     affinity::{self, Forwarded},
     catalog::CatalogServer,
-    events::Journal,
+    events::{Journal, parse_cursor},
     gateway::{GatewayService, ToolError},
     modern::Modern,
     sessions::{PendingError, Session, SessionAccess, SessionError, Sessions, new_session_id},
@@ -320,7 +320,11 @@ async fn forward_remote(state: &McpState, request: Request) -> Result<Request, B
     let Some(redis) = sessions.redis() else {
         return Ok(request);
     };
-    if *request.method() != Method::GET && !redis.affinity_enabled() {
+    if request.method() == Method::GET {
+        if !has_post_cursor(request.headers()) {
+            return Ok(request);
+        }
+    } else if !redis.affinity_enabled() {
         return Ok(request);
     }
     let Ok(Some(id)) = session_header(request.headers()) else {
@@ -383,6 +387,18 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
             "GET /mcp stream disabled by operator (MCP_GET_STREAM_ENABLED=False).",
         );
     }
+    if let Some(redis) = sessions.redis()
+        && !has_post_cursor(request.headers())
+    {
+        return handle_shared_events(
+            state,
+            sessions,
+            redis,
+            request.headers(),
+            request.extensions(),
+        )
+        .await;
+    }
     let (session_id, session) = match session_from_request(
         sessions,
         request.headers(),
@@ -412,10 +428,22 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
     let authorization = principal.map(Principal::authorization_fingerprint);
     let server = request.extensions().get::<CatalogServer>();
     let cursor = request.headers().get(LAST_EVENT_ID);
-    let replay = if let Some((journal, replay)) = cursor
+    let resumed = cursor
         .and_then(|value| value.to_str().ok())
-        .and_then(|cursor| session.replay(cursor))
+        .and_then(|cursor| session.replay(cursor));
+    if let Some(redis) = sessions.redis()
+        && resumed.is_none()
     {
+        return handle_shared_events(
+            state,
+            sessions,
+            redis,
+            request.headers(),
+            request.extensions(),
+        )
+        .await;
+    }
+    let replay = if let Some((journal, replay)) = resumed {
         if journal.authorization != authorization {
             return session_error(SessionError::Forbidden);
         }
@@ -432,9 +460,11 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         Some(replay)
     } else {
         match allows_tool_events(state, principal, server).await {
-            Ok(true) => session
-                .passive_journal(authorization)
-                .map(|journal| journal.listen(cursor.is_none())),
+            Ok(true) => session.passive_journal(authorization).and_then(|journal| {
+                journal
+                    .local()
+                    .map(|journal| journal.listen(cursor.is_none()))
+            }),
             Ok(false) => None,
             Err(error) => return event_permission_error(error),
         }
@@ -444,16 +474,7 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         Ok(None) => {
             return stream_conflict("Another GET /mcp stream is already open for this session.");
         }
-        Err(SessionError::Unavailable) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(RETRY_AFTER, "1")],
-                Json(Detail {
-                    detail: "Listener-claim storage unavailable; retry shortly.",
-                }),
-            )
-                .into_response();
-        }
+        Err(SessionError::Unavailable) => return listener_unavailable(),
         Err(error) => return session_error(error),
     };
     let events = stream::unfold((listener, replay), |(listener, mut replay)| async move {
@@ -468,6 +489,114 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         }?;
         Some((Ok::<_, Infallible>(frame.into_event()), (listener, replay)))
     });
+    event_stream(events)
+}
+
+fn has_post_cursor(headers: &HeaderMap) -> bool {
+    headers
+        .get(LAST_EVENT_ID)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_cursor)
+        .is_some()
+}
+
+async fn handle_shared_events(
+    state: &McpState,
+    sessions: &Sessions,
+    redis: &Arc<RedisSessionDirectory>,
+    headers: &HeaderMap,
+    extensions: &Extensions,
+) -> Response {
+    let id = match session_header(headers) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return get_not_allowed(
+                "Passive SSE stream requires an Mcp-Session-Id from a prior initialize.",
+            );
+        }
+        Err(error) => return session_error(error),
+    };
+    let principal = extensions.get::<Principal>();
+    let server = extensions.get::<CatalogServer>();
+    match redis
+        .locate(
+            id,
+            principal.map(|p| p.email.as_str()),
+            server.map(|s| s.id.as_str()),
+            false,
+        )
+        .await
+    {
+        Ok(()) | Err(SessionError::Remote(_)) => {}
+        Err(error) => return session_error(error),
+    }
+    if !accepts_event_stream(headers) {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            Json(Detail {
+                detail: "GET /mcp requires Accept: text/event-stream",
+            }),
+        )
+            .into_response();
+    }
+    let allowed = match allows_tool_events(state, principal, server).await {
+        Ok(allowed) => allowed,
+        Err(error) => return event_permission_error(error),
+    };
+    let journal = match sessions.shared_events(
+        redis,
+        id,
+        principal.map(Principal::authorization_fingerprint),
+    ) {
+        Ok(journal) => journal,
+        Err(error) => return session_error(error),
+    };
+    let cursor = headers
+        .get(LAST_EVENT_ID)
+        .map(|value| value.to_str().unwrap_or(""));
+    let after = match journal.after(cursor, allowed) {
+        Ok(after) => after,
+        Err(error) => return session_error(error),
+    };
+    let listener = match sessions.listen_shared(redis, id).await {
+        Ok(Some(listener)) => listener,
+        Ok(None) => {
+            return stream_conflict("Another GET /mcp stream is already open for this session.");
+        }
+        Err(SessionError::Unavailable) => return listener_unavailable(),
+        Err(error) => return session_error(error),
+    };
+    let reader = match journal.listen(after, allowed).await {
+        Ok(reader) => reader,
+        Err(error) => return session_error(error),
+    };
+    event_stream(stream::unfold(
+        (listener, reader),
+        |(listener, mut reader)| async move {
+            let event = tokio::select! {
+                biased;
+                () = listener.wait_until_lost() => None,
+                event = reader.next() => event,
+            }?;
+            Some((Ok(event), (listener, reader)))
+        },
+    ))
+}
+
+fn listener_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(RETRY_AFTER, "1")],
+        Json(Detail {
+            detail: "Listener-claim storage unavailable; retry shortly.",
+        }),
+    )
+        .into_response()
+}
+
+fn event_stream(
+    events: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
+) -> Response {
     (
         [
             (CONTENT_TYPE, "text/event-stream; charset=utf-8"),

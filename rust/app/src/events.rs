@@ -14,8 +14,37 @@ use axum::{body::Bytes, response::sse::Event};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use uuid::Uuid;
 
+use crate::redis_events::RedisEventJournal;
+
 pub(crate) const HISTORY_BUDGET: usize = 64 * 1024 * 1024;
 const ENTRY_OVERHEAD: usize = 128;
+
+pub(crate) enum PassiveEvents {
+    Local(Arc<Journal>),
+    Redis(RedisEventJournal),
+}
+
+impl PassiveEvents {
+    pub(crate) async fn publish(&self, data: String) {
+        match self {
+            Self::Local(journal) => {
+                journal.publish(Some(Arc::from(data)));
+            }
+            Self::Redis(journal) => {
+                if let Err(error) = journal.publish(&data).await {
+                    tracing::warn!(%error, "MCP passive event could not be recorded");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn local(&self) -> Option<&Arc<Journal>> {
+        match self {
+            Self::Local(journal) => Some(journal),
+            Self::Redis(_) => None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Frame {

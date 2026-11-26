@@ -49,6 +49,7 @@ if record[1] ~= ARGV[1] then
 end
 if ARGV[5] == 'delete' then
   redis.call('DEL', KEYS[1])
+  redis.call('PUBLISH', KEYS[1] .. ':events', 'closed')
 elseif ARGV[5] == 'touch' or ARGV[5] == 'renew' then
   redis.call('PEXPIRE', KEYS[1], ARGV[4])
   if ARGV[5] == 'renew' then
@@ -325,7 +326,10 @@ impl RedisSessionDirectory {
             .await
     }
 
-    async fn query<T: FromRedisValue>(&self, command: &redis::Cmd) -> redis::RedisResult<T> {
+    pub(crate) async fn query<T: FromRedisValue>(
+        &self,
+        command: &redis::Cmd,
+    ) -> redis::RedisResult<T> {
         let (generation, mut connection) = {
             let mut cached = self.connection.lock().await;
             if let Some(connection) = cached.as_ref() {
@@ -361,7 +365,10 @@ pub(crate) struct RedisListener {
 
 impl RedisListener {
     pub(crate) async fn wait_until_lost(&self) {
-        self.lost.cancelled().await;
+        tokio::select! {
+            () = self.stop.cancelled() => {},
+            () = self.lost.cancelled() => {},
+        }
     }
 }
 
@@ -371,7 +378,7 @@ impl Drop for RedisListener {
     }
 }
 
-fn session_key(id: &HeaderValue) -> Result<String, SessionError> {
+pub(crate) fn session_key(id: &HeaderValue) -> Result<String, SessionError> {
     let bytes = id.as_bytes();
     if bytes.len() != 32
         || !bytes
@@ -384,7 +391,7 @@ fn session_key(id: &HeaderValue) -> Result<String, SessionError> {
     Ok(format!("{SESSION_KEY_PREFIX}{id}"))
 }
 
-fn ttl_millis(ttl: Duration) -> i64 {
+pub(crate) fn ttl_millis(ttl: Duration) -> i64 {
     ttl.as_millis().clamp(1, (i64::MAX / 2) as u128) as i64
 }
 

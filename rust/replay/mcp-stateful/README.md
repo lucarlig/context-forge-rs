@@ -39,7 +39,7 @@ In the Redis affinity profile, two pinned gateway processes shared an isolated S
 
 With `MCPGATEWAY_SESSION_AFFINITY_TTL=4`, both gateways let the original worker keep the session when remote POST routing expired. A peer POST returned `404`, the peer could open a passive GET, and a POST to the original worker renewed routing. The pinned gateway's peer DELETE returned `404` when affinity was current and `200` after it expired. The session on the original worker survived both. Rust routes DELETE to the original worker while the session is active and invalidates it there. [Session deletion decision](../../DECISIONS.md#equivalence)
 
-A separate run opened the passive GET on the peer, generated three events and saved the first cursor, then stopped the original worker with `SIGKILL`. The pinned peer returned `200` and replayed the two later events from Redis. The Rust peer returned `404` in the same scenario. Rust retains the passive event journal on the owning process, so durable replay after worker loss remains open.
+A separate run opened the passive GET on the peer, generated three events and saved the first cursor, then stopped the original worker with `SIGKILL`. Both the pinned gateway and the Rust binary returned `200` on the surviving peer and replayed the two later events from Redis in their original delivery order.
 
 Bind session access to the authorized principal and virtual server on every request. Apply the ownership check regardless of the cache backend. DELETE must invalidate the session for both POST and GET and close active streams. Verify those rules, cross-session cursor isolation, and cancellation through a live Rust gateway before checking off the milestone. [Legacy MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management)
 
@@ -66,13 +66,13 @@ Set `CACHE_TYPE=redis` and `REDIS_URL` to store session ownership and expiry in 
 
 Redis makes passive GET available on any worker with or without POST affinity. The pinned gateway renewed the listener lease after its configured three-second lifetime and removed it when the connection ended. Rust uses `MCP_GET_STREAM_LISTENER_TTL_SECONDS`, which defaults to 30 seconds, and closes the stream after two missed renewals. A two-process Rust run verified that remote POST stayed disabled, a competing GET returned `409`, a lost lease ended SSE, and release preserved a replacement lease.
 
-Requests can reach any worker with access to the same Redis cache. The owning worker authenticates the relayed request and serves POST, passive GET, or DELETE. Redis Pub/Sub carries response chunks. Credits bound the relay to one pending chunk per request. A live test used two native processes for POST and DELETE. The Rust integration test also covers forwarded POST SSE, concurrent passive GET, recovery after a client disconnect, authorization, and stream closure after deletion.
+Requests can reach any worker with access to the same Redis cache. The owning worker authenticates forwarded POST and DELETE requests and can serve retained POST streams. Redis Pub/Sub carries relayed response chunks. Credits bound the relay to one pending chunk per request. Each peer can serve passive GET directly from a Redis journal bound to the session and the caller's authorization scope. The journal retains up to `STREAMABLE_HTTP_MAX_EVENTS_PER_STREAM` events and 8 MiB per scope, and expires events after `STREAMABLE_HTTP_EVENT_TTL`. Tests cover eviction, concurrent passive GET, replay after worker loss, cursor isolation, and stream closure on deletion.
 
 The pinned gateway dispatched two forwarded calls to the same upstream in order. Rust queues forwarded POSTs per session before applying `MCPGATEWAY_AFFINITY_FORWARD_CONCURRENCY`. `MCPGATEWAY_AFFINITY_SESSION_LOCK_TIMEOUT` bounds the ordering wait and defaults to 30 seconds. Passive GET and cancellation can proceed while a POST is in flight. Calls sharing an upstream association remain serialized after the forwarding lock times out. A live Rust test covers the timeout and forwarded cancellation.
 
 ```sh
 REDIS_URL=redis://127.0.0.1:6379/0 \
-  cargo test --locked --lib redis_sessions::tests -- --ignored
+  cargo test --locked --lib redis_ -- --ignored
 REDIS_URL=redis://127.0.0.1:6379/0 \
   cargo test --locked --test gateway redis_affinity -- --ignored
 ```

@@ -40,7 +40,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use crate::{events::Journal, sessions::SessionLifetime};
+use crate::{events::PassiveEvents, sessions::SessionLifetime};
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
 const MODERN_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
@@ -62,7 +62,7 @@ const PROGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct ToolContext<'a> {
     pub(crate) cancellation: &'a CancellationToken,
     pub(crate) progress: Option<&'a ToolProgress>,
-    pub(crate) notifications: Option<Arc<Journal>>,
+    pub(crate) notifications: Option<Arc<PassiveEvents>>,
     pub(crate) client_capabilities: Option<&'a ClientCapabilities>,
 }
 
@@ -894,7 +894,7 @@ impl Session {
         }
     }
 
-    async fn follow_notifications(&self, journal: &Journal) {
+    async fn follow_notifications(&self, journal: &PassiveEvents) {
         let mut cursor = None;
         loop {
             match self.notification_stream(journal, &mut cursor).await {
@@ -916,7 +916,7 @@ impl Session {
 
     async fn notification_stream(
         &self,
-        journal: &Journal,
+        journal: &PassiveEvents,
         cursor: &mut Option<HeaderValue>,
     ) -> Result<(), UpstreamError> {
         let mut request = self.request_builder(Method::GET, self.protocol_version.as_ref());
@@ -949,7 +949,7 @@ impl Session {
                 }
                 match decode_message(&frame) {
                     Ok(JsonRpcMessage::Notification(notification)) => {
-                        publish_notification(journal, &notification.notification);
+                        publish_notification(journal, &notification.notification).await;
                     }
                     Ok(JsonRpcMessage::Request(request)) => {
                         self.answer_server_request(request).await
@@ -1089,7 +1089,7 @@ async fn read_reply(
     mut response: Response,
     id: i64,
     mut progress: Option<&ToolProgress>,
-    notifications: Option<&Journal>,
+    notifications: Option<&PassiveEvents>,
 ) -> Result<Reply, UpstreamError> {
     check_message_length(&response)?;
     match response_media_type(&response) {
@@ -1132,7 +1132,7 @@ async fn read_reply(
                     progress = None;
                 }
                 if let Some(journal) = notifications {
-                    publish_notification(journal, &notification.notification);
+                    publish_notification(journal, &notification.notification).await;
                 }
             }
             if let Some(result) = take_result(message, id)? {
@@ -1146,7 +1146,7 @@ async fn read_reply(
     Err(UpstreamError::InvalidResponse)
 }
 
-fn publish_notification(journal: &Journal, payload: &Value) {
+async fn publish_notification(journal: &PassiveEvents, payload: &Value) {
     let Ok(notification) = ServerNotification::deserialize(payload) else {
         return;
     };
@@ -1161,7 +1161,7 @@ fn publish_notification(journal: &Journal, payload: &Value) {
         return;
     }
     if let Ok(encoded) = serde_json::to_string(&ServerJsonRpcMessage::notification(notification)) {
-        journal.publish(Some(Arc::from(encoded)));
+        journal.publish(encoded).await;
     }
 }
 

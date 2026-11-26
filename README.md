@@ -4,9 +4,9 @@ ContextForge RS is a standalone Rust rewrite of the [ContextForge gateway](https
 
 ## Full-port progress
 
-`█████░░░░░░░░░░░░░░░░░░░░` **20%**
+`██████░░░░░░░░░░░░░░░░░░░` **24%**
 
-5 of 25 [port milestones](rust/MAP.md#milestones) are verified. Each milestone counts equally.
+6 of 25 [port milestones](rust/MAP.md#milestones) are verified. Each milestone counts equally.
 
 The Rust binary serves health and readiness probes, modern and legacy MCP, and scoped tool listing and invocation. Register a Streamable HTTP upstream through `POST /gateways` or `POST /v1/mcp-servers`. The gateway uses [rmcp](https://github.com/modelcontextprotocol/rust-sdk) protocol models and the modern Streamable HTTP server.
 
@@ -22,7 +22,7 @@ The current registration path accepts `STREAMABLEHTTP` upstreams with no upstrea
 
 The gateway negotiates modern and legacy MCP by default. Set `MCP_INBOUND_PROTOCOL_MODE=legacy` to accept legacy versions only. Set `MCP_CLIENT_CONNECT_MODE=legacy` to use legacy initialization for all upstreams.
 
-Set `USE_STATEFUL_SESSIONS=true` to enable legacy sessions and `JSON_RESPONSE_ENABLED=false` to stream legacy POST replies over SSE. With `CACHE_TYPE=redis` and `REDIS_URL` set, passive GET can connect through any worker. Set `MCPGATEWAY_SESSION_AFFINITY_ENABLED=true` to also route POST and DELETE to the worker that owns the session. The [stateful MCP notes](rust/replay/mcp-stateful/README.md) cover routing leases, delivery, and resumption.
+Set `USE_STATEFUL_SESSIONS=true` to enable legacy sessions and `JSON_RESPONSE_ENABLED=false` to stream legacy POST replies over SSE. With `CACHE_TYPE=redis` and `REDIS_URL` set, passive GET replays retained events through any worker, including after the session's original worker exits. Set `MCPGATEWAY_SESSION_AFFINITY_ENABLED=true` to also route POST and DELETE to the worker that owns the session. The [stateful MCP notes](rust/replay/mcp-stateful/README.md) cover routing leases, delivery, and resumption.
 
 ```sh
 cargo test --locked --workspace
