@@ -19,3 +19,5 @@ The server reports its Rust version and advertises implemented MCP capabilities.
 Use `rmcp` 3.12 protocol models and its stateless Streamable HTTP server. Authorize requests in Axum before dispatch. Resolve the schema for tool argument headers within the caller's visibility and permissions. Use pinned DNS resolution and bounded HTTP reads for upstream requests. Try modern discovery before legacy initialization in automatic mode. Send each tool call once. [rmcp release](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.12.0)
 
 Bind MCP list cursors to caller, team scope, method, and virtual server. Derive the signing key from the configured gateway secret or generate it at startup for an unconfigured process.
+
+With Redis affinity enabled, route session DELETE to the owning worker until the session expires. Return success only after the worker invalidates the session. The pinned gateway sometimes acknowledges a peer DELETE while leaving the original session active. [Two-worker reference observations](replay/mcp-stateful/README.md#event-resumption)

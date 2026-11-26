@@ -6,6 +6,7 @@ use crate::{
     gateway::{CatalogRefresh, Pagination},
     jwt::{JwtConfig, JwtVerifier},
     mcp::{HttpOptions, IngressPolicy, ProtocolMode, RedisSessionDirectory, SessionSettings},
+    redis_sessions::DEFAULT_AFFINITY_TTL,
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
 
@@ -156,13 +157,20 @@ impl Settings {
         if event_capacity == 0 || event_ttl == 0 {
             return Err("MCP event history settings must be positive".into());
         }
-        let redis = if flag("MCPGATEWAY_SESSION_AFFINITY_ENABLED")?.unwrap_or(false) {
-            self.redis
-                .as_ref()
-                .map(RedisSessionDirectory::new)
-                .transpose()
+        let redis = if flag("MCPGATEWAY_SESSION_AFFINITY_ENABLED")?.unwrap_or(false)
+            && let Some(redis) = &self.redis
+        {
+            let seconds = parse(
+                "MCPGATEWAY_SESSION_AFFINITY_TTL",
+                DEFAULT_AFFINITY_TTL.as_secs(),
+            )?;
+            if seconds == 0 {
+                return Err("MCPGATEWAY_SESSION_AFFINITY_TTL must be positive".into());
+            }
+            let directory = RedisSessionDirectory::new(redis)
                 .map_err(|_| "invalid REDIS_URL")?
-                .map(std::sync::Arc::new)
+                .with_affinity_ttl(Duration::from_secs(seconds));
+            Some(std::sync::Arc::new(directory))
         } else {
             None
         };

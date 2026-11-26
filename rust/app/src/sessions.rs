@@ -78,6 +78,13 @@ pub(crate) enum SessionError {
     Unavailable,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SessionAccess {
+    Get,
+    Post,
+    Delete,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PendingError {
     DuplicateId,
@@ -215,21 +222,22 @@ impl Sessions {
         id: Option<&HeaderValue>,
         owner: Option<&str>,
         server: Option<&str>,
-        delete: bool,
+        access: SessionAccess,
     ) -> Result<Arc<Session>, SessionError> {
         let id = id.ok_or(SessionError::Missing)?;
         if let Some(redis) = &self.settings.redis {
             redis
-                .access(id, owner, server, self.settings.ttl, delete)
+                .access(id, owner, server, self.settings.ttl, access)
                 .await?;
         }
+        let delete = matches!(access, SessionAccess::Delete);
         let session = self.access_local(id, owner, server, delete);
         if matches!(session, Err(SessionError::NotFound))
             && !delete
             && let Some(redis) = &self.settings.redis
         {
             let _ = redis
-                .access(id, owner, server, self.settings.ttl, true)
+                .access(id, owner, server, self.settings.ttl, SessionAccess::Delete)
                 .await;
         }
         session

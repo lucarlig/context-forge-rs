@@ -39,7 +39,7 @@ use crate::{
     events::Journal,
     gateway::{GatewayService, ToolError},
     modern::Modern,
-    sessions::{PendingError, Session, SessionError, Sessions, new_session_id},
+    sessions::{PendingError, Session, SessionAccess, SessionError, Sessions, new_session_id},
     upstream::{ToolContext, ToolProgress},
 };
 
@@ -324,7 +324,10 @@ async fn forward_remote(state: &McpState, request: Request) -> Result<Request, B
         .extensions()
         .get::<CatalogServer>()
         .map(|server| server.id.as_str());
-    let worker = match redis.locate(id, owner, server).await {
+    let worker = match redis
+        .locate(id, owner, server, *request.method() == Method::POST)
+        .await
+    {
         Err(SessionError::Remote(worker)) => worker,
         // The local route applies endpoint-specific validation and error formatting.
         _ => return Ok(request),
@@ -371,7 +374,7 @@ async fn handle_get(state: &McpState, request: Request) -> Response {
         sessions,
         request.headers(),
         request.extensions(),
-        false,
+        SessionAccess::Get,
     )
     .await
     {
@@ -531,7 +534,14 @@ async fn delete_session(sessions: Option<&Sessions>, request: Request) -> Respon
             "Method Not Allowed: Session termination not supported",
         );
     };
-    match session_from_request(sessions, request.headers(), request.extensions(), true).await {
+    match session_from_request(
+        sessions,
+        request.headers(),
+        request.extensions(),
+        SessionAccess::Delete,
+    )
+    .await
+    {
         Ok(_) => Json(json!({"jsonrpc": "2.0", "result": {}})).into_response(),
         Err(error) => session_error(error),
     }
@@ -541,12 +551,12 @@ async fn session_from_request(
     sessions: &Sessions,
     headers: &HeaderMap,
     extensions: &Extensions,
-    delete: bool,
+    access: SessionAccess,
 ) -> Result<Arc<Session>, SessionError> {
     let owner = extensions.get::<Principal>().map(|p| p.email.as_str());
     let server = extensions.get::<CatalogServer>().map(|s| s.id.as_str());
     sessions
-        .access(session_header(headers)?, owner, server, delete)
+        .access(session_header(headers)?, owner, server, access)
         .await
 }
 
@@ -717,7 +727,7 @@ async fn dispatch(
         }
         let session = match &state.sessions {
             Some(sessions) => match sessions
-                .access(session_id.as_ref(), owner, server_id, false)
+                .access(session_id.as_ref(), owner, server_id, SessionAccess::Post)
                 .await
             {
                 Ok(session) => Some(session),
@@ -819,7 +829,7 @@ async fn dispatch(
     if id.is_some() && valid_response {
         if let Some(sessions) = &state.sessions
             && let Err(error) = sessions
-                .access(session_id.as_ref(), owner, server_id, false)
+                .access(session_id.as_ref(), owner, server_id, SessionAccess::Post)
                 .await
         {
             return post_session_error(error);

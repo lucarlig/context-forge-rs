@@ -10,26 +10,45 @@ use redis::{
 use tokio::{sync::Mutex, time::timeout};
 use uuid::Uuid;
 
-use crate::{config::RedisSettings, sessions::SessionError};
+use crate::{
+    config::RedisSettings,
+    sessions::{SessionAccess, SessionError},
+};
 
 const SESSION_KEY_PREFIX: &str = "context-forge-rs:mcp:session:";
+pub(crate) const DEFAULT_AFFINITY_TTL: Duration = Duration::from_secs(300);
 
 const REGISTER: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-redis.call('HSET', KEYS[1], 'worker', ARGV[1], 'owner', ARGV[2], 'server', ARGV[3])
+local time = redis.call('TIME')
+local now = time[1] * 1000 + math.floor(time[2] / 1000)
+redis.call('HSET', KEYS[1], 'worker', ARGV[1], 'owner', ARGV[2], 'server', ARGV[3],
+    'affinity_until', now + tonumber(ARGV[5]))
 redis.call('PEXPIRE', KEYS[1], ARGV[4])
 return 1
 "#;
 
 const ACCESS: &str = r#"
-local record = redis.call('HMGET', KEYS[1], 'worker', 'owner', 'server')
+local record = redis.call('HMGET', KEYS[1], 'worker', 'owner', 'server', 'affinity_until')
 if not record[1] then return {0, ''} end
 if record[2] ~= ARGV[2] or record[3] ~= ARGV[3] then return {1, ''} end
-if record[1] ~= ARGV[1] then return {2, record[1]} end
+local function now_millis()
+  local time = redis.call('TIME')
+  return time[1] * 1000 + math.floor(time[2] / 1000)
+end
+if record[1] ~= ARGV[1] then
+  if ARGV[5] == 'locate-post' and record[4] and tonumber(record[4]) <= now_millis() then
+    return {0, ''}
+  end
+  return {2, record[1]}
+end
 if ARGV[5] == 'delete' then
   redis.call('DEL', KEYS[1])
-elseif ARGV[5] == 'touch' then
+elseif ARGV[5] == 'touch' or ARGV[5] == 'renew' then
   redis.call('PEXPIRE', KEYS[1], ARGV[4])
+  if ARGV[5] == 'renew' then
+    redis.call('HSET', KEYS[1], 'affinity_until', now_millis() + tonumber(ARGV[6]))
+  end
 end
 return {3, record[1]}
 "#;
@@ -39,6 +58,7 @@ pub struct RedisSessionDirectory {
     client: redis::Client,
     config: AsyncConnectionConfig,
     worker: String,
+    affinity_ttl: Duration,
     connection: Mutex<Option<(Uuid, MultiplexedConnection)>>,
     socket_timeout: Duration,
 }
@@ -53,11 +73,17 @@ impl RedisSessionDirectory {
             client,
             config,
             worker: Uuid::new_v4().simple().to_string(),
+            affinity_ttl: DEFAULT_AFFINITY_TTL,
             connection: Mutex::new(None),
             socket_timeout: settings
                 .connect_timeout
                 .saturating_add(settings.response_timeout),
         })
+    }
+
+    pub(crate) fn with_affinity_ttl(mut self, ttl: Duration) -> Self {
+        self.affinity_ttl = ttl;
+        self
     }
 
     pub(crate) async fn register(
@@ -76,7 +102,8 @@ impl RedisSessionDirectory {
             .arg(&self.worker)
             .arg(owner.unwrap_or_default())
             .arg(server.unwrap_or_default())
-            .arg(ttl_millis(ttl));
+            .arg(ttl_millis(ttl))
+            .arg(ttl_millis(self.affinity_ttl));
         match self.query::<u8>(&command).await {
             Ok(1) => Ok(()),
             Ok(_) => Err(SessionError::Unavailable),
@@ -90,14 +117,18 @@ impl RedisSessionDirectory {
         owner: Option<&str>,
         server: Option<&str>,
         ttl: Duration,
-        delete: bool,
+        access: SessionAccess,
     ) -> Result<(), SessionError> {
         self.lookup(
             id,
             owner,
             server,
             ttl,
-            if delete { "delete" } else { "touch" },
+            match access {
+                SessionAccess::Get => "touch",
+                SessionAccess::Post => "renew",
+                SessionAccess::Delete => "delete",
+            },
         )
         .await
     }
@@ -107,8 +138,10 @@ impl RedisSessionDirectory {
         id: &HeaderValue,
         owner: Option<&str>,
         server: Option<&str>,
+        post: bool,
     ) -> Result<(), SessionError> {
-        self.lookup(id, owner, server, Duration::ZERO, "lookup")
+        let operation = if post { "locate-post" } else { "locate" };
+        self.lookup(id, owner, server, Duration::ZERO, operation)
             .await
     }
 
@@ -130,7 +163,8 @@ impl RedisSessionDirectory {
             .arg(owner.unwrap_or_default())
             .arg(server.unwrap_or_default())
             .arg(ttl_millis(ttl))
-            .arg(operation);
+            .arg(operation)
+            .arg(ttl_millis(self.affinity_ttl));
         let (status, worker): (u8, String) = self.query(&command).await.map_err(unavailable)?;
         match status {
             0 => Err(SessionError::NotFound),
@@ -239,30 +273,74 @@ mod tests {
         first.register(&id, owner, server, ttl).await.unwrap();
 
         assert_eq!(
-            second.access(&id, owner, server, ttl, true).await,
+            second
+                .access(&id, owner, server, ttl, SessionAccess::Delete)
+                .await,
             Err(SessionError::Remote(
                 Uuid::parse_str(&first.worker).unwrap()
             )),
         );
         assert_eq!(
-            second.access(&id, None, server, ttl, false).await,
+            second
+                .access(&id, None, server, ttl, SessionAccess::Post)
+                .await,
             Err(SessionError::Forbidden),
         );
         assert_eq!(
-            first.access(&id, owner, None, ttl, false).await,
+            first
+                .access(&id, owner, None, ttl, SessionAccess::Post)
+                .await,
             Err(SessionError::Forbidden),
         );
 
-        first
-            .access(&id, owner, server, Duration::from_secs(30), false)
+        let key = session_key(&id).unwrap();
+        let modified: u32 = first
+            .query(redis::cmd("HSET").arg(&key).arg("affinity_until").arg(1))
             .await
             .unwrap();
-        let key = session_key(&id).unwrap();
-        let remaining: i64 = first.query(redis::cmd("PTTL").arg(key)).await.unwrap();
-        assert!((10_000..=30_000).contains(&remaining));
-        first.access(&id, owner, server, ttl, true).await.unwrap();
+        assert_eq!(modified, 0);
         assert_eq!(
-            second.access(&id, owner, server, ttl, false).await,
+            second.locate(&id, owner, server, true).await,
+            Err(SessionError::NotFound)
+        );
+        let remote = Err(SessionError::Remote(
+            Uuid::parse_str(&first.worker).unwrap(),
+        ));
+        assert_eq!(second.locate(&id, owner, server, false).await, remote);
+        first
+            .access(&id, owner, server, ttl, SessionAccess::Get)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.locate(&id, owner, server, true).await,
+            Err(SessionError::NotFound)
+        );
+        assert_eq!(
+            second.locate(&id, None, server, false).await,
+            Err(SessionError::Forbidden)
+        );
+
+        first
+            .access(
+                &id,
+                owner,
+                server,
+                Duration::from_secs(30),
+                SessionAccess::Post,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.locate(&id, owner, server, true).await, remote);
+        let remaining: i64 = first.query(redis::cmd("PTTL").arg(&key)).await.unwrap();
+        assert!((10_000..=30_000).contains(&remaining));
+        first
+            .access(&id, owner, server, ttl, SessionAccess::Delete)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .access(&id, owner, server, ttl, SessionAccess::Post)
+                .await,
             Err(SessionError::NotFound),
         );
     }
