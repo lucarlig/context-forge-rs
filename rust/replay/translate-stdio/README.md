@@ -16,4 +16,8 @@ rust-anything app replay rust/replay/translate-stdio \
   --build "$PWD/target/debug/context-forge-translate --stdio /path/to/stdio-fixture --expose-sse --expose-streamable-http --port {port}"
 ```
 
-The pinned translator's exposed `POST /mcp` waits for a correlated JSON response under either `--stateless` or `--jsonResponse` setting. The Rust binary accepts both flags and implements that response behavior. Remote transport connections and dynamic environment mapping are still in progress.
+The pinned translator's exposed `POST /mcp` waits for a correlated JSON response under either `--stateless` or `--jsonResponse` setting. The Rust binary accepts both flags and implements that response behavior.
+
+Both translators also passed four live remote connection cases. Each of `--connect-sse` and `--connect-streamable-http` printed an incoming notification to stdout and, with `--stdioCommand`, sent the child's request upstream and delivered the reply to its stdin. The fixture required a bearer token, which both translators forwarded with `--oauth2Bearer`. The Rust test also verifies that the remote Streamable HTTP bridge uses the session ID and protocol version negotiated by the child process.
+
+Dynamic header-to-environment mapping remains open.

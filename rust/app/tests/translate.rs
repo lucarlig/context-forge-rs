@@ -10,6 +10,72 @@ use tokio::{
 };
 
 #[tokio::test]
+async fn remote_translator_preserves_streamable_http_session_headers() {
+    use axum::{Json, Router, http::HeaderMap, routing::post};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let upstream = Router::new().route("/mcp", post(async |headers: HeaderMap, Json(message): Json<Value>| {
+            assert_eq!(headers["authorization"], "Bearer fixture");
+            let result = if message["method"] == "initialize" {
+                assert!(!headers.contains_key("mcp-session-id"));
+                json!({"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}})
+            } else {
+                assert_eq!(message["method"], "ping");
+                assert_eq!(headers["mcp-session-id"], "fixture-session");
+                assert_eq!(headers["mcp-protocol-version"], "2025-11-25");
+                json!({"session":"preserved"})
+            };
+            ([("mcp-session-id", "fixture-session")], Json(json!({"jsonrpc":"2.0","id":message["id"],"result":result})))
+        }));
+        axum::serve(listener, upstream).await.unwrap();
+    });
+    let child = r#"sh -c '
+        printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}"
+        IFS= read -r initialization || exit 1
+        printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}"
+        IFS= read -r reply || exit 1
+        printf "fixture-reply %s\n" "$reply" >&2
+    '"#;
+    let output = timeout(
+        Duration::from_secs(5),
+        Command::new(env!("CARGO_BIN_EXE_context-forge-translate"))
+            .args([
+                "--connect-streamable-http",
+                &base_url,
+                "--oauth2Bearer",
+                "fixture",
+                "--stdioCommand",
+                child,
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("remote bridge exits with its stdio child")
+    .unwrap();
+    server.abort();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let reply = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("fixture-reply "))
+        .expect("child got the reply");
+    assert_eq!(
+        serde_json::from_str::<Value>(reply).unwrap(),
+        json!({
+            "jsonrpc":"2.0","id":2,"result":{"session":"preserved"}
+        })
+    );
+}
+
+#[tokio::test]
 async fn translator_correlates_stdio_replies_across_http_and_sse_clients() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();

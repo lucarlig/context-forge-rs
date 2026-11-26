@@ -12,8 +12,8 @@ use std::{
 
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
@@ -41,19 +41,7 @@ impl StdioProcess {
         command: &str,
         shutdown: &CancellationToken,
     ) -> io::Result<(Self, Arc<StdioBridge>)> {
-        let arguments = shell_words::split(command).map_err(io::Error::other)?;
-        let (program, arguments) = arguments
-            .split_first()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stdio command is empty"))?;
-        let mut child = Command::new(program)
-            .args(arguments)
-            .kill_on_drop(true)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let mut stdin = child.stdin.take().expect("piped child stdin");
-        let stdout = child.stdout.take().expect("piped child stdout");
+        let (child, mut stdin, stdout) = spawn(command)?;
         let (input, mut messages) = mpsc::channel::<Vec<u8>>(16);
         let bridge = Arc::new(StdioBridge {
             input,
@@ -88,16 +76,8 @@ impl StdioProcess {
                 let mut reader = BufReader::new(stdout);
                 let mut line = Vec::new();
                 loop {
-                    line.clear();
-                    let bytes = (&mut reader)
-                        .take((MAX_MESSAGE_BYTES + 1) as u64)
-                        .read_until(b'\n', &mut line)
-                        .await?;
-                    if bytes == 0 {
+                    if !read_line(&mut reader, &mut line).await? {
                         return Ok::<(), io::Error>(());
-                    }
-                    if bytes > MAX_MESSAGE_BYTES {
-                        return Err(io::Error::other("stdio output line exceeds the size limit"));
                     }
                     match serde_json::from_slice::<Value>(&line) {
                         Ok(Value::Array(messages)) => {
@@ -136,6 +116,38 @@ impl StdioProcess {
             let _ = task.await;
         }
     }
+}
+
+pub(super) fn spawn(command: &str) -> io::Result<(Child, ChildStdin, ChildStdout)> {
+    let arguments = shell_words::split(command).map_err(io::Error::other)?;
+    let (program, arguments) = arguments
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stdio command is empty"))?;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdin = child.stdin.take().expect("piped child stdin");
+    let stdout = child.stdout.take().expect("piped child stdout");
+    Ok((child, stdin, stdout))
+}
+
+pub(super) async fn read_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
+) -> io::Result<bool> {
+    line.clear();
+    let bytes = reader
+        .take((MAX_MESSAGE_BYTES + 1) as u64)
+        .read_until(b'\n', line)
+        .await?;
+    if bytes > MAX_MESSAGE_BYTES {
+        return Err(io::Error::other("stdio output line exceeds the size limit"));
+    }
+    Ok(bytes > 0)
 }
 
 impl StdioBridge {

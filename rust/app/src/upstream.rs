@@ -808,7 +808,7 @@ struct Session {
     capabilities: Value,
     protocol_version: Option<ProtocolVersion>,
     session_id: Option<HeaderValue>,
-    sse: Option<Mutex<Option<SseInbox>>>,
+    sse: Option<Mutex<Option<SseStream>>>,
     next_id: AtomicI64,
 }
 
@@ -823,25 +823,12 @@ impl Session {
         {
             return Err(UpstreamError::InvalidResponse);
         }
-        let mut inbox = SseInbox::new(response);
+        let mut inbox = SseStream::new(response);
         while let Some(frame) = inbox.next().await? {
             if inbox.decoder.event_type.as_deref() != Some("endpoint") {
                 continue;
             }
-            let address =
-                std::str::from_utf8(&frame).map_err(|_| UpstreamError::InvalidResponse)?;
-            let endpoint = self
-                .url
-                .join(address.trim())
-                .map_err(|_| UpstreamError::InvalidResponse)?;
-            if endpoint.origin() != self.url.origin()
-                || !endpoint.username().is_empty()
-                || endpoint.password().is_some()
-                || endpoint.fragment().is_some()
-            {
-                return Err(UpstreamError::BlockedDestination);
-            }
-            self.url = endpoint;
+            self.url = resolve_sse_endpoint(&self.url, &frame)?;
             self.sse = Some(Mutex::new(Some(inbox)));
             return Ok(());
         }
@@ -1297,14 +1284,14 @@ impl Session {
     }
 }
 
-struct SseInbox {
+pub struct SseStream {
     response: Response,
     buffered: Bytes,
     decoder: SseDecoder,
 }
 
-impl SseInbox {
-    fn new(response: Response) -> Self {
+impl SseStream {
+    pub fn new(response: Response) -> Self {
         Self {
             response,
             buffered: Bytes::new(),
@@ -1312,7 +1299,11 @@ impl SseInbox {
         }
     }
 
-    async fn next(&mut self) -> Result<Option<Vec<u8>>, UpstreamError> {
+    pub fn event_type(&self) -> Option<&str> {
+        self.decoder.event_type.as_deref()
+    }
+
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>, UpstreamError> {
         loop {
             if self.buffered.is_empty() {
                 let Some(chunk) = self.response.chunk().await? else {
@@ -1338,6 +1329,21 @@ impl SseInbox {
             }
         }
     }
+}
+
+pub fn resolve_sse_endpoint(origin: &Url, event: &[u8]) -> Result<Url, UpstreamError> {
+    let address = std::str::from_utf8(event).map_err(|_| UpstreamError::InvalidResponse)?;
+    let endpoint = origin
+        .join(address.trim())
+        .map_err(|_| UpstreamError::InvalidResponse)?;
+    if endpoint.origin() != origin.origin()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(UpstreamError::BlockedDestination);
+    }
+    Ok(endpoint)
 }
 
 fn client_info() -> Implementation {
