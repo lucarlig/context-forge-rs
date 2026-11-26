@@ -11,6 +11,7 @@ pub mod gateway;
 mod identity;
 pub mod jwt;
 mod legacy_sse;
+mod legacy_sse_cache;
 pub mod mcp;
 mod modern;
 mod modern_validation;

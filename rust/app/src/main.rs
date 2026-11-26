@@ -59,8 +59,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Settings::mcp_inbound_protocol_mode()?,
         http_options,
     );
-    let legacy_sse =
-        service.legacy_sse_router(require_api_auth, Settings::sse_settings(shutdown.clone())?);
+    let legacy_sse = service.legacy_sse_router(
+        require_api_auth,
+        settings.gateway_sse_settings(shutdown.clone())?,
+    );
     let websocket = service.websocket_router(Settings::websocket_settings(shutdown.clone())?);
     let app = probes::router(database, redis)
         .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse).merge(websocket)))

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-pub use crate::legacy_sse::SseSettings;
+pub use crate::legacy_sse::{SseBackend, SseSettings};
 pub use crate::redis_sessions::RedisSessionDirectory;
 pub use crate::subscriptions::ListenSettings;
 pub use crate::websocket::WebSocketSettings;

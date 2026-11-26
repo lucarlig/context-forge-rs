@@ -9,7 +9,7 @@ use crate::{
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
-        SessionSettings, SseSettings, WebSocketSettings,
+        SessionSettings, SseBackend, SseSettings, WebSocketSettings,
     },
     redis_sessions::{DEFAULT_AFFINITY_TTL, DEFAULT_LISTENER_TTL},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
@@ -150,7 +150,22 @@ impl Settings {
             retry_ms: parse("SSE_RETRY_TIMEOUT", 5000)?,
             keepalive,
             shutdown,
+            ..SseSettings::default()
         })
+    }
+
+    pub fn gateway_sse_settings(
+        &self,
+        shutdown: CancellationToken,
+    ) -> Result<SseSettings, Box<dyn Error + Send + Sync>> {
+        let mut settings = Self::sse_settings(shutdown)?;
+        if let Some(redis) = &self.redis {
+            let directory = RedisSessionDirectory::new(redis).map_err(|_| "invalid REDIS_URL")?;
+            settings.backend = SseBackend::Redis(std::sync::Arc::new(directory));
+            settings.session_ttl = positive_seconds("SESSION_TTL", 3600.0)?;
+            settings.message_ttl = positive_seconds("MESSAGE_TTL", 600.0)?;
+        }
+        Ok(settings)
     }
 
     pub fn mcp_ingress_policy() -> Result<IngressPolicy, Box<dyn Error + Send + Sync>> {

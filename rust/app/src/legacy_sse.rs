@@ -27,7 +27,9 @@ use crate::{
     access::{self, Principal},
     catalog::CatalogServer,
     gateway::GatewayService,
+    legacy_sse_cache::{Access, RedisQueue, Scope},
     mcp::{MAX_REQUEST_BODY_BYTES, legacy_transport_reply},
+    redis_sessions::RedisSessionDirectory,
 };
 
 const MAX_CONNECTIONS: usize = 4096;
@@ -37,6 +39,14 @@ pub struct SseSettings {
     pub retry_ms: u64,
     pub keepalive: Option<Duration>,
     pub shutdown: CancellationToken,
+    pub backend: SseBackend,
+    pub session_ttl: Duration,
+    pub message_ttl: Duration,
+}
+
+pub enum SseBackend {
+    Memory,
+    Redis(Arc<RedisSessionDirectory>),
 }
 
 impl Default for SseSettings {
@@ -45,6 +55,9 @@ impl Default for SseSettings {
             retry_ms: 5000,
             keepalive: Some(Duration::from_secs(30)),
             shutdown: CancellationToken::new(),
+            backend: SseBackend::Memory,
+            session_ttl: Duration::from_secs(3600),
+            message_ttl: Duration::from_secs(600),
         }
     }
 }
@@ -59,6 +72,20 @@ struct Connection {
     owner: Option<String>,
     server: Option<String>,
     incoming: mpsc::Sender<Value>,
+}
+
+enum Inbox {
+    Local(mpsc::Receiver<Value>),
+    Redis(RedisQueue),
+}
+
+impl SseState {
+    fn shared_queue(&self, id: Uuid) -> Option<RedisQueue> {
+        match &self.settings.backend {
+            SseBackend::Memory => None,
+            SseBackend::Redis(redis) => Some(RedisQueue::new(redis.clone(), id)),
+        }
+    }
 }
 
 pub(crate) fn router(
@@ -129,17 +156,31 @@ async fn open(State(state): State<Arc<SseState>>, request: Request) -> Response 
         );
     }
     let cancel = state.settings.shutdown.child_token();
+    let connection = StreamConnection { state, id, cancel };
+    let inbox = if let Some(queue) = connection.state.shared_queue(id) {
+        let scope = session_scope(principal.as_ref(), server.as_ref());
+        if let Err(error) = queue
+            .register(scope, connection.state.settings.session_ttl)
+            .await
+        {
+            tracing::warn!(%error, "legacy SSE session registration failed");
+            return detail(StatusCode::SERVICE_UNAVAILABLE, "SSE connection failed");
+        }
+        Inbox::Redis(queue)
+    } else {
+        Inbox::Local(inbox)
+    };
     tokio::spawn(respond(
-        state.gateway.clone(),
+        connection.state.gateway.clone(),
         principal,
         server,
-        cancel.clone(),
+        connection.cancel.clone(),
         inbox,
         outbox,
     ));
     let stream = stream::unfold(
         Output {
-            connection: StreamConnection { state, id, cancel },
+            connection,
             endpoint: Some(endpoint),
             initial_keepalive: true,
             outgoing,
@@ -201,6 +242,23 @@ async fn enqueue(
     let Ok(id) = Uuid::parse_str(&id) else {
         return detail(StatusCode::NOT_FOUND, "Session not found");
     };
+    if let Some(queue) = state.shared_queue(id) {
+        let principal = principal.cloned();
+        let server = server.cloned();
+        let shared_scope = || session_scope(principal.as_ref(), server.as_ref());
+        let ttl = state.settings.message_ttl;
+        if let Err(response) = check_cache_access(queue.access(shared_scope(), None, ttl).await) {
+            return *response;
+        }
+        let message = match parse_message(request).await {
+            Ok(message) => message,
+            Err(response) => return *response,
+        };
+        return match check_cache_access(queue.access(shared_scope(), Some(&message), ttl).await) {
+            Ok(()) => accepted(),
+            Err(response) => *response,
+        };
+    }
     let incoming = {
         let connections = state.connections.lock().expect("SSE connections");
         let Some(connection) = connections.get(&id).filter(|connection| {
@@ -215,14 +273,12 @@ async fn enqueue(
         }
         connection.incoming.clone()
     };
-    let Ok(bytes) = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES).await else {
-        return detail(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large");
-    };
-    let Ok(message) = serde_json::from_slice(&bytes) else {
-        return detail(StatusCode::BAD_REQUEST, "Invalid JSON in request body");
+    let message = match parse_message(request).await {
+        Ok(message) => message,
+        Err(response) => return *response,
     };
     match incoming.try_send(message) {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"status":"success"}))).into_response(),
+        Ok(()) => accepted(),
         Err(mpsc::error::TrySendError::Closed(_)) => {
             detail(StatusCode::NOT_FOUND, "Session not found")
         }
@@ -230,6 +286,57 @@ async fn enqueue(
             detail(StatusCode::TOO_MANY_REQUESTS, "SSE message queue is full")
         }
     }
+}
+
+async fn parse_message(request: Request) -> Result<Value, Box<Response>> {
+    let bytes = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            Box::new(detail(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body too large",
+            ))
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        Box::new(detail(
+            StatusCode::BAD_REQUEST,
+            "Invalid JSON in request body",
+        ))
+    })
+}
+
+fn session_scope<'a>(
+    principal: Option<&'a Principal>,
+    server: Option<&'a CatalogServer>,
+) -> Scope<'a> {
+    Scope {
+        owner: principal.map(|user| user.email.as_str()),
+        server: server.map(|server| server.id.as_str()),
+        admin: principal.is_some_and(Principal::is_global_admin),
+    }
+}
+
+fn check_cache_access(
+    result: Result<Access, Box<dyn std::error::Error + Send + Sync>>,
+) -> Result<(), Box<Response>> {
+    let response = match result {
+        Ok(Access::Allowed) => return Ok(()),
+        Ok(Access::Missing) => detail(StatusCode::NOT_FOUND, "Session not found"),
+        Ok(Access::Denied) => detail(StatusCode::FORBIDDEN, "Session access denied"),
+        Ok(Access::Full) => detail(StatusCode::TOO_MANY_REQUESTS, "SSE message queue is full"),
+        Err(error) => {
+            tracing::warn!(%error, "legacy SSE session lookup failed");
+            detail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SSE session cache unavailable",
+            )
+        }
+    };
+    Err(Box::new(response))
+}
+
+fn accepted() -> Response {
+    (StatusCode::ACCEPTED, Json(json!({"status":"success"}))).into_response()
 }
 
 struct StreamConnection {
@@ -289,11 +396,11 @@ async fn respond(
     principal: Option<Principal>,
     server: Option<CatalogServer>,
     cancel: CancellationToken,
-    mut incoming: mpsc::Receiver<Value>,
+    mut incoming: Inbox,
     outgoing: mpsc::Sender<Value>,
 ) {
     let run = async {
-        while let Some(request) = incoming.recv().await {
+        while let Some(request) = incoming.receive().await {
             let initialized = request["method"] == "initialize";
             let Some(reply) =
                 legacy_transport_reply(&gateway, principal.as_ref(), server.as_ref(), request)
@@ -331,6 +438,25 @@ async fn respond(
         biased;
         () = cancel.cancelled() => {},
         () = run => {},
+    }
+    cancel.cancel();
+    if let Inbox::Redis(queue) = incoming {
+        queue.remove().await;
+    }
+}
+
+impl Inbox {
+    async fn receive(&mut self) -> Option<Value> {
+        match self {
+            Self::Local(inbox) => inbox.recv().await,
+            Self::Redis(queue) => match queue.receive().await {
+                Ok(message) => message,
+                Err(error) => {
+                    tracing::warn!(%error, "legacy SSE session receive failed");
+                    None
+                }
+            },
+        }
     }
 }
 

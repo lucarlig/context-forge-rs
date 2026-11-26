@@ -20,12 +20,13 @@ use axum::{
 };
 use context_forge_rs::{
     access::Authorizer,
-    config::Settings,
+    config::{RedisSettings, Settings},
     database::Database,
     gateway::{CatalogRefresh, GatewayService, Pagination},
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
-        HttpOptions, ListenSettings, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings,
+        HttpOptions, ListenSettings, ProtocolMode, RedisSessionDirectory, SessionSettings,
+        SseBackend, SseSettings, WebSocketSettings,
     },
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
@@ -350,6 +351,98 @@ async fn legacy_sse_routes_messages_to_the_bound_virtual_server_and_owner() {
     })
     .await
     .expect("the message endpoint closes with its stream");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable Redis or Valkey database in REDIS_URL"]
+async fn legacy_sse_workers_share_redis_sessions() {
+    let redis = RedisSettings {
+        url: std::env::var("REDIS_URL").unwrap(),
+        connect_timeout: Duration::from_secs(2),
+        response_timeout: Duration::from_secs(2),
+    };
+    verify_shared_legacy_sse(|| {
+        SseBackend::Redis(Arc::new(RedisSessionDirectory::new(&redis).unwrap()))
+    })
+    .await;
+}
+
+async fn verify_shared_legacy_sse(backend: impl Fn() -> SseBackend) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    sqlx::query("INSERT INTO servers (id, name, visibility) VALUES ('v', 'Virtual', 'public')")
+        .execute(pool)
+        .await
+        .unwrap();
+    let worker = || {
+        let service = Arc::new(GatewayService::new(
+            database.clone(),
+            authorizer(database.clone()),
+            UpstreamClient::new(EgressPolicy::default(), Duration::from_secs(5)),
+            Pagination::new(100, 900, None),
+            CatalogRefresh::default(),
+        ));
+        service.legacy_sse_router(
+            true,
+            SseSettings {
+                backend: backend(),
+                keepalive: None,
+                ..SseSettings::default()
+            },
+        )
+    };
+    let first = Running::start(worker()).await;
+    let second = Running::start(worker()).await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let owner = token("member", json!(["alpha"]), json!({}));
+    let outsider = token("outsider", json!(["beta"]), json!({}));
+    let mut stream = client
+        .get(first.url("/servers/v/sse"))
+        .bearer_auth(&owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    let mut frame = Vec::new();
+    while !frame.ends_with(b"\r\n\r\n") {
+        frame.extend_from_slice(&stream.chunk().await.unwrap().expect("endpoint frame"));
+    }
+    let endpoint = std::str::from_utf8(&frame)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let remote = endpoint.replacen(&first.url(""), &second.url(""), 1);
+    let ping = json!({"jsonrpc":"2.0","id":"ping","method":"ping"});
+    let (status, _) = send(&client, remote.clone(), ping.clone(), Some(&outsider)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let wrong = remote.replace("/servers/v/message", "/message");
+    let (status, _) = send(&client, wrong, ping.clone(), Some(&owner)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = send(&client, remote.clone(), ping.clone(), Some(&owner)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body, json!({"status":"success"}));
+    let (_, reply) = next_sse_message(&mut stream, &mut Vec::new()).await;
+    assert_eq!(reply, json!({"jsonrpc":"2.0","id":"ping","result":{}}));
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (status, _) = send(&client, remote.clone(), ping.clone(), Some(&owner)).await;
+            if status == StatusCode::NOT_FOUND {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the other worker sees the session close");
 }
 
 const WATCHED_RESOURCE: &str = "fixture://notes/watched";
