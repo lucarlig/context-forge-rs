@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::BTreeMap;
+
+use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
+use base64::{
+    Engine,
+    prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
+};
+use ring::{
+    aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey},
+    rand::{SecureRandom, SystemRandom},
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+pub(crate) struct CredentialCipher {
+    key: LessSafeKey,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid or unavailable encrypted credential")]
+pub(crate) struct CredentialError;
+
+impl CredentialCipher {
+    pub(crate) fn new(secret: &str) -> Self {
+        let digest = Sha256::digest(secret.as_bytes());
+        let key = UnboundKey::new(&AES_256_GCM, &digest).expect("SHA-256 yields a 256-bit key");
+        Self {
+            key: LessSafeKey::new(key),
+        }
+    }
+
+    pub(crate) fn seal(&self, value: &impl Serialize) -> Result<String, CredentialError> {
+        let mut nonce = [0; NONCE_LEN];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| CredentialError)?;
+        let mut plaintext = serde_json::to_vec(value).map_err(|_| CredentialError)?;
+        self.key
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::empty(),
+                &mut plaintext,
+            )
+            .map_err(|_| CredentialError)?;
+        let mut combined = Vec::with_capacity(NONCE_LEN + plaintext.len());
+        combined.extend_from_slice(&nonce);
+        combined.extend_from_slice(&plaintext);
+        Ok(BASE64_URL_SAFE_NO_PAD.encode(combined))
+    }
+
+    pub(crate) fn open<T: DeserializeOwned>(&self, encoded: &str) -> Result<T, CredentialError> {
+        let mut bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(encoded.trim_end_matches('='))
+            .map_err(|_| CredentialError)?;
+        let (nonce, ciphertext) = bytes
+            .split_first_chunk_mut::<NONCE_LEN>()
+            .ok_or(CredentialError)?;
+        let plaintext = self
+            .key
+            .open_in_place(
+                Nonce::assume_unique_for_key(*nonce),
+                Aad::empty(),
+                ciphertext,
+            )
+            .map_err(|_| CredentialError)?;
+        serde_json::from_slice(plaintext).map_err(|_| CredentialError)
+    }
+}
+
+type HeaderValues = BTreeMap<String, String>;
+
+#[derive(Deserialize)]
+pub(crate) struct HeaderAuthInput {
+    #[serde(alias = "authType")]
+    pub(crate) auth_type: Option<String>,
+    #[serde(alias = "authUsername")]
+    auth_username: Option<String>,
+    #[serde(alias = "authPassword")]
+    auth_password: Option<String>,
+    #[serde(alias = "authToken")]
+    auth_token: Option<String>,
+    #[serde(alias = "authHeaderKey")]
+    auth_header_key: Option<String>,
+    #[serde(alias = "authHeaderValue")]
+    auth_header_value: Option<String>,
+    #[serde(alias = "authHeaders")]
+    auth_headers: Option<Vec<ConfiguredHeader>>,
+}
+
+#[derive(Deserialize)]
+struct ConfiguredHeader {
+    key: String,
+    value: String,
+}
+
+pub(crate) struct PreparedHeaderAuth<'a> {
+    pub(crate) kind: &'static str,
+    pub(crate) encoded: String,
+    pub(crate) headers: HeaderMap,
+    pub(crate) masked: Value,
+    cipher: &'a CredentialCipher,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HeaderAuthError {
+    #[error("invalid upstream authentication credentials")]
+    Invalid,
+    #[error("unsupported upstream authentication method")]
+    Unsupported,
+    #[error(transparent)]
+    Encryption(#[from] CredentialError),
+}
+
+impl HeaderAuthInput {
+    pub(crate) fn prepare<'a>(
+        &self,
+        cipher: Option<&'a CredentialCipher>,
+    ) -> Result<Option<PreparedHeaderAuth<'a>>, HeaderAuthError> {
+        let kind = self
+            .auth_type
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let mut masked = json!({"authType": kind, "authValue": "*****"});
+        let (kind, values) = match kind.as_str() {
+            "" | "none" => return Ok(None),
+            "basic" => {
+                let username = required(self.auth_username.as_deref())?;
+                let password = required(self.auth_password.as_deref())?;
+                if username.contains(':') {
+                    return Err(HeaderAuthError::Invalid);
+                }
+                let encoded = BASE64_STANDARD.encode(format!("{username}:{password}"));
+                masked["authUsername"] = username.into();
+                masked["authPassword"] = "*****".into();
+                (
+                    "basic",
+                    HeaderValues::from([("Authorization".into(), format!("Basic {encoded}"))]),
+                )
+            }
+            "bearer" => {
+                let token = required(self.auth_token.as_deref())?;
+                masked["authToken"] = "*****".into();
+                (
+                    "bearer",
+                    HeaderValues::from([("Authorization".into(), format!("Bearer {token}"))]),
+                )
+            }
+            "authheaders" => {
+                let legacy;
+                let configured = match self
+                    .auth_headers
+                    .as_deref()
+                    .filter(|headers| !headers.is_empty())
+                {
+                    Some(headers) => headers,
+                    None => {
+                        legacy = [ConfiguredHeader {
+                            key: required(self.auth_header_key.as_deref())?.to_owned(),
+                            value: required(self.auth_header_value.as_deref())?.to_owned(),
+                        }];
+                        &legacy
+                    }
+                };
+                let mut values = HeaderValues::new();
+                let mut response = Vec::with_capacity(configured.len());
+                for entry in configured {
+                    let name = required(Some(&entry.key))?;
+                    let value = required(Some(&entry.value))?;
+                    if values.insert(name.to_owned(), value.to_owned()).is_some() {
+                        return Err(HeaderAuthError::Invalid);
+                    }
+                    response.push(json!({"key": name, "value": "*****"}));
+                }
+                masked["authHeaderKey"] = response[0]["key"].clone();
+                masked["authHeaderValue"] = "*****".into();
+                masked["authHeaders"] = response.into();
+                ("authheaders", values)
+            }
+            _ => return Err(HeaderAuthError::Unsupported),
+        };
+        let headers = http_headers(values.iter()).map_err(|_| HeaderAuthError::Invalid)?;
+        let cipher = cipher.ok_or(CredentialError)?;
+        let encoded = cipher.seal(&values)?;
+        Ok(Some(PreparedHeaderAuth {
+            kind,
+            encoded,
+            headers,
+            masked,
+            cipher,
+        }))
+    }
+}
+
+impl PreparedHeaderAuth<'_> {
+    pub(crate) fn matches_stored(&self, stored: &str) -> bool {
+        decode_headers(Some(self.cipher), stored).is_ok_and(|headers| self.headers == headers)
+    }
+}
+
+pub(crate) fn decode_headers(
+    cipher: Option<&CredentialCipher>,
+    stored: &str,
+) -> Result<HeaderMap, CredentialError> {
+    let value: Value = serde_json::from_str(stored).map_err(|_| CredentialError)?;
+    let values: HeaderValues = match value {
+        Value::String(encoded) => cipher.ok_or(CredentialError)?.open(&encoded)?,
+        Value::Object(_) => serde_json::from_value(value).map_err(|_| CredentialError)?,
+        _ => return Err(CredentialError),
+    };
+    http_headers(values.iter())
+}
+
+fn http_headers<'a>(
+    values: impl Iterator<Item = (&'a String, &'a String)>,
+) -> Result<HeaderMap, CredentialError> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in values {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| CredentialError)?;
+        if name.as_str().starts_with("mcp-")
+            || name.as_str().starts_with("proxy-")
+            || [
+                header::HOST,
+                header::ACCEPT,
+                header::CONNECTION,
+                header::UPGRADE,
+                header::CONTENT_LENGTH,
+                header::CONTENT_TYPE,
+                header::TRANSFER_ENCODING,
+                header::TE,
+                header::TRAILER,
+            ]
+            .contains(&name)
+            || headers.contains_key(&name)
+        {
+            return Err(CredentialError);
+        }
+        let mut value = HeaderValue::from_str(value).map_err(|_| CredentialError)?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    if headers.is_empty() {
+        return Err(CredentialError);
+    }
+    Ok(headers)
+}
+
+fn required(value: Option<&str>) -> Result<&str, HeaderAuthError> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        .ok_or(HeaderAuthError::Invalid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opens_pinned_gateway_ciphertext_and_rejects_the_wrong_key() {
+        let captured = "ulkmjUnOaqW3DiMsK7eQ10FqpUDjG81kpM25-CDex96eCSk55xrkQhWWl1YABYFDrWgm9Wj3rISlhhkZd9iO3c9hoxmoOhQ9DuoC";
+        let cipher =
+            CredentialCipher::new("context-forge-fixture-encryption-key-with-ample-entropy");
+        let expected = HeaderValues::from([(
+            "Authorization".to_owned(),
+            "Bearer fixture-bearer-token".to_owned(),
+        )]);
+        assert_eq!(cipher.open::<HeaderValues>(captured).unwrap(), expected);
+        assert!(
+            CredentialCipher::new("other synthetic key")
+                .open::<HeaderValues>(captured)
+                .is_err()
+        );
+        let first = cipher.seal(&expected).unwrap();
+        let second = cipher.seal(&expected).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(cipher.open::<HeaderValues>(&first).unwrap(), expected);
+    }
+}

@@ -20,6 +20,7 @@ jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "fuel", "serde"] }
 redis = { version = "1.8.3", default-features = false, features = ["tokio-rustls-comp"] }
 regex = { version = "1.12", default-features = false, features = ["std", "perf"] }
+ring = "0.17.14"
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider"] }
 rmcp = { version = "3.12", default-features = false, features = ["server", "transport-streamable-http-server"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

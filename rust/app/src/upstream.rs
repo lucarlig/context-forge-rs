@@ -18,7 +18,7 @@ use ipnet::IpNet;
 use reqwest::{
     Client, Method, Response,
     dns::{Name, Resolve, Resolving},
-    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
@@ -34,6 +34,7 @@ use rmcp::model::{
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     net::lookup_host,
@@ -291,6 +292,7 @@ impl UpstreamTransport {
 pub(crate) struct UpstreamEndpoint<'a> {
     pub url: &'a str,
     pub transport: UpstreamTransport,
+    pub headers: Option<&'a HeaderMap>,
 }
 
 impl<'a> UpstreamEndpoint<'a> {
@@ -298,7 +300,22 @@ impl<'a> UpstreamEndpoint<'a> {
         Self {
             url,
             transport: UpstreamTransport::StreamableHttp,
+            headers: None,
         }
+    }
+
+    pub(crate) fn header_fingerprint(self) -> Option<[u8; 32]> {
+        let headers = self.headers.filter(|headers| !headers.is_empty())?;
+        let mut entries: Vec<_> = headers.iter().collect();
+        entries.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        let mut hash = Sha256::new();
+        for (name, value) in entries {
+            hash.update(name.as_str().as_bytes());
+            hash.update([0]);
+            hash.update(value.as_bytes());
+            hash.update([0]);
+        }
+        Some(hash.finalize().into())
     }
 }
 
@@ -705,7 +722,7 @@ impl UpstreamClient {
         endpoint: UpstreamEndpoint<'_>,
         deadline: Instant,
     ) -> Result<Session, UpstreamError> {
-        let mut session = timeout_at(deadline, self.connect(endpoint.url))
+        let mut session = timeout_at(deadline, self.connect(endpoint))
             .await
             .map_err(|_| UpstreamError::Timeout)??;
         let result = timeout_at(deadline, async {
@@ -729,8 +746,8 @@ impl UpstreamClient {
         Ok(session)
     }
 
-    async fn connect(&self, endpoint: &str) -> Result<Session, UpstreamError> {
-        let url = self.policy.validate_url(endpoint)?;
+    async fn connect(&self, endpoint: UpstreamEndpoint<'_>) -> Result<Session, UpstreamError> {
+        let url = self.policy.validate_url(endpoint.url)?;
         let mut builder = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -739,6 +756,9 @@ impl UpstreamClient {
             .connect_timeout(CONNECT_TIMEOUT.min(self.timeout))
             .dns_resolver(Arc::new(DenyDns))
             .tls_backend_preconfigured(tls_config()?);
+        if let Some(headers) = endpoint.headers {
+            builder = builder.default_headers(headers.clone());
+        }
         if let Some(domain) = url.domain() {
             let port = url
                 .port_or_known_default()

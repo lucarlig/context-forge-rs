@@ -31,6 +31,7 @@ use crate::{
         CatalogList, CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool,
         RegistrationError, ToolDefinition, slugify,
     },
+    credentials::{CredentialCipher, HeaderAuthError, HeaderAuthInput, decode_headers},
     database::Database,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     sessions::Session,
@@ -46,6 +47,7 @@ pub struct GatewayService {
     refresh: CatalogRefresh,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
+    credential_cipher: Option<CredentialCipher>,
 }
 
 pub struct CatalogRefresh {
@@ -108,6 +110,7 @@ impl GatewayService {
             refresh,
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
+            credential_cipher: None,
         }
     }
 
@@ -118,6 +121,11 @@ impl GatewayService {
 
     pub fn with_listen_settings(mut self, settings: ListenSettings) -> Self {
         self.subscriptions = CatalogSubscriptions::new(settings);
+        self
+    }
+
+    pub fn with_credential_secret(mut self, secret: Option<&str>) -> Self {
+        self.credential_cipher = secret.map(CredentialCipher::new);
         self
     }
 
@@ -359,9 +367,13 @@ impl GatewayService {
         {
             return Err(ToolError::Unavailable);
         }
+        let headers = self
+            .configured_headers(&tool.gateway_id, &tool.gateway_url, tool.needs_header_auth)
+            .await?;
         let endpoint = UpstreamEndpoint {
             url: &tool.gateway_url,
             transport,
+            headers: headers.as_ref(),
         };
         let association = downstream.and_then(|session| {
             let authorization = principal.map(Principal::authorization_fingerprint);
@@ -390,6 +402,27 @@ impl GatewayService {
                 Err(ToolError::Unavailable)
             }
         }
+    }
+
+    async fn configured_headers(
+        &self,
+        id: &str,
+        url: &str,
+        needs_header_auth: bool,
+    ) -> Result<Option<HeaderMap>, ToolError> {
+        if !needs_header_auth {
+            return Ok(None);
+        }
+        let stored = self
+            .database
+            .gateway_header_auth(id, url)
+            .await?
+            .ok_or(ToolError::Unavailable)?;
+        let headers = decode_headers(self.credential_cipher.as_ref(), &stored).map_err(|_| {
+            tracing::warn!(gateway = %id, "could not load upstream authentication");
+            ToolError::Unavailable
+        })?;
+        Ok(Some(headers))
     }
 
     pub(crate) async fn tool_definition(
@@ -550,8 +583,8 @@ struct RegisterGateway {
     tags: Option<Vec<String>>,
     #[serde(alias = "gatewayMode")]
     gateway_mode: Option<String>,
-    #[serde(alias = "authType")]
-    auth_type: Option<String>,
+    #[serde(flatten)]
+    auth: HeaderAuthInput,
 }
 
 async fn register(
@@ -580,10 +613,6 @@ async fn register(
         .gateway_mode
         .as_deref()
         .is_some_and(|mode| mode != "cache")
-        || input
-            .auth_type
-            .as_deref()
-            .is_some_and(|auth| auth != "none")
     {
         return Err(RegistrationResponse::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -615,9 +644,30 @@ async fn register(
     }
 
     let url = input.url.trim();
+    let auth = input
+        .auth
+        .prepare(service.credential_cipher.as_ref())
+        .map_err(|error| match error {
+            HeaderAuthError::Invalid => RegistrationResponse::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid upstream authentication credentials",
+            ),
+            HeaderAuthError::Unsupported => RegistrationResponse::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Unsupported gateway transport, mode, or authentication",
+            ),
+            HeaderAuthError::Encryption(_) => RegistrationResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway credential encryption unavailable",
+            ),
+        })?;
     let (discovery, metadata) = service
         .upstream
-        .discover_catalog(UpstreamEndpoint { url, transport })
+        .discover_catalog(UpstreamEndpoint {
+            url,
+            transport,
+            headers: auth.as_ref().map(|auth| &auth.headers),
+        })
         .await
         .map_err(|error| {
             tracing::warn!(%error, "upstream gateway discovery failed");
@@ -676,14 +726,23 @@ async fn register(
         .collect();
     service
         .database
-        .register_discovered_gateway(&registration, &registered_tools, &metadata)
+        .register_discovered_gateway(&registration, &registered_tools, &metadata, auth.as_ref())
         .await?;
     service.subscriptions.registered(&registration);
     let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
     let agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
-    Ok(Json(registration_response(&registration, address, agent)))
+    let mut response = registration_response(&registration, address, agent);
+    if let Some(auth) = auth
+        && let Value::Object(masked) = auth.masked
+    {
+        response
+            .as_object_mut()
+            .expect("registration response object")
+            .extend(masked);
+    }
+    Ok(Json(response))
 }
 
 async fn registration_team(

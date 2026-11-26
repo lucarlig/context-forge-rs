@@ -16,7 +16,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Stateful sessions, streaming, cancellation, and event resumption
 - [x] Resources, prompts, completions, logging, and subscriptions
 - [x] Legacy SSE, WebSocket, and stdio transports and translation
-- [ ] Authenticated MCP upstreams, identity forwarding, and direct proxy mode
+- [ ] Authenticated MCP upstreams, identity forwarding, and direct proxy mode (in progress)
 - [ ] Gateway update, delete, refresh, health lifecycle, and full catalog APIs
 - [ ] Virtual-server management and OAuth resource metadata
 - [ ] API token issuance, usage limits, and lifecycle

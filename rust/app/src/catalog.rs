@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::{
     auth::TeamVisibility,
+    credentials::PreparedHeaderAuth,
     database::Database,
     upstream::{DiscoveredMetadata, UpstreamTransport},
 };
@@ -108,6 +109,7 @@ pub struct CatalogTool {
     pub gateway_transport: String,
     pub request_type: String,
     pub requires_gateway_policy: bool,
+    pub(crate) needs_header_auth: bool,
     pub definition: ToolDefinition,
 }
 
@@ -123,6 +125,7 @@ pub(crate) struct ContentGateway {
     pub(crate) url: String,
     pub(crate) transport: Option<UpstreamTransport>,
     pub(crate) available: bool,
+    pub(crate) needs_header_auth: bool,
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
@@ -237,6 +240,7 @@ type ToolRow = (
     String,
     String,
     bool,
+    bool,
     String,
     Option<String>,
     String,
@@ -278,13 +282,13 @@ macro_rules! non_empty_json {
 macro_rules! gateway_policy {
     () => {
         concat!(
-            "(LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none')
+            "(LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none', 'basic', 'bearer', 'authheaders')
             OR COALESCE(g.ca_certificate, '') <> ''
             OR COALESCE(g.client_cert, '') <> ''
             OR COALESCE(g.client_key, '') <> ''
-            OR ",
+            OR (LOWER(COALESCE(g.auth_type, 'none')) IN ('', 'none') AND ",
             non_empty_json!("g.auth_value"),
-            "
+            ")
             OR ",
             non_empty_json!("g.oauth_config"),
             "
@@ -310,6 +314,12 @@ macro_rules! gateway_policy {
     };
 }
 
+macro_rules! header_auth {
+    () => {
+        "LOWER(COALESCE(g.auth_type, '')) IN ('basic', 'bearer', 'authheaders')"
+    };
+}
+
 // Keep configured gateway and tool policies visible to callers before network dispatch.
 macro_rules! tool_query {
     ($team_ids:literal) => {
@@ -318,8 +328,10 @@ macro_rules! tool_query {
              SELECT t.id, t.original_name, g.id, g.name, g.url, g.gateway_mode, g.transport, t.request_type,
                 (
                     ", gateway_policy!(), "
-                    OR LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none')
-                    OR COALESCE(t.auth_value, '') <> ''
+                    OR ((LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none')
+                        OR COALESCE(t.auth_value, '') <> '')
+                        AND NOT (", header_auth!(), "
+                            AND LOWER(COALESCE(t.auth_type, '')) = LOWER(COALESCE(g.auth_type, ''))))
                     OR COALESCE(t.jsonpath_filter, '') <> ''
                     OR COALESCE(t.timeout_ms, 0) <> 0
                     OR t.validation_refusal IS NOT NULL
@@ -328,7 +340,7 @@ macro_rules! tool_query {
                     OR ", non_empty_json!("t.plugin_chain_pre"), "
                     OR ", non_empty_json!("t.plugin_chain_post"), "
                 ),
-                t.name, t.title, COALESCE(t.description, ''), CAST(t.input_schema AS TEXT),
+                ", header_auth!(), ", t.name, t.title, COALESCE(t.description, ''), CAST(t.input_schema AS TEXT),
                 CAST(t.output_schema AS TEXT), CAST(t.annotations AS TEXT)
              FROM tools t
              JOIN gateways g ON g.id = t.gateway_id
@@ -389,7 +401,7 @@ macro_rules! metadata_query {
 
 macro_rules! content_gateway_columns {
     () => {
-        concat!("g.id, g.url, g.transport, COALESCE(UPPER(g.transport) IN ('SSE', 'STREAMABLEHTTP') AND g.gateway_mode = 'cache' AND NOT ", gateway_policy!(), ", FALSE)")
+        concat!("g.id, g.url, g.transport, COALESCE(UPPER(g.transport) IN ('SSE', 'STREAMABLEHTTP') AND g.gateway_mode = 'cache' AND NOT ", gateway_policy!(), ", FALSE), ", header_auth!())
     };
 }
 
@@ -434,6 +446,7 @@ type ResourceContentRow = (
     Option<String>,
     Option<String>,
     bool,
+    bool,
 );
 type PromptContentRow = (
     String,
@@ -447,6 +460,7 @@ type PromptContentRow = (
     Option<String>,
     Option<String>,
     bool,
+    bool,
 );
 
 type ResourceSubscriptionRow = (
@@ -458,6 +472,7 @@ type ResourceSubscriptionRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    bool,
     bool,
 );
 
@@ -513,7 +528,7 @@ const CONFLICT_QUERY: &str = concat!(
                 ((g.visibility = 'public' AND $3 = 'public')
                   OR (g.visibility = 'team' AND $3 = 'team' AND g.team_id = $4))
         ) THEN 'name'
-        WHEN EXISTS (
+        WHEN $6 AND EXISTS (
             SELECT 1 FROM gateways g WHERE g.url = $2 AND
                 ((g.visibility = 'public' AND $3 = 'public')
                  OR (g.visibility = 'team' AND $3 = 'team' AND g.team_id = $4)
@@ -536,6 +551,22 @@ const CONFLICT_QUERY: &str = concat!(
     END"
 );
 
+const AUTH_CONFLICT_QUERY: &str = "
+    SELECT CAST(auth_value AS TEXT) FROM gateways
+    WHERE url = $1 AND auth_value IS NOT NULL
+        AND ((visibility = 'public' AND $2 = 'public')
+            OR (visibility = 'team' AND $2 = 'team' AND team_id = $3)
+            OR (visibility = 'private' AND $2 = 'private' AND owner_email = $4))";
+
+const HEADER_AUTH_QUERY: &str = concat!(
+    "SELECT CAST(g.auth_value AS TEXT) FROM gateways g
+    WHERE g.id = $1 AND g.url = $2 AND g.enabled = TRUE AND g.status = 'active'
+        AND g.gateway_mode = 'cache' AND ",
+    header_auth!(),
+    " AND NOT ",
+    gateway_policy!()
+);
+
 macro_rules! tool_conflict_query {
     ($names:literal) => {
         concat!(
@@ -552,13 +583,15 @@ macro_rules! tool_conflict_query {
 }
 
 macro_rules! insert_gateway {
-    ($capabilities:literal, $tags:literal) => {
+    ($capabilities:literal, $tags:literal, $auth_value:literal) => {
         concat!(
             "INSERT INTO gateways (
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
-                updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status
+                updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status,
+                auth_type, auth_value
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
-                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, 'cache', 'active')"
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, 'cache', 'active',
+                $12, ", $auth_value, ")"
         )
     };
 }
@@ -813,16 +846,20 @@ impl Database {
         };
         Ok(rows
             .into_iter()
-            .filter_map(|(_, _, _, _, uri, gateway_id, url, _, available)| {
-                match (gateway_id, url, available) {
+            .filter_map(
+                |(_, _, _, _, uri, gateway_id, url, _, available, needs_auth)| match (
+                    gateway_id,
+                    url,
+                    available && !needs_auth,
+                ) {
                     (Some(gateway_id), Some(url), true) => Some(ResourceSubscriptionTarget {
                         gateway_id,
                         uri,
                         url,
                     }),
                     _ => None,
-                }
-            })
+                },
+            )
             .collect())
     }
 
@@ -960,6 +997,7 @@ impl Database {
             url,
             transport,
             available,
+            needs_header_auth,
         )) = rows.pop()
         else {
             return Ok(None);
@@ -969,7 +1007,7 @@ impl Database {
             description,
             template,
             argument_schema: decode_optional_json(schema.as_deref())?,
-            gateway: content_gateway(id, url, transport.as_deref(), available),
+            gateway: content_gateway(id, url, transport.as_deref(), available, needs_header_auth),
         }))
     }
 
@@ -1035,7 +1073,7 @@ impl Database {
         gateway: &GatewayRegistration<'_>,
         tools: &[RegisteredTool<'_>],
     ) -> Result<(), RegistrationError> {
-        self.register_discovered_gateway(gateway, tools, &DiscoveredMetadata::default())
+        self.register_discovered_gateway(gateway, tools, &DiscoveredMetadata::default(), None)
             .await
     }
 
@@ -1044,6 +1082,7 @@ impl Database {
         gateway: &GatewayRegistration<'_>,
         tools: &[RegisteredTool<'_>],
         metadata: &DiscoveredMetadata,
+        auth: Option<&PreparedHeaderAuth<'_>>,
     ) -> Result<(), RegistrationError> {
         validate_registration(gateway, tools)?;
         let capabilities = gateway.capabilities.to_string();
@@ -1065,12 +1104,25 @@ impl Database {
                     .bind(gateway.visibility)
                     .bind(gateway.team_id)
                     .bind(gateway.owner_email)
+                    .bind(auth.is_none())
                     .fetch_one(&mut *$tx)
                     .await?;
                 match conflict.as_deref() {
                     Some("name") => return Err(RegistrationError::NameConflict),
                     Some("url") => return Err(RegistrationError::UrlConflict),
                     _ => {}
+                }
+                if let Some(auth) = auth {
+                    let existing = sqlx::query_scalar::<_, String>(AUTH_CONFLICT_QUERY)
+                        .bind(gateway.url)
+                        .bind(gateway.visibility)
+                        .bind(gateway.team_id)
+                        .bind(gateway.owner_email)
+                        .fetch_all(&mut *$tx)
+                        .await?;
+                    if existing.iter().any(|stored| auth.matches_stored(stored)) {
+                        return Err(RegistrationError::UrlConflict);
+                    }
                 }
 
                 if sqlx::query_scalar::<_, bool>($tool_conflicts)
@@ -1096,6 +1148,8 @@ impl Database {
                     .bind(gateway.team_id)
                     .bind(gateway.visibility)
                     .bind(gateway.transport.name())
+                    .bind(auth.map(|auth| auth.kind))
+                    .bind(auth.map(|auth| json!(auth.encoded).to_string()))
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1178,7 +1232,7 @@ impl Database {
                 register!(
                     transaction,
                     tool_conflict_query!("SELECT value FROM json_each($1)"),
-                    insert_gateway!("json($6)", "json($7)"),
+                    insert_gateway!("json($6)", "json($7)", "json($13)"),
                     insert_tool!("json($8)", "json($9)", "json($10)"),
                     "json($7)"
                 );
@@ -1189,13 +1243,34 @@ impl Database {
                 register!(
                     transaction,
                     tool_conflict_query!("SELECT json_array_elements_text(CAST($1 AS JSON))"),
-                    insert_gateway!("CAST($6 AS JSON)", "CAST($7 AS JSON)"),
+                    insert_gateway!("CAST($6 AS JSON)", "CAST($7 AS JSON)", "CAST($13 AS JSON)"),
                     insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)"),
                     "CAST($7 AS JSON)"
                 );
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn gateway_header_auth(
+        &self,
+        id: &str,
+        url: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        macro_rules! fetch {
+            ($pool:expr) => {
+                sqlx::query_scalar::<_, Option<String>>(HEADER_AUTH_QUERY)
+                    .bind(id)
+                    .bind(url)
+                    .fetch_optional($pool)
+                    .await
+                    .map(Option::flatten)
+            };
+        }
+        match self {
+            Self::Sqlite(pool) => fetch!(pool),
+            Self::Postgres(pool) => fetch!(pool),
+        }
     }
 }
 
@@ -1208,12 +1283,12 @@ fn visible_team_ids(scope: CatalogScope<'_>) -> Result<String, sqlx::Error> {
 }
 
 fn resource_content_record(row: ResourceContentRow) -> ResourceContentRecord {
-    let (_, _, _, _, _, mime, text, blob, id, url, transport, available) = row;
+    let (_, _, _, _, _, mime, text, blob, id, url, transport, available, needs_header_auth) = row;
     ResourceContentRecord {
         mime,
         text,
         blob,
-        gateway: content_gateway(id, url, transport.as_deref(), available),
+        gateway: content_gateway(id, url, transport.as_deref(), available, needs_header_auth),
     }
 }
 
@@ -1222,12 +1297,14 @@ fn content_gateway(
     url: Option<String>,
     transport: Option<&str>,
     available: bool,
+    needs_header_auth: bool,
 ) -> Option<ContentGateway> {
     Some(ContentGateway {
         id: id?,
         url: url?,
         transport: transport.and_then(UpstreamTransport::from_name),
         available,
+        needs_header_auth,
     })
 }
 
@@ -1344,6 +1421,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         gateway_transport,
         request_type,
         requires_gateway_policy,
+        needs_header_auth,
         name,
         title,
         description,
@@ -1361,6 +1439,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         gateway_transport,
         request_type,
         requires_gateway_policy,
+        needs_header_auth,
         definition: ToolDefinition {
             name,
             title,

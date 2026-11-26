@@ -292,9 +292,14 @@ impl GatewayService {
             .transport
             .filter(|_| gateway.available)
             .ok_or_else(|| ErrorData::internal_error("Upstream gateway unavailable", None))?;
+        let headers = self
+            .configured_headers(&gateway.id, &gateway.url, gateway.needs_header_auth)
+            .await
+            .map_err(|_| ErrorData::internal_error("Upstream gateway unavailable", None))?;
         let endpoint = UpstreamEndpoint {
             url: &gateway.url,
             transport,
+            headers: headers.as_ref(),
         };
         let association = downstream.and_then(|session| {
             session.upstream(

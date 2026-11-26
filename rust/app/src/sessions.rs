@@ -63,6 +63,7 @@ struct UpstreamKey {
     endpoint: String,
     transport: UpstreamTransport,
     authorization: Option<[u8; 32]>,
+    upstream_headers: Option<[u8; 32]>,
 }
 
 pub(crate) struct SessionLifetime {
@@ -343,6 +344,7 @@ impl Session {
             endpoint: endpoint.url.to_owned(),
             transport: endpoint.transport,
             authorization,
+            upstream_headers: endpoint.header_fingerprint(),
         };
         let mut upstreams = self
             .upstreams

@@ -5,6 +5,7 @@ mod affinity;
 pub mod auth;
 pub mod catalog;
 pub mod config;
+mod credentials;
 pub mod database;
 mod events;
 pub mod gateway;

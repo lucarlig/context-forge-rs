@@ -116,6 +116,11 @@ impl Settings {
         })?))
     }
 
+    pub fn auth_encryption_secret() -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        let secret = value("AUTH_ENCRYPTION_SECRET", "")?;
+        Ok((!secret.is_empty()).then_some(secret))
+    }
+
     pub fn mcp_requires_auth() -> Result<bool, Box<dyn Error + Send + Sync>> {
         match flag("MCP_REQUIRE_AUTH")? {
             Some(required) => Ok(required),

@@ -168,6 +168,122 @@ async fn registration_invokes_sse_upstream_and_rejects_cross_origin_message_endp
 }
 
 #[tokio::test]
+async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let upstream = Running::start(Router::new().route(
+        "/mcp",
+        post(async |headers: HeaderMap, Json(message): Json<Value>| {
+            assert_eq!(headers[header::AUTHORIZATION], "Bearer upstream-fixture");
+            if message["method"] == "notifications/initialized" {
+                return StatusCode::ACCEPTED.into_response();
+            }
+            let result = match message["method"].as_str().unwrap() {
+                "initialize" => {
+                    json!({"protocolVersion":PROTOCOL,"capabilities":{"tools":{},"resources":{}},
+                    "serverInfo":{"name":"Authenticated fixture","version":"1"}})
+                }
+                "tools/list" => json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}),
+                "tools/call" => json!({"content":[{"type":"text","text":"Authorized tool"}]}),
+                "resources/list" => {
+                    json!({"resources":[{"name":"note","uri":"fixture://auth/note"}]})
+                }
+                "resources/templates/list" => json!({"resourceTemplates":[]}),
+                "resources/read" => {
+                    json!({"contents":[{"uri":"fixture://auth/note","text":"Authorized resource"}]})
+                }
+                method => panic!("unexpected upstream request {method}"),
+            };
+            Json(json!({"jsonrpc":"2.0","id":message["id"],"result":result})).into_response()
+        }),
+    ))
+    .await;
+    let database = database().await;
+    let service = Arc::new(
+        GatewayService::new(
+            database.clone(),
+            authorizer(database.clone()),
+            UpstreamClient::new(
+                EgressPolicy {
+                    allow_localhost: true,
+                    ..EgressPolicy::default()
+                },
+                Duration::from_secs(4),
+            )
+            .with_connect_mode(ConnectMode::Legacy),
+            Pagination::new(100, 900, None),
+            CatalogRefresh::default(),
+        )
+        .with_credential_secret(Some("synthetic encryption key for the gateway test")),
+    );
+    let app = Running::start(
+        service
+            .registration_router()
+            .merge(service.mcp_router(false, ProtocolMode::Legacy)),
+    )
+    .await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({"is_admin":true}));
+    let mut registration = json!({"name":"protected","url":upstream.url("/mcp"),"transport":"STREAMABLEHTTP",
+        "authType":"bearer","authToken":"upstream-fixture"});
+    let (status, response) = send(
+        &client,
+        app.url("/gateways"),
+        registration.clone(),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["authType"], "bearer");
+    assert_eq!(response["authValue"], "*****");
+    assert_eq!(response["authToken"], "*****");
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    let encrypted = sqlx::query_scalar::<_, String>(
+        "SELECT CAST(auth_value AS TEXT) FROM gateways WHERE name = 'protected'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        serde_json::from_str::<Value>(&encrypted)
+            .unwrap()
+            .is_string()
+    );
+    assert!(!encrypted.contains("upstream-fixture"));
+    registration["name"] = "duplicate".into();
+    let (status, _) = send(&client, app.url("/gateways"), registration, Some(&admin)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    for (method, params, text) in [
+        (
+            "tools/call",
+            json!({"name":"protected-echo","arguments":{}}),
+            "Authorized tool",
+        ),
+        (
+            "resources/read",
+            json!({"uri":"fixture://auth/note"}),
+            "Authorized resource",
+        ),
+    ] {
+        let (status, result) = send(
+            &client,
+            app.url("/mcp"),
+            json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(result["result"].to_string().contains(text), "{result}");
+    }
+}
+
+#[tokio::test]
 async fn websocket_relay_requires_header_authentication_and_returns_rpc_errors() {
     use futures_util::SinkExt;
     use tokio_tungstenite::{

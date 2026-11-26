@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Settings::catalog_refresh()?,
         )
         .with_logging_filter(handle)
+        .with_credential_secret(Settings::auth_encryption_secret()?.as_deref())
         .with_listen_settings(Settings::mcp_listen_settings(shutdown.clone())?),
     );
     let mut http_options = settings.mcp_http_options()?;
