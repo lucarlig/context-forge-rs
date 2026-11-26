@@ -200,6 +200,15 @@ impl Settings {
         } else {
             defaults.affinity_forward_concurrency
         };
+        let affinity_session_lock_timeout =
+            if redis.as_ref().is_some_and(|redis| redis.affinity_enabled()) {
+                positive_seconds(
+                    "MCPGATEWAY_AFFINITY_SESSION_LOCK_TIMEOUT",
+                    defaults.affinity_session_lock_timeout.as_secs_f64(),
+                )?
+            } else {
+                defaults.affinity_session_lock_timeout
+            };
         if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&affinity_forward_concurrency) {
             return Err("invalid MCPGATEWAY_AFFINITY_FORWARD_CONCURRENCY".into());
         }
@@ -212,6 +221,7 @@ impl Settings {
             redis,
             affinity_forward_timeout,
             affinity_forward_concurrency,
+            affinity_session_lock_timeout,
             ..defaults
         }))
     }

@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Redis transport for requests whose MCP session belongs to another worker.
 
-use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::{Future, poll_fn},
+    io,
+    net::SocketAddr,
+    sync::{Arc, Weak},
+    task::Poll,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -15,7 +23,7 @@ use redis::aio::PubSubStream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc},
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -66,6 +74,15 @@ impl WireRequest {
                 && serde_json::from_str::<serde_json::Value>(&self.body).is_ok_and(|body| {
                     body.get("id").is_none() && body["method"] == "notifications/cancelled"
                 }))
+    }
+
+    fn ordered_session(&self, control: bool) -> Option<&str> {
+        if self.method != "POST" || control {
+            return None;
+        }
+        self.headers
+            .iter()
+            .find_map(|(name, value)| (name == "mcp-session-id").then_some(value.as_str()))
     }
 
     fn into_request(self) -> Option<Request> {
@@ -286,13 +303,21 @@ struct Active {
     cancel: CancellationToken,
 }
 
+#[derive(Default)]
+struct Forwards {
+    requests: HashMap<String, Active>,
+    sessions: HashMap<String, Weak<Mutex<()>>>,
+}
+
+#[derive(Clone)]
 struct Worker {
     directory: Arc<RedisSessionDirectory>,
     router: Router,
     wait: Duration,
+    lock_timeout: Duration,
     permits: Arc<Semaphore>,
     control_permits: Arc<Semaphore>,
-    active: Arc<std::sync::Mutex<HashMap<String, Active>>>,
+    active: Arc<std::sync::Mutex<Forwards>>,
     shutdown: CancellationToken,
 }
 
@@ -301,6 +326,7 @@ pub(crate) fn spawn(
     router: Router,
     wait: Duration,
     concurrency: usize,
+    lock_timeout: Duration,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(
@@ -308,6 +334,7 @@ pub(crate) fn spawn(
             directory,
             router,
             wait,
+            lock_timeout,
             permits: Arc::new(Semaphore::new(concurrency)),
             control_permits: Arc::new(Semaphore::new(concurrency.min(32))),
             active: Arc::default(),
@@ -350,12 +377,24 @@ impl Worker {
     async fn handle(&self, command: Command) {
         match command {
             Command::Ack { id } => {
-                if let Some(active) = self.active.lock().expect("affinity worker lock").get(&id) {
+                if let Some(active) = self
+                    .active
+                    .lock()
+                    .expect("affinity worker lock")
+                    .requests
+                    .get(&id)
+                {
                     let _ = active.ack.try_send(());
                 }
             }
             Command::Cancel { id } => {
-                if let Some(active) = self.active.lock().expect("affinity worker lock").get(&id) {
+                if let Some(active) = self
+                    .active
+                    .lock()
+                    .expect("affinity worker lock")
+                    .requests
+                    .get(&id)
+                {
                     active.cancel.cancel();
                 }
             }
@@ -367,50 +406,114 @@ impl Worker {
         if Uuid::parse_str(&id).is_err() {
             return;
         }
-        let directory = self.directory.clone();
         let channel = reply_channel(&id);
-        let saturated =
-            self.active.lock().expect("affinity worker lock").len() >= MAX_ACTIVE_FORWARDS;
-        let permit = if saturated {
-            None
-        } else {
-            self.permits.clone().try_acquire_owned().ok().or_else(|| {
-                if request.is_control() {
-                    self.control_permits.clone().try_acquire_owned().ok()
-                } else {
-                    None
-                }
-            })
-        };
-        let Some(permit) = permit else {
-            let _ = send_busy(&directory, &channel).await;
+        let saturated = self
+            .active
+            .lock()
+            .expect("affinity worker lock")
+            .requests
+            .len()
+            >= MAX_ACTIVE_FORWARDS;
+        if saturated {
+            let _ = send_busy(&self.directory, &channel).await;
             return;
-        };
+        }
+        let control = request.is_control();
         let cancellation = self.shutdown.child_token();
         let (ack, credit) = mpsc::channel(1);
-        {
+        let ordering = {
             let mut active = self.active.lock().expect("affinity worker lock");
-            if active.contains_key(&id) {
+            if active.requests.contains_key(&id) {
                 return;
             }
-            active.insert(
+            active.requests.insert(
                 id.clone(),
                 Active {
                     ack,
                     cancel: cancellation.clone(),
                 },
             );
-        }
-        let router = self.router.clone();
-        let active = self.active.clone();
-        let wait = self.wait;
+            request.ordered_session(control).map(|session| {
+                let entry = active.sessions.entry(session.to_owned()).or_default();
+                let lock = entry.upgrade().unwrap_or_else(|| {
+                    let lock = Arc::new(Mutex::new(()));
+                    *entry = Arc::downgrade(&lock);
+                    lock
+                });
+                (session.to_owned(), lock)
+            })
+        };
+        // Join the mutex queue in Redis receive order, before scheduling dispatch.
+        let order = if let Some((_, lock)) = &ordering {
+            let mut acquire = Box::pin(lock.clone().lock_owned());
+            let ready = poll_fn(|cx| Poll::Ready(acquire.as_mut().poll(cx))).await;
+            Some(async move {
+                match ready {
+                    Poll::Ready(guard) => guard,
+                    Poll::Pending => acquire.await,
+                }
+            })
+        } else {
+            None
+        };
+        let worker = self.clone();
         tokio::spawn(async move {
             tokio::select! {
                 () = cancellation.cancelled() => {},
-                _ = dispatch(&directory, &channel, router, request, wait, credit, permit) => {},
+                _ = worker.dispatch(&channel, request, credit, control, order) => {},
             }
-            active.lock().expect("affinity worker lock").remove(&id);
+            let mut active = worker.active.lock().expect("affinity worker lock");
+            active.requests.remove(&id);
+            if let Some((session, lock)) = ordering
+                && Arc::strong_count(&lock) == 1
+            {
+                active.sessions.remove(&session);
+            }
         });
+    }
+
+    async fn dispatch(
+        &self,
+        channel: &str,
+        request: WireRequest,
+        credit: mpsc::Receiver<()>,
+        control: bool,
+        order: Option<impl Future<Output = OwnedMutexGuard<()>>>,
+    ) -> io::Result<()> {
+        let (_ordered, _permit) = timeout(self.wait, async {
+            let ordered = if let Some(order) = order {
+                match timeout(self.lock_timeout, order).await {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        tracing::debug!("MCP affinity exceeded the per-session lock timeout");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let permits = if control {
+                &self.control_permits
+            } else {
+                &self.permits
+            };
+            let permit = if request.method == "GET" {
+                None
+            } else {
+                Some(permits.acquire().await.map_err(io::Error::other)?)
+            };
+            Ok::<_, io::Error>((ordered, permit))
+        })
+        .await??;
+        dispatch(
+            &self.directory,
+            channel,
+            self.router.clone(),
+            request,
+            self.wait,
+            credit,
+        )
+        .await
     }
 }
 
@@ -421,7 +524,6 @@ async fn dispatch(
     request: WireRequest,
     wait: Duration,
     mut credit: mpsc::Receiver<()>,
-    permit: OwnedSemaphorePermit,
 ) -> io::Result<()> {
     let response = match request.into_request() {
         Some(request) => match timeout(wait, router.oneshot(request)).await {
@@ -431,8 +533,6 @@ async fn dispatch(
         },
         None => relay_error(StatusCode::BAD_REQUEST, "Invalid forwarded MCP request"),
     };
-    // Open SSE streams hold a response body, not a dispatch slot.
-    drop(permit);
     send_frame(
         directory,
         reply,

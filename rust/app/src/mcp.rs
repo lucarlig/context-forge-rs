@@ -82,6 +82,7 @@ pub struct SessionSettings {
     pub redis: Option<Arc<RedisSessionDirectory>>,
     pub affinity_forward_timeout: Duration,
     pub affinity_forward_concurrency: usize,
+    pub affinity_session_lock_timeout: Duration,
 }
 
 impl Default for SessionSettings {
@@ -95,6 +96,7 @@ impl Default for SessionSettings {
             redis: None,
             affinity_forward_timeout: Duration::from_secs(30),
             affinity_forward_concurrency: 32,
+            affinity_session_lock_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -132,6 +134,7 @@ pub(crate) fn router(
             sessions.redis.as_ref()?.clone(),
             sessions.affinity_forward_timeout,
             sessions.affinity_forward_concurrency,
+            sessions.affinity_session_lock_timeout,
             sessions.shutdown.clone(),
         ))
     });
@@ -152,8 +155,15 @@ pub(crate) fn router(
             service,
         }));
     let router = gateway.access.protect_mcp(router, require_auth);
-    if let Some((redis, timeout, concurrency, shutdown)) = relay {
-        affinity::spawn(redis, router.clone(), timeout, concurrency, shutdown);
+    if let Some((redis, timeout, concurrency, lock_timeout, shutdown)) = relay {
+        affinity::spawn(
+            redis,
+            router.clone(),
+            timeout,
+            concurrency,
+            lock_timeout,
+            shutdown,
+        );
     }
     router
 }

@@ -1005,7 +1005,9 @@ async fn fixture_progress(
             "protocolVersion":PROTOCOL, "capabilities":{"tools":{}},
             "serverInfo":{"name":"progress fixture","version":"1"}
         }),
-        "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+        "notifications/initialized" | "notifications/cancelled" => {
+            return StatusCode::ACCEPTED.into_response();
+        }
         "tools/list" => json!({"tools":[{"name":"hold","inputSchema":{"type":"object"}}]}),
         "tools/call" => {
             let token = body["params"]["_meta"]["progressToken"].clone();
@@ -2015,4 +2017,136 @@ async fn redis_affinity_relays_post_and_passive_streams_across_workers() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable Redis or Valkey database in REDIS_URL"]
+async fn redis_affinity_orders_forwarded_posts_until_the_session_lock_timeout() {
+    use context_forge_rs::{config::RedisSettings, mcp::RedisSessionDirectory};
+    use tokio_util::sync::CancellationToken;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let upstream = Running::start(
+        Router::new()
+            .route("/mcp", post(fixture_progress))
+            .with_state(release.clone()),
+    )
+    .await;
+    let database = database().await;
+    let gateway = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let settings = RedisSettings {
+        url: std::env::var("REDIS_URL").unwrap(),
+        connect_timeout: Duration::from_secs(2),
+        response_timeout: Duration::from_secs(2),
+    };
+    let shutdown = CancellationToken::new();
+    let _stop = shutdown.clone().drop_guard();
+    let router = || {
+        gateway.mcp_router_with_options(
+            false,
+            ProtocolMode::Legacy,
+            HttpOptions {
+                json_response: false,
+                sessions: Some(SessionSettings {
+                    redis: Some(Arc::new(RedisSessionDirectory::new(&settings).unwrap())),
+                    affinity_forward_concurrency: 2,
+                    affinity_session_lock_timeout: Duration::from_millis(600),
+                    shutdown: shutdown.clone(),
+                    ..SessionSettings::default()
+                }),
+            },
+        )
+    };
+    let first = Running::start(gateway.registration_router().merge(router())).await;
+    let second = Running::start(router()).await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registration) = send(&client, first.url("/gateways"), json!({
+        "name":"queue","url":upstream.url("/mcp"),"visibility":"public","transport":"STREAMABLEHTTP"
+    }), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{registration}");
+    let post = |worker: &Running, body: Value| {
+        client
+            .post(worker.url("/mcp/"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", PROTOCOL)
+            .body(body.to_string())
+    };
+    let initialized = post(&first, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }})).send().await.unwrap();
+    assert_eq!(initialized.status(), StatusCode::OK);
+    let session = initialized.headers()["mcp-session-id"].clone();
+
+    let call = |id: &str, wait: bool| {
+        post(
+            &second,
+            json!({
+                "jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                    "name":"queue-hold","arguments":{"wait":wait},"_meta":{"progressToken":id}
+                }
+            }),
+        )
+        .header("mcp-session-id", &session)
+    };
+    let mut holding = call("held", true).send().await.unwrap();
+    assert_eq!(holding.status(), StatusCode::OK);
+    let mut buffered = Vec::new();
+    let (_, progress) = next_sse_message(&mut holding, &mut buffered).await;
+    assert_eq!(progress["params"]["progressToken"], "held");
+    let mut queued = Box::pin(call("queued", false).send());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut queued)
+            .await
+            .is_err()
+    );
+    let mut queued = tokio::time::timeout(Duration::from_secs(3), queued)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.status(), StatusCode::OK);
+    let mut queued_buffer = Vec::new();
+    let queued_progress = next_sse_message(&mut queued, &mut queued_buffer);
+    let mut queued_progress = Box::pin(queued_progress);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut queued_progress)
+            .await
+            .is_err()
+    );
+    release.add_permits(1);
+    let (_, result) = next_sse_message(&mut holding, &mut buffered).await;
+    assert_eq!(result["id"], "held");
+    let (_, progress) = queued_progress.await;
+    assert_eq!(progress["params"]["progressToken"], "queued");
+    assert!(queued.text().await.unwrap().contains("\"id\":\"queued\""));
+
+    let mut holding = call("cancelled", true).send().await.unwrap();
+    assert_eq!(holding.status(), StatusCode::OK);
+    buffered.clear();
+    let (_, progress) = next_sse_message(&mut holding, &mut buffered).await;
+    assert_eq!(progress["params"]["progressToken"], "cancelled");
+    let cancel = post(&second, json!({"jsonrpc":"2.0","method":"notifications/cancelled", "params":{"requestId":"cancelled"}}))
+        .header("mcp-session-id", &session).send().await.unwrap();
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    let (_, cancelled) = next_sse_message(&mut holding, &mut buffered).await;
+    assert_eq!(cancelled["error"]["code"], -32800);
 }

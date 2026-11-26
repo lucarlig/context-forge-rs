@@ -66,11 +66,13 @@ Redis makes passive GET available on any worker with or without POST affinity. T
 
 Requests can reach any worker with access to the same Redis cache. The owning worker authenticates the relayed request and serves POST, passive GET, or DELETE. Redis Pub/Sub carries response chunks. Credits bound the relay to one pending chunk per request. A live test used two native processes for POST and DELETE. The Rust integration test also covers forwarded POST SSE, concurrent passive GET, recovery after a client disconnect, authorization, and stream closure after deletion.
 
+The pinned gateway dispatched two forwarded calls to the same upstream in order. Rust queues forwarded POSTs per session before applying `MCPGATEWAY_AFFINITY_FORWARD_CONCURRENCY`. `MCPGATEWAY_AFFINITY_SESSION_LOCK_TIMEOUT` bounds the ordering wait and defaults to 30 seconds. Passive GET and cancellation can proceed while a POST is in flight. Calls sharing an upstream association remain serialized after the forwarding lock times out. A live Rust test covers the timeout and forwarded cancellation.
+
 ```sh
 REDIS_URL=redis://127.0.0.1:6379/0 \
   cargo test --locked --lib redis_sessions::tests -- --ignored
 REDIS_URL=redis://127.0.0.1:6379/0 \
-  cargo test --locked --test gateway redis_affinity_relays -- --ignored
+  cargo test --locked --test gateway redis_affinity -- --ignored
 ```
 
 The public legacy JSON profile produced eight recordings with rust-anything v5.0.1. The original matched all eight and Rust matched seven. The remaining initialization difference includes the Rust version and the current capability set and instructions. Missing-session POST and DELETE errors and rejected POST Accept headers before initialization include a temporary session ID. The live test verifies that reusing the ID from either missing-session error yields `404`.

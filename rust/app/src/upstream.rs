@@ -250,6 +250,7 @@ pub struct DiscoveredCatalog {
 pub(crate) struct UpstreamAssociation {
     lifetime: Arc<SessionLifetime>,
     connection: Mutex<Option<AssociatedConnection>>,
+    operation: Mutex<()>,
 }
 
 struct AssociatedConnection {
@@ -268,6 +269,7 @@ impl UpstreamAssociation {
         Self {
             lifetime,
             connection: Mutex::new(None),
+            operation: Mutex::new(()),
         }
     }
 
@@ -387,6 +389,17 @@ impl UpstreamClient {
         params.arguments.get_or_insert_default();
         let request = CallToolRequest::new(params);
         let deadline = self.deadline()?;
+        let _operation = if let Some(association) = association {
+            Some(tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(UpstreamError::Cancelled),
+                lock = timeout_at(deadline, association.operation.lock()) => {
+                    lock.map_err(|_| UpstreamError::Timeout)?
+                }
+            })
+        } else {
+            None
+        };
         let session = match association {
             Some(association) => association.session(self, url, deadline, &context).await?,
             None => Arc::new(self.open_session(url, deadline).await?),
