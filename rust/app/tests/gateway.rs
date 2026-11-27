@@ -79,11 +79,16 @@ async fn rest_tool_calls_require_visibility_and_execute_scope_before_dispatch() 
     };
     sqlx::query(
         "INSERT INTO tools (id, name, original_name, custom_name, custom_name_slug, url,
-                integration_type, request_type, input_schema, visibility, team_id)
+                integration_type, request_type, input_schema, visibility, team_id, output_schema)
          VALUES ('rest', 'team-rest', 'team-rest', 'team-rest', 'team-rest', $1,
-                'REST', 'POST', '{\"type\":\"object\"}', 'team', 'alpha')",
+                'REST', 'POST', $2, 'team', 'alpha', $3)",
     )
     .bind(upstream.url("/items/{item}?signed=a%2Bb"))
+    .bind(json!({"type":"object","properties":{"value":{"type":["string","integer"]}}}).to_string())
+    .bind(
+        json!({"type":"object","properties":{"body":{"properties":{"value":{"type":"integer"}}}}})
+            .to_string(),
+    )
     .execute(pool)
     .await
     .unwrap();
@@ -113,12 +118,12 @@ async fn rest_tool_calls_require_visibility_and_execute_scope_before_dispatch() 
         json!(["alpha"]),
         json!({"permissions":["tools.read"]}),
     );
-    let call = async |credential: &str, item: &str| {
+    let call = async |credential: &str, item: &str, value: Value| {
         send(
             &client,
             gateway.url("/mcp/"),
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                "params":{"name":"team-rest","arguments":{"item":item,"value":42}}}),
+                "params":{"name":"team-rest","arguments":{"item":item,"value":value}}}),
             Some(credential),
         )
         .await
@@ -129,20 +134,51 @@ async fn rest_tool_calls_require_visibility_and_execute_scope_before_dispatch() 
         (&read_only, "demo"),
         (&member, "a/../b"),
     ] {
-        let response = call(credential, item).await;
+        let response = call(credential, item, json!(42)).await;
         assert!(
             response["error"].is_object() || response["result"]["isError"] == true,
             "{response}"
         );
         assert_eq!(hits.load(Ordering::Relaxed), 0);
     }
-    let response = call(&member, "blue").await;
+    let invalid = call(&member, "blue", json!(false)).await;
+    assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+    assert!(
+        invalid["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(
+                "Invalid arguments for tool 'team-rest': False is not of type 'string', 'integer'"
+            ),
+        "{invalid}"
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    let response = call(&member, "blue", json!(42)).await;
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("REST invocation failed: {response}"));
     let body: Value = serde_json::from_str(text).unwrap();
     assert_eq!(body, json!({"name":"blue","body":{"value":42}}));
     assert_eq!(hits.load(Ordering::Relaxed), 1);
+
+    let response = call(&member, "blue", json!("wrong")).await;
+    let result = &response["result"];
+    assert_eq!(result["isError"], true, "{response}");
+    assert_eq!(
+        result["structuredContent"],
+        json!({"name":"blue","body":{"value":"wrong"}}),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+        json!({
+            "code":"type",
+            "expected":"integer",
+            "received":"str",
+            "path":["body","value"],
+            "message":"'wrong' is not of type 'integer'"
+        }),
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
 }
 
 type SseFixtureSessions = Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;

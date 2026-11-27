@@ -168,8 +168,16 @@ Linked credentials apply only to the gateway's origin. REST calls also honor
 stored gateway identity settings. Ten scenarios verify signatures, retry counts,
 request bodies, and response limits on SQLite and PostgreSQL. A live check
 verifies that only the token endpoint receives the caller's JWT during exchange,
-even with authorization forwarding enabled. Exact output-schema validation
-diagnostics remain open.
+even with authorization forwarding enabled.
+
+REST calls validate arguments before dispatch and preserve the response data
+when output validation fails. The replays cover 53 invocation scenarios on
+SQLite and PostgreSQL, including nested error paths, local schema references,
+older schema drafts, regex subject limits, and malformed HTTP responses. They
+also compare catalog schemas and result shaping for 2025 and 2026 clients.
+Rust validates offline with native regex limits. The reference sandbox's
+wall-clock timeout and unusual parser diagnostics still need parity checks.
+The public `/rpc` tool invocation path remains open.
 
 `POST /v1/tools/generate-schemas-from-openapi` generates schemas for a selected
 operation. It requires `tools.create` and accepts an explicit document URL or

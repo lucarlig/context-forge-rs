@@ -135,6 +135,7 @@ pub struct GatewayService {
     response_filters: crate::response_filter::ResponseFilters,
     rest_timeout: Duration,
     rest_response_text_limit: usize,
+    regex_max_subject_bytes: usize,
     openapi: openapi::Documents,
     export: ExportSettings,
     imports: import_api::Imports,
@@ -241,6 +242,7 @@ impl GatewayService {
             response_filters: crate::response_filter::ResponseFilters::default(),
             rest_timeout: Duration::from_secs(60),
             rest_response_text_limit: 5000,
+            regex_max_subject_bytes: 262_144,
             openapi: openapi::Documents::default(),
             export: ExportSettings::default(),
             imports: import_api::Imports::default(),
@@ -263,6 +265,11 @@ impl GatewayService {
     pub fn with_rest_tool_limits(mut self, timeout: Duration, response_text_limit: usize) -> Self {
         self.rest_timeout = timeout;
         self.rest_response_text_limit = response_text_limit;
+        self
+    }
+
+    pub fn with_regex_max_subject_bytes(mut self, bytes: usize) -> Self {
+        self.regex_max_subject_bytes = bytes;
         self
     }
 
@@ -716,7 +723,9 @@ impl GatewayService {
                     return tokio::select! {
                         biased;
                         () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
-                        result = rest_tool::execute(self, &tool, rest, &request, principal, context.request_headers) => result,
+                        result = rest_tool::execute(self, &tool, rest, &request, principal, context.request_headers) => {
+                            result.map(|value| rest_tool::for_caller(value, context.client_capabilities.is_some()))
+                        }
                     };
                 }
                 let transport = UpstreamTransport::from_name(&tool.gateway_transport);

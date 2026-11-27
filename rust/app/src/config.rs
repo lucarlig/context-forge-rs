@@ -145,6 +145,14 @@ impl Settings {
         Ok((timeout, chars))
     }
 
+    pub fn regex_max_subject_bytes() -> Result<usize, Box<dyn Error + Send + Sync>> {
+        let bytes = parse("REGEX_MAX_SUBJECT_BYTES", 262_144)?;
+        if !(1024..=10_485_760).contains(&bytes) {
+            return Err("invalid REGEX_MAX_SUBJECT_BYTES".into());
+        }
+        Ok(bytes)
+    }
+
     pub fn response_filters()
     -> Result<crate::response_filter::ResponseFilters, Box<dyn Error + Send + Sync>> {
         let workers = parse("CEL_FILTER_WORKERS", 2)?;

@@ -1369,7 +1369,13 @@ async fn list_tools(
         .list_tools(principal, server, cursor.as_deref())
         .await
     {
-        Ok(page) => rpc_success(id, page),
+        Ok(mut page) => {
+            for tool in &mut page.tools {
+                tool.output_schema
+                    .take_if(|schema| schema.get("type").and_then(Value::as_str) != Some("object"));
+            }
+            rpc_success(id, page)
+        }
         Err(error) => tool_error(id, error),
     }
 }

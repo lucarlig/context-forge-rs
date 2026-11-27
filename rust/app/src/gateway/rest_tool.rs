@@ -14,6 +14,8 @@ use crate::{
     sigv4::{SigV4Config, has_query_signature},
 };
 
+mod diagnostics;
+
 const URL_VALUE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
@@ -31,6 +33,33 @@ pub(super) async fn execute(
 ) -> Result<Value, ToolError> {
     if config.pending_policy {
         return tool_result_error("REST tool requires an unavailable invocation policy");
+    }
+    let arguments = params.arguments.clone().unwrap_or_default();
+    let input_schema = &tool.definition.input_schema;
+    if input_schema.as_object().is_some_and(|fields| {
+        !fields.is_empty() && !(fields.len() == 1 && fields.get("type") == Some(&json!("object")))
+    }) {
+        let schema = input_schema.clone();
+        let data = Value::Object(arguments.clone());
+        let limit = service.regex_max_subject_bytes;
+        let validation = tokio::task::spawn_blocking(move || {
+            diagnostics::validate(&schema, &data, diagnostics::Target::Input, limit)
+        })
+        .await;
+        match validation {
+            Ok(None) => {}
+            Ok(Some(error)) => {
+                return tool_result_error(format!(
+                    "Invalid arguments for tool '{}': {error}",
+                    params.name
+                ));
+            }
+            Err(_) => {
+                return tool_result_error(
+                    "Input validation error: REST validation could not complete",
+                );
+            }
+        }
     }
     let connection = if tool.needs_upstream_config {
         let version = tool.gateway_version.ok_or(ToolError::Unavailable)?;
@@ -62,7 +91,6 @@ pub(super) async fn execute(
     if inherited_signer && gateway_signer.is_none() {
         return tool_result_error("Tool invocation failed: SigV4 tool has no stored credentials");
     }
-    let arguments = params.arguments.clone().unwrap_or_default();
     let (mut credentials, managed) = match stored_credentials(service, config, gateway_signer) {
         Ok(config) => config,
         Err(_) if uses_signer => {
@@ -156,6 +184,7 @@ pub(super) async fn execute(
             &service.response_filters,
             &tool.response_filter,
             service.rest_response_text_limit,
+            service.regex_max_subject_bytes,
             status,
             &body,
             tool.definition.output_schema.as_ref(),
@@ -564,6 +593,7 @@ async fn response_result(
     filters: &crate::response_filter::ResponseFilters,
     expression: &str,
     text_limit: usize,
+    regex_max_subject_bytes: usize,
     status: StatusCode,
     body: &[u8],
     output_schema: Option<&Value>,
@@ -574,6 +604,7 @@ async fn response_result(
     let text = String::from_utf8_lossy(body);
     let bounded: String = text.chars().take(text_limit).collect();
     let json_body: Result<Value, _> = serde_json::from_slice(body);
+    let output_schema = output_schema.filter(|value| !value.as_object().is_some_and(Map::is_empty));
     let success = matches!(status.as_u16(), 200 | 201 | 202 | 206);
     if !success {
         let message = match &json_body {
@@ -589,11 +620,14 @@ async fn response_result(
                 }),
             Ok(_) if status.is_success() => "Tool error encountered".into(),
             Ok(_) => format!("HTTP {}: {bounded}", status.as_u16()),
-            Err(_) if body.is_empty() => format!("HTTP {}: Empty response body", status.as_u16()),
-            Err(_) => format!(
-                "HTTP {}: Response body is not valid JSON.\n{bounded}",
-                status.as_u16()
-            ),
+            Err(error) => {
+                let diagnostic = diagnostics::parse_error(error, &text, &bounded, text_limit);
+                if status.is_success() {
+                    diagnostic
+                } else {
+                    format!("HTTP {}: {diagnostic}", status.as_u16())
+                }
+            }
         };
         let mut result = text_result(message, true);
         if !status.is_success() {
@@ -604,13 +638,9 @@ async fn response_result(
 
     let result = match json_body {
         Ok(value) => value,
-        Err(_) if output_schema.is_some() => {
+        Err(error) if output_schema.is_some() => {
             return text_result(
-                if body.is_empty() {
-                    "Empty response body".into()
-                } else {
-                    format!("Response body is not valid JSON.\n{bounded}")
-                },
+                diagnostics::parse_error(&error, &text, &bounded, text_limit),
                 true,
             );
         }
@@ -629,7 +659,7 @@ async fn response_result(
             false,
         )
     });
-    if let Some(schema) = output_schema.filter(|schema| *schema != &json!({}))
+    if let Some(schema) = output_schema
         && response["isError"] != true
     {
         let parsed_text = wrapped
@@ -643,26 +673,67 @@ async fn response_result(
             })
             .flatten();
         let data = if wrapped {
-            response.get("structuredContent").or(parsed_text.as_ref())
+            response
+                .get("structuredContent")
+                .or(parsed_text.as_ref().filter(|value| !value.is_null()))
         } else {
-            Some(&result)
+            (!result.is_null()).then_some(&result)
         };
-        let Some(data) = data else {
-            return text_result(
-                "Output validation error: outputSchema defined but no structured output returned",
-                true,
-            );
-        };
-        let validator = jsonschema::options().offline().build(schema);
-        if validator.is_err() || !validator.is_ok_and(|validator| validator.is_valid(data)) {
-            return text_result(
-                "Output validation error: REST response does not match outputSchema",
-                true,
-            );
+        if let Some(data) = data {
+            let data = data.clone();
+            let schema = schema.clone();
+            let validation = tokio::task::spawn_blocking(move || {
+                let error = diagnostics::validate(
+                    &schema,
+                    &data,
+                    diagnostics::Target::Output,
+                    regex_max_subject_bytes,
+                );
+                (data, error)
+            })
+            .await;
+            let Ok((data, error)) = validation else {
+                return text_result(
+                    "Output validation error: REST validation could not complete",
+                    true,
+                );
+            };
+            if let Some(error) = error {
+                response["content"] = json!([ContentBlock::text(error)]);
+                response["isError"] = json!(true);
+            }
+            response["structuredContent"] = data;
         }
-        response["structuredContent"] = data.clone();
     }
     response
+}
+
+pub(super) fn for_caller(mut result: Value, modern: bool) -> Value {
+    let Some(fields) = result.as_object_mut() else {
+        return result;
+    };
+    if fields.get("structuredContent").is_some_and(Value::is_null) {
+        fields.remove("structuredContent");
+    } else if !modern
+        && fields
+            .get("structuredContent")
+            .is_some_and(|value| !value.is_object())
+    {
+        let data = fields
+            .remove("structuredContent")
+            .expect("structured content");
+        if let Some(content) = fields.get_mut("content").and_then(Value::as_array_mut)
+            && !content.iter().any(|block| {
+                block["type"] == "text"
+                    && block["text"].as_str().is_some_and(|text| {
+                        serde_json::from_str::<Value>(text).is_ok_and(|value| value == data)
+                    })
+            })
+        {
+            content.push(json!(ContentBlock::text(data.to_string())));
+        }
+    }
+    result
 }
 
 fn mcp_envelope(result: &Value) -> Option<Value> {
