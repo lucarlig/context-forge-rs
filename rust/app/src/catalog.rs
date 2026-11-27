@@ -1663,25 +1663,31 @@ pub(crate) fn prompt_argument_schema(prompt: &rmcp::model::Prompt) -> Value {
 }
 
 pub(crate) fn slugify(value: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
+    slugify_with_separator(value, "-")
+}
 
+pub(crate) fn slugify_with_separator(value: &str, delimiter: &str) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+
+    let is_alphanumeric =
+        |character: char| character.is_alphanumeric() && !is_combining_mark(character);
+    let is_word = |character: char| is_alphanumeric(character) || character == '_';
     let lower = value.to_lowercase();
     let mut letters = lower.chars().peekable();
+    let mut contracted = String::with_capacity(lower.len());
+    while let Some(character) = letters.next() {
+        contracted.push(character);
+        if is_word(character) && letters.next_if_eq(&'\'').is_some() {
+            contracted.push(letters.next_if(|next| is_word(*next)).unwrap_or('\''));
+        }
+    }
+
     let mut result = String::new();
     let mut separator = false;
-    let mut previous = None;
-    while let Some(character) = letters.next() {
-        if character == '\''
-            && previous.is_some_and(char::is_alphanumeric)
-            && letters
-                .peek()
-                .is_some_and(|character| character.is_alphanumeric())
-        {
-            continue;
-        }
-        if character.is_alphanumeric() {
+    for character in contracted.chars() {
+        if is_alphanumeric(character) {
             if separator && !result.is_empty() {
-                result.push('-');
+                result.push_str(delimiter);
             }
             match character {
                 'æ' => result.push_str("ae"),
@@ -1693,7 +1699,6 @@ pub(crate) fn slugify(value: &str) -> String {
         } else {
             separator = true;
         }
-        previous = Some(character);
     }
     result.nfkd().filter(char::is_ascii).collect()
 }

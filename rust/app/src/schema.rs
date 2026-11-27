@@ -3,7 +3,7 @@
 use std::error::Error;
 
 use crate::{
-    catalog::CATALOG_LOCK,
+    catalog::{CATALOG_LOCK, slugify_with_separator},
     config::{Settings, flag},
     database::Database,
 };
@@ -11,7 +11,55 @@ use crate::{
 const IDENTITY: &str = include_str!("../migrations/001_identity.sql");
 const CATALOG: &str = include_str!("../migrations/002_catalog.sql");
 const LEGACY_SSE: &str = include_str!("../migrations/003_legacy_sse.sql");
-const MIGRATIONS: [&str; 3] = ["identity", "catalog", "legacy_sse"];
+const MIGRATIONS: [&str; 4] = ["identity", "catalog", "legacy_sse", "historical_catalog"];
+
+type ColumnDefinition = (&'static str, &'static str);
+
+const CATALOG_AUDIT_COLUMNS: [ColumnDefinition; 11] = [
+    ("created_by", "VARCHAR(255)"),
+    ("created_from_ip", "VARCHAR(45)"),
+    ("created_via", "VARCHAR(100)"),
+    ("created_user_agent", "TEXT"),
+    ("modified_by", "VARCHAR(255)"),
+    ("modified_from_ip", "VARCHAR(45)"),
+    ("modified_via", "VARCHAR(100)"),
+    ("modified_user_agent", "TEXT"),
+    ("import_batch_id", "VARCHAR(36)"),
+    ("federation_source", "VARCHAR(255)"),
+    ("version", "INTEGER NOT NULL DEFAULT 1"),
+];
+
+const HISTORICAL_COLUMNS: &[(&str, &[ColumnDefinition])] = &[
+    ("sso_providers", &[("ca_certificate", "TEXT")]),
+    ("oauth_states", &[("browser_binding_hash", "VARCHAR(64)")]),
+    (
+        "gateways",
+        &[
+            ("upstream_instructions", "TEXT"),
+            ("tool_validation_policy", "TEXT"),
+            ("sigv4_config", "JSON"),
+        ],
+    ),
+    (
+        "tools",
+        &[
+            ("tool_validation_policy", "TEXT"),
+            ("validation_refusal", "TEXT"),
+            ("sigv4_config", "JSON"),
+        ],
+    ),
+    (
+        "servers",
+        &[
+            ("instructions", "TEXT"),
+            ("oauth_config_approved", "BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("oauth_config_generation", "VARCHAR(32)"),
+        ],
+    ),
+];
+
+const RESOURCE_NAME_COLUMNS: [ColumnDefinition; 2] =
+    [("original_name", "TEXT"), ("custom_name_slug", "TEXT")];
 
 const CREATE_HISTORY: &str = "
     CREATE TABLE IF NOT EXISTS context_forge_schema_migrations (
@@ -65,74 +113,80 @@ pub async fn cli(
     }
 }
 
-macro_rules! catalog_audit_columns {
-    ($prefix:literal) => {
-        [
-            ("created_by", concat!($prefix, "created_by VARCHAR(255)")),
-            (
-                "created_from_ip",
-                concat!($prefix, "created_from_ip VARCHAR(45)"),
-            ),
-            ("created_via", concat!($prefix, "created_via VARCHAR(100)")),
-            (
-                "created_user_agent",
-                concat!($prefix, "created_user_agent TEXT"),
-            ),
-            ("modified_by", concat!($prefix, "modified_by VARCHAR(255)")),
-            (
-                "modified_from_ip",
-                concat!($prefix, "modified_from_ip VARCHAR(45)"),
-            ),
-            (
-                "modified_via",
-                concat!($prefix, "modified_via VARCHAR(100)"),
-            ),
-            (
-                "modified_user_agent",
-                concat!($prefix, "modified_user_agent TEXT"),
-            ),
-            (
-                "import_batch_id",
-                concat!($prefix, "import_batch_id VARCHAR(36)"),
-            ),
-            (
-                "federation_source",
-                concat!($prefix, "federation_source VARCHAR(255)"),
-            ),
-            (
-                "version",
-                concat!($prefix, "version INTEGER NOT NULL DEFAULT 1"),
-            ),
-        ]
-    };
+macro_rules! add_columns {
+    ($transaction:ident, $columns:expr, $table:expr, $definitions:expr) => {{
+        let table = $table;
+        let existing = sqlx::query_scalar::<_, String>($columns)
+            .bind(table)
+            .fetch_all(&mut *$transaction)
+            .await?;
+        let mut added = false;
+        for (name, data_type) in $definitions {
+            if !existing.iter().any(|column| column == name) {
+                // The revision supplies every identifier and type as static SQL.
+                let statement = sqlx::AssertSqlSafe(format!(
+                    "ALTER TABLE {table} ADD COLUMN {name} {data_type}"
+                ));
+                sqlx::query(statement).execute(&mut *$transaction).await?;
+                added = true;
+            }
+        }
+        added
+    }};
 }
 
-macro_rules! add_catalog_columns {
-    ($transaction:ident, $columns:expr) => {{
-        let resources = catalog_audit_columns!("ALTER TABLE resources ADD COLUMN ");
-        let prompts = catalog_audit_columns!("ALTER TABLE prompts ADD COLUMN ")
-            .into_iter()
-            .chain([(
-                "display_name",
-                "ALTER TABLE prompts ADD COLUMN display_name VARCHAR(255)",
-            )]);
-
-        macro_rules! add_columns {
-            ($table:expr, $definitions:expr) => {{
-                let existing = sqlx::query_scalar::<_, String>($columns)
-                    .bind($table)
-                    .fetch_all(&mut *$transaction)
-                    .await?;
-                for (name, statement) in $definitions {
-                    if !existing.iter().any(|column| column == name) {
-                        sqlx::query(statement).execute(&mut *$transaction).await?;
-                    }
-                }
-            }};
+macro_rules! backfill_resource_names {
+    ($transaction:ident, $separator:expr) => {{
+        loop {
+            let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT r.id, r.name, g.name FROM resources r
+                 LEFT JOIN gateways g ON r.gateway_id = g.id
+                 WHERE r.original_name IS NULL ORDER BY r.id LIMIT 500",
+            )
+            .fetch_all(&mut *$transaction)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+            for (id, original, gateway) in rows {
+                let slug = slugify_with_separator(&original, $separator);
+                let name = resource_name(&original, &slug, gateway.as_deref(), $separator);
+                sqlx::query(
+                    "UPDATE resources SET original_name = $1, custom_name_slug = $2, name = $3
+                     WHERE id = $4 AND original_name IS NULL",
+                )
+                .bind(original)
+                .bind(slug)
+                .bind(name)
+                .bind(id)
+                .execute(&mut *$transaction)
+                .await?;
+            }
         }
-        add_columns!("resources", resources);
-        add_columns!("prompts", prompts);
     }};
+}
+
+fn resource_name(original: &str, slug: &str, gateway: Option<&str>, separator: &str) -> String {
+    let gateway = gateway.map_or_else(String::new, |name| slugify_with_separator(name, separator));
+    if gateway.is_empty() {
+        return original.to_owned();
+    }
+    let mut name = gateway;
+    if !slug.is_empty() {
+        name.push_str(separator);
+        name.push_str(slug);
+    }
+    name.truncate(255);
+    name
+}
+
+fn resource_name_separator() -> &'static str {
+    match std::env::var("GATEWAY_TOOL_NAME_SEPARATOR").as_deref() {
+        Ok("--") => "--",
+        Ok("_") => "_",
+        Ok(".") => ".",
+        _ => "-",
+    }
 }
 
 impl Database {
@@ -187,12 +241,44 @@ impl Database {
                         }
                         1 => {
                             sqlx::raw_sql(CATALOG).execute(&mut *$transaction).await?;
-                            add_catalog_columns!($transaction, $columns);
+                            add_columns!(
+                                $transaction,
+                                $columns,
+                                "resources",
+                                CATALOG_AUDIT_COLUMNS
+                            );
+                            add_columns!(
+                                $transaction,
+                                $columns,
+                                "prompts",
+                                CATALOG_AUDIT_COLUMNS
+                                    .into_iter()
+                                    .chain([("display_name", "VARCHAR(255)")])
+                            );
                         }
                         2 => {
                             sqlx::raw_sql(LEGACY_SSE)
                                 .execute(&mut *$transaction)
                                 .await?;
+                        }
+                        3 => {
+                            for &(table, definitions) in HISTORICAL_COLUMNS {
+                                add_columns!(
+                                    $transaction,
+                                    $columns,
+                                    table,
+                                    definitions.iter().copied()
+                                );
+                            }
+                            if add_columns!(
+                                $transaction,
+                                $columns,
+                                "resources",
+                                RESOURCE_NAME_COLUMNS
+                            ) {
+                                let separator = resource_name_separator();
+                                backfill_resource_names!($transaction, separator);
+                            }
                         }
                         _ => unreachable!("unknown migration implementation"),
                     }
@@ -317,6 +403,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upgrades_historical_resources_and_oauth_configuration() {
+        let (database, pool) = database().await;
+        database.migrate_schema().await.unwrap();
+        sqlx::raw_sql(
+            "DELETE FROM context_forge_schema_migrations WHERE name = 'historical_catalog';
+             ALTER TABLE resources DROP COLUMN original_name;
+             ALTER TABLE resources DROP COLUMN custom_name_slug;
+             ALTER TABLE servers DROP COLUMN oauth_config_approved;
+             ALTER TABLE servers DROP COLUMN oauth_config_generation;
+             ALTER TABLE oauth_states DROP COLUMN browser_binding_hash;
+             INSERT INTO gateways (id, name, slug, url, transport)
+             VALUES ('peer', 'Research', 'old-slug', 'https://peer.example.test/mcp', 'STREAMABLEHTTP');
+             INSERT INTO resources (id, uri, name, gateway_id) VALUES
+                 ('local', 'fixture://local', 'Local Document', NULL),
+                 ('remote', 'fixture://remote', 'Café a''b''c', 'peer');
+             INSERT INTO servers (id, name, oauth_enabled, oauth_config)
+             VALUES ('server', 'Existing server', TRUE, '{\"provider\":\"idp\"}');
+             INSERT INTO oauth_states (id, gateway_id, state, expires_at)
+             VALUES ('state', 'peer', 'fixture-state', '2027-01-01 00:00:00');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        database.migrate_schema().await.unwrap();
+        database.require_current_schema().await.unwrap();
+
+        let names: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT name, original_name, custom_name_slug FROM resources ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let separator = resource_name_separator();
+        assert_eq!(
+            names[0],
+            (
+                "Local Document".into(),
+                "Local Document".into(),
+                format!("local{separator}document")
+            )
+        );
+        assert_eq!(
+            names[1],
+            (
+                format!("research{separator}cafe{separator}ab{separator}c"),
+                "Café a'b'c".into(),
+                format!("cafe{separator}ab{separator}c")
+            )
+        );
+        let server: (bool, bool, Option<String>, String) = sqlx::query_as(
+            "SELECT oauth_enabled, oauth_config_approved, oauth_config_generation, oauth_config
+             FROM servers WHERE id = 'server'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(server, (true, false, None, "{\"provider\":\"idp\"}".into()));
+        let binding: Option<String> =
+            sqlx::query_scalar("SELECT browser_binding_hash FROM oauth_states WHERE id = 'state'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(binding, None);
+    }
+
+    #[tokio::test]
     async fn rolls_back_the_schema_and_ledger_if_an_upgrade_fails() {
         let (database, pool) = database().await;
         sqlx::query("CREATE TABLE gateways (id TEXT)")
@@ -343,19 +496,20 @@ mod tests {
     async fn rejects_history_from_a_newer_binary() {
         let (database, pool) = database().await;
         database.migrate_schema().await.unwrap();
+        let future = MIGRATIONS.len() as i32 + 1;
         sqlx::query(RECORD)
-            .bind(4_i32)
+            .bind(future)
             .bind("future")
             .execute(&pool)
             .await
             .unwrap();
         assert!(matches!(
             database.require_current_schema().await,
-            Err(MigrationError::InconsistentHistory(4))
+            Err(MigrationError::InconsistentHistory(version)) if version == future
         ));
         assert!(matches!(
             database.migrate_schema().await,
-            Err(MigrationError::InconsistentHistory(4))
+            Err(MigrationError::InconsistentHistory(version)) if version == future
         ));
     }
 }

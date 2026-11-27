@@ -59,8 +59,19 @@ Concurrent migration commands recorded each native revision once on both
 backends. SQLite also verified that skip mode rejects an uninitialized
 database and starts when the native history is current.
 
-Historical Alembic upgrades and the remaining upstream tables are still
-part of the database migration milestone.
+The historical catalog revision adds missing identity, OAuth, and MCP catalog
+columns. It namespaces legacy federated resources and records the original
+names. It preserves published names already customized by an operator.
+Existing OAuth configurations require approval when the revision adds the
+approval fields.
+
+Seeded fixtures start at the v1.0.11, v1.1.0, and v1.1.1 revisions in
+the pinned Alembic history. All eight replay cases match the reference column
+definitions and seeded rows for this revision on SQLite and PostgreSQL.
+The cases exercise custom resource name separators and verify idempotence.
+A live SQLite check exercises startup migration, resource lookup, and OAuth
+approval enforcement. Historical response-filter translation and additional
+upstream tables remain open.
 
 Configuration export supports full and selective requests at both API prefixes.
 The pinned 14-case suite matched native SQLite, SQLite initialized by the pinned
