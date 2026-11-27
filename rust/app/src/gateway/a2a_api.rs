@@ -11,6 +11,7 @@ use super::{catalog_api::*, *};
 use crate::catalog::{AgentLookup, AgentRecord, AgentWriteError};
 use crate::schema_validation::Target;
 
+mod lifecycle;
 mod protocol;
 mod push_configs;
 mod tasks;
@@ -23,7 +24,12 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
         router = router
             .route(base, get(list).post(register))
             .route(&format!("{base}/"), get(list).post(register))
-            .route(&format!("{base}/{{id}}"), get(detail))
+            .route(
+                &format!("{base}/{{id}}"),
+                get(detail).put(lifecycle::update).delete(lifecycle::remove),
+            )
+            .route(&format!("{base}/{{id}}/state"), post(lifecycle::set_state))
+            .route(&format!("{base}/{{id}}/toggle"), post(lifecycle::set_state))
             .route(&format!("{base}/invoke"), post(invoke_by_id))
             .route(&format!("{base}/{{name}}/invoke"), post(invoke_by_name))
             .route(&format!("{base}/{{name}}/jsonrpc"), post(raw_rpc))
@@ -123,13 +129,8 @@ async fn register(
     let name = input.name.trim();
     let endpoint = input.endpoint_url.trim();
     let binding = input.protocol_binding.as_deref();
-    let slug = slugify(name);
-    if slug.is_empty()
-        || name.chars().count() > 255
-        || slug.chars().count() > 255
-        || name.contains(['<', '>'])
-        || name.chars().any(char::is_control)
-        || endpoint.len() > 767
+    let slug = agent_slug(name)?;
+    if endpoint.len() > 767
         || input.agent_type.is_empty()
         || input.agent_type.len() > 50
         || input.protocol_version.len() > 10
@@ -261,6 +262,9 @@ async fn register(
                     ),
                 )
             }
+            AgentWriteError::Changed | AgentWriteError::ToolConflict => {
+                lifecycle::write_error(error, &record)
+            }
             AgentWriteError::Database(error) => error.into(),
         })?;
     app.subscriptions.changed(
@@ -269,6 +273,22 @@ async fn register(
         agent.owner_email.as_deref(),
     );
     Ok((StatusCode::CREATED, Json(read_agent(&agent))))
+}
+
+fn agent_slug(name: &str) -> Result<String, CatalogApiError> {
+    let slug = slugify(name);
+    if slug.is_empty()
+        || name.chars().count() > 255
+        || slug.chars().count() > 255
+        || name.contains(['<', '>'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(CatalogApiError::detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid A2A agent configuration",
+        ));
+    }
+    Ok(slug)
 }
 
 async fn list(
@@ -356,6 +376,23 @@ async fn find(
                 format!("A2A Agent not found with {field}: {key}"),
             )
         })
+}
+
+async fn owns_agent(
+    app: &GatewayService,
+    principal: &Principal,
+    agent: &AgentRecord,
+) -> Result<bool, CatalogApiError> {
+    if agent.owner_email.as_deref() == Some(principal.email.as_str()) || principal.is_global_admin()
+    {
+        return Ok(true);
+    }
+    if agent.visibility == "team"
+        && let Some(team) = agent.team_id.as_deref()
+    {
+        return Ok(app.database.team_owner(&principal.email, team).await?);
+    }
+    Ok(false)
 }
 
 #[derive(Deserialize)]
@@ -547,12 +584,7 @@ async fn invoke(
     match agent.auth_type.as_deref() {
         None | Some("none" | "") => {}
         Some("bearer" | "basic" | "authheaders") => {
-            let stored = agent.auth_value.as_deref().ok_or_else(fail)?;
-            let stored = if stored.starts_with(['"', '{']) {
-                stored.to_owned()
-            } else {
-                json!(stored).to_string()
-            };
+            let stored = agent.stored_headers().ok_or_else(fail)?;
             headers.extend(
                 decode_headers(app.credential_cipher.as_ref(), &stored).map_err(|_| fail())?,
             );

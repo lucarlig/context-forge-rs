@@ -809,7 +809,7 @@ type DirectGatewayRow = (
     String,
     bool,
 );
-#[derive(sqlx::FromRow)]
+#[derive(Default, sqlx::FromRow)]
 pub(crate) struct GatewayConnectionRow {
     pub(crate) kind: String,
     pub(crate) version: i32,

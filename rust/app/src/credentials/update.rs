@@ -14,6 +14,56 @@ pub(crate) enum UpdateAuthError {
 }
 
 impl AuthInput {
+    pub(crate) async fn apply_agent_update(
+        &mut self,
+        current: &mut GatewayConnectionRow,
+        cipher: Option<&CredentialCipher>,
+        query_hosts: Option<&HashSet<String>>,
+        url: &str,
+        url_changed: bool,
+    ) -> Result<bool, UpdateAuthError> {
+        let kind = self
+            .auth_type
+            .as_deref()
+            .map(|kind| kind.trim().to_ascii_lowercase());
+        if self.oauth_config.is_some()
+            || self.sigv4_config.is_some()
+            || kind.as_deref().is_some_and(|kind| {
+                !matches!(
+                    kind,
+                    "" | "none" | "basic" | "bearer" | "authheaders" | "query_param"
+                )
+            })
+        {
+            return Err(UpdateAuthError::Validation(
+                "Unsupported A2A authentication method",
+            ));
+        }
+        if url_changed && kind.as_deref().unwrap_or(&current.kind) == "query_param" {
+            validate_query_host(query_hosts, url)?;
+        }
+        if kind.as_deref() == Some(current.kind.as_str()) {
+            match current.kind.as_str() {
+                "basic" if self.auth_password.is_none() && self.auth_username.is_none() => {
+                    return Ok(false);
+                }
+                "basic" if self.auth_password.is_none() => {
+                    self.auth_password = Some(MASK.to_owned())
+                }
+                "bearer" if self.auth_token.is_none() => return Ok(false),
+                "authheaders"
+                    if self.auth_headers.is_none() && self.auth_header_value.is_none() =>
+                {
+                    return Ok(false);
+                }
+                "query_param" => self.auth_type = None,
+                _ => {}
+            }
+        }
+        self.apply_update(current, cipher, None, query_hosts, url)
+            .await
+    }
+
     pub(crate) fn has_update(&self) -> bool {
         self.auth_type.is_some()
             || self.auth_password.is_some()

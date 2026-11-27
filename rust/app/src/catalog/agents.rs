@@ -4,7 +4,9 @@ use super::entry_filters::fetch_catalog_entries;
 use super::*;
 use sqlx::types::Json as DbJson;
 
-#[derive(Serialize, sqlx::FromRow)]
+mod lifecycle;
+
+#[derive(Clone, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentRecord {
     pub(crate) id: String,
@@ -52,6 +54,16 @@ pub(crate) struct AgentRecord {
 }
 
 impl AgentRecord {
+    pub(crate) fn stored_headers(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.auth_value.as_deref().map(|stored| {
+            if stored.starts_with(['"', '{']) {
+                std::borrow::Cow::Borrowed(stored)
+            } else {
+                std::borrow::Cow::Owned(json!(stored).to_string())
+            }
+        })
+    }
+
     pub(crate) fn visible(&self, scope: CatalogScope<'_>) -> bool {
         scope.visible(
             &self.visibility,
@@ -71,6 +83,10 @@ pub(crate) enum AgentLookup<'a> {
 pub(crate) enum AgentWriteError {
     #[error("agent name is in use")]
     Duplicate { id: String, enabled: bool },
+    #[error("the associated MCP tool name is in use")]
+    ToolConflict,
+    #[error("agent changed during the request")]
+    Changed,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -105,6 +121,7 @@ const DUPLICATE: &str = "
        AND ($2 = 'public'
           OR ($2 = 'team' AND team_id = $3)
           OR ($2 = 'private' AND owner_email = $4 AND team_id IS NOT DISTINCT FROM $3))
+       AND id <> $5
     LIMIT 1";
 
 const INSERT_AGENT: &str = "
@@ -216,22 +233,14 @@ impl Database {
         let tool_id = (original_name.chars().count() <= 255)
             .then(|| uuid::Uuid::new_v4().simple().to_string());
         let tool_name = slugify(&original_name);
-        let description = format!(
-            "A2A Agent: {}",
-            agent.description.as_deref().unwrap_or(&agent.name)
-        );
+        let description = tool_description(agent);
         let input_schema = json!({
             "type":"object",
             "properties":{"query":{"type":"string","description":"User query","default":"Hello from ContextForge Admin UI test!"}},
             "required":["query"],
         });
         let annotations = json!({"title":format!("A2A Agent: {}", agent.name)});
-        let mut tags = agent.tags.0.as_array().cloned().unwrap_or_default();
-        for label in ["a2a", "agent"] {
-            if !tags.iter().any(|tag| tag["id"] == label) {
-                tags.push(json!({"id":label,"label":label}));
-            }
-        }
+        let tags = tool_tags(agent);
         macro_rules! insert {
             ($tx:ident) => {{
                 if let Some((id, enabled)) = sqlx::query_as::<_, (String, bool)>(DUPLICATE)
@@ -239,6 +248,7 @@ impl Database {
                     .bind(&agent.visibility)
                     .bind(&agent.team_id)
                     .bind(&agent.owner_email)
+                    .bind(&agent.id)
                     .fetch_optional(&mut *$tx)
                     .await?
                 {
@@ -318,4 +328,23 @@ impl Database {
         };
         Ok(())
     }
+}
+
+fn tool_description(agent: &AgentRecord) -> String {
+    let description = agent
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+        .unwrap_or(&agent.name);
+    format!("A2A Agent: {description}")
+}
+
+fn tool_tags(agent: &AgentRecord) -> Vec<Value> {
+    let mut tags = agent.tags.0.as_array().cloned().unwrap_or_default();
+    for label in ["a2a", "agent"] {
+        if !tags.iter().any(|tag| tag["id"] == label) {
+            tags.push(json!({"id":label,"label":label}));
+        }
+    }
+    tags
 }

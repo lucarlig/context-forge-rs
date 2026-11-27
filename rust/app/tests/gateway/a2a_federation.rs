@@ -33,7 +33,7 @@ async fn a2a_routes_and_mcp_tools_enforce_parent_scope_before_dispatch() {
         unreachable!()
     };
     sqlx::query(
-        "UPDATE roles SET permissions = '[\"a2a.create\",\"a2a.read\",\"a2a.invoke\",\"servers.use\",\"tools.read\",\"tools.execute\"]' WHERE id = 'developer'",
+        "UPDATE roles SET permissions = '[\"a2a.create\",\"a2a.read\",\"a2a.invoke\",\"a2a.update\",\"a2a.delete\",\"servers.use\",\"tools.read\",\"tools.execute\"]' WHERE id = 'developer'",
     )
     .execute(pool)
     .await
@@ -139,9 +139,86 @@ async fn a2a_routes_and_mcp_tools_enforce_parent_scope_before_dispatch() {
         .execute(pool)
         .await
         .unwrap();
-    let (_, result) = send(&client, gateway.url("/mcp/"), rpc_call, Some(&member)).await;
+    let (_, result) = send(
+        &client,
+        gateway.url("/mcp/"),
+        rpc_call.clone(),
+        Some(&member),
+    )
+    .await;
     assert_eq!(result["result"]["isError"], false, "{result}");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    let agent_url = gateway.url(&format!("/v1/a2a/{id}"));
+    let edit = |body: Value| {
+        client
+            .put(&agent_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+    };
+    assert_eq!(
+        edit(json!({"name":"anonymous"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        edit(json!({"name":"wrong-team"}))
+            .bearer_auth(&outsider)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let reader = token(
+        "member",
+        json!(["alpha"]),
+        json!({"permissions":["a2a.read"]}),
+    );
+    assert_eq!(
+        client
+            .delete(&agent_url)
+            .bearer_auth(reader)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let raw_ciphertext: String = serde_json::from_str(&stored).unwrap();
+    sqlx::query("UPDATE a2a_agents SET auth_value=$2 WHERE id=$1")
+        .bind(id)
+        .bind(&raw_ciphertext)
+        .execute(pool)
+        .await
+        .unwrap();
+    let updated = edit(json!({
+        "name":"renamed-agent","description":"Renamed","owner_email":"outsider@example.test",
+        "auth_type":"bearer","auth_token":"*****","passthrough_headers":null,
+    }))
+    .bearer_auth(&member)
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value = serde_json::from_slice(&updated.bytes().await.unwrap()).unwrap();
+    assert_eq!(updated["ownerEmail"], "member@example.test");
+    assert_eq!(updated["authValue"], "*****");
+    assert_eq!(updated["version"], 2);
+    let stored: String = sqlx::query_scalar("SELECT auth_value FROM a2a_agents WHERE id=$1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, raw_ciphertext);
+    let mut renamed_call = rpc_call;
+    renamed_call["params"]["name"] = "a2a-renamed-agent".into();
+    let (_, result) = send(&client, gateway.url("/mcp/"), renamed_call, Some(&member)).await;
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
 
     sqlx::query("UPDATE a2a_agents SET uaid = 'uaid:fixture' WHERE id = $1")
         .bind(id)
@@ -160,7 +237,7 @@ async fn a2a_routes_and_mcp_tools_enforce_parent_scope_before_dispatch() {
         "UPDATE a2a_agents SET uaid = NULL;
          CREATE TABLE a2a_agent_plugin_bindings
             (team_id TEXT, agent_name TEXT, plugin_id TEXT, mode TEXT);
-         INSERT INTO a2a_agent_plugin_bindings VALUES ('alpha', '*', 'fixture-policy', 'enforce');",
+         INSERT INTO a2a_agent_plugin_bindings VALUES ('alpha', 'renamed-agent', 'fixture-policy', 'enforce');",
     )
     .execute(pool)
     .await
@@ -173,7 +250,16 @@ async fn a2a_routes_and_mcp_tools_enforce_parent_scope_before_dispatch() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        edit(json!({"name":"would-drop-policy"}))
+            .bearer_auth(&member)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
 
     let disabled = Running::start(service(false).registration_router()).await;
     let (status, result) = send(
@@ -185,5 +271,15 @@ async fn a2a_routes_and_mcp_tools_enforce_parent_scope_before_dispatch() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(result["detail"]["error"], "a2a_disabled");
-    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        client
+            .delete(disabled.url(&format!("/a2a/{id}")))
+            .bearer_auth(&member)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 }

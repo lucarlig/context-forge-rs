@@ -317,14 +317,7 @@ pub(super) async fn manageable(
         .find_agent(access::catalog_scope(Some(principal)), AgentLookup::Id(id))
         .await?
         .ok_or_else(not_found)?;
-    let owner = agent.owner_email.as_deref() == Some(principal.email.as_str());
-    if owner || principal.is_global_admin() {
-        return Ok(agent);
-    }
-    if agent.visibility == "team"
-        && let Some(team) = agent.team_id.as_deref()
-        && app.database.team_owner(&principal.email, team).await?
-    {
+    if owns_agent(app, principal, &agent).await? {
         return Ok(agent);
     }
     Err(not_found())

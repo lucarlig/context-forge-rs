@@ -286,8 +286,18 @@ retries, ownership checks, and blocked callback destinations. A v1.1.2
 SQLite database retained its settings and ciphertext across migration and
 an identical retry.
 
-Agent updates, deletion, cards, OAuth, streaming with webhook delivery, and
-UAID routing remain open.
+Agent edits, activation, and deletion update the derived MCP tool in the same
+transaction. Edits preserve the tool ID and reject conflicting names. Delete
+removes task data, webhook settings, and catalog associations. The scope and
+permission checks also apply to the deprecated activation alias.
+
+Rust Anything matched the agent lifecycle on SQLite. The normalized
+PostgreSQL responses matched the pinned gateway. The deprecated `/toggle`
+route accepts authorized calls in Rust. The pinned route returned 401 for
+the replay caller. An adopted SQLite database passed credential retention,
+rotation, clearing, and metric deletion checks through the live gateway.
+
+Cards, OAuth, streaming with webhook delivery, and UAID routing remain open.
 
 ## Gateway management
 
