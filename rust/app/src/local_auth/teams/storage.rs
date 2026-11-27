@@ -108,7 +108,7 @@ macro_rules! team_permission {
 macro_rules! sync_member_role {
     ($tx:ident,$member:expr,$actor:expr,$settings:expr,$active:expr) => {{
         let member=&$member;
-        let owner=&$settings.owner_role;
+        let owner=&$settings.provisioning.owner_role;
         let viewer=&$settings.teams.member_role;
         let selected=if member.role=="owner" { owner } else { viewer };
         sqlx::query("UPDATE user_roles SET is_active=FALSE WHERE user_email=$1

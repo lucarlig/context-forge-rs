@@ -29,11 +29,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let database = Database::from_settings(&settings)?;
     let redis = settings.redis.as_ref().map(RedisProbe::new).transpose()?;
     let verifier = Settings::jwt_verifier()?;
+    let external_identity = Settings::sso_external_identity()?;
     let require_mcp_auth = Settings::mcp_requires_auth()?;
     let require_api_auth = Settings::api_requires_auth()?;
     let shutdown = CancellationToken::new();
     let sse = settings.gateway_sse_settings(shutdown.clone())?;
-    let catalog_available = verifier.is_some() || !require_mcp_auth;
+    let catalog_available = verifier.is_some() || external_identity.is_some() || !require_mcp_auth;
     if catalog_available {
         database.migrate_identity().await?;
         database.migrate_catalog().await?;
@@ -47,6 +48,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             verifier,
             Settings::invalidate_sessions_on_password_change()?,
         )
+        .with_external_identity(external_identity)
         .with_token_usage_logging(Settings::token_usage_logging()?),
     );
     let email_auth_enabled = Settings::email_auth_enabled()?;

@@ -13,7 +13,8 @@ use crate::{
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     local_auth::{
-        AccountSettings, ResetSettings, SsoSettings, TeamSettings,
+        AccountSettings, ExternalIdentitySettings, ResetSettings, SsoSettings, TeamSettings,
+        UserProvisioning,
         mail::{MailSettings, MailTls, Mailer},
     },
     mcp::{
@@ -422,8 +423,7 @@ impl Settings {
             bootstrap_require_change: enabled("ADMIN_REQUIRE_PASSWORD_CHANGE_ON_BOOTSTRAP", true)?,
             default_password: Zeroizing::new(value("DEFAULT_USER_PASSWORD", "changeme")?),
             public_registration: enabled("PUBLIC_REGISTRATION_ENABLED", false)?,
-            personal_teams: enabled("AUTO_CREATE_PERSONAL_TEAMS", true)?,
-            personal_team_prefix: value("PERSONAL_TEAM_PREFIX", "")?,
+            provisioning: Self::user_provisioning()?,
             teams: Self::account_teams()?,
             enforce_password_change: enabled("PASSWORD_CHANGE_ENFORCEMENT_ENABLED", true)?,
             detect_default_password: enabled("DETECT_DEFAULT_PASSWORD_ON_LOGIN", true)?,
@@ -451,14 +451,33 @@ impl Settings {
             csrf_httponly: enabled("CSRF_COOKIE_HTTPONLY", false)?,
             csrf_seconds,
             a2a_enabled: enabled("MCPGATEWAY_A2A_ENABLED", true)?,
-            admin_role: value("DEFAULT_ADMIN_ROLE", "platform_admin")?,
-            user_role: value("DEFAULT_USER_ROLE", "platform_viewer")?,
-            owner_role: value("DEFAULT_TEAM_OWNER_ROLE", "team_admin")?,
             page_size,
             max_page_size,
             kdf: Self::secret_kdf()?,
             sso: Self::sso()?,
         })
+    }
+
+    fn user_provisioning() -> Result<UserProvisioning, Box<dyn Error + Send + Sync>> {
+        Ok(UserProvisioning {
+            personal_teams: flag("AUTO_CREATE_PERSONAL_TEAMS")?.unwrap_or(true),
+            personal_team_prefix: value("PERSONAL_TEAM_PREFIX", "")?,
+            admin_role: value("DEFAULT_ADMIN_ROLE", "platform_admin")?,
+            user_role: value("DEFAULT_USER_ROLE", "platform_viewer")?,
+            owner_role: value("DEFAULT_TEAM_OWNER_ROLE", "team_admin")?,
+        })
+    }
+
+    pub fn sso_external_identity()
+    -> Result<Option<ExternalIdentitySettings>, Box<dyn Error + Send + Sync>> {
+        if !flag("SSO_API_TOKEN_AUTH_ENABLED")?.unwrap_or(false) {
+            return Ok(None);
+        }
+        Ok(Some(ExternalIdentitySettings {
+            upstream: Self::upstream_client()?,
+            provisioning: Self::user_provisioning()?,
+            internal_issuer: value("JWT_ISSUER", "mcpgateway")?,
+        }))
     }
 
     fn sso() -> Result<Option<SsoSettings>, Box<dyn Error + Send + Sync>> {

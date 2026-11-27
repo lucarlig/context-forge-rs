@@ -245,7 +245,7 @@ impl Database {
     pub(super) async fn create_local_user(
         &self,
         user: &NewUser,
-        settings: &AccountSettings,
+        settings: &UserProvisioning,
     ) -> Result<bool, sqlx::Error> {
         let roles: Vec<SystemRole> = serde_json::from_str(include_str!("system_roles.json"))
             .expect("built-in role data is valid");

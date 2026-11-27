@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod external;
 mod flow;
+mod identity;
 mod oidc;
 mod providers;
 
@@ -8,6 +10,7 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::{secret_envelope::SecretEnvelope, upstream::UpstreamClient};
+pub use external::ExternalIdentitySettings;
 
 pub(crate) struct SsoSettings {
     pub(crate) upstream: UpstreamClient,

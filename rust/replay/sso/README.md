@@ -13,3 +13,10 @@ audience, and nonce, and checked that the userinfo subject matched the ID
 token. The flow issued a gateway session for the new user and refused an
 unbound browser, a replay, the wrong nonce, an unverified email claim, and
 an attempt to sign in as an existing local account.
+
+External OIDC bearer authentication matched 16 HTTP responses after
+normalizing timestamps and first-login metadata. Both databases supported
+trusted human and service identities through MCP and REST. The checks
+covered the provider's configured audience, expiry, ID-token rejection,
+trusted domains, account binding, and disabling a provider. Rust reads the
+persisted login timestamp when constructing an account response.

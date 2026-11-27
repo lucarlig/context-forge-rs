@@ -23,6 +23,7 @@ use crate::{
     database::Database,
     identity::{Grant, Identity},
     jwt::{JwtError, JwtVerifier, TokenUse, VerifiedJwt, validate_time_restrictions},
+    local_auth::ExternalIdentitySettings,
     tokens::{ApiTokenRecord, TokenIdentity, TokenRequest, TokenReservation, TokenUsageRecord},
 };
 
@@ -40,6 +41,7 @@ pub struct Authorizer {
     verifier: Option<JwtVerifier>,
     invalidate_sessions_on_password_change: bool,
     log_token_usage: bool,
+    external: Option<ExternalIdentitySettings>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,11 +82,17 @@ impl Authorizer {
             verifier,
             invalidate_sessions_on_password_change,
             log_token_usage: true,
+            external: None,
         }
     }
 
     pub fn with_token_usage_logging(mut self, enabled: bool) -> Self {
         self.log_token_usage = enabled;
+        self
+    }
+
+    pub fn with_external_identity(mut self, settings: Option<ExternalIdentitySettings>) -> Self {
+        self.external = settings;
         self
     }
 
@@ -218,11 +226,17 @@ impl Authorizer {
         peer: Option<IpAddr>,
         server_id: Option<&str>,
     ) -> Result<Principal, AuthError> {
-        let verifier = self.verifier.as_ref().ok_or(AuthError::Invalid)?;
-        let jwt = verifier.verify(token).map_err(|error| match error {
-            JwtError::TimeRestricted | JwtError::InvalidTimeRestrictions => AuthError::Forbidden,
-            _ => AuthError::Invalid,
-        })?;
+        let jwt = match self
+            .verifier
+            .as_ref()
+            .map(|verifier| verifier.verify(token))
+        {
+            Some(Ok(jwt)) => jwt,
+            Some(Err(JwtError::TimeRestricted | JwtError::InvalidTimeRestrictions)) => {
+                return Err(AuthError::Forbidden);
+            }
+            _ => return self.authenticate_external(token).await,
+        };
         let tracked = if jwt.token_use() == TokenUse::Api
             && let Some(jti) = jwt.jti()
         {
@@ -294,6 +308,31 @@ impl Authorizer {
             catalog_scopes,
             is_admin: identity.is_admin,
             scopes,
+        })
+    }
+
+    async fn authenticate_external(&self, token: &str) -> Result<Principal, AuthError> {
+        let settings = self.external.as_ref().ok_or(AuthError::Invalid)?;
+        let (email, expires) = settings
+            .authenticate(&self.database, token)
+            .await?
+            .ok_or(AuthError::Invalid)?;
+        let identity = self
+            .database
+            .active_identity(Some(&email), None, None)
+            .await?
+            .ok_or(AuthError::Invalid)?;
+        let visibility = identity.session_visibility(&self.database).await?;
+        Ok(Principal {
+            email: identity.email,
+            visibility,
+            full_name: identity.full_name,
+            expires_at: Some(expires),
+            token_use: TokenUse::Session,
+            catalog_token: None,
+            catalog_scopes: None,
+            is_admin: identity.is_admin,
+            scopes: Vec::new(),
         })
     }
 

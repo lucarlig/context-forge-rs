@@ -207,8 +207,8 @@ pub(super) struct ProviderConfig {
     pub(super) jwks_uri: Option<String>,
     pub(super) ca_certificate: Option<String>,
     #[serde(default)]
-    trusted_for_api_auth: bool,
-    api_audience: Option<String>,
+    pub(super) trusted_for_api_auth: bool,
+    pub(super) api_audience: Option<String>,
     #[serde(default)]
     pub(super) trusted_domains: DbJson<Vec<String>>,
     #[serde(default = "default_scope")]
@@ -464,6 +464,24 @@ impl Database {
             Self::Sqlite(pool) => sqlx::query_as(GET).bind(id).fetch_optional(pool).await,
             Self::Postgres(pool) => sqlx::query_as(GET).bind(id).fetch_optional(pool).await,
         }
+    }
+
+    pub(super) async fn trusted_sso_provider(
+        &self,
+        issuer: &str,
+    ) -> Result<Option<Provider>, sqlx::Error> {
+        const SQL: &str = concat!(
+            "SELECT ",
+            provider_columns!(),
+            " FROM sso_providers WHERE is_enabled AND trusted_for_api_auth
+               AND rtrim(issuer,'/')=$1 ORDER BY id LIMIT 2"
+        );
+        let issuer = issuer.trim_end_matches('/');
+        let mut rows = match self {
+            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(issuer).fetch_all(pool).await?,
+            Self::Postgres(pool) => sqlx::query_as(SQL).bind(issuer).fetch_all(pool).await?,
+        };
+        Ok(if rows.len() == 1 { rows.pop() } else { None })
     }
 
     async fn insert_sso_provider(

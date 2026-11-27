@@ -146,6 +146,7 @@ impl Database {
                 }
                 let privilege_changed=current.is_admin!=admin;
                 if privilege_changed {
+                    let settings=&settings.provisioning;
                     let (old,new)=if admin {(&settings.user_role,&settings.admin_role)}
                         else {(&settings.admin_role,&settings.user_role)};
                     sqlx::query("UPDATE user_roles SET is_active=FALSE WHERE user_email=$1

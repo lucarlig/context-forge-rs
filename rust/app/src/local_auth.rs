@@ -37,6 +37,7 @@ use crate::{
 };
 
 pub(crate) use password_reset::ResetSettings;
+pub use sso::ExternalIdentitySettings;
 pub(crate) use sso::SsoSettings;
 pub(crate) use storage::{POSTGRES_MIGRATION, SQLITE_MIGRATION};
 pub(crate) use teams::TeamSettings;
@@ -48,8 +49,7 @@ pub struct AccountSettings {
     pub(crate) bootstrap_require_change: bool,
     pub(crate) default_password: Zeroizing<String>,
     pub(crate) public_registration: bool,
-    pub(crate) personal_teams: bool,
-    pub(crate) personal_team_prefix: String,
+    pub(crate) provisioning: UserProvisioning,
     pub(crate) teams: TeamSettings,
     pub(crate) enforce_password_change: bool,
     pub(crate) detect_default_password: bool,
@@ -74,13 +74,18 @@ pub struct AccountSettings {
     pub(crate) csrf_httponly: bool,
     pub(crate) csrf_seconds: i64,
     pub(crate) a2a_enabled: bool,
-    pub(crate) admin_role: String,
-    pub(crate) user_role: String,
-    pub(crate) owner_role: String,
     pub(crate) page_size: u32,
     pub(crate) max_page_size: u32,
     pub(crate) kdf: SecretKdf,
     pub(crate) sso: Option<SsoSettings>,
+}
+
+pub(crate) struct UserProvisioning {
+    pub(crate) personal_teams: bool,
+    pub(crate) personal_team_prefix: String,
+    pub(crate) admin_role: String,
+    pub(crate) user_role: String,
+    pub(crate) owner_role: String,
 }
 
 struct Accounts {
@@ -170,7 +175,7 @@ pub async fn router(
             };
             state
                 .database
-                .create_local_user(&user, &state.settings)
+                .create_local_user(&user, &state.settings.provisioning)
                 .await?;
         }
     }
@@ -520,7 +525,7 @@ async fn create_account(
     };
     if !accounts
         .database
-        .create_local_user(&new, &accounts.settings)
+        .create_local_user(&new, &accounts.settings.provisioning)
         .await?
     {
         return Err(duplicate_user(&email));

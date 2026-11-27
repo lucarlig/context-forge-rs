@@ -56,7 +56,7 @@ pub(super) async fn id_token_claims(
     Some(claims)
 }
 
-async fn verify(
+pub(super) async fn verify(
     upstream: &UpstreamClient,
     issuer: &str,
     audience: &str,
@@ -94,7 +94,14 @@ async fn verify(
                 )
                 .await
                 .ok()?;
-            if metadata.issuer != issuer {
+            if metadata.issuer.trim_end_matches('/') != issuer.trim_end_matches('/')
+                || crate::oauth_client::validate_endpoint(
+                    upstream,
+                    &metadata.jwks_uri,
+                    Some(issuer),
+                )
+                .is_err()
+            {
                 return None;
             }
             &metadata.jwks_uri
