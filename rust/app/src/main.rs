@@ -50,7 +50,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .init();
 
     let settings = Settings::from_env()?;
-    let http_boundary = HttpBoundary::from_env(settings.port)?;
     let database = Database::from_settings(&settings)?;
     let redis = settings.redis.as_ref().map(RedisProbe::new).transpose()?;
     let verifier = Settings::jwt_verifier()?;
@@ -78,6 +77,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_external_identity(external_identity)
         .with_token_usage_logging(Settings::token_usage_logging()?),
     );
+    let http_boundary = HttpBoundary::from_env(settings.port, access.clone())?;
     let email_auth_enabled = Settings::email_auth_enabled()?;
     let issuer = Settings::jwt_issuer()?;
     let accounts = match issuer

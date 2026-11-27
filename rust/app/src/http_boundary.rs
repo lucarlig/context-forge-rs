@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{error::Error, future::Future, pin::pin};
+use std::{error::Error, future::Future, pin::pin, sync::Arc};
 
 use axum::{
     Extension, Json, Router,
@@ -22,9 +22,13 @@ use tower::ServiceBuilder;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::config::{flag, parse, value};
+use crate::{
+    access::Authorizer,
+    config::{flag, parse, value},
+};
 
 mod proxy;
+mod rate_limit;
 mod response_policy;
 
 pub(crate) use proxy::public_scheme;
@@ -37,10 +41,14 @@ pub struct HttpBoundary {
     correlation: Option<Correlation>,
     proxies: proxy::ProxyHeaders,
     responses: response_policy::ResponsePolicy,
+    rate_limiter: Option<rate_limit::RateLimiter>,
 }
 
 impl HttpBoundary {
-    pub fn from_env(port: u16) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub fn from_env(
+        port: u16,
+        auth: Arc<Authorizer>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let header_limits = if flag("HEADER_SIZE_VALIDATION_ENABLED")?.unwrap_or(true) {
             Some(HeaderLimits {
                 total: parse("MAX_HEADER_TOTAL_SIZE_BYTES", 16_384)?,
@@ -65,6 +73,7 @@ impl HttpBoundary {
             correlation,
             proxies: proxy::ProxyHeaders::from_env()?,
             responses: response_policy::ResponsePolicy::from_env(port)?,
+            rate_limiter: rate_limit::RateLimiter::from_env(auth)?,
         })
     }
 
@@ -122,6 +131,9 @@ impl HttpBoundary {
         router = self.responses.apply(router);
         if let Some(limits) = self.header_limits {
             router = router.layer(middleware::from_fn_with_state(limits, limit_headers));
+        }
+        if let Some(limiter) = self.rate_limiter {
+            router = limiter.apply(router);
         }
         router = self.proxies.apply(router);
         if let Some(correlation) = self.correlation {
@@ -299,6 +311,7 @@ mod tests {
             correlation: None,
             proxies: proxy::ProxyHeaders::parse("").unwrap(),
             responses: response_policy::ResponsePolicy::from_env(4444).unwrap(),
+            rate_limiter: None,
         };
         let router = Router::new().route(
             "/",
@@ -345,6 +358,7 @@ mod tests {
             }),
             proxies: proxy::ProxyHeaders::parse("").unwrap(),
             responses: response_policy::ResponsePolicy::from_env(4444).unwrap(),
+            rate_limiter: None,
         }
         .apply(Router::new().route("/", get(|| async { StatusCode::UNAUTHORIZED })));
         let request = || {

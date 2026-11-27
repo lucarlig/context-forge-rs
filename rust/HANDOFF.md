@@ -130,6 +130,14 @@ headers. They cover unique CSP nonces, cache exemptions, frame and HSTS flags,
 CORS defaults by environment, and preflight denials. The profiles disable
 response compression and compare the fields in `Vary` without regard to order.
 
+Seventeen live rate-limit replays match the reference for endpoint tiers,
+anonymous and authenticated requests, IP and team scopes, tier-specific
+lockouts, and the 429 body and headers. They verify dedicated and shared Redis
+across two gateway instances, database-cache isolation, and in-memory fallback
+when Redis is unavailable. The Redis checks use plain TCP. Redis hostname
+verification stays enabled. Rate-limit security event persistence and
+response compression remain open.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

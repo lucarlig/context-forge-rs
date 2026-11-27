@@ -268,6 +268,45 @@ impl Authorizer {
             .await
     }
 
+    pub(crate) async fn rate_limit_identity(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<IpAddr>,
+    ) -> Option<(String, Option<String>)> {
+        let token = bearer(headers).ok().flatten().or_else(|| {
+            let cookies = || {
+                headers
+                    .get_all(header::COOKIE)
+                    .iter()
+                    .filter_map(|cookie| cookie.to_str().ok())
+                    .flat_map(|value| value.split(';'))
+                    .filter_map(|value| value.trim().split_once('='))
+            };
+            ["jwt_token", "access_token"].into_iter().find_map(|name| {
+                cookies()
+                    .find(|(key, value)| *key == name && !value.trim().is_empty())
+                    .map(|(_, value)| value.trim())
+            })
+        })?;
+        let principal = self
+            .authenticate_for(token, peer, ServerTarget::RpcParameters)
+            .await
+            .ok()?;
+        let team = match (principal.token_use, principal.visibility) {
+            (TokenUse::Api, TeamVisibility::Teams(mut teams)) if teams.len() == 1 => {
+                let team = teams.pop().expect("one team");
+                self.database
+                    .is_personal_team(&team)
+                    .await
+                    .ok()
+                    .filter(|personal| !personal)
+                    .map(|_| team)
+            }
+            _ => None,
+        };
+        Some((principal.email, team))
+    }
+
     async fn authenticate_for(
         &self,
         token: &str,

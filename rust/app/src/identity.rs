@@ -122,6 +122,14 @@ impl Database {
         }
     }
 
+    pub(crate) async fn is_personal_team(&self, id: &str) -> Result<bool, sqlx::Error> {
+        const QUERY: &str = "SELECT is_personal FROM email_teams WHERE id = $1";
+        match self {
+            Self::Sqlite(pool) => sqlx::query_scalar(QUERY).bind(id).fetch_one(pool).await,
+            Self::Postgres(pool) => sqlx::query_scalar(QUERY).bind(id).fetch_one(pool).await,
+        }
+    }
+
     pub(crate) async fn grants(&self, email: &str) -> Result<Vec<Grant>, sqlx::Error> {
         macro_rules! query {
             ($unexpired:literal) => {
