@@ -6,6 +6,7 @@ mod health;
 mod lifecycle;
 mod listeners;
 mod management;
+mod oauth_api;
 mod prompt_api;
 mod proxy;
 mod resource_api;
@@ -408,6 +409,7 @@ impl GatewayService {
         }
         self.access.protect_api(
             router
+                .merge(oauth_api::router())
                 .merge(roots::router())
                 .merge(tags::router())
                 .merge(prompt_api::router(self.max_prompt_bytes))

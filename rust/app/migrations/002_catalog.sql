@@ -256,3 +256,22 @@ CREATE TABLE IF NOT EXISTS server_prompt_association (
     prompt_id VARCHAR(36) NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
     PRIMARY KEY (server_id, prompt_id)
 );
+
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    gateway_id VARCHAR(36) NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
+    user_id VARCHAR(255) NOT NULL,
+    app_user_email VARCHAR(255) NOT NULL REFERENCES email_users(email) ON DELETE CASCADE,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    token_type VARCHAR(50),
+    expires_at TIMESTAMP WITH TIME ZONE,
+    scopes JSON,
+    learned_aud JSON,
+    learned_iss VARCHAR(500),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (gateway_id,app_user_email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_app_user_email ON oauth_tokens(app_user_email);
