@@ -131,6 +131,7 @@ pub struct GatewayService {
     identity_forwarding: IdentityForwarding,
     direct_proxy_timeout: Option<Duration>,
     proxy_catalog: ProxyCatalogCache,
+    response_filters: crate::response_filter::ResponseFilters,
     export: ExportSettings,
     imports: import_api::Imports,
 }
@@ -233,6 +234,7 @@ impl GatewayService {
             identity_forwarding: IdentityForwarding::default(),
             direct_proxy_timeout: None,
             proxy_catalog: ProxyCatalogCache::new(ProxyCatalogSettings::default()),
+            response_filters: crate::response_filter::ResponseFilters::default(),
             export: ExportSettings::default(),
             imports: import_api::Imports::default(),
         }
@@ -240,6 +242,14 @@ impl GatewayService {
 
     pub fn with_export_settings(mut self, export: ExportSettings) -> Self {
         self.export = export;
+        self
+    }
+
+    pub fn with_response_filters(
+        mut self,
+        filters: crate::response_filter::ResponseFilters,
+    ) -> Self {
+        self.response_filters = filters;
         self
     }
 
@@ -669,10 +679,10 @@ impl GatewayService {
                 self.direct_target(context.request_headers, principal).await.map_err(ToolError::from)
             } => result?,
         };
-        let (gateway, direct_timeout) = match target {
+        let (gateway, direct_timeout, response_filter) = match target {
             DirectTarget::Found {
                 gateway, timeout, ..
-            } => (gateway, Some(timeout)),
+            } => (gateway, Some(timeout), String::new()),
             DirectTarget::Denied => {
                 return tool_result_error(format!("Tool not found: {}", request.name));
             }
@@ -710,6 +720,7 @@ impl GatewayService {
                         needs_upstream_config: tool.needs_upstream_config,
                     },
                     None,
+                    tool.response_filter,
                 )
             }
         };
@@ -760,6 +771,7 @@ impl GatewayService {
             session.upstream(&gateway.id, endpoint, authorization)
         });
         let legacy_caller = context.client_capabilities.is_none();
+        let cancellation = context.cancellation;
         let client = direct_timeout.map(|timeout| self.upstream.with_timeout_cap(timeout));
         let result = client
             .as_ref()
@@ -769,6 +781,16 @@ impl GatewayService {
         match result {
             Ok(result) if legacy_caller && result["resultType"] == "input_required" => {
                 input_error_result("Elicitation not supported", None)
+            }
+            Ok(result)
+                if !response_filter.trim().is_empty()
+                    && result["resultType"] != "input_required" =>
+            {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => Err(ToolError::Cancelled),
+                    result = self.filter_mcp_result(&response_filter, result) => result,
+                }
             }
             Ok(result) => Ok(result),
             Err(UpstreamError::Cancelled) => Err(ToolError::Cancelled),
@@ -786,6 +808,29 @@ impl GatewayService {
                 }
             }
         }
+    }
+
+    async fn filter_mcp_result(
+        &self,
+        expression: &str,
+        mut result: Value,
+    ) -> Result<Value, ToolError> {
+        let object = result.as_object_mut().ok_or(ToolError::Unavailable)?;
+        let content = object.remove("content").unwrap_or_else(|| json!([]));
+        let filtered = match self.response_filters.apply(expression, content).await {
+            Ok(filtered) => filtered,
+            Err(error) => return tool_result_error(error.invocation_message()),
+        };
+        let content = if filtered.as_array().is_some_and(|items| !items.is_empty())
+            && Vec::<ContentBlock>::deserialize(&filtered).is_ok()
+        {
+            filtered
+        } else {
+            json!([ContentBlock::text(filtered.to_string())])
+        };
+        object.remove("structuredContent");
+        object.insert("content".into(), content);
+        Ok(result)
     }
 
     async fn configured_upstream(

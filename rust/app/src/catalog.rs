@@ -127,6 +127,7 @@ pub struct CatalogTool {
     pub(crate) reachable: bool,
     pub(crate) needs_upstream_config: bool,
     pub(crate) rest: Option<RestTool>,
+    pub(crate) response_filter: String,
     pub definition: ToolDefinition,
 }
 
@@ -380,6 +381,7 @@ struct ToolRow {
     output_schema: Option<String>,
     annotations: Option<String>,
     integration_type: String,
+    response_filter: String,
     #[sqlx(flatten)]
     rest: RestTool,
 }
@@ -468,13 +470,13 @@ macro_rules! tool_query {
                 COALESCE(g.name, '') AS gateway_name, COALESCE(g.url, '') AS gateway_url,
                 COALESCE(g.gateway_mode, '') AS gateway_mode, COALESCE(g.transport, '') AS gateway_transport,
                 t.request_type, t.integration_type,
+                COALESCE(t.jsonpath_filter, '') AS response_filter,
                 (
                     ", gateway_policy!(), "
                     OR ((LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth')
                         OR COALESCE(t.auth_value, '') <> '')
                         AND NOT (", configured_auth!(), "
                             AND LOWER(COALESCE(t.auth_type, '')) = LOWER(COALESCE(g.auth_type, ''))))
-                    OR COALESCE(t.jsonpath_filter, '') <> ''
                     OR COALESCE(t.tool_validation_policy, '') <> ''
                     OR COALESCE(t.timeout_ms, 0) <> 0
                     OR t.validation_refusal IS NOT NULL
@@ -497,7 +499,7 @@ macro_rules! tool_query {
                     THEN CAST(t.sigv4_config AS TEXT) END AS sigv4_config,
                 CAST(t.query_mapping AS TEXT) AS query_mapping,
                 CAST(t.header_mapping AS TEXT) AS header_mapping,
-                (TRIM(COALESCE(t.jsonpath_filter, '')) <> '' OR t.validation_refusal IS NOT NULL
+                (t.validation_refusal IS NOT NULL
                     OR COALESCE(t.tool_validation_policy, '') <> ''
                     OR COALESCE(g.tool_validation_policy, '') <> ''
                     OR ", non_empty_json!("t.plugin_chain_pre"), "
@@ -1802,6 +1804,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         output_schema,
         annotations,
         integration_type,
+        response_filter,
         rest,
     } = row;
     Ok(CatalogTool {
@@ -1817,6 +1820,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         reachable,
         deprecated,
         rest: (integration_type == "REST").then_some(rest),
+        response_filter,
         needs_upstream_config,
         definition: ToolDefinition {
             name,

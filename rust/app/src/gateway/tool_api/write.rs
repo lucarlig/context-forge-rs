@@ -242,7 +242,7 @@ pub(in crate::gateway) async fn import_tool(
         expose_passthrough: true,
         ..ToolRecord::default()
     });
-    apply_fields(service, &mut record, fields, previous.is_none())?;
+    apply_fields(service, &mut record, fields, previous.is_none()).await?;
     if previous.is_some() {
         record.modified_by = Some(principal.email.clone());
         record.modified_via = Some("import".into());
@@ -311,7 +311,7 @@ pub(super) async fn create(
         ..ToolRecord::default()
     };
     set_gateway(&service, &principal, &mut record, &fields).await?;
-    apply_fields(&service, &mut record, fields, true)?;
+    apply_fields(&service, &mut record, fields, true).await?;
     record.original_description.clone_from(&record.description);
     let created = service
         .database
@@ -352,7 +352,7 @@ pub(super) async fn update(
         record.visibility = visibility;
     }
     set_gateway(&service, &principal, &mut record, &fields).await?;
-    apply_fields(&service, &mut record, fields, false)?;
+    apply_fields(&service, &mut record, fields, false).await?;
     record.modified_by = Some(principal.email.clone());
     record.modified_via = Some("api".into());
     record.modified_from_ip = client_address(peer).or(record.modified_from_ip);
@@ -536,7 +536,7 @@ async fn set_gateway(
     Ok(())
 }
 
-fn apply_fields(
+async fn apply_fields(
     service: &GatewayService,
     tool: &mut ToolRecord,
     mut fields: ToolFields,
@@ -611,6 +611,21 @@ fn apply_fields(
         tool.extension_metadata = Some(Value::Object(extension).to_string());
     }
     if let Some(expression) = fields.jsonpath_filter.take() {
+        if expression.trim_start().starts_with(['.', '$']) {
+            return Err(invalid(
+                "jsonpath_filter is a jq or JSONPath filter, which is no longer supported; write a CEL expression over 'response', for example 'response.items.map(i, i.name)'",
+            ));
+        }
+        service
+            .response_filters
+            .validate(&expression)
+            .await
+            .map_err(|error| {
+                CatalogApiError::detail(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("jsonpath_filter is not a valid CEL expression: {error}"),
+                )
+            })?;
         tool.jsonpath_filter = expression;
     }
     if let Some(tags) = fields.tags.take() {

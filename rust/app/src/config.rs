@@ -136,6 +136,18 @@ impl Default for HeaderForwarding {
 }
 
 impl Settings {
+    pub fn response_filters()
+    -> Result<crate::response_filter::ResponseFilters, Box<dyn Error + Send + Sync>> {
+        let workers = parse("CEL_FILTER_WORKERS", 2)?;
+        let timeout = positive_seconds("CEL_FILTER_TIMEOUT_SECONDS", 2.0)?;
+        if !(1..=16).contains(&workers) || timeout > Duration::from_secs(60) {
+            return Err("invalid CEL response filter limits".into());
+        }
+        Ok(crate::response_filter::ResponseFilters::new(
+            workers, timeout,
+        ))
+    }
+
     pub fn management_page_sizes() -> Result<(u32, u32), Box<dyn Error + Send + Sync>> {
         let default = parse("PAGINATION_DEFAULT_PAGE_SIZE", 50)?;
         let maximum = parse("PAGINATION_MAX_PAGE_SIZE", 500)?;

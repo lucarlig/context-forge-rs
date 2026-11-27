@@ -2,6 +2,8 @@
 
 use std::error::Error;
 
+mod response_filters;
+
 use crate::{
     catalog::{CATALOG_LOCK, slugify_with_separator},
     config::{Settings, flag},
@@ -11,7 +13,13 @@ use crate::{
 const IDENTITY: &str = include_str!("../migrations/001_identity.sql");
 const CATALOG: &str = include_str!("../migrations/002_catalog.sql");
 const LEGACY_SSE: &str = include_str!("../migrations/003_legacy_sse.sql");
-const MIGRATIONS: [&str; 4] = ["identity", "catalog", "legacy_sse", "historical_catalog"];
+const MIGRATIONS: [&str; 5] = [
+    "identity",
+    "catalog",
+    "legacy_sse",
+    "historical_catalog",
+    "cel_response_filters",
+];
 
 type ColumnDefinition = (&'static str, &'static str);
 
@@ -280,6 +288,7 @@ impl Database {
                                 backfill_resource_names!($transaction, separator);
                             }
                         }
+                        4 => response_filters::translate_filters!($transaction),
                         _ => unreachable!("unknown migration implementation"),
                     }
                     sqlx::query(RECORD)
@@ -407,7 +416,7 @@ mod tests {
         let (database, pool) = database().await;
         database.migrate_schema().await.unwrap();
         sqlx::raw_sql(
-            "DELETE FROM context_forge_schema_migrations WHERE name = 'historical_catalog';
+            "DELETE FROM context_forge_schema_migrations WHERE version > 3;
              ALTER TABLE resources DROP COLUMN original_name;
              ALTER TABLE resources DROP COLUMN custom_name_slug;
              ALTER TABLE servers DROP COLUMN oauth_config_approved;

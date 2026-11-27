@@ -70,8 +70,10 @@ the pinned Alembic history. All eight replay cases match the reference column
 definitions and seeded rows for this revision on SQLite and PostgreSQL.
 The cases exercise custom resource name separators and verify idempotence.
 A live SQLite check exercises startup migration, resource lookup, and OAuth
-approval enforcement. Historical response-filter translation and additional
-upstream tables remain open.
+approval enforcement. A separate revision translates supported jq paths to CEL.
+Eight SQLite and PostgreSQL replays match the pinned Alembic upgrade, including
+the treatment of expressions that require a manual rewrite. Additional upstream
+tables remain open.
 
 Configuration export supports full and selective requests at both API prefixes.
 The pinned 14-case suite matched native SQLite, SQLite initialized by the pinned
@@ -157,8 +159,13 @@ form data, and multipart bodies. The Rust client pins the upstream destination.
 Fourteen scenarios matched the pinned gateway's results and outbound requests
 on SQLite and PostgreSQL. A Rust integration test verifies that wrong-team
 tokens, read-only tokens, and invalid URL arguments stop before outbound dispatch.
-OpenAPI import, direct passthrough, gateway credential inheritance, and response
-filter evaluation remain open.
+OpenAPI import, direct passthrough, and gateway credential inheritance remain open.
+
+REST and cached MCP tools evaluate CEL response filters over `response`.
+Tool writes check syntax and free variables before saving. Seventeen scenarios
+match the pinned gateway's evaluation and validation on SQLite and PostgreSQL.
+A live test verifies that migrated filters run after startup and that the
+configured deadline returns a tool error.
 
 The gateway management and catalog milestone is verified. Standing upstream
 listeners reconcile the catalog after acknowledgment and apply subsequent

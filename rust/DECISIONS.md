@@ -7,6 +7,17 @@ schema changes. Keep applied revision definitions stable and append subsequent
 schema changes as new revisions. Databases from the pinned gateway retain
 their existing Alembic history.
 
+## CEL response filters
+
+Use the MIT-licensed `cel` crate starting with v0.16.1. This release counts
+operator chains toward the parser depth limit and fixes the associated
+stack overflow. [CEL release](https://github.com/cel-rust/cel-rust/releases/tag/v0.16.1)
+
+Start one Rust subprocess per filter check or evaluation. Process startup adds
+latency. It gives each operation a killable deadline and an empty environment.
+The gateway limits concurrent workers, input and output sizes, and comprehension
+iterations. Linux also enforces a per-worker address-space limit.
+
 ## Reference release and runtime
 
 Use the public v1.1.2 source at the commit in [the map](MAP.md). Run it only as an external behavior reference. Use a separate public GitHub repository under `lucarlig` for the Rust code. Start the Rust server directly with Axum and Tokio. Use SQLx pools for SQLite and PostgreSQL.

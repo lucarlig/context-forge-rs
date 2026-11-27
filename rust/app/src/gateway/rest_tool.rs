@@ -72,10 +72,13 @@ pub(super) async fn execute(
         .await;
     match result {
         Ok((status, body)) => Ok(response_result(
+            &service.response_filters,
+            &tool.response_filter,
             status,
             &body,
             tool.definition.output_schema.as_ref(),
-        )),
+        )
+        .await),
         Err(UpstreamError::BlockedDestination | UpstreamError::InvalidUrl) => {
             tool_result_error("Tool invocation failed: Outbound URL blocked by URL policy")
         }
@@ -395,7 +398,13 @@ fn multipart(headers: &mut HeaderMap, fields: Map<String, Value>) -> String {
     body
 }
 
-fn response_result(status: StatusCode, body: &[u8], output_schema: Option<&Value>) -> Value {
+async fn response_result(
+    filters: &crate::response_filter::ResponseFilters,
+    expression: &str,
+    status: StatusCode,
+    body: &[u8],
+    output_schema: Option<&Value>,
+) -> Value {
     if status == StatusCode::NO_CONTENT {
         return text_result("Request completed successfully (No Content)", false);
     }
@@ -444,6 +453,10 @@ fn response_result(status: StatusCode, body: &[u8], output_schema: Option<&Value
         }
         Err(_) if body.is_empty() => json!({"error":"Empty response body"}),
         Err(_) => json!({"response_text":bounded}),
+    };
+    let result = match filters.apply(expression, result).await {
+        Ok(value) => value,
+        Err(error) => return text_result(error.invocation_message(), true),
     };
     let envelope = mcp_envelope(&result);
     let wrapped = envelope.is_some();

@@ -30,6 +30,7 @@ mod proxy_catalog_cache;
 mod redis_events;
 mod redis_sessions;
 mod resource_relay;
+pub mod response_filter;
 pub mod schema;
 mod secret_envelope;
 mod sessions;

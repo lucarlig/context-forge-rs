@@ -17,8 +17,15 @@ use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    if std::env::args().nth(1).as_deref() == Some(context_forge_rs::response_filter::WORKER_ARG) {
+        return context_forge_rs::response_filter::worker().map_err(Into::into);
+    }
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("rotate-credentials") => {
@@ -99,6 +106,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_resource_limits(Settings::resource_limits()?)
         .with_max_prompt_bytes(Settings::max_prompt_bytes()?)
         .with_tool_preview(Settings::tool_preview_enabled()?)
+        .with_response_filters(Settings::response_filters()?)
         .with_token_issuer(email_auth_enabled, issuer)
         .with_gateway_oauth(Settings::gateway_oauth()?)
         .with_virtual_server_base(Settings::virtual_server_base()?)
