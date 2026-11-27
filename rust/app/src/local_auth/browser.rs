@@ -145,28 +145,38 @@ pub(super) fn router(
             .route(path, get(home));
         for kind in ManagedCatalog::ALL {
             let base = format!("{path}/{}", kind.name());
-            let mut listing = get(catalog::list);
-            if catalog::editor::supported(kind) {
-                listing = listing.post(catalog::editor::save);
-                router = router
-                    .route(
-                        &format!("{base}/new"),
-                        get(catalog::editor::page).layer(Extension(kind)),
-                    )
-                    .route(
-                        &format!("{base}/{{id}}/edit"),
-                        get(catalog::editor::page)
-                            .post(catalog::editor::save)
-                            .layer(Extension(kind)),
-                    );
-                if matches!(kind, ManagedCatalog::Tools) {
-                    router = router.route(
-                        &format!("{base}/{{id}}/edit/"),
-                        post(catalog::editor::save).layer(Extension(kind)),
-                    );
-                }
+            router = router
+                .route(
+                    &base,
+                    get(catalog::list)
+                        .post(catalog::editor::save)
+                        .layer(Extension(kind)),
+                )
+                .route(
+                    &format!("{base}/new"),
+                    get(catalog::editor::page).layer(Extension(kind)),
+                )
+                .route(
+                    &format!("{base}/{{id}}/edit"),
+                    get(catalog::editor::page)
+                        .post(catalog::editor::save)
+                        .layer(Extension(kind)),
+                );
+            if matches!(kind, ManagedCatalog::Tools) {
+                router = router.route(
+                    &format!("{base}/{{id}}/edit/"),
+                    post(catalog::editor::save).layer(Extension(kind)),
+                );
             }
-            router = router.route(&base, listing.layer(Extension(kind)));
+            if matches!(kind, ManagedCatalog::Gateways) {
+                router = router.route(
+                    &format!("{base}/{{id}}"),
+                    get(catalog::gateway_detail)
+                        .put(catalog::editor::save)
+                        .delete(catalog::delete_gateway)
+                        .layer(Extension(kind)),
+                );
+            }
             for action in [catalog::Action::State, catalog::Action::Delete] {
                 router = router.route(
                     &format!("{path}/{}/{{id}}/{}", kind.name(), action.path()),

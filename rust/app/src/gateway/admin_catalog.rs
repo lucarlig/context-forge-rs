@@ -101,8 +101,10 @@ impl GatewayService {
                     ManagedCatalog::Gateways => {
                         return management::remove(self, principal, id)
                             .await
-                            .map(|response| {
-                                (response.status() == StatusCode::ACCEPTED)
+                            .map(|result| {
+                                result
+                                    .retry_after
+                                    .is_some()
                                     .then_some("gateway_delete_pending")
                             })
                             .map_err(|error| {

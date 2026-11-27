@@ -52,6 +52,79 @@ pub(super) async fn list(
     Ok(with_usage(&accounts, &principal, &parts, peer.ip(), response).await)
 }
 
+pub(super) async fn gateway_detail(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(service): Extension<Arc<GatewayService>>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Result<Response, AccountError> {
+    let settings = settings_for(&accounts);
+    let Session { principal, .. } =
+        match access(&accounts, request.headers(), request.uri(), peer.ip()).await {
+            Ok(session) => session,
+            Err(denial) => return Ok(denial.response(settings, request.headers())),
+        };
+    if password_change_pending(&accounts, &principal).await? {
+        return Ok(settings.redirect(CHANGE));
+    }
+    let team = sessions::request_team(request.uri(), &principal);
+    if !allows(
+        &accounts,
+        &principal,
+        ManagedCatalog::Gateways,
+        "read",
+        team.as_deref(),
+    )
+    .await?
+    {
+        return Err(AccountError::detail(
+            StatusCode::FORBIDDEN,
+            "Permission denied",
+        ));
+    }
+    let (parts, _) = request.into_parts();
+    let response = async {
+        service
+            .admin_gateway_detail(&principal, id)
+            .await
+            .map(|value| Json(value).into_response())
+            .unwrap_or_else(IntoResponse::into_response)
+    };
+    Ok(with_usage(&accounts, &principal, &parts, peer.ip(), response).await)
+}
+
+pub(super) async fn delete_gateway(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(service): Extension<Arc<GatewayService>>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    let AuthorizedForm {
+        principal, parts, ..
+    } = match authorized_form(
+        &accounts,
+        ManagedCatalog::Gateways,
+        "delete",
+        request,
+        peer.ip(),
+        false,
+    )
+    .await
+    {
+        Ok(form) => form,
+        Err(response) => return *response,
+    };
+    let response = async {
+        service
+            .delete_admin_gateway(&principal, id)
+            .await
+            .unwrap_or_else(CatalogApiError::form_response)
+    };
+    with_usage(&accounts, &principal, &parts, peer.ip(), response).await
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Action {
     State,
@@ -82,11 +155,24 @@ pub(super) async fn mutate(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Response, AccountError> {
-    let (principal, parts, form) =
-        match authorized_form(&accounts, kind, action.permission(), request, peer.ip()).await {
-            Ok(form) => form,
-            Err(response) => return Ok(*response),
-        };
+    let AuthorizedForm {
+        principal,
+        parts,
+        form,
+        ..
+    } = match authorized_form(
+        &accounts,
+        kind,
+        action.permission(),
+        request,
+        peer.ip(),
+        false,
+    )
+    .await
+    {
+        Ok(form) => form,
+        Err(response) => return Ok(*response),
+    };
     let settings = settings_for(&accounts);
     let response = async {
         let affirmative = |name| form.get(name).eq_ignore_ascii_case("true");
@@ -130,13 +216,21 @@ pub(super) async fn mutate(
     Ok(with_usage(&accounts, &principal, &parts, peer.ip(), response).await)
 }
 
+struct AuthorizedForm {
+    principal: Principal,
+    parts: Parts,
+    form: Form,
+    json: Option<serde_json::Map<String, Value>>,
+}
+
 async fn authorized_form(
     accounts: &Accounts,
     kind: ManagedCatalog,
     permission: &str,
     request: Request,
     peer: IpAddr,
-) -> Result<(Principal, Parts, Form), Box<Response>> {
+    json_allowed: bool,
+) -> Result<AuthorizedForm, Box<Response>> {
     let settings = settings_for(accounts);
     let Session { principal, .. } =
         match access(accounts, request.headers(), request.uri(), peer).await {
@@ -149,9 +243,42 @@ async fn authorized_form(
     {
         return Err(Box::new(settings.redirect(CHANGE)));
     }
-    let (parts, form) = Form::from_catalog_request(request)
-        .await
-        .map_err(|error| Box::new(error.into_response()))?;
+    let (parts, form, json) = if json_allowed
+        && forms::has_media_type(request.headers(), "application/json")
+    {
+        let (parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, forms::MAX_FORM_BYTES)
+            .await
+            .map_err(|_| {
+                Box::new(
+                    AccountError::detail(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large")
+                        .into_response(),
+                )
+            })?;
+        let json = serde_json::from_slice(&bytes).map_err(|_| {
+            Box::new(
+                AccountError::detail(StatusCode::BAD_REQUEST, "Invalid JSON body").into_response(),
+            )
+        })?;
+        (parts, Form::default(), Some(json))
+    } else {
+        if json_allowed
+            && !forms::urlencoded(request.headers())
+            && !forms::has_media_type(request.headers(), "multipart/form-data")
+        {
+            return Err(Box::new(
+                AccountError::detail(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "Use application/json or multipart/form-data",
+                )
+                .into_response(),
+            ));
+        }
+        let (parts, form) = Form::from_catalog_request(request)
+            .await
+            .map_err(|error| Box::new(error.into_response()))?;
+        (parts, form, None)
+    };
     csrf(settings, &parts, &form, false).map_err(|error| Box::new(error.into_response()))?;
     if sessions::bearer_token(settings, &parts.headers).is_none()
         && !browser_request(&parts.headers)
@@ -171,7 +298,12 @@ async fn authorized_form(
             AccountError::detail(StatusCode::FORBIDDEN, "Permission denied").into_response(),
         ));
     }
-    Ok((principal, parts, form))
+    Ok(AuthorizedForm {
+        principal,
+        parts,
+        form,
+        json,
+    })
 }
 
 pub(super) async fn with_usage(
@@ -260,7 +392,6 @@ struct Section {
     rows: Vec<Row>,
     actions: bool,
     create: bool,
-    editor: bool,
     purge_metrics: bool,
     total: i64,
     page: i64,
@@ -377,9 +508,7 @@ pub(super) async fn dashboard(
                     let page_link =
                         |page| href(Some(kind.name()), Some((page, pagination.per_page)));
                     let rows = rows(accounts, principal, kind, &data).await?;
-                    let editor = editor::supported(kind);
-                    let create =
-                        editor && allows(accounts, principal, kind, "create", team).await?;
+                    let create = allows(accounts, principal, kind, "create", team).await?;
 
                     Ok::<_, CatalogApiError>(Section {
                         name: kind.name(),
@@ -388,7 +517,6 @@ pub(super) async fn dashboard(
                         actions: rows.iter().any(|row| row.update || row.delete),
                         rows,
                         create,
-                        editor,
                         purge_metrics: !matches!(kind, ManagedCatalog::Gateways),
                         total: pagination.total_items,
                         page: pagination.page,
@@ -414,8 +542,11 @@ pub(super) async fn dashboard(
             Some("state_change_failed") => Some("Could not change the state of the entry."),
             _ => None,
         },
-        message: (parameters.get("message").map(String::as_str) == Some("gateway_delete_pending"))
-            .then_some("MCP server deletion is pending."),
+        message: match parameters.get("message").map(String::as_str) {
+            Some("gateway_delete_pending") => Some("MCP server deletion is pending."),
+            Some("gateway_write_pending") => Some("MCP server initialization is pending."),
+            _ => None,
+        },
     })
 }
 

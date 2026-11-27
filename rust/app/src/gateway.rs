@@ -1416,15 +1416,21 @@ async fn register(
         &service,
         &principal,
         input,
-        GatewayRegistrationSource::Api { address, agent },
+        GatewayRegistrationSource::Request {
+            address,
+            agent,
+            via: "api",
+        },
     )
     .await
+    .map(IntoResponse::into_response)
 }
 
 enum GatewayRegistrationSource<'a> {
-    Api {
+    Request {
         address: Option<String>,
         agent: Option<&'a str>,
+        via: &'static str,
     },
     Import(&'a import_api::ImportScope<'a>),
 }
@@ -1434,7 +1440,7 @@ async fn register_gateway(
     principal: &Principal,
     mut input: RegisterGateway,
     source: GatewayRegistrationSource<'_>,
-) -> Result<Response, RegistrationResponse> {
+) -> Result<lifecycle::GatewayWriteResult, RegistrationResponse> {
     let name = input.name.trim();
     let slug = slugify(name);
     if name.len() > 255 || slug.is_empty() {
@@ -1468,7 +1474,11 @@ async fn register_gateway(
     };
 
     let (visibility, team, created_via, batch_id, address, agent) = match source {
-        GatewayRegistrationSource::Api { address, agent } => {
+        GatewayRegistrationSource::Request {
+            address,
+            agent,
+            via,
+        } => {
             let visibility = input.visibility.as_deref().unwrap_or("public");
             if !matches!(visibility, "public" | "team" | "private") {
                 return Err(RegistrationResponse::new(
@@ -1491,7 +1501,7 @@ async fn register_gateway(
                     "Access denied",
                 ));
             }
-            (visibility, team, "api", None, address, agent)
+            (visibility, team, via, None, address, agent)
         }
         GatewayRegistrationSource::Import(scope) => {
             if scope.principal.email != principal.email
@@ -1529,7 +1539,7 @@ async fn register_gateway(
     let lifecycle = service
         .lifecycle
         .as_ref()
-        .filter(|_| !one_time_auth && created_via == "api");
+        .filter(|_| !one_time_auth && created_via != "import");
     service.upstream.check_endpoint(url).map_err(|_| {
         RegistrationResponse::new(
             StatusCode::BAD_REQUEST,
@@ -1821,7 +1831,7 @@ async fn register_gateway(
                     && (visibility != "team" || record.team_id == team)
             })
     {
-        return Ok(lifecycle.accepted(management::response(
+        return Ok(lifecycle.pending(management::response(
             &existing,
             service.credential_cipher.as_ref(),
         )));
@@ -1840,7 +1850,7 @@ async fn register_gateway(
                     "Gateway registry unavailable",
                 )
             })?;
-        return Ok(lifecycle.accepted(management::response(
+        return Ok(lifecycle.pending(management::response(
             &record,
             service.credential_cipher.as_ref(),
         )));
@@ -1876,7 +1886,7 @@ async fn register_gateway(
             .expect("registration response object")
             .extend(masked);
     }
-    Ok(Json(response).into_response())
+    Ok(lifecycle::GatewayWriteResult::active(response))
 }
 
 async fn registration_team(

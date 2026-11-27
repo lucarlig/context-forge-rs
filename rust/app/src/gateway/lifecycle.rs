@@ -25,18 +25,44 @@ enum LifecycleError {
 }
 
 impl GatewayLifecycle {
-    pub(super) fn accepted(&self, payload: Value) -> Response {
+    pub(super) fn pending(&self, payload: Value) -> GatewayWriteResult {
         let seconds = self
             .poll_interval
             .as_secs()
             .saturating_add(u64::from(self.poll_interval.subsec_nanos() != 0))
             .max(1);
-        (
-            StatusCode::ACCEPTED,
-            [(header::RETRY_AFTER, seconds.to_string())],
-            Json(payload),
-        )
-            .into_response()
+        GatewayWriteResult {
+            payload,
+            retry_after: Some(seconds),
+        }
+    }
+}
+
+pub(super) struct GatewayWriteResult {
+    pub(super) payload: Value,
+    pub(super) retry_after: Option<u64>,
+}
+
+impl GatewayWriteResult {
+    pub(super) fn active(payload: Value) -> Self {
+        Self {
+            payload,
+            retry_after: None,
+        }
+    }
+}
+
+impl IntoResponse for GatewayWriteResult {
+    fn into_response(self) -> Response {
+        match self.retry_after {
+            Some(seconds) => (
+                StatusCode::ACCEPTED,
+                [(header::RETRY_AFTER, seconds.to_string())],
+                Json(self.payload),
+            )
+                .into_response(),
+            None => Json(self.payload).into_response(),
+        }
     }
 }
 

@@ -21,7 +21,7 @@ use crate::{
 use super::*;
 
 mod update;
-pub(super) use update::{import_update, update};
+pub(super) use update::{UpdateError, import_update, update, update_admin_record};
 
 const MASKED: &str = "*****";
 
@@ -181,14 +181,16 @@ pub(super) async fn delete(
     Extension(principal): Extension<Principal>,
     Path(key): Path<String>,
 ) -> Result<Response, ManagementError> {
-    remove(&service, &principal, key).await
+    remove(&service, &principal, key)
+        .await
+        .map(IntoResponse::into_response)
 }
 
 pub(super) async fn remove(
     service: &GatewayService,
     principal: &Principal,
     key: String,
-) -> Result<Response, ManagementError> {
+) -> Result<lifecycle::GatewayWriteResult, ManagementError> {
     let mut record = manageable(
         service,
         principal,
@@ -200,7 +202,7 @@ pub(super) async fn remove(
     let lifecycle = service.lifecycle.as_ref();
     let changed = if let Some(lifecycle) = lifecycle {
         if record.status == "deleting" {
-            return Ok(lifecycle.accepted(response(&record, service.credential_cipher.as_ref())));
+            return Ok(lifecycle.pending(response(&record, service.credential_cipher.as_ref())));
         }
         service.database.queue_gateway_deletion(&record).await?
     } else {
@@ -224,12 +226,11 @@ pub(super) async fn remove(
         record.lifecycle_claimed_by = None;
         record.lifecycle_claimed_at = None;
         record.lifecycle_claim_expires_at = None;
-        return Ok(lifecycle.accepted(response(&record, service.credential_cipher.as_ref())));
+        return Ok(lifecycle.pending(response(&record, service.credential_cipher.as_ref())));
     }
-    Ok(
-        Json(json!({"status":"success","message":format!("Gateway {} deleted", record.id)}))
-            .into_response(),
-    )
+    Ok(lifecycle::GatewayWriteResult::active(json!({
+        "status":"success", "message":format!("Gateway {} deleted", record.id),
+    })))
 }
 
 pub(super) async fn refresh(
@@ -560,7 +561,7 @@ fn refresh_response(
     Json(body)
 }
 
-async fn manageable(
+pub(super) async fn manageable(
     service: &GatewayService,
     principal: &Principal,
     key: String,
@@ -611,7 +612,7 @@ pub(in crate::gateway) async fn owns_gateway(
     Ok(false)
 }
 
-async fn lookup(
+pub(super) async fn lookup(
     service: &GatewayService,
     principal: &Principal,
     key: String,

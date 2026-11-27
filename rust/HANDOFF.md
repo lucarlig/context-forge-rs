@@ -217,8 +217,20 @@ field is blank.
 Five Rust Anything scenarios match on SQLite and PostgreSQL. They cover
 URL-encoded and multipart forms, stored fields, validation failures, scoped
 credentials, and virtual server associations. Chromium verifies both editor
-pages in all four sections. MCP server create and edit and the remaining
-dashboard sections are open.
+pages in all four sections.
+
+MCP server registration, editing, details, and deletion serve under both
+admin route prefixes. Registration and REST updates accept JSON and form
+data. The dashboard saves connection settings and preserves stored
+credentials when the editor leaves authentication alone. Registration,
+updates, and deletion use the native gateway lifecycle. The admin responses
+report queued initialization or cleanup when asynchronous processing is on.
+
+Eight Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+form and JSON submissions, scoped credentials, validation, masked bearer
+credentials, OAuth forms, and queued lifecycle operations. Chromium verifies
+creation and editing with a bearer credential. OAuth authorization controls
+and the remaining dashboard sections are open.
 
 ## Gateway and protocol verification
 

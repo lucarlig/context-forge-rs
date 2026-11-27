@@ -121,19 +121,71 @@ pub(crate) async fn update(
     headers: HeaderMap,
     Json(input): Json<GatewayUpdate>,
 ) -> Result<Response, UpdateError> {
+    let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    update_record(&service, &principal, id, input, "api", address, agent)
+        .await
+        .map(IntoResponse::into_response)
+}
+
+async fn update_record(
+    service: &GatewayService,
+    principal: &Principal,
+    id: String,
+    input: GatewayUpdate,
+    via: &'static str,
+    address: Option<String>,
+    agent: Option<&str>,
+) -> Result<lifecycle::GatewayWriteResult, UpdateError> {
     let previous = manageable(
-        &service,
-        &principal,
+        service,
+        principal,
         id,
         "gateways.update",
         "Only the owner can update this gateway",
     )
     .await?;
-    let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
-    let agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok());
-    update_existing(&service, &principal, previous, input, "api", address, agent).await
+    update_existing(service, principal, previous, input, via, address, agent).await
+}
+
+pub(in crate::gateway) async fn update_admin_record(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    mut fields: Value,
+    address: Option<String>,
+    agent: Option<&str>,
+    legacy_edit: bool,
+) -> Result<lifecycle::GatewayWriteResult, UpdateError> {
+    let previous = manageable(
+        service,
+        principal,
+        id.to_owned(),
+        "gateways.update",
+        "Only the owner can update this gateway",
+    )
+    .await?;
+    if legacy_edit
+        && fields
+            .get("auth_type")
+            .or_else(|| fields.get("authType"))
+            .is_none_or(|value| value.as_str() == Some(""))
+    {
+        if previous.auth_type.as_deref() == Some("sigv4") {
+            if let Some(fields) = fields.as_object_mut() {
+                fields.remove("auth_type");
+                fields.remove("authType");
+            }
+        } else {
+            fields["auth_type"] = "".into();
+        }
+    }
+    let input = serde_json::from_value(fields).map_err(|_| {
+        UpdateError::message(StatusCode::UNPROCESSABLE_ENTITY, "Invalid form fields")
+    })?;
+    update_existing(service, principal, previous, input, "ui", address, agent).await
 }
 
 pub(in crate::gateway) async fn import_update(
@@ -180,12 +232,12 @@ async fn update_existing(
     via: &'static str,
     address: Option<String>,
     agent: Option<&str>,
-) -> Result<Response, UpdateError> {
-    if via == "api"
+) -> Result<lifecycle::GatewayWriteResult, UpdateError> {
+    if via != "import"
         && previous.status == "pending"
         && let Some(lifecycle) = &service.lifecycle
     {
-        return Ok(lifecycle.accepted(response(&previous, service.credential_cipher.as_ref())));
+        return Ok(lifecycle.pending(response(&previous, service.credential_cipher.as_ref())));
     }
     if previous.status != "active" {
         return Err(ManagementError::LifecycleInProgress.into());
@@ -196,7 +248,7 @@ async fn update_existing(
     let lifecycle = service
         .lifecycle
         .as_ref()
-        .filter(|_| !one_time_auth && via == "api");
+        .filter(|_| !one_time_auth && via != "import");
     gateway.modified_by = Some(principal.email.clone());
     gateway.modified_via = Some(via.to_owned());
     if let Some(address) = address {
@@ -265,6 +317,7 @@ async fn update_existing(
             .await;
     }
     let auth_changed = if let Some(connection) = &mut connection {
+        let explicit_no_auth = via == "ui" && auth.clears_auth();
         let changed = auth
             .apply_update(
                 connection,
@@ -278,7 +331,7 @@ async fn update_existing(
             validate_query_host(service.query_auth_hosts.as_ref(), &gateway.url)
                 .map_err(UpdateAuthError::from)?;
         }
-        if changed && !one_time_auth {
+        if (changed || explicit_no_auth) && !one_time_auth {
             gateway.auth_type = Some(connection.kind.clone());
             gateway.auth_value.clone_from(&connection.headers);
             gateway.auth_query_params.clone_from(&connection.query);
@@ -392,8 +445,8 @@ async fn update_existing(
         .ok_or(ManagementError::ConcurrentChange)?;
     let payload = response(&updated, service.credential_cipher.as_ref());
     Ok(match lifecycle {
-        Some(lifecycle) => lifecycle.accepted(payload),
-        None => Json(payload).into_response(),
+        Some(lifecycle) => lifecycle.pending(payload),
+        None => lifecycle::GatewayWriteResult::active(payload),
     })
 }
 
@@ -777,5 +830,11 @@ impl From<UpdateAuthError> for UpdateError {
 impl IntoResponse for UpdateError {
     fn into_response(self) -> Response {
         (self.0, Json(self.1)).into_response()
+    }
+}
+
+impl From<UpdateError> for CatalogApiError {
+    fn from(UpdateError(status, body): UpdateError) -> Self {
+        Self(status, body)
     }
 }

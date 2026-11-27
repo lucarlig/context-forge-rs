@@ -47,6 +47,7 @@ async fn gateway() -> BrowserGateway {
         .env("MCPGATEWAY_ADMIN_API_ENABLED", "true")
         .env("SECURE_COOKIES", "false")
         .env("RATE_LIMITING_ENABLED", "false")
+        .env("SSRF_ALLOW_LOCALHOST", "true")
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -498,4 +499,101 @@ async fn admin_prompt_editor_preserves_the_row_when_validation_fails() {
     assert_eq!(updated["template"], "Published");
     assert_eq!(updated["modifiedVia"], "ui");
     gateway.process.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_gateway_json_update_preserves_owner_and_unsubmitted_fields() {
+    use axum::{Json, Router, response::IntoResponse, routing::post};
+    use serde_json::{Value, json};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let upstream_task = tokio::spawn(async move {
+        let fixture = Router::new().route(
+            "/mcp",
+            post(|Json(packet): Json<Value>| async move {
+                if packet["id"].is_null() {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                let result = match packet["method"].as_str() {
+                    Some("initialize") => json!({
+                        "protocolVersion":packet["params"]["protocolVersion"],
+                        "serverInfo":{"name":"admin-editor-fixture","version":"1"},
+                        "capabilities":{"tools":{}}
+                    }),
+                    Some("tools/list") => json!({"tools":[]}),
+                    _ => json!({}),
+                };
+                Json(json!({"jsonrpc":"2.0","id":packet["id"],"result":result})).into_response()
+            }),
+        );
+        axum::serve(listener, fixture).await.unwrap();
+    });
+
+    let mut fixture = gateway().await;
+    let client = &fixture.client;
+    let origin = &fixture.origin;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"email":EMAIL, "password":fixture.password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let jwt = login["access_token"].as_str().unwrap();
+    let base = format!("{origin}/v1/admin/gateways");
+    let created = client
+        .post(&base)
+        .bearer_auth(jwt)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "name":"fixture-editor", "url":upstream, "transport":"STREAMABLEHTTP",
+                "visibility":"public", "description":"Draft",
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = serde_json::from_str(&created.text().await.unwrap()).unwrap();
+    let gateway = &created["gateway"];
+    assert_eq!(gateway["createdVia"], "ui");
+    let url = format!("{base}/{}", gateway["id"].as_str().unwrap());
+    let updated = client
+        .put(&url)
+        .bearer_auth(jwt)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"description":"Published","ownerEmail":"other@example.test"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let detail = client.get(&url).bearer_auth(jwt).send().await.unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: Value = serde_json::from_str(&detail.text().await.unwrap()).unwrap();
+    assert_eq!(detail["description"], "Published");
+    assert_eq!(detail["modifiedVia"], "ui");
+    assert_eq!(detail["ownerEmail"], EMAIL);
+    assert_eq!(detail["visibility"], "public");
+    assert_eq!(detail["url"], upstream);
+
+    let deleted = client.delete(&url).bearer_auth(jwt).send().await.unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert!(deleted.text().await.unwrap().is_empty());
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(jwt)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    fixture.process.kill().await.unwrap();
+    upstream_task.abort();
 }

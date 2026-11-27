@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod gateway;
+
 use serde_json::Map;
 
 use super::*;
-
-pub(in crate::local_auth::browser) fn supported(kind: ManagedCatalog) -> bool {
-    !matches!(kind, ManagedCatalog::Gateways)
-}
 
 pub(in crate::local_auth::browser) async fn save(
     State(accounts): State<Arc<Accounts>>,
@@ -17,12 +15,20 @@ pub(in crate::local_auth::browser) async fn save(
     request: Request,
 ) -> Response {
     let id = path.map(|Path(id)| id);
-    let (principal, parts, form) = match authorized_form(
+    let gateway = matches!(kind, ManagedCatalog::Gateways);
+    let json_allowed = gateway && (id.is_none() || request.method() == Method::PUT);
+    let AuthorizedForm {
+        principal,
+        parts,
+        form,
+        json,
+    } = match authorized_form(
         &accounts,
         kind,
         operation(id.as_deref()),
         request,
         peer.ip(),
+        json_allowed,
     )
     .await
     {
@@ -31,27 +37,47 @@ pub(in crate::local_auth::browser) async fn save(
     };
     let response = async {
         let browser = form.get("_dashboard") == "true";
-        let result = match fields(kind, &form, id.is_some(), browser) {
-            Ok(fields) => {
+        let input = json.map_or_else(|| fields(kind, &form, id.is_some(), browser), Ok);
+        let result = match input {
+            Ok(fields) if gateway => {
+                let legacy_edit = !browser && id.is_some() && parts.method == Method::POST;
                 service
-                    .save_admin_catalog(
-                        kind,
+                    .save_admin_gateway(
                         &principal,
                         id.as_deref(),
                         fields,
                         &parts.headers,
                         peer,
+                        legacy_edit,
                     )
                     .await
             }
+            Ok(fields) => service
+                .save_admin_catalog(
+                    kind,
+                    &principal,
+                    id.as_deref(),
+                    fields,
+                    &parts.headers,
+                    peer,
+                )
+                .await
+                .map(|()| {
+                    Json(json!({"message":success(kind, id.is_some()),"success":true}))
+                        .into_response()
+                }),
             Err(error) => Err(error),
         };
         match (browser, result) {
-            (false, Ok(())) => {
-                Json(json!({"message":success(kind, id.is_some()),"success":true})).into_response()
-            }
+            (false, Ok(response)) => response,
             (false, Err(error)) => error.form_response(),
-            (true, Ok(())) => settings_for(&accounts).redirect(&back(kind, &parts.uri, &principal)),
+            (true, Ok(response)) => {
+                let mut location = back(kind, &parts.uri, &principal);
+                if response.status() == StatusCode::ACCEPTED {
+                    location.push_str("&message=gateway_write_pending");
+                }
+                settings_for(&accounts).redirect(&location)
+            }
             (true, Err(error)) => {
                 let original = match id.as_deref() {
                     Some(id) => match service.editable_admin_catalog(kind, &principal, id).await {
@@ -179,7 +205,9 @@ fn fields(
             } else {
                 "private"
             });
-    fields.insert("visibility".to_owned(), visibility.into());
+    if !matches!(kind, ManagedCatalog::Gateways) || !edit || form.value("visibility").is_some() {
+        fields.insert("visibility".to_owned(), visibility.into());
+    }
     if let Some(team) = nonempty(form, "team_id") {
         fields.insert("team_id".to_owned(), team.trim().into());
     }
@@ -369,7 +397,7 @@ fn fields(
                 fields.insert("oauth_config".to_owned(), json!(config));
             }
         }
-        ManagedCatalog::Gateways => unreachable!("catalog editor route"),
+        ManagedCatalog::Gateways => gateway::fields(form, &mut fields)?,
     }
     Ok(fields)
 }
@@ -457,7 +485,7 @@ impl Page<'_> {
             ManagedCatalog::Servers => "virtual server",
             ManagedCatalog::Resources => "resource",
             ManagedCatalog::Prompts => "prompt",
-            ManagedCatalog::Gateways => unreachable!("catalog editor route"),
+            ManagedCatalog::Gateways => "MCP server",
         };
         let heading = format!("{} {singular}", if id.is_some() { "Edit" } else { "Add" });
         let mut values = Map::new();
@@ -476,6 +504,8 @@ impl Page<'_> {
             "template",
             "icon",
             "instructions",
+            "transport",
+            "gatewayMode",
         ] {
             values.insert(name.to_owned(), record[name].as_str().unwrap_or("").into());
         }
@@ -492,6 +522,14 @@ impl Page<'_> {
                 serde_json::to_string_pretty(&record[name]).unwrap_or_default()
             };
             values.insert(name.to_owned(), text.into());
+        }
+        if let Some(headers) = record["passthroughHeaders"].as_array() {
+            let headers = headers
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            values.insert("passthroughHeaders".to_owned(), headers.into());
         }
         let tags = record["tags"]
             .as_array()
@@ -536,6 +574,10 @@ impl Page<'_> {
                 ("arguments", "arguments"),
                 ("icon", "icon"),
                 ("instructions", "instructions"),
+                ("transport", "transport"),
+                ("gateway_mode", "gatewayMode"),
+                ("passthrough_headers", "passthroughHeaders"),
+                ("auth_type", "authType"),
             ],
         );
         self

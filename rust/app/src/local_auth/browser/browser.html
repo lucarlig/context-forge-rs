@@ -114,6 +114,40 @@
       {% elif editor.kind == "servers" %}
       <label>Icon URL <input type="url" name="icon" value="{{ values.icon }}"></label>
       <label>Instructions <textarea name="instructions" rows="6">{{ values.instructions }}</textarea></label>
+      {% elif editor.kind == "gateways" %}
+      <label>Endpoint URL <input type="url" name="url" value="{{ values.url }}" required></label>
+      <label><span id="gateway-transport-label">Transport</span>
+        <select name="transport" aria-labelledby="gateway-transport-label">
+          <option value="SSE"{% if values.transport == "SSE" %} selected{% endif %}>SSE</option>
+          <option value="STREAMABLEHTTP"{% if values.transport == "STREAMABLEHTTP" %} selected{% endif %}>Streamable HTTP</option>
+        </select>
+      </label>
+      <details>
+        <summary>Connection settings</summary>
+        <label><span id="gateway-mode-label">Gateway mode</span>
+          <select name="gateway_mode" aria-labelledby="gateway-mode-label">
+            <option value="cache"{% if values.gatewayMode == "cache" %} selected{% endif %}>Cache</option>
+            <option value="direct_proxy"{% if values.gatewayMode == "direct_proxy" %} selected{% endif %}>Direct proxy</option>
+          </select>
+        </label>
+        <label>Passthrough headers <input name="passthrough_headers" value="{{ values.passthroughHeaders|default('', true) }}" placeholder="Comma-separated"></label>
+        <label><span id="gateway-auth-label">Authentication</span>
+          <select name="auth_type" aria-labelledby="gateway-auth-label">
+            <option value="">{{ "Keep current authentication" if editor.editing else "None" }}</option>
+            {% for method, label in [("none", "Remove authentication"), ("basic", "Basic"), ("bearer", "Bearer"), ("authheaders", "Custom header"), ("oauth", "OAuth")] %}
+            {% if editor.editing or method != "none" %}
+            <option value="{{ method }}"{% if values.authType == method %} selected{% endif %}>{{ label }}</option>
+            {% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>Upstream username <input name="auth_username" autocomplete="off"></label>
+        <label>Upstream password <input type="password" name="auth_password" autocomplete="new-password"></label>
+        <label>Bearer token <input type="password" name="auth_token" autocomplete="off"></label>
+        <label>Authentication header name <input name="auth_header_key" autocomplete="off"></label>
+        <label>Authentication header value <input type="password" name="auth_header_value" autocomplete="off"></label>
+        <label>OAuth configuration (JSON) <textarea name="oauth_config" rows="5" autocomplete="off" spellcheck="false"></textarea></label>
+      </details>
       {% endif %}
       <label>Visibility
         <select name="visibility">
@@ -155,7 +189,7 @@
     {% for part in catalog.sections %}
     <section id="{{ part.fragment }}" aria-labelledby="heading-{{ part.name }}">
       <h2 id="heading-{{ part.name }}">{{ part.label }}</h2>
-      {% if part.editor %}{% set editor_query = "?include_inactive=" ~ ("true" if catalog.include_inactive else "false") ~ ("&team_id=" ~ catalog.team if catalog.team else "") %}{% endif %}
+      {% set editor_query = "?include_inactive=" ~ ("true" if catalog.include_inactive else "false") ~ ("&team_id=" ~ catalog.team if catalog.team else "") %}
       {% if part.create %}<p><a href="{{ root }}/admin/{{ part.name }}/new{{ editor_query }}">Add entry</a></p>{% endif %}
       {% if part.rows %}
       <div class="table-scroll">
@@ -167,7 +201,7 @@
               <th scope="row">{{ item.name }}</th><td>{{ item.description|default('—', true) }}</td><td>{{ "Active" if item.enabled else "Inactive" }}</td><td>{{ item.visibility|default('—', true) }}</td>
               {% if part.actions %}<td><div class="actions">
                 {% if item.update %}
-                {% if part.editor %}<a href="{{ root }}/admin/{{ part.name }}/{{ item.id }}/edit{{ editor_query }}">Edit</a>{% endif %}
+                <a href="{{ root }}/admin/{{ part.name }}/{{ item.id }}/edit{{ editor_query }}">Edit</a>
                 <form method="post" action="{{ root }}/admin/{{ part.name }}/{{ item.id }}/state">
                   <input type="hidden" name="csrf_token" value="{{ proof }}">
                   {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}

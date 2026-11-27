@@ -21,9 +21,10 @@ pub(super) const QUERY_ENCODE: AsciiSet = NON_ALPHANUMERIC
     .remove(b'~')
     .remove(b'/');
 
+#[derive(Default)]
 pub(super) struct Form(HashMap<String, Vec<Zeroizing<String>>>);
 
-const MAX_FORM_BYTES: usize = 65_536;
+pub(super) const MAX_FORM_BYTES: usize = 65_536;
 
 impl Form {
     pub(super) async fn from_request(request: Request) -> Result<(Parts, Self), AccountError> {
@@ -96,11 +97,11 @@ impl Form {
     }
 }
 
-fn urlencoded(headers: &HeaderMap) -> bool {
+pub(super) fn urlencoded(headers: &HeaderMap) -> bool {
     has_media_type(headers, "application/x-www-form-urlencoded")
 }
 
-fn has_media_type(headers: &HeaderMap, media_type: &str) -> bool {
+pub(super) fn has_media_type(headers: &HeaderMap, media_type: &str) -> bool {
     header_text(headers, header::CONTENT_TYPE)
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case(media_type))

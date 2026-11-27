@@ -14,6 +14,13 @@ pub(crate) enum UpdateAuthError {
 }
 
 impl AuthInput {
+    pub(crate) fn clears_auth(&self) -> bool {
+        self.auth_type.as_deref().is_some_and(|kind| {
+            let kind = kind.trim();
+            kind.is_empty() || kind.eq_ignore_ascii_case("none")
+        })
+    }
+
     pub(crate) async fn apply_agent_update(
         &mut self,
         current: &mut GatewayConnectionRow,
