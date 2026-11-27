@@ -77,7 +77,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_external_identity(external_identity)
         .with_token_usage_logging(Settings::token_usage_logging()?),
     );
-    let http_boundary = HttpBoundary::from_env(settings.port, access.clone())?;
+    let http_boundary = HttpBoundary::from_env(settings.port, access.clone(), database.clone())?;
     let email_auth_enabled = Settings::email_auth_enabled()?;
     let issuer = Settings::jwt_issuer()?;
     let accounts = match issuer

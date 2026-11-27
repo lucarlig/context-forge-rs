@@ -19,15 +19,17 @@ const ADMIT: &str = r#"
 local limit, interval, threshold, lockout_ttl = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
 local window_count = #KEYS / 2
 if threshold >= 0 then
-    for index = window_count + 1, #KEYS do
-        if tonumber(redis.call('GET', KEYS[index]) or '0') >= threshold then
-            return {2, 0}
+    local locked = 0
+    for index = 1, window_count do
+        if tonumber(redis.call('GET', KEYS[window_count + index]) or '0') >= threshold then
+            locked = locked + 2 ^ (index - 1)
         end
     end
+    if locked > 0 then return {2, locked} end
 end
 local time = redis.call('TIME')
 local now = tonumber(time[1]) + tonumber(time[2]) / 1000000
-local exceeded = false
+local exceeded = 0
 local remaining = 0
 for index = 1, window_count do
     local key = KEYS[index]
@@ -38,7 +40,7 @@ for index = 1, window_count do
         redis.call('EXPIRE', key, interval * 2)
         if index == 1 then remaining = limit - count - 1 end
     else
-        exceeded = true
+        exceeded = exceeded + 2 ^ (index - 1)
         if threshold >= 0 then
             local violations = KEYS[window_count + index]
             redis.call('INCR', violations)
@@ -46,7 +48,7 @@ for index = 1, window_count do
         end
     end
 end
-if exceeded then return {1, 0} end
+if exceeded > 0 then return {1, exceeded} end
 return {0, remaining}
 "#;
 
@@ -127,8 +129,8 @@ impl RedisBuckets {
             .arg(Uuid::new_v4().simple().to_string());
         match command.query_async::<(u8, usize)>(&mut connection).await {
             Ok((0, remaining)) => Some(Admission::Allowed(remaining)),
-            Ok((1, _)) => Some(Admission::Exceeded),
-            Ok((2, _)) => Some(Admission::Locked),
+            Ok((1, denied @ 1..=7)) => Some(Admission::Exceeded(denied as u8)),
+            Ok((2, denied @ 1..=7)) => Some(Admission::Locked(denied as u8)),
             _ => {
                 let mut state = self.connection.lock().await;
                 if state

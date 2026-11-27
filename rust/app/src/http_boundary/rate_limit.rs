@@ -22,14 +22,17 @@ use serde_json::json;
 use crate::{
     access::Authorizer,
     config::{allowlist, flag, parse, value},
+    database::Database,
 };
 
 const WINDOW: Duration = Duration::from_secs(60);
 
+mod events;
 mod redis;
 
 pub(super) struct RateLimiter {
     auth: Arc<Authorizer>,
+    database: Database,
     identify_actor: bool,
     limits: [usize; 9],
     root: String,
@@ -117,6 +120,7 @@ impl Lockout {
 impl RateLimiter {
     pub(super) fn from_env(
         auth: Arc<Authorizer>,
+        database: Database,
     ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         if !flag("RATE_LIMITING_ENABLED")?.unwrap_or(true) {
             return Ok(None);
@@ -136,6 +140,7 @@ impl RateLimiter {
         };
         Ok(Some(Self {
             auth,
+            database,
             identify_actor: flag("PASSWORD_CHANGE_ENFORCEMENT_ENABLED")?.unwrap_or(true)
                 || flag("SECURITY_LOGGING_ENABLED")?.unwrap_or(false)
                 || flag("MCPGATEWAY_ADMIN_API_ENABLED")?.unwrap_or(false)
@@ -221,8 +226,8 @@ struct Bucket {
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
     Allowed(usize),
-    Exceeded,
-    Locked,
+    Exceeded(u8),
+    Locked(u8),
 }
 
 impl Memory {
@@ -249,8 +254,9 @@ impl Memory {
             });
             self.last_cleanup = Some(now);
         }
-        if let Some(lockout) = lockout
-            && keys.iter().any(|key| {
+        if let Some(lockout) = lockout {
+            let mut locked = 0;
+            for (index, key) in keys.iter().enumerate() {
                 let bucket = self.buckets.get(key);
                 let violations = bucket
                     .filter(|bucket| {
@@ -259,13 +265,16 @@ impl Memory {
                             .is_some_and(|time| now.duration_since(time) < violation_period)
                     })
                     .map_or(0, |bucket| bucket.violations);
-                violations >= lockout.threshold
-            })
-        {
-            return Admission::Locked;
+                if violations >= lockout.threshold {
+                    locked |= 1 << index;
+                }
+            }
+            if locked != 0 {
+                return Admission::Locked(locked);
+            }
         }
         let mut remaining = 0;
-        let mut exceeded = false;
+        let mut exceeded = 0;
         for (index, key) in keys.iter().enumerate() {
             let bucket = self.buckets.entry(key.clone()).or_default();
             while bucket
@@ -276,7 +285,7 @@ impl Memory {
                 bucket.requests.pop_front();
             }
             if bucket.requests.len() >= limit {
-                exceeded = true;
+                exceeded |= 1 << index;
                 if lockout.is_some() {
                     if bucket
                         .violation_at
@@ -294,8 +303,8 @@ impl Memory {
                 remaining = limit - bucket.requests.len();
             }
         }
-        if exceeded {
-            Admission::Exceeded
+        if exceeded != 0 {
+            Admission::Exceeded(exceeded)
         } else {
             Admission::Allowed(remaining)
         }
@@ -308,8 +317,8 @@ async fn limit(State(limiter): State<Arc<RateLimiter>>, request: Request, next: 
         .get::<ConnectInfo<SocketAddr>>()
         .map(|peer| peer.0.ip());
     let ip = peer.map_or_else(|| "unknown".to_owned(), |address| address.to_string());
-    let path = percent_decode_str(request.uri().path()).decode_utf8_lossy();
-    let path = limiter.effective_rate_path(&path);
+    let endpoint = percent_decode_str(request.uri().path()).decode_utf8_lossy();
+    let path = limiter.effective_rate_path(&endpoint);
     if path == "/ws"
         && request
             .headers()
@@ -320,23 +329,31 @@ async fn limit(State(limiter): State<Arc<RateLimiter>>, request: Request, next: 
     }
     let tier = Tier::detect(&path, request.method());
     let limit = limiter.limits[tier as usize];
-    let mut keys = vec![format!("ratelimit:ip:{ip}:{}", tier.name())];
-    if limiter.identify_actor
+    let mut dimensions = vec![format!("ip:{ip}")];
+    let actor = if limiter.identify_actor
         && !matches!(
             path.as_str(),
             "/health" | "/healthz" | "/ready" | "/metrics"
         )
         && !path.starts_with("/static/")
-        && let Some((user, team)) = limiter
+    {
+        limiter
             .auth
             .rate_limit_identity(request.headers(), peer)
             .await
-    {
-        keys.push(format!("ratelimit:user:{user}:{}", tier.name()));
+    } else {
+        None
+    };
+    if let Some((user, team)) = &actor {
+        dimensions.push(format!("user:{user}"));
         if let Some(team) = team {
-            keys.push(format!("ratelimit:team:{team}:{}", tier.name()));
+            dimensions.push(format!("team:{team}"));
         }
     }
+    let keys = dimensions
+        .iter()
+        .map(|dimension| format!("ratelimit:{dimension}:{}", tier.name()))
+        .collect::<Vec<_>>();
     let lockout = limiter.lockout.filter(|_| !lockout_exempt(&path));
     let violation_period = limiter.lockout.map_or(Duration::ZERO, Lockout::period);
     let admission = match &limiter.redis {
@@ -352,18 +369,34 @@ async fn limit(State(limiter): State<Arc<RateLimiter>>, request: Request, next: 
             violation_period,
         )
     });
-    if let Admission::Allowed(remaining) = admission {
-        let mut response = next.run(request).await;
-        set_number(response.headers_mut(), "x-ratelimit-limit", limit);
-        set_number(response.headers_mut(), "x-ratelimit-remaining", remaining);
-        return response;
-    }
-    tracing::warn!(%ip, %path, tier = tier.name(), locked = admission == Admission::Locked, "rate limit exceeded");
-    rejected(
+    let (locked, denied) = match admission {
+        Admission::Allowed(remaining) => {
+            let mut response = next.run(request).await;
+            set_number(response.headers_mut(), "x-ratelimit-limit", limit);
+            set_number(response.headers_mut(), "x-ratelimit-remaining", remaining);
+            return response;
+        }
+        Admission::Exceeded(denied) => (false, denied),
+        Admission::Locked(denied) => (true, denied),
+    };
+    tracing::warn!(%ip, %path, tier = tier.name(), locked, "rate limit exceeded");
+    let event = events::RateLimitEvent {
+        ip: &ip,
+        endpoint: &endpoint,
+        method: request.method().as_str(),
+        team: actor.as_ref().and_then(|(_, team)| team.as_deref()),
         tier,
         limit,
-        lockout.filter(|_| admission == Admission::Locked),
-    )
+        locked,
+    };
+    for (index, dimension) in dimensions.iter().enumerate() {
+        if denied & (1 << index) != 0
+            && let Err(error) = event.record(&limiter.database, dimension).await
+        {
+            tracing::warn!(%error, "could not persist rate-limit security event");
+        }
+    }
+    rejected(tier, limit, lockout.filter(|_| locked))
 }
 
 fn rejected(tier: Tier, limit: usize, lockout: Option<Lockout>) -> Response {
@@ -436,9 +469,9 @@ mod tests {
         );
         assert_eq!(
             check(&mut memory, &medium, Duration::ZERO),
-            Admission::Exceeded
+            Admission::Exceeded(1)
         );
-        assert_eq!(check(&mut memory, &medium, WINDOW), Admission::Locked);
+        assert_eq!(check(&mut memory, &medium, WINDOW), Admission::Locked(1));
         assert_eq!(check(&mut memory, &low, WINDOW), Admission::Allowed(0));
         assert_eq!(
             check(&mut memory, &medium, lockout.period()),

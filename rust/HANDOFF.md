@@ -140,9 +140,13 @@ Seventeen live rate-limit replays match the reference for endpoint tiers,
 anonymous and authenticated requests, IP and team scopes, tier-specific
 lockouts, and the 429 body and headers. They verify dedicated and shared Redis
 across two gateway instances, database-cache isolation, and in-memory fallback
-when Redis is unavailable. The Redis checks use plain TCP. Redis hostname
-verification stays enabled. Rate-limit security event persistence and
-Redis TLS replay remain open.
+when Redis is unavailable.
+
+Nine additional replays match persisted rate-limit events. They cover SQLite,
+PostgreSQL, plaintext Redis, and mutually authenticated Redis TLS. Each blocked
+IP, user, or team produces its own event. Native revision 14 preserves existing
+security events and Alembic history when adopting a pinned SQLite database.
+Redis certificate verification stays enabled. SIEM delivery remains open.
 
 ## Gateway and protocol verification
 

@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     access::Authorizer,
     config::{flag, parse, value},
+    database::Database,
 };
 
 mod compression;
@@ -49,6 +50,7 @@ impl HttpBoundary {
     pub fn from_env(
         port: u16,
         auth: Arc<Authorizer>,
+        database: Database,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let header_limits = if flag("HEADER_SIZE_VALIDATION_ENABLED")?.unwrap_or(true) {
             Some(HeaderLimits {
@@ -74,7 +76,7 @@ impl HttpBoundary {
             correlation,
             proxies: proxy::ProxyHeaders::from_env()?,
             responses: response_policy::ResponsePolicy::from_env(port)?,
-            rate_limiter: rate_limit::RateLimiter::from_env(auth)?,
+            rate_limiter: rate_limit::RateLimiter::from_env(auth, database)?,
         })
     }
 

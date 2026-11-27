@@ -20,7 +20,8 @@ const A2A_PUSH_CONFIGS: &str = include_str!("../migrations/007_a2a_push_configs.
 const A2A_CARDS: &str = include_str!("../migrations/008_a2a_cards.sql");
 const A2A_UAID: &str = include_str!("../migrations/009_a2a_uaid.sql");
 const A2A_METRICS: &str = include_str!("../migrations/010_a2a_metrics.sql");
-const MIGRATIONS: [&str; 13] = [
+const SECURITY_EVENTS: &str = include_str!("../migrations/011_security_events.sql");
+const MIGRATIONS: [&str; 14] = [
     "identity",
     "catalog",
     "legacy_sse",
@@ -34,6 +35,7 @@ const MIGRATIONS: [&str; 13] = [
     "a2a_uaid",
     "a2a_metrics",
     "historical_a2a",
+    "security_events",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -340,6 +342,11 @@ impl Database {
                                 "a2a_agent_cards",
                                 [("kind", "VARCHAR(20) NOT NULL DEFAULT 'public'")]
                             );
+                        }
+                        13 => {
+                            sqlx::raw_sql(SECURITY_EVENTS)
+                                .execute(&mut *$transaction)
+                                .await?;
                         }
                         _ => unreachable!("unknown migration implementation"),
                     }
