@@ -266,7 +266,14 @@ impl GatewayService {
             router = router
                 .route(route, get(management::list).post(register))
                 .route(&format!("{route}/"), get(management::list).post(register))
-                .route(&format!("{route}/{{key}}"), get(management::detail));
+                .route(
+                    &format!("{route}/{{key}}"),
+                    get(management::detail).delete(management::delete),
+                )
+                .route(
+                    &format!("{route}/{{key}}/impact-preview"),
+                    get(management::impact_preview),
+                );
         }
         self.access.protect_api(router.with_state(self.clone()))
     }

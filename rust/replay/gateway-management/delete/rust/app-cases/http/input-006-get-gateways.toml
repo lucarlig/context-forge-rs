@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/gateways/private-fixture"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc2NzIyNTYwMCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJnYXRld2F5LXJlYWQtZml4dHVyZS1zdGF0aWMiLCJpc19hZG1pbiI6dHJ1ZSwidGVhbXMiOm51bGwsInRva2VuX3VzZSI6ImFwaSIsInVzZXIiOnsiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzX2FkbWluIjp0cnVlfX0.GKyvu18IIJPIM-mr6zlik6Q5Mw73Uci1YT0qDiyD_jU"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

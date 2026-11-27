@@ -52,15 +52,15 @@ impl Default for ListenSettings {
 pub(crate) struct CatalogSubscriptions {
     settings: ListenSettings,
     active: Arc<Mutex<HashMap<Option<String>, usize>>>,
-    registrations: broadcast::Sender<RegistrationChange>,
+    changes: broadcast::Sender<CatalogChange>,
     resources: ResourceRelay,
 }
 
 #[derive(Clone)]
-struct RegistrationChange {
+struct CatalogChange {
     visibility: String,
     team_id: Option<String>,
-    owner: String,
+    owner: Option<String>,
 }
 
 impl CatalogSubscriptions {
@@ -68,16 +68,35 @@ impl CatalogSubscriptions {
         Self {
             settings,
             active: Arc::default(),
-            registrations: broadcast::channel(256).0,
+            changes: broadcast::channel(256).0,
             resources: ResourceRelay::new(),
         }
     }
 
     pub(crate) fn registered(&self, registration: &GatewayRegistration<'_>) {
-        let _ = self.registrations.send(RegistrationChange {
-            visibility: registration.visibility.to_owned(),
-            team_id: registration.team_id.map(str::to_owned),
-            owner: registration.owner_email.to_owned(),
+        self.changed(
+            registration.visibility,
+            registration.team_id,
+            Some(registration.owner_email),
+        );
+    }
+
+    pub(crate) fn removed(
+        &self,
+        gateway_id: &str,
+        visibility: &str,
+        team: Option<&str>,
+        owner: Option<&str>,
+    ) {
+        self.resources.remove_gateway(gateway_id);
+        self.changed(visibility, team, owner);
+    }
+
+    fn changed(&self, visibility: &str, team: Option<&str>, owner: Option<&str>) {
+        let _ = self.changes.send(CatalogChange {
+            visibility: visibility.to_owned(),
+            team_id: team.map(str::to_owned),
+            owner: owner.map(str::to_owned),
         });
     }
 
@@ -144,6 +163,7 @@ impl CatalogSubscriptions {
             .filter(|uri| permitted_resources && distinct.insert(*uri))
             .take(MAX_RESOURCE_URIS_PER_LISTEN)
             .collect::<Vec<_>>();
+        let resource_generation = self.resources.generation();
         let targets = if wanted.is_empty() {
             Vec::new()
         } else {
@@ -178,7 +198,7 @@ impl CatalogSubscriptions {
                 Some((target, credentials))
             })
             .collect();
-        let resources = self.resources.watch(targets, upstream);
+        let resources = self.resources.watch(targets, upstream, resource_generation);
         let accepted_uris: Vec<_> = wanted
             .into_iter()
             .filter(|uri| resources.contains_uri(uri))
@@ -200,7 +220,7 @@ impl CatalogSubscriptions {
             filter,
             stream: Arc::new(Mutex::new(Some(SubscriptionStream {
                 _slot: slot,
-                registrations: self.registrations.subscribe(),
+                changes: self.changes.subscribe(),
                 resources,
                 principal: principal.cloned(),
                 server_scoped: server.is_some(),
@@ -258,7 +278,7 @@ impl AcceptedSubscription {
 
 struct SubscriptionStream {
     _slot: Slot,
-    registrations: broadcast::Receiver<RegistrationChange>,
+    changes: broadcast::Receiver<CatalogChange>,
     resources: ResourceWatches,
     principal: Option<Principal>,
     server_scoped: bool,
@@ -278,7 +298,7 @@ impl SubscriptionStream {
             () = context.cancelled() => return,
             () = sleep_until(self.expires) => {},
             () = shutdown.cancelled() => {},
-            _ = publish_changes(&mut self.registrations, scope, &context), if receives_catalog_changes => return,
+            _ = publish_changes(&mut self.changes, scope, &context), if receives_catalog_changes => return,
             _ = self.resources.publish_updates(&context), if receives_resource_updates => return,
         }
         let request = context.request_context();
@@ -300,14 +320,14 @@ impl SubscriptionStream {
 }
 
 async fn publish_changes(
-    registrations: &mut broadcast::Receiver<RegistrationChange>,
+    changes: &mut broadcast::Receiver<CatalogChange>,
     scope: CatalogScope<'_>,
     context: &SubscriptionContext,
 ) -> Result<(), SubscriptionSendError> {
     let filter = context.accepted();
     let sink = context.sink();
     loop {
-        let change = match registrations.recv().await {
+        let change = match changes.recv().await {
             Ok(change) => change,
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -315,7 +335,7 @@ async fn publish_changes(
         if !scope.visible(
             &change.visibility,
             change.team_id.as_deref(),
-            Some(&change.owner),
+            change.owner.as_deref(),
         ) {
             continue;
         }

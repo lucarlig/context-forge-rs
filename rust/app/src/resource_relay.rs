@@ -55,6 +55,7 @@ pub(crate) struct ResourceRelay {
 struct RelayState {
     watches: HashMap<Target, Watch>,
     legacy: HashMap<GatewayScope, Instant>,
+    generation: u64,
 }
 
 struct Watch {
@@ -70,10 +71,31 @@ impl ResourceRelay {
         }
     }
 
+    pub(crate) fn remove_gateway(&self, id: &str) {
+        let mut state = self.state.lock().expect("resource watches");
+        state.generation = state.generation.wrapping_add(1);
+        state.watches.retain(|target, watch| {
+            if target.resource.gateway_id == id {
+                watch.task.abort();
+                false
+            } else {
+                true
+            }
+        });
+        state
+            .legacy
+            .retain(|(gateway_id, _, _), _| gateway_id != id);
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.state.lock().expect("resource watches").generation
+    }
+
     pub(crate) fn watch(
         &self,
         targets: Vec<(ResourceSubscriptionTarget, Option<UpstreamCredentials>)>,
         upstream: &UpstreamClient,
+        generation: u64,
     ) -> ResourceWatches {
         let mut active = ResourceWatches {
             state: self.state.clone(),
@@ -81,6 +103,9 @@ impl ResourceRelay {
             updates: self.updates.subscribe(),
         };
         let mut state = self.state.lock().expect("resource watches");
+        if state.generation != generation {
+            return active;
+        }
         let now = Instant::now();
         state.legacy.retain(|_, until| *until > now);
         for (resource, credentials) in targets {
@@ -146,7 +171,13 @@ impl ResourceWatches {
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             };
-            if self.targets.contains(&target) {
+            let live = self
+                .state
+                .lock()
+                .expect("resource watches")
+                .watches
+                .contains_key(&target);
+            if live && self.targets.contains(&target) {
                 sink.notify_resource_updated(target.resource.uri.clone())
                     .await?;
             }

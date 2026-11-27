@@ -16,7 +16,7 @@ use crate::{
 };
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
-const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
+pub(crate) const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
 
 #[derive(Clone, Copy)]
 pub struct CatalogScope<'a> {

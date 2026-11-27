@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::{
     auth::TeamVisibility,
-    catalog::{CatalogScope, visible_team_ids},
+    catalog::{CATALOG_LOCK, CatalogScope, visible_team_ids},
     database::Database,
 };
 
@@ -85,6 +85,18 @@ pub(crate) struct GatewayList<'a> {
     pub(crate) limit: i64,
 }
 
+#[derive(Serialize, sqlx::FromRow)]
+pub(crate) struct ImpactServer {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    #[serde(skip)]
+    visibility: String,
+    #[serde(skip)]
+    team_id: Option<String>,
+    #[serde(skip)]
+    owner_email: Option<String>,
+}
+
 macro_rules! gateway_select {
     () => {
         "SELECT g.id, g.name, g.slug, g.url, g.description, g.tool_validation_policy, g.transport,
@@ -136,6 +148,61 @@ const GATEWAY_LOOKUP_QUERY: &str = concat!(
       ORDER BY g.id"
 );
 
+const GATEWAY_IMPACT_QUERY: &str = "
+    SELECT s.id, s.name, s.visibility, s.team_id, s.owner_email
+    FROM servers s
+    WHERE s.id IN (
+        SELECT a.server_id FROM server_tool_association a
+        JOIN tools t ON t.id = a.tool_id WHERE t.gateway_id = $1
+        UNION
+        SELECT a.server_id FROM server_resource_association a
+        JOIN resources r ON r.id = a.resource_id WHERE r.gateway_id = $1
+        UNION
+        SELECT a.server_id FROM server_prompt_association a
+        JOIN prompts p ON p.id = a.prompt_id WHERE p.gateway_id = $1
+    )
+    ORDER BY s.name, s.id";
+
+macro_rules! locked_gateway_query {
+    ($lock:literal) => {
+        concat!(
+            "SELECT id FROM gateways WHERE id = $1 AND version = $2
+               AND CAST(updated_at AS TEXT) = $3 AND visibility = $4
+               AND owner_email IS NOT DISTINCT FROM $5 AND team_id IS NOT DISTINCT FROM $6",
+            $lock
+        )
+    };
+}
+
+const OPTIONAL_GATEWAY_DELETES: &[(&str, &str)] = &[
+    (
+        "tool_metrics",
+        "DELETE FROM tool_metrics WHERE tool_id IN (SELECT id FROM tools WHERE gateway_id = $1)",
+    ),
+    (
+        "resource_metrics",
+        "DELETE FROM resource_metrics WHERE resource_id IN (SELECT id FROM resources WHERE gateway_id = $1)",
+    ),
+    (
+        "prompt_metrics",
+        "DELETE FROM prompt_metrics WHERE prompt_id IN (SELECT id FROM prompts WHERE gateway_id = $1)",
+    ),
+    (
+        "resource_subscriptions",
+        "DELETE FROM resource_subscriptions WHERE resource_id IN (SELECT id FROM resources WHERE gateway_id = $1)",
+    ),
+];
+
+const GATEWAY_DELETES: &[&str] = &[
+    "DELETE FROM server_tool_association WHERE tool_id IN (SELECT id FROM tools WHERE gateway_id = $1)",
+    "DELETE FROM server_resource_association WHERE resource_id IN (SELECT id FROM resources WHERE gateway_id = $1)",
+    "DELETE FROM server_prompt_association WHERE prompt_id IN (SELECT id FROM prompts WHERE gateway_id = $1)",
+    "DELETE FROM tools WHERE gateway_id = $1",
+    "DELETE FROM resources WHERE gateway_id = $1",
+    "DELETE FROM prompts WHERE gateway_id = $1",
+    "DELETE FROM gateways WHERE id = $1",
+];
+
 impl Database {
     pub(crate) async fn listed_gateways(
         &self,
@@ -186,6 +253,94 @@ impl Database {
         match self {
             Self::Sqlite(pool) => select!(pool),
             Self::Postgres(pool) => select!(pool),
+        }
+    }
+
+    pub(crate) async fn gateway_impact(
+        &self,
+        gateway_id: &str,
+        scope: CatalogScope<'_>,
+    ) -> Result<Vec<ImpactServer>, sqlx::Error> {
+        macro_rules! select {
+            ($pool:expr) => {
+                sqlx::query_as::<_, ImpactServer>(GATEWAY_IMPACT_QUERY)
+                    .bind(gateway_id)
+                    .fetch_all($pool)
+                    .await?
+            };
+        }
+        let mut servers = match self {
+            Self::Sqlite(pool) => select!(pool),
+            Self::Postgres(pool) => select!(pool),
+        };
+        servers.retain(|server| {
+            scope.visible(
+                &server.visibility,
+                server.team_id.as_deref(),
+                server.owner_email.as_deref(),
+            )
+        });
+        Ok(servers)
+    }
+
+    pub(crate) async fn delete_gateway(
+        &self,
+        expected: &GatewayRecord,
+    ) -> Result<bool, sqlx::Error> {
+        macro_rules! delete {
+            ($transaction:ident, $lock:literal, $table_exists:literal) => {{
+                let id = sqlx::query_scalar::<_, String>(locked_gateway_query!($lock))
+                    .bind(&expected.id)
+                    .bind(expected.version)
+                    .bind(&expected.updated_at)
+                    .bind(&expected.visibility)
+                    .bind(expected.owner_email.as_deref())
+                    .bind(expected.team_id.as_deref())
+                    .fetch_optional(&mut *$transaction)
+                    .await?;
+                let Some(id) = id else {
+                    return Ok(false);
+                };
+                for (table, statement) in OPTIONAL_GATEWAY_DELETES {
+                    if sqlx::query_scalar::<_, bool>($table_exists)
+                        .bind(table)
+                        .fetch_one(&mut *$transaction)
+                        .await?
+                    {
+                        sqlx::query(*statement)
+                            .bind(&id)
+                            .execute(&mut *$transaction)
+                            .await?;
+                    }
+                }
+                for statement in GATEWAY_DELETES {
+                    sqlx::query(*statement)
+                        .bind(&id)
+                        .execute(&mut *$transaction)
+                        .await?;
+                }
+                $transaction.commit().await?;
+                Ok(true)
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+                delete!(
+                    transaction,
+                    "",
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = $1)"
+                )
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
+                delete!(
+                    transaction,
+                    " FOR UPDATE",
+                    "SELECT to_regclass(CAST($1 AS TEXT)) IS NOT NULL"
+                )
+            }
         }
     }
 }

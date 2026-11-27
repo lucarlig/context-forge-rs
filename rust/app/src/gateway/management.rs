@@ -123,6 +123,92 @@ pub(super) async fn detail(
     Ok(Json(response(&record, service.credential_cipher.as_ref())))
 }
 
+pub(super) async fn impact_preview(
+    State(service): State<Arc<GatewayService>>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+) -> Result<Json<Value>, ManagementError> {
+    check_read(&service, &principal).await?;
+    let record = lookup(&service, &principal, key).await?;
+    let servers = service
+        .database
+        .gateway_impact(&record.id, access::catalog_scope(Some(&principal)))
+        .await?;
+    Ok(Json(
+        json!({"gatewayId":record.id,"mcpServerId":record.id,"servers":servers}),
+    ))
+}
+
+pub(super) async fn delete(
+    State(service): State<Arc<GatewayService>>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+) -> Result<Json<Value>, ManagementError> {
+    let record = manageable(
+        &service,
+        &principal,
+        key,
+        "gateways.delete",
+        "Only the owner can delete this gateway",
+    )
+    .await?;
+    if !service.database.delete_gateway(&record).await? {
+        return Err(ManagementError::ConcurrentChange);
+    }
+    service.subscriptions.removed(
+        &record.id,
+        &record.visibility,
+        record.team_id.as_deref(),
+        record.owner_email.as_deref(),
+    );
+    Ok(Json(
+        json!({"status":"success","message":format!("Gateway {} deleted", record.id)}),
+    ))
+}
+
+async fn manageable(
+    service: &GatewayService,
+    principal: &Principal,
+    key: String,
+    permission: &str,
+    ownership_error: &'static str,
+) -> Result<GatewayRecord, ManagementError> {
+    if !service
+        .access
+        .allows(principal, permission, RoleContext::AnyTeam, true)
+        .await?
+    {
+        return Err(ManagementError::Denied);
+    }
+    let record = lookup(service, principal, key.clone()).await?;
+    if record.id != key {
+        return Err(ManagementError::NotFound(key));
+    }
+    let team = record.team_id.as_deref();
+    let context = team.map_or(RoleContext::AnyTeam, RoleContext::Team);
+    if !service
+        .access
+        .allows(principal, permission, context, true)
+        .await?
+    {
+        return Err(ManagementError::Denied);
+    }
+    let owned = record.owner_email.as_deref() == Some(principal.email.as_str())
+        || principal.is_global_admin();
+    let team_owned = if !owned
+        && record.visibility == "team"
+        && let Some(team) = team
+    {
+        service.database.team_owner(&principal.email, team).await?
+    } else {
+        false
+    };
+    if !owned && !team_owned {
+        return Err(ManagementError::Ownership(ownership_error));
+    }
+    Ok(record)
+}
+
 async fn lookup(
     service: &GatewayService,
     principal: &Principal,
@@ -326,8 +412,10 @@ fn mask_fields(value: &mut Value, sensitive: &[&str]) {
 pub(super) enum ManagementError {
     Invalid(&'static str),
     Denied,
+    Ownership(&'static str),
     NotFound(String),
     Conflict(String),
+    ConcurrentChange,
     Internal,
 }
 
@@ -343,10 +431,15 @@ impl IntoResponse for ManagementError {
         let (status, detail) = match self {
             Self::Invalid(message) => (StatusCode::UNPROCESSABLE_ENTITY, message.to_owned()),
             Self::Denied => (StatusCode::FORBIDDEN, "Access denied".to_owned()),
+            Self::Ownership(message) => (StatusCode::FORBIDDEN, message.to_owned()),
             Self::NotFound(key) => (StatusCode::NOT_FOUND, format!("Gateway not found: {key}")),
             Self::Conflict(key) => (
                 StatusCode::CONFLICT,
                 format!("Multiple gateways match: {key}"),
+            ),
+            Self::ConcurrentChange => (
+                StatusCode::CONFLICT,
+                "Gateway changed during request".to_owned(),
             ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -9,6 +9,14 @@ const ACTIVE_MEMBERSHIPS: &str = "
     JOIN email_teams t ON t.id = m.team_id AND t.is_active = TRUE
     WHERE m.user_email = $1 AND m.is_active = TRUE ORDER BY m.id";
 
+const ACTIVE_TEAM_OWNER: &str = "
+    SELECT EXISTS (
+        SELECT 1 FROM email_team_members m
+        JOIN email_teams t ON t.id = m.team_id AND t.is_active = TRUE
+        WHERE m.user_email = $1 AND m.team_id = $2
+          AND m.is_active = TRUE AND m.role = 'owner'
+    )";
+
 type IdentityRow = (String, Option<String>, bool, Option<i64>);
 type GrantRow = (String, Option<String>, bool, String);
 
@@ -29,6 +37,22 @@ pub(crate) struct Grant {
 }
 
 impl Database {
+    pub(crate) async fn team_owner(&self, email: &str, team_id: &str) -> Result<bool, sqlx::Error> {
+        macro_rules! select {
+            ($pool:expr) => {
+                sqlx::query_scalar(ACTIVE_TEAM_OWNER)
+                    .bind(email)
+                    .bind(team_id)
+                    .fetch_one($pool)
+                    .await
+            };
+        }
+        match self {
+            Self::Sqlite(pool) => select!(pool),
+            Self::Postgres(pool) => select!(pool),
+        }
+    }
+
     /// Initialize the account, membership, role, and revocation tables.
     pub async fn migrate_identity(&self) -> Result<(), sqlx::Error> {
         match self {

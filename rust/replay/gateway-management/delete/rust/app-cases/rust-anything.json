@@ -1,0 +1,20 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-rs",
+  "run": [
+    "context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "input-001-get-gateways",
+    "input-002-get-v1",
+    "input-003-delete-v1",
+    "input-004-delete-v1",
+    "input-005-get-gateways",
+    "input-006-get-gateways"
+  ]
+}
