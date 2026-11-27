@@ -42,14 +42,14 @@ impl Drop for ServiceOAuthOverride {
 
 pub(crate) struct ExchangedCredential {
     pub(crate) authorization: HeaderValue,
-    pub(crate) expires_in: Option<u64>,
+    pub(crate) expires_in: u64,
 }
 
 #[derive(Deserialize)]
 struct ExchangeResponse {
     access_token: String,
     token_type: String,
-    expires_in: Option<u64>,
+    expires_in: Option<Value>,
 }
 
 impl Drop for ExchangeResponse {
@@ -389,7 +389,16 @@ impl OAuthConfig {
         authorization.set_sensitive(true);
         Ok(ExchangedCredential {
             authorization,
-            expires_in: token.expires_in,
+            expires_in: token
+                .expires_in
+                .as_ref()
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+                })
+                .filter(|lifetime| *lifetime > 0)
+                .unwrap_or(60),
         })
     }
 }

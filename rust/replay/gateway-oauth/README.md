@@ -57,3 +57,10 @@ A separate check matched the pinned tool error when the provider returned
 a non-bearer token. That response did not reach the MCP upstream. Gateway
 configuration and connection changes for token exchange require a
 platform administrator.
+
+Two workers sharing Valkey reused successful exchanges and recent
+failures on SQLite and PostgreSQL. A fresh credential for the same
+caller used a separate cache entry. The fixture inspected the stored
+values to verify that they contain no plaintext access tokens. Shared
+entries are encrypted and bound to the gateway revision and caller
+credential, and each worker has a bounded fallback cache.

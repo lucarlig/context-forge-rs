@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_logging_filter(handle)
         .with_management_page_sizes(management_page_size, management_max_page_size)
         .with_credential_secret(Settings::auth_encryption_secret()?.as_deref())
+        .with_redis_oauth_cache(Settings::redis_connection()?.as_ref())
         .with_secret_kdf(Settings::secret_kdf()?)
         .with_query_auth_hosts(Settings::query_auth_hosts()?)
         .with_header_forwarding(Settings::header_forwarding()?)

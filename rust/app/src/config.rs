@@ -157,18 +157,7 @@ impl Settings {
     }
     pub fn from_env() -> Result<Self, Box<dyn Error + Send + Sync>> {
         let redis = match value("CACHE_TYPE", "database")?.as_str() {
-            "redis" => {
-                let url = value("REDIS_URL", "")?;
-                if url.is_empty() {
-                    None
-                } else {
-                    Some(RedisSettings {
-                        url,
-                        connect_timeout: positive_seconds("REDIS_SOCKET_CONNECT_TIMEOUT", 2.0)?,
-                        response_timeout: positive_seconds("REDIS_SOCKET_TIMEOUT", 2.0)?,
-                    })
-                }
-            }
+            "redis" => Self::redis_connection()?,
             "database" | "memory" | "none" => None,
             _ => return Err("invalid CACHE_TYPE".into()),
         };
@@ -1129,6 +1118,18 @@ impl Settings {
                 .map_err(|_| "invalid CONTENT_ALLOWED_RESOURCE_MIMETYPES")?;
         }
         Ok(limits)
+    }
+
+    pub fn redis_connection() -> Result<Option<RedisSettings>, Box<dyn Error + Send + Sync>> {
+        let url = value("REDIS_URL", "")?;
+        if url.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RedisSettings {
+            url,
+            connect_timeout: positive_seconds("REDIS_SOCKET_CONNECT_TIMEOUT", 2.0)?,
+            response_timeout: positive_seconds("REDIS_SOCKET_TIMEOUT", 2.0)?,
+        }))
     }
 
     pub fn invalidate_sessions_on_password_change() -> Result<bool, Box<dyn Error + Send + Sync>> {

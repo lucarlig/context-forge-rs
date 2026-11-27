@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::{
     catalog::GatewayConnectionRow,
@@ -44,16 +45,24 @@ impl CredentialCipher {
     }
 
     pub(crate) fn seal(&self, value: &impl Serialize) -> Result<String, CredentialError> {
+        self.seal_scoped(value, &[])
+    }
+
+    pub(crate) fn seal_scoped(
+        &self,
+        value: &impl Serialize,
+        context: &[u8],
+    ) -> Result<String, CredentialError> {
         let mut nonce = [0; NONCE_LEN];
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| CredentialError)?;
-        let mut plaintext = serde_json::to_vec(value).map_err(|_| CredentialError)?;
+        let mut plaintext = Zeroizing::new(serde_json::to_vec(value).map_err(|_| CredentialError)?);
         self.key
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(nonce),
-                Aad::empty(),
-                &mut plaintext,
+                Aad::from(context),
+                &mut *plaintext,
             )
             .map_err(|_| CredentialError)?;
         let mut combined = Vec::with_capacity(NONCE_LEN + plaintext.len());
@@ -63,9 +72,19 @@ impl CredentialCipher {
     }
 
     pub(crate) fn open<T: DeserializeOwned>(&self, encoded: &str) -> Result<T, CredentialError> {
-        let mut bytes = BASE64_URL_SAFE_NO_PAD
-            .decode(encoded.trim_end_matches('='))
-            .map_err(|_| CredentialError)?;
+        self.open_scoped(encoded, &[])
+    }
+
+    pub(crate) fn open_scoped<T: DeserializeOwned>(
+        &self,
+        encoded: &str,
+        context: &[u8],
+    ) -> Result<T, CredentialError> {
+        let mut bytes = Zeroizing::new(
+            BASE64_URL_SAFE_NO_PAD
+                .decode(encoded.trim_end_matches('='))
+                .map_err(|_| CredentialError)?,
+        );
         let (nonce, ciphertext) = bytes
             .split_first_chunk_mut::<NONCE_LEN>()
             .ok_or(CredentialError)?;
@@ -73,7 +92,7 @@ impl CredentialCipher {
             .key
             .open_in_place(
                 Nonce::assume_unique_for_key(*nonce),
-                Aad::empty(),
+                Aad::from(context),
                 ciphertext,
             )
             .map_err(|_| CredentialError)?;

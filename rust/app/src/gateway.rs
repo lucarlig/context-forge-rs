@@ -322,6 +322,14 @@ impl GatewayService {
         self
     }
 
+    pub fn with_redis_oauth_cache(
+        mut self,
+        settings: Option<&crate::config::RedisSettings>,
+    ) -> Self {
+        self.exchanged_tokens.set_redis(settings);
+        self
+    }
+
     pub fn with_secret_kdf(mut self, kdf: SecretKdf) -> Self {
         if let Some(vault) = &mut self.vault {
             vault.kdf = kdf;
@@ -927,7 +935,7 @@ impl GatewayService {
                         .ok_or(ToolError::OAuthExchangeFailed)?;
                     Some(self.exchanged_tokens.authorization(
                         ExchangeConnection {gateway_id:id,version:connection.version,
-                            upstream:&upstream,config:&config,tls:credentials.tls.as_ref()},
+                            upstream:&upstream,config:&config,tls:credentials.tls.as_ref(),cipher},
                         principal, subject,
                     ).await.map_err(|error| {
                         tracing::warn!(gateway=%id, %error, "upstream OAuth exchange failed");
