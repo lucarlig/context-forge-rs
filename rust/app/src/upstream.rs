@@ -310,6 +310,12 @@ pub struct UpstreamClient {
     mode: ConnectMode,
 }
 
+pub(crate) struct RestResponse {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) content_type: Option<HeaderValue>,
+    pub(crate) body: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ConnectMode {
     #[default]
@@ -1124,7 +1130,7 @@ impl UpstreamClient {
         &self,
         mut request: reqwest::Request,
         signer: Option<&crate::sigv4::SigV4>,
-    ) -> Result<(reqwest::StatusCode, Vec<u8>), UpstreamError> {
+    ) -> Result<RestResponse, UpstreamError> {
         timeout_at(self.deadline()?, async {
             let (client, url) = self
                 .pinned_client(request.url().as_str(), None, None)
@@ -1138,8 +1144,11 @@ impl UpstreamClient {
                 drop(response);
                 response = send_rest_request(&client, retry, signer).await?;
             }
-            let status = response.status();
-            Ok((status, read_json_body(response).await?))
+            Ok(RestResponse {
+                status: response.status(),
+                content_type: response.headers().get(CONTENT_TYPE).cloned(),
+                body: read_bounded_body(response, MAX_MESSAGE_BYTES).await?,
+            })
         })
         .await
         .map_err(|_| UpstreamError::Timeout)?

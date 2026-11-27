@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-pub(super) fn parse_error(
-    error: &serde_json::Error,
-    text: &str,
-    bounded: &str,
-    limit: usize,
-) -> String {
+pub(super) fn parse_error(error: &str, text: &str, bounded: &str, limit: usize) -> String {
     if text.is_empty() {
         return "Empty response body".into();
     }
+    let total = text.chars().count();
+    if total > limit {
+        format!(
+            "Response body is not valid JSON: {error}. Showing the first {limit} of {total} characters:\n{bounded}"
+        )
+    } else {
+        format!("Response body is not valid JSON: {error}.\n{bounded}")
+    }
+}
+
+pub(super) fn syntax_error(error: &serde_json::Error, text: &str) -> String {
     let rendered = error.to_string();
     let reason = rendered.split(" at line ").next().unwrap_or(&rendered);
     let line_start: usize = text
@@ -68,7 +74,20 @@ pub(super) fn parse_error(
             (reason, comma)
         }
         "trailing characters" => ("Extra data", offset),
-        "invalid escape" => ("Invalid \\escape", offset.saturating_sub(1)),
+        "invalid escape" => {
+            let unicode = text.as_bytes()[..offset]
+                .windows(2)
+                .rposition(|pair| pair == b"\\u")
+                .filter(|start| offset - start <= 5);
+            if let Some(start) = unicode {
+                ("Invalid \\uXXXX escape", start + 1)
+            } else {
+                ("Invalid \\escape", offset.saturating_sub(1))
+            }
+        }
+        "control character (\\u0000-\\u001F) found while parsing a string" => {
+            ("Invalid control character at", offset)
+        }
         reason => (reason, offset),
     };
     let mut line = 1;
@@ -82,15 +101,7 @@ pub(super) fn parse_error(
             column = 1;
         }
     }
-    let total = text.chars().count();
-    let error = format!("{reason}: line {line} column {column} (char {position})");
-    if total > limit {
-        format!(
-            "Response body is not valid JSON: {error}. Showing the first {limit} of {total} characters:\n{bounded}"
-        )
-    } else {
-        format!("Response body is not valid JSON: {error}.\n{bounded}")
-    }
+    format!("{reason}: line {line} column {column} (char {position})")
 }
 
 fn last_string_start(text: &str) -> Option<usize> {

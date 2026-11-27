@@ -181,8 +181,13 @@ concurrency, `REGEX_MAX_SUBJECT_BYTES` limits the validation input, and
 `REGEX_TIMEOUT_SECONDS` covers worker startup and execution. The replay
 compared timeout and size-limit errors and verified that saturated requests
 stop before dispatch on SQLite and PostgreSQL. The worker slot remains
-available for the next request after validation finishes. Unusual response
-parser diagnostics still need parity checks.
+available for the next request after validation finishes.
+
+REST parses UTF-8, UTF-16, and UTF-32 JSON bodies. Text fallback uses the
+declared HTTP charset through `encoding_rs`. Ten response cases matched on
+SQLite and PostgreSQL, including multibyte JSON, legacy text charsets, and
+malformed JSON escapes. Compressed REST responses and diagnostics for
+malformed UTF-16 and UTF-32 remain open.
 
 Authenticated `POST /rpc` and `POST /rpc/` serve tool calls, legacy tool
 names, catalog reads, resource reads, prompt retrieval, and initialization.

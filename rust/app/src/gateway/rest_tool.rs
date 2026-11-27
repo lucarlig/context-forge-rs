@@ -13,9 +13,11 @@ use crate::{
     forward_headers::hop_header_name,
     schema_validation::Target,
     sigv4::{SigV4Config, has_query_signature},
+    upstream::RestResponse,
 };
 
 mod diagnostics;
+mod response_body;
 
 const URL_VALUE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -161,7 +163,14 @@ pub(super) async fn execute(
         .rest_response(request, credentials.sigv4.as_deref())
         .await;
     let result = match (initial, exchange, retry) {
-        (Ok((StatusCode::UNAUTHORIZED, _)), Some((gateway, encoded)), Some(mut retry)) => {
+        (
+            Ok(RestResponse {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            }),
+            Some((gateway, encoded)),
+            Some(mut retry),
+        ) => {
             let authorization = match refreshed_exchange(
                 service, tool, gateway, encoded, principal, incoming,
             )
@@ -180,11 +189,10 @@ pub(super) async fn execute(
         (result, _, _) => result,
     };
     match result {
-        Ok((status, body)) => Ok(response_result(
+        Ok(response) => Ok(response_result(
             service,
             &tool.response_filter,
-            status,
-            &body,
+            &response,
             tool.definition.output_schema.as_ref(),
         )
         .await),
@@ -590,17 +598,23 @@ fn multipart(headers: &mut HeaderMap, fields: Map<String, Value>) -> String {
 async fn response_result(
     service: &GatewayService,
     expression: &str,
-    status: StatusCode,
-    body: &[u8],
+    response: &RestResponse,
     output_schema: Option<&Value>,
 ) -> Value {
+    let status = response.status;
     if status == StatusCode::NO_CONTENT {
         return text_result("Request completed successfully (No Content)", false);
     }
     let text_limit = service.rest_response_text_limit;
-    let text = String::from_utf8_lossy(body);
+    let text = response_body::decode_text(
+        &response.body,
+        response
+            .content_type
+            .as_ref()
+            .and_then(|value| value.to_str().ok()),
+    );
     let bounded: String = text.chars().take(text_limit).collect();
-    let json_body: Result<Value, _> = serde_json::from_slice(body);
+    let json_body = response_body::decode_json(&response.body);
     let output_schema = output_schema.filter(|value| !value.as_object().is_some_and(Map::is_empty));
     let success = matches!(status.as_u16(), 200 | 201 | 202 | 206);
     if !success {
@@ -641,7 +655,7 @@ async fn response_result(
                 true,
             );
         }
-        Err(_) if body.is_empty() => json!({"error":"Empty response body"}),
+        Err(_) if text.is_empty() => json!({"error":"Empty response body"}),
         Err(_) => json!({"response_text":bounded}),
     };
     let result = match service.response_filters.apply(expression, result).await {
