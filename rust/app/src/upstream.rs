@@ -217,6 +217,14 @@ pub enum UpstreamError {
     Status(u16),
     #[error("upstream message exceeded a size or pagination limit")]
     LimitExceeded,
+    #[error("Upstream MCP catalog contains duplicate identifiers")]
+    DuplicateCatalogItems,
+    #[error("Upstream MCP server repeats an invalid pagination cursor")]
+    InvalidCatalogCursor,
+    #[error("Direct-proxy MCP catalog exceeds the snapshot byte limit")]
+    CatalogByteLimit,
+    #[error("Upstream MCP catalog exceeds the pagination page limit")]
+    CatalogPageLimit,
     #[error("upstream returned an invalid MCP response")]
     InvalidResponse,
     #[error("upstream does not advertise MCP completions")]
@@ -232,6 +240,34 @@ pub enum UpstreamError {
 pub(crate) enum ResourceListenEvent {
     Acknowledged,
     Updated,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ProxyCatalogKind {
+    Tools,
+    Resources,
+}
+
+impl ProxyCatalogKind {
+    pub(crate) fn method(self) -> &'static str {
+        match self {
+            Self::Tools => "tools/list",
+            Self::Resources => "resources/list",
+        }
+    }
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Tools => "tools",
+            Self::Resources => "resources",
+        }
+    }
+}
+
+struct ProxyListOptions<'a> {
+    identifier: &'static str,
+    max_bytes: usize,
+    user: Option<&'a Value>,
 }
 
 pub(crate) enum ResourceListenEnd {
@@ -310,10 +346,37 @@ impl<'a> UpstreamEndpoint<'a> {
     }
 
     pub(crate) fn credential_fingerprint(self) -> Option<[u8; 32]> {
+        self.fingerprint(false)
+    }
+
+    pub(crate) fn catalog_fingerprint(self) -> Option<[u8; 32]> {
+        self.fingerprint(true)
+    }
+
+    fn fingerprint(self, catalog: bool) -> Option<[u8; 32]> {
         let credentials = self.credentials.filter(|credentials| {
             !credentials.headers.is_empty() || !credentials.query.is_empty()
         })?;
         let mut entries: Vec<_> = credentials.headers.iter().collect();
+        if catalog {
+            entries.retain(|(name, _)| {
+                credentials.request_bound_header.as_ref() != Some(*name)
+                    && !matches!(
+                        name.as_str(),
+                        "traceparent"
+                            | "tracestate"
+                            | "x-trace-id"
+                            | "x-request-id"
+                            | "x-correlation-id"
+                            | "b3"
+                            | "x-b3-traceid"
+                            | "x-b3-spanid"
+                            | "x-b3-parentspanid"
+                            | "x-b3-sampled"
+                            | "x-b3-flags"
+                    )
+            });
+        }
         entries.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
         let mut hash = Sha256::new();
         hash.update((entries.len() as u64).to_be_bytes());
@@ -457,6 +520,40 @@ impl UpstreamClient {
             .open_session(UpstreamEndpoint::streamable(url), deadline)
             .await?;
         let result = timeout_at(deadline, session.list_tools()).await;
+        session.close().await;
+        result.map_err(|_| UpstreamError::Timeout)?
+    }
+
+    pub(crate) async fn collect_proxy_catalog(
+        &self,
+        endpoint: UpstreamEndpoint<'_>,
+        kind: ProxyCatalogKind,
+        max_bytes: usize,
+    ) -> Result<Vec<Value>, UpstreamError> {
+        let deadline = self.deadline()?;
+        let session = self.open_session(endpoint, deadline).await?;
+        let options = ProxyListOptions {
+            identifier: match kind {
+                ProxyCatalogKind::Tools => "name",
+                ProxyCatalogKind::Resources => "uri",
+            },
+            max_bytes,
+            user: endpoint
+                .credentials
+                .and_then(|credentials| credentials.identity_meta.as_ref()),
+        };
+        let result = timeout_at(
+            deadline,
+            session.list_items(
+                kind.key(),
+                |params| match kind {
+                    ProxyCatalogKind::Tools => ListToolsRequest::with_param(params).into(),
+                    ProxyCatalogKind::Resources => ListResourcesRequest::with_param(params).into(),
+                },
+                Some(options),
+            ),
+        )
+        .await;
         session.close().await;
         result.map_err(|_| UpstreamError::Timeout)?
     }
@@ -1003,9 +1100,11 @@ impl Session {
 
     async fn list_tools(&self) -> Result<DiscoveredCatalog, UpstreamError> {
         let tools = self
-            .list_items("tools", |params| {
-                ListToolsRequest::with_param(params).into()
-            })
+            .list_items(
+                "tools",
+                |params| ListToolsRequest::with_param(params).into(),
+                None,
+            )
             .await?;
         Ok(DiscoveredCatalog {
             capabilities: self.capabilities.clone(),
@@ -1018,7 +1117,7 @@ impl Session {
         key: &str,
         request: impl Fn(PaginatedRequestParams) -> ClientRequest,
     ) -> Result<Vec<T>, UpstreamError> {
-        self.list_items(key, request)
+        self.list_items(key, request, None)
             .await?
             .into_iter()
             .map(|item| serde_json::from_value(item).map_err(|_| UpstreamError::InvalidResponse))
@@ -1029,25 +1128,56 @@ impl Session {
         &self,
         key: &str,
         request: impl Fn(PaginatedRequestParams) -> ClientRequest,
+        proxy: Option<ProxyListOptions<'_>>,
     ) -> Result<Vec<Value>, UpstreamError> {
         let mut listed = Vec::new();
         let mut cursors = HashSet::new();
+        let mut seen = HashSet::new();
         let mut cursor = None;
-        let mut received = 0usize;
-        for _ in 0..MAX_TOOL_PAGES {
+        let mut received = if proxy.is_some() { 2usize } else { 0usize };
+        let max_pages = if proxy.is_some() {
+            10_000
+        } else {
+            MAX_TOOL_PAGES
+        };
+        for _ in 0..max_pages {
             let params = PaginatedRequestParams::default().with_cursor(cursor.take());
+            let mut request = request(params);
+            if let Some(user) = proxy.as_ref().and_then(|options| options.user) {
+                request.get_meta_mut().insert("user".into(), user.clone());
+            }
             let reply = self
-                .request_with_id(request(params), self.next_request_id(), None)
+                .request_with_id(request, self.next_request_id(), None)
                 .await?;
-            received += reply.bytes;
             let Value::Object(mut result) = reply.result else {
                 return Err(UpstreamError::InvalidResponse);
             };
             let Some(Value::Array(items)) = result.remove(key) else {
                 return Err(UpstreamError::InvalidResponse);
             };
-            if received > MAX_CATALOG_BYTES || listed.len() + items.len() > MAX_TOOLS {
-                return Err(UpstreamError::LimitExceeded);
+            if let Some(proxy) = &proxy {
+                for item in &items {
+                    let identifier = item
+                        .get(proxy.identifier)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or(UpstreamError::InvalidResponse)?;
+                    if !seen.insert(identifier.to_owned()) {
+                        return Err(UpstreamError::DuplicateCatalogItems);
+                    }
+                    let bytes = serde_json::to_vec(item)
+                        .map_err(|_| UpstreamError::InvalidResponse)?
+                        .len();
+                    received = received.saturating_add(bytes.saturating_add(1));
+                    if received > proxy.max_bytes {
+                        return Err(UpstreamError::CatalogByteLimit);
+                    }
+                }
+            } else {
+                received += reply.bytes;
+                if received > MAX_CATALOG_BYTES || listed.len() + items.len() > MAX_TOOLS {
+                    return Err(UpstreamError::LimitExceeded);
+                }
             }
             if items.iter().any(|item| {
                 item.get("name")
@@ -1060,9 +1190,16 @@ impl Session {
             match result.remove("nextCursor") {
                 Some(Value::String(next_cursor)) if !next_cursor.is_empty() => {
                     if !cursors.insert(next_cursor.clone()) {
-                        return Err(UpstreamError::LimitExceeded);
+                        return Err(if proxy.is_some() {
+                            UpstreamError::InvalidCatalogCursor
+                        } else {
+                            UpstreamError::LimitExceeded
+                        });
                     }
                     cursor = Some(next_cursor);
+                }
+                Some(Value::String(_)) if proxy.is_some() => {
+                    return Err(UpstreamError::InvalidCatalogCursor);
                 }
                 None | Some(Value::Null | Value::String(_)) => {
                     return Ok(listed);
@@ -1070,7 +1207,11 @@ impl Session {
                 _ => return Err(UpstreamError::InvalidResponse),
             }
         }
-        Err(UpstreamError::LimitExceeded)
+        Err(if proxy.is_some() {
+            UpstreamError::CatalogPageLimit
+        } else {
+            UpstreamError::LimitExceeded
+        })
     }
 
     async fn request_with_id(

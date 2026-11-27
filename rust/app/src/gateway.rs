@@ -32,7 +32,7 @@ use crate::{
         CatalogList, CatalogServer, CatalogTool, ContentGateway, GatewayMode, GatewayRegistration,
         RegisteredTool, RegistrationError, RegistrationOptions, ToolDefinition, slugify,
     },
-    config::{HeaderForwarding, IdentityForwarding},
+    config::{HeaderForwarding, IdentityForwarding, ProxyCatalogSettings},
     credentials::{
         AuthError, AuthInput, CredentialCipher, CredentialError, UpstreamCredentials,
         decode_headers, decode_query, validate_query_host,
@@ -40,6 +40,7 @@ use crate::{
     database::Database,
     forward_identity::IdentityError,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
+    proxy_catalog_cache::ProxyCatalogCache,
     sessions::Session,
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
     upstream::{ToolContext, UpstreamClient, UpstreamEndpoint, UpstreamError, UpstreamTransport},
@@ -61,6 +62,7 @@ pub struct GatewayService {
     header_forwarding: HeaderForwarding,
     identity_forwarding: IdentityForwarding,
     direct_proxy_timeout: Option<Duration>,
+    proxy_catalog: ProxyCatalogCache,
 }
 
 pub struct CatalogRefresh {
@@ -128,6 +130,7 @@ impl GatewayService {
             header_forwarding: HeaderForwarding::default(),
             identity_forwarding: IdentityForwarding::default(),
             direct_proxy_timeout: None,
+            proxy_catalog: ProxyCatalogCache::new(ProxyCatalogSettings::default()),
         }
     }
 
@@ -167,6 +170,11 @@ impl GatewayService {
 
     pub fn with_direct_proxy(mut self, timeout: Option<Duration>) -> Self {
         self.direct_proxy_timeout = timeout;
+        self
+    }
+
+    pub fn with_proxy_catalog(mut self, settings: ProxyCatalogSettings) -> Self {
+        self.proxy_catalog = ProxyCatalogCache::new(settings);
         self
     }
 
@@ -403,11 +411,13 @@ impl GatewayService {
             } => result?,
         };
         let (gateway, direct_timeout) = match target {
-            DirectTarget::Found(gateway, timeout) => (gateway, Some(timeout)),
+            DirectTarget::Found {
+                gateway, timeout, ..
+            } => (gateway, Some(timeout)),
             DirectTarget::Denied => {
                 return tool_result_error(format!("Tool not found: {}", request.name));
             }
-            DirectTarget::Fallback => {
+            DirectTarget::Fallback | DirectTarget::Disabled => {
                 let tool = tokio::select! {
                     biased;
                     () = context.cancellation.cancelled() => return Err(ToolError::Cancelled),

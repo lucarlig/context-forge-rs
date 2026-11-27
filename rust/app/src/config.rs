@@ -49,6 +49,26 @@ pub struct IdentityForwarding {
     pub(crate) signing_key: Option<EncodingKey>,
 }
 
+pub struct ProxyCatalogSettings {
+    pub(crate) redis: Option<std::sync::Arc<RedisSessionDirectory>>,
+    pub(crate) max_snapshot_bytes: usize,
+    pub(crate) max_total_bytes: usize,
+    pub(crate) max_collectors: usize,
+    pub(crate) max_snapshots: usize,
+}
+
+impl Default for ProxyCatalogSettings {
+    fn default() -> Self {
+        Self {
+            redis: None,
+            max_snapshot_bytes: 64 * 1024 * 1024,
+            max_total_bytes: 128 * 1024 * 1024,
+            max_collectors: 32,
+            max_snapshots: 128,
+        }
+    }
+}
+
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum IdentityMode {
@@ -252,6 +272,33 @@ impl Settings {
             .unwrap_or(false)
             .then(|| positive_seconds("MCPGATEWAY_DIRECT_PROXY_TIMEOUT", 30.0))
             .transpose()
+    }
+
+    pub fn proxy_catalog(&self) -> Result<ProxyCatalogSettings, Box<dyn Error + Send + Sync>> {
+        let defaults = ProxyCatalogSettings::default();
+        let settings = ProxyCatalogSettings {
+            redis: self
+                .redis
+                .as_ref()
+                .map(RedisSessionDirectory::new)
+                .transpose()?
+                .map(std::sync::Arc::new),
+            max_snapshot_bytes: parse(
+                "MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES",
+                defaults.max_snapshot_bytes,
+            )?,
+            max_total_bytes: parse("MCP_PROXY_LIST_MAX_TOTAL_BYTES", defaults.max_total_bytes)?,
+            max_collectors: parse("MCP_PROXY_LIST_MAX_COLLECTORS", defaults.max_collectors)?,
+            max_snapshots: parse("MCP_PROXY_LIST_MAX_SNAPSHOTS", defaults.max_snapshots)?,
+        };
+        if settings.max_snapshot_bytes == 0
+            || settings.max_total_bytes == 0
+            || !(1..=128).contains(&settings.max_collectors)
+            || !(1..=1024).contains(&settings.max_snapshots)
+        {
+            return Err("invalid direct-proxy catalog limits".into());
+        }
+        Ok(settings)
     }
 
     pub fn mcp_requires_auth() -> Result<bool, Box<dyn Error + Send + Sync>> {

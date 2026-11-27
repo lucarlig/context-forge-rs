@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_header_forwarding(Settings::header_forwarding()?)
         .with_identity_forwarding(Settings::identity_forwarding()?)
         .with_direct_proxy(Settings::direct_proxy_timeout()?)
+        .with_proxy_catalog(settings.proxy_catalog()?)
         .with_listen_settings(Settings::mcp_listen_settings(shutdown.clone())?),
     );
     let mut http_options = settings.mcp_http_options()?;

@@ -124,7 +124,10 @@ impl IdentityForwarding {
         }
         if matches!(options.mode, IdentityMode::Headers | IdentityMode::Both) {
             apply_headers(&mut credentials.headers, options.prefix, &claims)?;
-            credentials.request_bound_headers = options.sign_claims;
+            credentials.request_bound_header = options
+                .sign_claims
+                .then(|| header_name(options.prefix, "Claims-Signature"))
+                .transpose()?;
         }
         if matches!(options.mode, IdentityMode::Meta | IdentityMode::Both) {
             credentials.identity_meta = Some(Value::Object(claims));

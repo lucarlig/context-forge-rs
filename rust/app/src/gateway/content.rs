@@ -38,9 +38,11 @@ impl GatewayService {
             .await
             .map_err(content_database_error)?
         {
-            DirectTarget::Found(gateway, timeout) => (gateway, Some(timeout)),
+            DirectTarget::Found {
+                gateway, timeout, ..
+            } => (gateway, Some(timeout)),
             DirectTarget::Denied => return Err(unknown()),
-            DirectTarget::Fallback => {
+            DirectTarget::Fallback | DirectTarget::Disabled => {
                 let mut resource = self
                     .database
                     .resource_content(

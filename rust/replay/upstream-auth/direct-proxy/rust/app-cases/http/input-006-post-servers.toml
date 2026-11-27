@@ -1,0 +1,18 @@
+[request]
+method = "POST"
+path = "/servers/v/mcp"
+body = '{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}'
+
+[request.headers]
+Accept = "application/json"
+Content-Type = "application/json"
+MCP-Protocol-Version = "2025-11-25"
+X-Context-Forge-Gateway-Id = "612ae0150afe4eed99756befc6cc0253"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin"
+x-contextforge-mcp-runtime = "[..]"

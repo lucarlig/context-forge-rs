@@ -48,7 +48,7 @@ use crate::{
         PendingError, PendingRequest, Session, SessionAccess, SessionError, Sessions,
         new_session_id,
     },
-    upstream::{ToolContext, ToolProgress},
+    upstream::{ProxyCatalogKind, ToolContext, ToolProgress},
 };
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -958,7 +958,17 @@ async fn dispatch(
             match method.as_str() {
                 "ping" => rpc_success(&id, Empty {}),
                 "logging/setLevel" => set_log_level(&service, principal, server, &id, params).await,
-                "tools/list" => list_tools(&service, principal, server, &id, params).await,
+                "tools/list" => {
+                    list_tools(
+                        &service,
+                        principal,
+                        server,
+                        &id,
+                        params,
+                        request_headers.as_ref(),
+                    )
+                    .await
+                }
                 "resources/list" => {
                     list_catalog_metadata(
                         &service,
@@ -967,6 +977,7 @@ async fn dispatch(
                         server,
                         &id,
                         params,
+                        request_headers.as_ref(),
                     )
                     .await
                 }
@@ -978,6 +989,7 @@ async fn dispatch(
                         server,
                         &id,
                         params,
+                        None,
                     )
                     .await
                 }
@@ -989,6 +1001,7 @@ async fn dispatch(
                         server,
                         &id,
                         params,
+                        None,
                     )
                     .await
                 }
@@ -1331,12 +1344,27 @@ async fn list_tools(
     server: Option<&CatalogServer>,
     id: &Value,
     params: Option<&Value>,
+    headers: Option<&HeaderMap>,
 ) -> Response {
     let cursor = match params.map(PaginatedRequestParams::deserialize) {
         None => None,
         Some(Ok(params)) => params.cursor,
         Some(Err(_)) => return invalid_params(id),
     };
+    match service
+        .direct_catalog(
+            ProxyCatalogKind::Tools,
+            principal,
+            server,
+            headers,
+            cursor.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(result)) => return rpc_success(id, result),
+        Err(error) => return content_error(id, error),
+        Ok(None) => {}
+    }
     match service
         .list_tools(principal, server, cursor.as_deref())
         .await
@@ -1353,12 +1381,29 @@ async fn list_catalog_metadata(
     server: Option<&CatalogServer>,
     id: &Value,
     params: Option<&Value>,
+    headers: Option<&HeaderMap>,
 ) -> Response {
     let cursor = match params.map(PaginatedRequestParams::deserialize) {
         None => None,
         Some(Ok(params)) => params.cursor,
         Some(Err(_)) => return invalid_params(id),
     };
+    if matches!(list, CatalogList::Resources) {
+        match service
+            .direct_catalog(
+                ProxyCatalogKind::Resources,
+                principal,
+                server,
+                headers,
+                cursor.as_deref(),
+            )
+            .await
+        {
+            Ok(Some(result)) => return rpc_success(id, result),
+            Err(error) => return content_error(id, error),
+            Ok(None) => {}
+        }
+    }
     match service
         .list_catalog_metadata(list, principal, server, cursor.as_deref())
         .await

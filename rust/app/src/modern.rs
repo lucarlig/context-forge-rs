@@ -50,7 +50,7 @@ use crate::{
     },
     modern_validation::reject_invalid_request,
     subscriptions::AcceptedSubscription,
-    upstream::{ToolContext, ToolProgress},
+    upstream::{ProxyCatalogKind, ToolContext, ToolProgress},
 };
 
 const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
@@ -336,16 +336,41 @@ impl GatewayHandler {
     ) -> Result<R, ErrorData> {
         let parts = request_parts(&context)?;
         let server = parts.extensions.get::<CatalogServer>();
-        let mut page = self
-            .gateway
-            .list_catalog_metadata(
-                list,
-                parts.extensions.get::<Principal>(),
-                server,
-                request.as_ref().and_then(|params| params.cursor.as_deref()),
-            )
-            .await
-            .map_err(tool_error)?;
+        let principal = parts.extensions.get::<Principal>();
+        let cursor = request.as_ref().and_then(|params| params.cursor.as_deref());
+        let proxy_page = if matches!(list, CatalogList::Resources) {
+            let result = self
+                .gateway
+                .direct_catalog(
+                    ProxyCatalogKind::Resources,
+                    principal,
+                    server,
+                    Some(&parts.headers),
+                    cursor,
+                )
+                .await;
+            HandlerErrorStatus::record(parts, &result);
+            result?
+        } else {
+            None
+        };
+        let page = match proxy_page {
+            Some(page) => page,
+            None => self
+                .gateway
+                .list_catalog_metadata(list, principal, server, cursor)
+                .await
+                .map_err(tool_error)?,
+        };
+        self.catalog_result(page, server, list.method()).await
+    }
+
+    async fn catalog_result<R: DeserializeOwned>(
+        &self,
+        mut page: Value,
+        server: Option<&CatalogServer>,
+        method: &str,
+    ) -> Result<R, ErrorData> {
         let mut meta = None;
         stamp_server_info(&mut meta);
         page["_meta"] = json!(meta);
@@ -353,7 +378,7 @@ impl GatewayHandler {
         page["cacheScope"] = json!("private");
         page["ttlMs"] = json!(self.gateway.catalog_ttl_ms(server).await);
         serde_json::from_value(page).map_err(|error| {
-            tracing::warn!(%error, method = list.method(), "invalid catalog metadata");
+            tracing::warn!(%error, method, "invalid catalog metadata");
             ErrorData::internal_error("Invalid catalog metadata", None)
         })
     }
@@ -416,13 +441,25 @@ impl ServerHandler for GatewayHandler {
     ) -> Result<ListToolsResult, ErrorData> {
         let parts = request_parts(&context)?;
         let server = parts.extensions.get::<CatalogServer>();
+        let principal = parts.extensions.get::<Principal>();
+        let cursor = request.as_ref().and_then(|params| params.cursor.as_deref());
+        let proxy_page = self
+            .gateway
+            .direct_catalog(
+                ProxyCatalogKind::Tools,
+                principal,
+                server,
+                Some(&parts.headers),
+                cursor,
+            )
+            .await;
+        HandlerErrorStatus::record(parts, &proxy_page);
+        if let Some(page) = proxy_page? {
+            return self.catalog_result(page, server, "tools/list").await;
+        }
         let page = self
             .gateway
-            .list_tools(
-                parts.extensions.get::<Principal>(),
-                server,
-                request.as_ref().and_then(|params| params.cursor.as_deref()),
-            )
+            .list_tools(principal, server, cursor)
             .await
             .map_err(tool_error)?;
         let tools = page

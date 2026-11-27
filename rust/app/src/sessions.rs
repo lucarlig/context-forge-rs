@@ -341,7 +341,7 @@ impl Session {
     ) -> Option<Arc<UpstreamAssociation>> {
         if endpoint
             .credentials
-            .is_some_and(|credentials| credentials.request_bound_headers)
+            .is_some_and(|credentials| credentials.request_bound_header.is_some())
         {
             return None;
         }

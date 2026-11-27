@@ -79,7 +79,7 @@ pub(crate) struct UpstreamCredentials {
     pub(crate) headers: HeaderMap,
     pub(crate) query: QueryValues,
     pub(crate) identity_meta: Option<Value>,
-    pub(crate) request_bound_headers: bool,
+    pub(crate) request_bound_header: Option<HeaderName>,
 }
 
 #[derive(Deserialize)]

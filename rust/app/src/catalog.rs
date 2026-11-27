@@ -130,6 +130,7 @@ pub(crate) struct ContentGateway {
 
 pub(crate) struct DirectGateway {
     pub(crate) content: ContentGateway,
+    pub(crate) revision: String,
     visibility: String,
     team_id: Option<String>,
     owner_email: Option<String>,
@@ -619,13 +620,21 @@ const CONNECTION_CONFIG: &str = concat!(
     gateway_policy!()
 );
 const DIRECT_GATEWAY_QUERY: &str = concat!(
-    "SELECT g.url, g.transport, g.visibility, g.team_id, g.owner_email,
+    "SELECT g.url, g.transport, g.visibility, g.team_id, g.owner_email, CAST(g.updated_at AS TEXT),
         (g.enabled = TRUE AND g.status = 'active' AND NOT ",
     gateway_policy!(),
     ")
     FROM gateways g WHERE g.id = $1 AND g.gateway_mode = 'direct_proxy'"
 );
-type DirectGatewayRow = (String, String, String, Option<String>, Option<String>, bool);
+type DirectGatewayRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    bool,
+);
 pub(crate) type GatewayConnectionRow = (
     String,
     Option<String>,
@@ -1390,17 +1399,20 @@ impl Database {
             Self::Postgres(pool) => fetch!(pool),
         };
         Ok(row.map(
-            |(url, transport, visibility, team_id, owner_email, available)| DirectGateway {
-                content: ContentGateway {
-                    id: id.to_owned(),
-                    url,
-                    transport: UpstreamTransport::from_name(&transport),
-                    available,
-                    needs_upstream_config: true,
-                },
-                visibility,
-                team_id,
-                owner_email,
+            |(url, transport, visibility, team_id, owner_email, revision, available)| {
+                DirectGateway {
+                    content: ContentGateway {
+                        id: id.to_owned(),
+                        url,
+                        transport: UpstreamTransport::from_name(&transport),
+                        available,
+                        needs_upstream_config: true,
+                    },
+                    revision,
+                    visibility,
+                    team_id,
+                    owner_email,
+                }
             },
         ))
     }
