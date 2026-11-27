@@ -7,6 +7,7 @@ use crate::catalog::{CatalogEntryFilters, slugify};
 pub(super) struct CatalogListQuery {
     pub(super) include_inactive: Option<String>,
     pub(super) include_pagination: Option<String>,
+    pub(super) include_metrics: Option<String>,
     pub(super) limit: Option<i64>,
     pub(super) cursor: Option<String>,
     pub(super) tags: Option<String>,

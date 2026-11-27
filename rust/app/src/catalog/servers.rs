@@ -122,6 +122,20 @@ macro_rules! server_interfaces {
     };
 }
 
+macro_rules! server_agents {
+    ($ids:literal, $teams:literal) => {
+        concat!(
+            "WITH ids(id) AS (", $ids, "), teams(id) AS (", $teams, ")
+             SELECT a.server_id,c.id FROM server_a2a_association a
+             JOIN a2a_agents c ON c.id=a.a2a_agent_id
+             WHERE c.enabled AND a.server_id IN (SELECT id FROM ids)
+                AND (c.visibility='public' OR (c.visibility='team' AND ($3 OR c.team_id IN (SELECT id FROM teams)))
+                     OR (c.visibility='private' AND $4 AND c.owner_email=$5))
+             ORDER BY a.server_id,c.id"
+        )
+    };
+}
+
 impl Database {
     pub(crate) async fn managed_server(
         &self,
@@ -209,6 +223,46 @@ impl Database {
                 .interfaces
                 .push(interface);
         }
+        macro_rules! agents {
+            ($pool:ident, $exists:literal, $ids:literal, $teams:literal) => {{
+                if sqlx::query_scalar::<_, bool>($exists)
+                    .bind("server_a2a_association")
+                    .fetch_one($pool)
+                    .await?
+                {
+                    sqlx::query_as::<_, (String, String)>(server_agents!($ids, $teams))
+                        .bind(&ids)
+                        .bind(&teams)
+                        .bind(scope.visibility == &TeamVisibility::Admin)
+                        .bind(scope.can_own())
+                        .bind(scope.email)
+                        .fetch_all($pool)
+                        .await?
+                } else {
+                    Vec::new()
+                }
+            }};
+        }
+        let agents = match self {
+            Self::Sqlite(pool) => agents!(
+                pool,
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=$1)",
+                "SELECT value FROM json_each($1)",
+                "SELECT value FROM json_each($2)"
+            ),
+            Self::Postgres(pool) => agents!(
+                pool,
+                "SELECT to_regclass(CAST($1 AS TEXT)) IS NOT NULL",
+                "SELECT json_array_elements_text(CAST($1 AS JSON))",
+                "SELECT json_array_elements_text(CAST($2 AS JSON))"
+            ),
+        };
+        for (server, agent) in agents {
+            links.entry(server).or_default().agents.push(agent);
+        }
         Ok(links)
     }
 }
+
+mod write;
+pub(crate) use write::{ServerInterfaceInput, ServerLinkUpdate, ServerWriteError};

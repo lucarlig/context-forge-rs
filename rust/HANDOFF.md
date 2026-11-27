@@ -73,3 +73,8 @@ one stream stays open and that the peer takes over during shutdown.
 Virtual-server reads list scoped servers, interfaces, and selected catalog
 associations. Public OAuth resource metadata is available for enabled servers
 with approved settings. [Virtual-server read verification](replay/server-management/read/README.md)
+
+Virtual-server writes manage associations, interfaces, instructions, and
+OAuth approval transactionally. The pinned comparison covered a failed
+association, encrypted OAuth settings, and approval of a specific revision.
+[Virtual-server write verification](replay/server-management/write.md)

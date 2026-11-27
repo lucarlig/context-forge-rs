@@ -3,18 +3,28 @@
 use axum::extract::{Path, Query};
 
 use super::{catalog_api::*, *};
-use crate::catalog::{ServerLinks, ServerRecord};
+use crate::catalog::{ExecutionMetrics, MetricEntity, ServerLinks, ServerRecord};
 
 mod oauth;
+mod write;
 pub(super) use oauth::router as well_known_router;
 
 pub(super) fn router() -> Router<Arc<GatewayService>> {
     let mut routes = Router::new();
     for base in ["/servers", "/v1/servers", "/v1/virtual-servers"] {
         routes = routes
-            .route(base, get(list))
-            .route(&format!("{base}/"), get(list))
-            .route(&format!("{base}/{{id}}"), get(detail))
+            .route(base, get(list).post(write::create))
+            .route(&format!("{base}/"), get(list).post(write::create))
+            .route(
+                &format!("{base}/{{id}}"),
+                get(detail).put(write::update).delete(write::delete),
+            )
+            .route(&format!("{base}/{{id}}/state"), post(write::set_state))
+            .route(&format!("{base}/{{id}}/toggle"), post(write::set_state))
+            .route(
+                &format!("{base}/{{id}}/oauth/approve"),
+                post(write::approve),
+            )
             .route(&format!("{base}/{{id}}/{{kind}}"), get(associated));
     }
     routes
@@ -40,13 +50,24 @@ async fn list(
         .collect::<Vec<_>>();
     let links = service.database.managed_server_links(&ids, scope).await?;
     let default = ServerLinks::default();
-    Ok(Json(page.envelope(
+    let mut response = page.envelope(
         &service,
         rows,
         "servers",
         |row| (&row.created_at, &row.id),
         |server| metadata(&service, server, links.get(&server.id).unwrap_or(&default)),
-    )?))
+    )?;
+    if flag(query.include_metrics.as_deref())? {
+        let rows = if response.is_array() {
+            &mut response
+        } else {
+            &mut response["servers"]
+        };
+        if let Some(rows) = rows.as_array_mut() {
+            include_metrics(&service, MetricEntity::Server, rows).await?;
+        }
+    }
+    Ok(Json(response))
 }
 
 async fn detail(
@@ -62,6 +83,7 @@ async fn detail(
 #[derive(Deserialize)]
 struct AssociatedQuery {
     include_inactive: Option<String>,
+    include_metrics: Option<String>,
 }
 
 async fn associated(
@@ -77,7 +99,7 @@ async fn associated(
     let server = find_visible(&service, &principal, &id).await?;
     let inactive = flag(query.include_inactive.as_deref())?;
     let scope = access::catalog_scope(Some(&principal));
-    let rows = match kind.as_str() {
+    let (entity, mut rows) = match kind.as_str() {
         "tools" => {
             let tools = service
                 .database
@@ -97,25 +119,59 @@ async fn associated(
                 let headers = tool_api::can_view_headers(&principal, &tool, owner);
                 entries.push(tool_api::metadata(&service, &tool, true, false, headers));
             }
-            entries
+            (MetricEntity::Tool, entries)
         }
-        "resources" => service
-            .database
-            .managed_server_resources(scope, &server.id, inactive)
-            .await?
-            .iter()
-            .map(|row| resource_api::metadata(row, true))
-            .collect(),
-        "prompts" => service
-            .database
-            .managed_server_prompts(scope, &server.id, inactive)
-            .await?
-            .iter()
-            .map(|row| prompt_api::metadata(row, true))
-            .collect(),
+        "resources" => (
+            MetricEntity::Resource,
+            service
+                .database
+                .managed_server_resources(scope, &server.id, inactive)
+                .await?
+                .iter()
+                .map(|row| resource_api::metadata(row, true))
+                .collect(),
+        ),
+        "prompts" => (
+            MetricEntity::Prompt,
+            service
+                .database
+                .managed_server_prompts(scope, &server.id, inactive)
+                .await?
+                .iter()
+                .map(|row| prompt_api::metadata(row, true))
+                .collect(),
+        ),
         _ => unreachable!("server association validated"),
     };
+    if flag(query.include_metrics.as_deref())? {
+        include_metrics(&service, entity, &mut rows).await?;
+    }
     Ok(Json(Value::Array(rows)))
+}
+
+async fn include_metrics(
+    service: &GatewayService,
+    entity: MetricEntity,
+    rows: &mut [Value],
+) -> Result<(), CatalogApiError> {
+    let ids = rows
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect::<Vec<_>>();
+    let metrics = service.database.execution_metrics(entity, &ids).await?;
+    let empty = ExecutionMetrics::default();
+    for row in rows {
+        let result = row["id"]
+            .as_str()
+            .and_then(|id| metrics.get(id))
+            .unwrap_or(&empty)
+            .json();
+        if matches!(entity, MetricEntity::Tool) {
+            row["executionCount"] = result["totalExecutions"].clone();
+        }
+        row["metrics"] = result;
+    }
+    Ok(())
 }
 
 async fn find_visible(
@@ -198,18 +254,7 @@ fn mask_oauth_fields(value: &mut Value) {
     match value {
         Value::Object(fields) => {
             for (name, value) in fields {
-                if [
-                    "client_secret",
-                    "private_key",
-                    "refresh_token",
-                    "access_token",
-                    "password",
-                    "token",
-                ]
-                .iter()
-                .any(|key| name.eq_ignore_ascii_case(key))
-                    && !value.is_null()
-                {
+                if is_oauth_secret(name) && !value.is_null() && value.as_str() != Some("") {
                     *value = "*****".into();
                 } else {
                     mask_oauth_fields(value);
@@ -219,6 +264,19 @@ fn mask_oauth_fields(value: &mut Value) {
         Value::Array(values) => values.iter_mut().for_each(mask_oauth_fields),
         _ => {}
     }
+}
+
+fn is_oauth_secret(name: &str) -> bool {
+    [
+        "client_secret",
+        "private_key",
+        "refresh_token",
+        "access_token",
+        "password",
+        "token",
+    ]
+    .into_iter()
+    .any(|key| name.eq_ignore_ascii_case(key))
 }
 
 fn missing(id: &str) -> CatalogApiError {

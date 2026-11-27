@@ -16,14 +16,18 @@ use crate::{
 };
 
 mod entry_filters;
+mod metrics;
 mod prompts;
 mod resources;
 mod servers;
 mod tools;
 pub(crate) use entry_filters::CatalogEntryFilters;
+pub(crate) use metrics::{ExecutionMetrics, MetricEntity};
 pub(crate) use prompts::{PromptRecord, PromptWriteError};
 pub(crate) use resources::{ResourceRecord, ResourceWriteError};
-pub(crate) use servers::{ServerLinks, ServerRecord};
+pub(crate) use servers::{
+    ServerInterfaceInput, ServerLinkUpdate, ServerLinks, ServerRecord, ServerWriteError,
+};
 pub(crate) use tools::{ToolRecord, ToolWriteError};
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
