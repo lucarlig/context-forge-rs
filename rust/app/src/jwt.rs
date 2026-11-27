@@ -164,6 +164,10 @@ impl JwtIssuer {
 }
 
 impl JwtVerifier {
+    pub(crate) fn requires_expiration(&self) -> bool {
+        self.validation.required_spec_claims.contains("exp")
+    }
+
     pub fn new(config: JwtConfig<'_>) -> Result<Self, JwtConfigError> {
         if config.issuer.is_some_and(str::is_empty)
             || config.audience.is_some_and(str::is_empty)

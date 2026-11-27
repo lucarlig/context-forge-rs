@@ -244,6 +244,20 @@ same resource origin. Chromium verifies consent, callback Fetch Tools,
 per-user status, and dashboard refresh with security headers enabled. The
 remaining dashboard sections are open.
 
+## API token dashboard
+
+The API Tokens section supports issuance, pagination, search, details, usage
+statistics, and revocation. Interactive sessions can view their own tokens
+and tokens in scope through active team memberships. Revocation requires
+ownership. Issuance shows the new credential on a no-store response, and
+subsequent views show metadata. The shared issuer enforces the verifier's
+expiration policy. Active lists filter out expired and revoked tokens.
+
+Six Rust Anything scenarios match on SQLite and PostgreSQL. They cover literal
+search, pagination, the versioned alias, CSRF-protected revocation, and both
+expiration policy settings. Chromium verifies issuance, scoped use, usage
+statistics, search, and revocation.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

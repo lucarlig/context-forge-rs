@@ -5,6 +5,7 @@ mod forms;
 mod keycloak;
 mod recovery;
 mod sessions;
+mod token;
 
 use std::error::Error;
 
@@ -139,7 +140,16 @@ pub(super) fn router(
                 get(password_page).post(change_password),
             )
             .route(&format!("{path}/"), get(home))
-            .route(path, get(home));
+            .route(path, get(home))
+            .route(&format!("{path}/tokens"), post(token::create))
+            .route(&format!("{path}/tokens/partial"), get(token::partial))
+            .route(&format!("{path}/tokens/search"), get(token::search))
+            .route(
+                &format!("{path}/tokens/{{id}}"),
+                axum::routing::delete(token::revoke),
+            )
+            .route(&format!("{path}/tokens/{{id}}/revoke"), post(token::revoke))
+            .route(&format!("{path}/tokens/{{id}}/usage"), get(token::usage));
         for kind in ManagedCatalog::ALL {
             let base = format!("{path}/{}", kind.name());
             router = router

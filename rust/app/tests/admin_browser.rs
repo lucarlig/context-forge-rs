@@ -685,3 +685,113 @@ async fn gateway_oauth_browser_session_requires_csrf_for_tool_fetch() {
     assert_eq!(raw_token.status(), StatusCode::UNAUTHORIZED);
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn dashboard_token_is_issued_once_and_revoked_by_its_owner() {
+    let mut fixture = gateway().await;
+    let client = &fixture.client;
+    let origin = &fixture.origin;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL,"password":fixture.password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let jwt = login["access_token"].as_str().unwrap();
+    let no_expiry = client
+        .post(format!("{origin}/tokens"))
+        .bearer_auth(jwt)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"expiry-required"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_expiry.status(), StatusCode::BAD_REQUEST);
+
+    let session = format!("jwt_token={jwt}");
+    let panel = client
+        .get(format!("{origin}/admin/?section=tokens"))
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(panel.status(), StatusCode::OK);
+    let proof = cookie(&panel, "mcpgateway_csrf_token");
+    let cookies = format!("{session}; mcpgateway_csrf_token={proof}");
+    let create = client
+        .post(format!("{origin}/admin/tokens"))
+        .header(header::COOKIE, &cookies)
+        .header(header::ORIGIN, origin)
+        .header(header::ACCEPT, "text/html")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(format!(
+            "name=fixture-token&expires_in_days=2&permissions=tools.read&csrf_token={proof}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    assert!(
+        create.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("no-store")
+    );
+    let html = create.text().await.unwrap();
+    let secret = html
+        .split_once("autocomplete=\"off\">")
+        .unwrap()
+        .1
+        .split_once("</textarea>")
+        .unwrap()
+        .0;
+    assert_eq!(secret.split('.').count(), 3);
+    let tools = || client.get(format!("{origin}/tools")).bearer_auth(secret);
+    assert_eq!(tools().send().await.unwrap().status(), StatusCode::OK);
+
+    let search = || {
+        client
+            .get(format!(
+                "{origin}/admin/tokens/search?include_inactive=true"
+            ))
+            .bearer_auth(jwt)
+    };
+    let rows = search().send().await.unwrap();
+    assert_eq!(rows.status(), StatusCode::OK);
+    let raw = rows.text().await.unwrap();
+    assert!(!raw.contains(secret));
+    let rows: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let id = rows[0]["id"].as_str().unwrap();
+    let revoke = || {
+        client
+            .delete(format!("{origin}/admin/tokens/{id}"))
+            .header(header::COOKIE, &cookies)
+            .header(header::ORIGIN, origin)
+            .header(header::ACCEPT, "text/html")
+    };
+    assert_eq!(
+        revoke().send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(tools().send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        revoke()
+            .header("X-CSRF-Token", proof)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        tools().send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let rows = search().send().await.unwrap().text().await.unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&rows).unwrap();
+    assert_eq!(rows[0]["is_revoked"], true);
+    fixture.process.kill().await.unwrap();
+}

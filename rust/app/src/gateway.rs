@@ -25,6 +25,7 @@ mod roots;
 mod server_api;
 mod tags;
 mod token_api;
+pub(crate) use token_api::{AdminTokenPage, AdminTokenQuery};
 mod tool_api;
 
 use std::{

@@ -1,0 +1,81 @@
+{% if not partial %}
+<section id="tokens" aria-labelledby="heading-tokens">
+  <h2 id="heading-tokens">API Tokens</h2>
+  {% if tokens.create %}
+  <details>
+    <summary>Create token</summary>
+    <form method="post" action="{{ root }}/admin/tokens">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Token name <input name="name" required maxlength="255"></label>
+      <label>Expires after (days) <input name="expires_in_days" type="number" value="30" min="1" max="365"{% if tokens.require_expiry %} required{% endif %}></label>
+      <label>Description <textarea name="description" maxlength="1000" rows="2"></textarea></label>
+      <label>Team ID <input name="team_id" value="{{ tokens.team|default('', true) }}"></label>
+      <details>
+        <summary>Token scope</summary>
+        <label>Virtual server ID <input name="server_id"></label>
+        <label>Permissions <input name="permissions" placeholder="Comma-separated"></label>
+        <label>IP restrictions <input name="ip_restrictions" placeholder="Comma-separated"></label>
+      </details>
+      <button type="submit">Create token</button>
+    </form>
+  </details>
+  {% endif %}
+{% endif %}
+{% if not controls %}
+  {% if tokens.rows %}
+  <div class="table-scroll">
+    <table aria-label="API tokens">
+      <thead><tr><th scope="col">Name</th><th scope="col">Status</th><th scope="col">Expires</th><th scope="col">Actions</th></tr></thead>
+      <tbody>
+      {% for row in tokens.rows %}
+      <tr>
+        <th scope="row">{{ row.token.name }}</th>
+        <td>{{ row.status }}</td>
+        <td>{{ row.token.expires_at|default('Never', true) }}</td>
+        <td><div class="actions">
+          <details>
+            <summary>Details</summary>
+            <dl>
+              {% if row.token.description %}<dt>Description</dt><dd>{{ row.token.description }}</dd>{% endif %}
+              <dt>Owner</dt><dd>{{ row.token.user_email }}</dd>
+              {% if row.token.team_id %}<dt>Team ID</dt><dd>{{ row.token.team_id }}</dd>{% endif %}
+              {% if row.token.server_id %}<dt>Virtual server ID</dt><dd>{{ row.token.server_id }}</dd>{% endif %}
+              {% if row.permissions %}<dt>Permissions</dt><dd>{{ row.permissions|join(', ') }}</dd>{% endif %}
+              {% if row.ips %}<dt>IP restrictions</dt><dd>{{ row.ips|join(', ') }}</dd>{% endif %}
+              {% if row.time_restrictions %}<dt>Time restrictions</dt><dd><code>{{ row.time_restrictions }}</code></dd>{% endif %}
+              {% if row.usage_limits %}<dt>Usage limits</dt><dd><code>{{ row.usage_limits }}</code></dd>{% endif %}
+              <dt>Created</dt><dd>{{ row.token.created_at }}</dd>
+              <dt>Last used</dt><dd>{{ row.token.last_used|default('Never', true) }}</dd>
+              {% if row.token.revoked_by %}<dt>Revoked by</dt><dd>{{ row.token.revoked_by }}</dd>{% endif %}
+              {% if row.token.revocation_reason %}<dt>Revocation reason</dt><dd>{{ row.token.revocation_reason }}</dd>{% endif %}
+            </dl>
+          </details>
+          {% if row.usage %}<a href="{{ root }}/admin/tokens/{{ row.token.id }}/usage">Usage stats</a>{% endif %}
+          {% if row.revoke %}
+          <details>
+            <summary>Revoke</summary>
+            <form method="post" action="{{ root }}/admin/tokens/{{ row.token.id }}/revoke">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              {% if tokens.team %}<input type="hidden" name="team_id" value="{{ tokens.team }}">{% endif %}
+              {% if tokens.search %}<input type="hidden" name="q" value="{{ tokens.search }}">{% endif %}
+              {% if tokens.include_inactive %}<input type="hidden" name="include_inactive" value="true">{% endif %}
+              <button type="submit">Confirm revocation</button>
+            </form>
+          </details>
+          {% endif %}
+        </div></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p>No tokens found.</p>
+  {% endif %}
+{% endif %}
+  <nav class="page-links" aria-label="Token pagination">
+    <span>{{ tokens.total }} {{ "token" if tokens.total == 1 else "tokens" }}{% if tokens.pages > 1 %} · Page {{ tokens.page }} of {{ tokens.pages }}{% endif %}</span>
+    {% if tokens.previous %}<a href="{{ tokens.previous }}" rel="prev">Previous page</a>{% endif %}
+    {% if tokens.next %}<a href="{{ tokens.next }}" rel="next">Next page</a>{% endif %}
+  </nav>
+{% if not partial %}</section>{% endif %}

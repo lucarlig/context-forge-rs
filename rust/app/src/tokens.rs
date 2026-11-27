@@ -101,23 +101,30 @@ macro_rules! token_select {
 const TOKEN_BY_ID: &str = concat!(token_select!(), " WHERE t.id=$1");
 const TOKEN_BY_JTI: &str = concat!(token_select!(), " WHERE t.jti=$1");
 
+#[derive(Clone, Copy)]
 pub(crate) struct TokenList<'a> {
     pub(crate) owner: Option<&'a str>,
     pub(crate) team: Option<&'a str>,
     pub(crate) owner_teams: &'a [String],
+    pub(crate) search: Option<&'a str>,
     pub(crate) include_inactive: bool,
     pub(crate) limit: i64,
     pub(crate) offset: i64,
 }
 
 macro_rules! token_filter {
-    ($visible_teams:literal) => {
+    ($visible_teams:literal, $active_expiry:literal, $search:literal) => {
         concat!(
-            " WHERE ($1 OR t.is_active)
+            " WHERE ($1 OR (t.is_active AND (t.expires_at IS NULL OR ",
+            $active_expiry,
+            ")))
                 AND (CAST($2 AS TEXT) IS NULL OR t.team_id=$2)
                 AND (CAST($3 AS TEXT) IS NULL OR t.user_email=$3 OR t.team_id IN (",
             $visible_teams,
-            "))"
+            "))
+                AND (CAST($5 AS TEXT) IS NULL OR ",
+            $search,
+            ")"
         )
     };
 }
@@ -170,36 +177,46 @@ impl Database {
         let teams = serde_json::to_string(filters.owner_teams)
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
         macro_rules! list {
-            ($pool:ident, $teams:literal) => {{
+            ($pool:ident, $teams:literal, $expiry:literal, $search:literal) => {{
                 let rows = sqlx::query_as(concat!(
                     token_select!(),
-                    token_filter!($teams),
-                    " ORDER BY t.created_at DESC,t.id DESC LIMIT $5 OFFSET $6"
+                    token_filter!($teams, $expiry, $search),
+                    " ORDER BY t.created_at DESC,t.id DESC LIMIT $6 OFFSET $7"
                 ))
                 .bind(filters.include_inactive)
                 .bind(filters.team)
                 .bind(filters.owner)
                 .bind(&teams)
+                .bind(filters.search)
                 .bind(filters.limit)
                 .bind(filters.offset)
                 .fetch_all($pool);
                 let total = sqlx::query_scalar(concat!(
                     "SELECT COUNT(*) FROM email_api_tokens t",
-                    token_filter!($teams)
+                    token_filter!($teams, $expiry, $search)
                 ))
                 .bind(filters.include_inactive)
                 .bind(filters.team)
                 .bind(filters.owner)
                 .bind(&teams)
+                .bind(filters.search)
                 .fetch_one($pool);
                 tokio::try_join!(rows, total)
             }};
         }
         match self {
-            Self::Sqlite(pool) => list!(pool, "SELECT value FROM json_each($4)"),
-            Self::Postgres(pool) => {
-                list!(pool, "SELECT json_array_elements_text(CAST($4 AS JSON))")
-            }
+            Self::Sqlite(pool) => list!(
+                pool,
+                "SELECT value FROM json_each($4)",
+                "julianday(t.expires_at) > julianday('now')",
+                "instr(LOWER(t.name), LOWER($5)) > 0"
+            ),
+            Self::Postgres(pool) => list!(
+                pool,
+                "SELECT json_array_elements_text(CAST($4 AS JSON))",
+                "t.expires_at > CURRENT_TIMESTAMP",
+                "POSITION(LOWER($5) IN LOWER(t.name)) > 0"
+            ),
         }
     }
 }

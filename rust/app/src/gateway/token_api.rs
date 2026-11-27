@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod dashboard;
+
+pub(crate) use dashboard::{AdminTokenPage, AdminTokenQuery};
+
 use axum::extract::{Path, Query};
 use serde_json::Map;
 
@@ -94,16 +98,23 @@ async fn list(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
     permit(&service, &principal, "tokens.read", RoleContext::AnyTeam).await?;
+    let teams = visible_teams(&service, &principal).await?;
+    list_response(&service, &query, Some(&principal.email), None, &teams, 50).await
+}
+
+async fn visible_teams(
+    service: &GatewayService,
+    principal: &Principal,
+) -> Result<Vec<String>, sqlx::Error> {
     let memberships = service.database.memberships(&principal.email).await?;
-    let teams = match &principal.visibility {
+    Ok(match &principal.visibility {
         TeamVisibility::Admin => memberships,
         TeamVisibility::Public => Vec::new(),
         TeamVisibility::Teams(allowed) => memberships
             .into_iter()
             .filter(|team| allowed.contains(team))
             .collect(),
-    };
-    list_response(&service, &query, Some(&principal.email), None, &teams, 50).await
+    })
 }
 
 async fn admin_list(
@@ -159,6 +170,7 @@ async fn list_response(
             owner,
             team,
             owner_teams: memberships,
+            search: None,
             limit,
             offset,
             include_inactive: flag(query.include_inactive.as_deref())?,
@@ -185,7 +197,9 @@ async fn create(
     Extension(principal): Extension<Principal>,
     Json(input): Json<CreateToken>,
 ) -> Result<Response, CatalogApiError> {
-    issue(&service, &principal, input, None).await
+    issue(&service, &principal, input, None)
+        .await
+        .map(IntoResponse::into_response)
 }
 
 async fn team_create(
@@ -194,7 +208,9 @@ async fn team_create(
     Path(team): Path<String>,
     Json(input): Json<CreateToken>,
 ) -> Result<Response, CatalogApiError> {
-    issue(&service, &principal, input, Some(&team)).await
+    issue(&service, &principal, input, Some(&team))
+        .await
+        .map(IntoResponse::into_response)
 }
 
 async fn issue(
@@ -202,7 +218,7 @@ async fn issue(
     principal: &Principal,
     input: CreateToken,
     route_team: Option<&str>,
-) -> Result<Response, CatalogApiError> {
+) -> Result<IssuedToken, CatalogApiError> {
     let requested = input.team_id.as_deref().filter(|team| !team.is_empty());
     if route_team
         .zip(requested)
@@ -254,6 +270,12 @@ async fn issue(
     let mut warnings = Vec::new();
     if team.is_none() && !principal.is_global_admin() {
         warnings.push("No team could be inferred for this token, so it is scoped to public resources only. It cannot access your private resources or any team resources. Recreate it with an explicit team_id to scope it.");
+    }
+    if input.expires_in_days.is_none() && service.access.requires_token_expiration() {
+        return Err(CatalogApiError::detail(
+            StatusCode::BAD_REQUEST,
+            INVALID_INPUT,
+        ));
     }
     let now = Timestamp::now();
     let expires = input
@@ -309,16 +331,32 @@ async fn issue(
         .issue_managed_token(&record)
         .await
         .map_err(persistence_error)?;
-    let mut response = (
-        StatusCode::CREATED,
-        Json(json!({"token":metadata(&stored),"access_token":signed.as_str(),"warnings":warnings})),
-    )
-        .into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
-    Ok(response)
+    Ok(IssuedToken {
+        token: stored,
+        secret: signed,
+        warnings,
+    })
+}
+
+pub(crate) struct IssuedToken {
+    pub(crate) token: ApiTokenRecord,
+    pub(crate) secret: Zeroizing<String>,
+    pub(crate) warnings: Vec<&'static str>,
+}
+
+impl IntoResponse for IssuedToken {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::CREATED,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "token":metadata(&self.token),
+                "access_token":self.secret.as_str(),
+                "warnings":self.warnings,
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn update(
@@ -362,7 +400,13 @@ async fn revoke(
 ) -> Result<StatusCode, CatalogApiError> {
     permit(&service, &principal, "tokens.revoke", RoleContext::AnyTeam).await?;
     let token = owned_token(&service, &principal, &id).await?;
-    revoke_token(&service, &principal, &token, input).await
+    revoke_token(
+        &service,
+        &principal,
+        &token,
+        input.and_then(|Json(input)| input.reason).as_deref(),
+    )
+    .await
 }
 
 async fn admin_revoke(
@@ -377,27 +421,29 @@ async fn admin_revoke(
         .managed_token(&id)
         .await?
         .ok_or_else(missing)?;
-    revoke_token(&service, &principal, &token, input).await
+    revoke_token(
+        &service,
+        &principal,
+        &token,
+        input.and_then(|Json(input)| input.reason).as_deref(),
+    )
+    .await
 }
 
 async fn revoke_token(
     service: &GatewayService,
     principal: &Principal,
     token: &ApiTokenRecord,
-    input: Option<Json<RevokeToken>>,
+    reason: Option<&str>,
 ) -> Result<StatusCode, CatalogApiError> {
-    let reason = input.and_then(|Json(input)| input.reason);
-    if reason
-        .as_ref()
-        .is_some_and(|reason| reason.chars().count() > 255)
-    {
+    if reason.is_some_and(|reason| reason.chars().count() > 255) {
         return Err(validation(
             "Revocation reason must be at most 255 characters",
         ));
     }
     service
         .database
-        .revoke_managed_token(token, &principal.email, reason.as_deref())
+        .revoke_managed_token(token, &principal.email, reason)
         .await
         .map_err(persistence_error)?;
     Ok(StatusCode::NO_CONTENT)

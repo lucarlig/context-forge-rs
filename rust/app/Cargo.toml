@@ -30,7 +30,7 @@ jiff = { version = "1", default-features = false, features = ["std", "tzdb-bundl
 jsonschema = { version = "0.63", default-features = false }
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 mime_guess = "2"
-minijinja = { version = "2.24", default-features = false, features = ["builtins", "fuel", "serde"] }
+minijinja = { version = "2.24", default-features = false, features = ["builtins", "fuel", "multi_template", "serde"] }
 p256 = "0.14"
 p384 = "0.14"
 p521 = "0.14"

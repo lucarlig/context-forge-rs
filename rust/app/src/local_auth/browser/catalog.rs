@@ -103,16 +103,7 @@ pub(super) async fn delete_gateway(
 ) -> Response {
     let AuthorizedForm {
         principal, parts, ..
-    } = match authorized_form(
-        &accounts,
-        ManagedCatalog::Gateways,
-        "delete",
-        request,
-        peer.ip(),
-        false,
-    )
-    .await
-    {
+    } = match authorized_form(&accounts, "gateways.delete", request, peer.ip(), false).await {
         Ok(form) => form,
         Err(response) => return *response,
     };
@@ -164,8 +155,7 @@ pub(super) async fn mutate(
         ..
     } = match authorized_form(
         &accounts,
-        kind,
-        action.permission(),
+        &format!("{}.{}", kind.name(), action.permission()),
         request,
         peer.ip(),
         false,
@@ -219,16 +209,15 @@ pub(super) async fn mutate(
     Ok(with_usage(&accounts, &principal, &parts, peer.ip(), response).await)
 }
 
-struct AuthorizedForm {
-    principal: Principal,
-    parts: Parts,
-    form: Form,
-    json: Option<serde_json::Map<String, Value>>,
+pub(super) struct AuthorizedForm {
+    pub(super) principal: Principal,
+    pub(super) parts: Parts,
+    pub(super) form: Form,
+    pub(super) json: Option<serde_json::Map<String, Value>>,
 }
 
-async fn authorized_form(
+pub(super) async fn authorized_form(
     accounts: &Accounts,
-    kind: ManagedCatalog,
     permission: &str,
     request: Request,
     peer: IpAddr,
@@ -293,7 +282,12 @@ async fn authorized_form(
         ).into_response()));
     }
     let team = sessions::request_team(&parts.uri, &principal);
-    if !allows(accounts, &principal, kind, permission, team.as_deref())
+    let role = team
+        .as_deref()
+        .map_or(RoleContext::AnyTeam, RoleContext::Team);
+    if !accounts
+        .access
+        .allows(&principal, permission, role, false)
         .await
         .map_err(|error| Box::new(AccountError::from(error).into_response()))?
     {
@@ -376,6 +370,7 @@ pub(super) struct Dashboard {
     include_inactive: bool,
     team: Option<String>,
     selected: Option<String>,
+    pub(super) tokens: Option<super::token::Panel>,
     error: Option<&'static str>,
     message: Option<&'static str>,
 }
@@ -494,18 +489,22 @@ pub(super) async fn dashboard(
             permitted.push(kind);
         }
     }
+    let tokens_visible = super::token::visible(accounts, principal, team).await?;
     let parameters = forms::query(uri);
     let selected = parameters
         .get("section")
         .map(String::as_str)
-        .filter(|name| permitted.iter().any(|kind| kind.name() == *name));
+        .filter(|name| {
+            (*name == "tokens" && tokens_visible)
+                || permitted.iter().any(|kind| kind.name() == *name)
+        });
     if selected.is_none() {
         query.page = None;
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
     let mut navigation = Vec::with_capacity(permitted.len() + 1);
-    if !permitted.is_empty() {
+    if !permitted.is_empty() || tokens_visible {
         navigation.push(Link {
             label: "All sections",
             href: href(None, None),
@@ -519,6 +518,18 @@ pub(super) async fn dashboard(
             selected: selected == Some(kind.name()),
         });
     }
+    if tokens_visible {
+        navigation.push(Link {
+            label: "API Tokens",
+            href: href(Some("tokens"), None),
+            selected: selected == Some("tokens"),
+        });
+    }
+    let tokens = if selected == Some("tokens") {
+        Some(super::token::panel(accounts, service, principal, uri).await?)
+    } else {
+        None
+    };
     let sections = futures_util::future::try_join_all(
         permitted
             .into_iter()
@@ -560,6 +571,7 @@ pub(super) async fn dashboard(
         include_inactive,
         team: team.map(str::to_owned),
         selected: selected.map(str::to_owned),
+        tokens,
         error: match parameters.get("error").map(String::as_str) {
             Some("conflict") => Some("This entry changed. Check its current state and try again."),
             Some("delete_failed") => Some("Could not delete the entry."),

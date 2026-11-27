@@ -93,6 +93,12 @@ struct McpAccess {
 }
 
 impl Authorizer {
+    pub(crate) fn requires_token_expiration(&self) -> bool {
+        self.verifier
+            .as_ref()
+            .is_none_or(JwtVerifier::requires_expiration)
+    }
+
     pub fn new(
         database: Database,
         verifier: Option<JwtVerifier>,

@@ -199,6 +199,13 @@ pub(super) fn query(uri: &Uri) -> HashMap<String, String> {
 }
 
 pub(super) fn render(context: minijinja::Value) -> Result<Response, AccountError> {
+    render_template("browser.html", context)
+}
+
+pub(super) fn render_template(
+    template: &str,
+    context: minijinja::Value,
+) -> Result<Response, AccountError> {
     static TEMPLATES: std::sync::LazyLock<minijinja::Environment<'static>> =
         std::sync::LazyLock::new(|| {
             let mut environment = minijinja::Environment::new();
@@ -207,9 +214,12 @@ pub(super) fn render(context: minijinja::Value) -> Result<Response, AccountError
                 .add_template("browser.html", include_str!("browser.html"))
                 .expect("valid browser template");
             environment
+                .add_template("tokens.html", include_str!("tokens.html"))
+                .expect("valid API tokens template");
+            environment
         });
     let html = TEMPLATES
-        .get_template("browser.html")
+        .get_template(template)
         .and_then(|template| template.render(context))
         .map_err(|error| {
             tracing::error!(%error, "could not render admin page");

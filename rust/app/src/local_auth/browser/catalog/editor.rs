@@ -24,8 +24,7 @@ pub(in crate::local_auth::browser) async fn save(
         json,
     } = match authorized_form(
         &accounts,
-        kind,
-        operation(id.as_deref()),
+        &format!("{}.{}", kind.name(), operation(id.as_deref())),
         request,
         peer.ip(),
         json_allowed,
