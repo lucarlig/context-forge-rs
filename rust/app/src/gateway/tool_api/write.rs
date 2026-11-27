@@ -129,8 +129,7 @@ pub(in crate::gateway) async fn import_tool(
             }
             Strategy::Update => {
                 if let Some(previous) = previous
-                    && (principal.is_global_admin()
-                        || previous.owner_email.as_deref() == Some(principal.email.as_str()))
+                    && import.owns(previous.owner_email.as_deref())
                 {
                     Some(previous)
                 } else {
@@ -167,7 +166,12 @@ pub(in crate::gateway) async fn import_tool(
         )
     });
     let auth_type = data.remove("auth_type");
-    if let Some(Value::String(stored)) = data.remove("auth_value") {
+    let auth_value = match data.remove("auth_value") {
+        Some(Value::String(stored)) => Some(stored),
+        None | Some(Value::Null) => None,
+        Some(_) => return Err(invalid("Invalid imported tool credentials")),
+    };
+    if let Some(stored) = auth_value {
         let auth_type = auth_type
             .and_then(|value| value.as_str().map(str::to_owned))
             .ok_or_else(|| invalid("Missing imported tool authentication type"))?;
@@ -229,12 +233,7 @@ pub(in crate::gateway) async fn import_tool(
         tags: "[]".into(),
         owner_email: Some(principal.email.clone()),
         team_id: import.team_id.map(str::to_owned),
-        visibility: if import.team_id.is_some() {
-            "team"
-        } else {
-            "private"
-        }
-        .into(),
+        visibility: import.visibility().into(),
         created_by: Some(principal.email.clone()),
         created_via: Some("import".into()),
         import_batch_id: Some(import.batch_id.into()),

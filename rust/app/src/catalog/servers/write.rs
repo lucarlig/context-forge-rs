@@ -65,9 +65,10 @@ macro_rules! insert_server {
         concat!(
             "INSERT INTO servers (id,name,description,icon,team_id,owner_email,visibility,tags,
                 oauth_enabled,oauth_config,oauth_config_approved,oauth_config_generation,instructions,
-                created_by,created_from_ip,created_user_agent,created_via,created_at,updated_at,enabled,version)
+                created_by,created_from_ip,created_user_agent,created_via,import_batch_id,federation_source,
+                created_at,updated_at,enabled,version)
             VALUES ($1,$2,$3,$4,$5,$6,$7,", $tags, ",$9,", $oauth, ",$11,$12,$13,$14,$15,$16,
-                'api',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,TRUE,1)"
+                $17,$18,$19,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,TRUE,1)"
         )
     };
 }
@@ -78,7 +79,7 @@ macro_rules! update_server {
             "UPDATE servers SET id=$1,name=$2,description=$3,icon=$4,team_id=$5,owner_email=$6,visibility=$7,tags=",
             $tags,",oauth_enabled=$9,oauth_config=",$oauth,",oauth_config_approved=$11,
                 oauth_config_generation=$12,instructions=$13,modified_by=$14,modified_from_ip=$15,modified_user_agent=$16,
-                modified_via='api',updated_at=CURRENT_TIMESTAMP,version=COALESCE(version,0)+1 WHERE id=$17"
+                modified_via=$17,updated_at=CURRENT_TIMESTAMP,version=COALESCE(version,0)+1 WHERE id=$18"
         )
     };
 }
@@ -179,16 +180,20 @@ impl Database {
                 } else {
                     (insert_server!($tags,$oauth),&server.created_by,&server.created_from_ip,&server.created_user_agent)
                 };
-                let mut statement = sqlx::query(statement)
+                let statement = sqlx::query(statement)
                     .bind(&server.id).bind(&server.name).bind(server.description.as_deref()).bind(server.icon.as_deref())
                     .bind(server.team_id.as_deref()).bind(server.owner_email.as_deref()).bind(&server.visibility)
                     .bind(&server.tags).bind(server.oauth_enabled).bind(server.oauth_config.as_deref())
                     .bind(server.oauth_config_approved).bind(server.oauth_config_generation.as_deref()).bind(server.instructions.as_deref())
                     .bind(actor.as_deref()).bind(ip.as_deref()).bind(agent.as_deref());
                 if let Some(old_id) = old_id.as_deref() {
-                    statement = statement.bind(old_id);
+                    statement.bind(server.modified_via.as_deref().unwrap_or("api")).bind(old_id)
+                        .execute(&mut *$tx).await?;
+                } else {
+                    statement.bind(server.created_via.as_deref().unwrap_or("api"))
+                        .bind(server.import_batch_id.as_deref()).bind(server.federation_source.as_deref())
+                        .execute(&mut *$tx).await?;
                 }
-                statement.execute(&mut *$tx).await?;
                 replace_links!($tx, server, scope, links.tools, "Tools", "tools", "server_tool_association", "tool_id", $decode);
                 replace_links!($tx, server, scope, links.resources, "Resources", "resources", "server_resource_association", "resource_id", $decode);
                 replace_links!($tx, server, scope, links.prompts, "Prompts", "prompts", "server_prompt_association", "prompt_id", $decode);

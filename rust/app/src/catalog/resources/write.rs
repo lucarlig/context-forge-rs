@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
+use super::{entry_filters::fetch_catalog_entries, *};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ResourceWriteError {
@@ -40,9 +40,10 @@ macro_rules! resource_insert {
             "INSERT INTO resources (id, uri, name, original_name, custom_name_slug, description, title,
                 mime_type, uri_template, gateway_id, size, text_content, binary_content, tags,
                 extension_metadata, owner_email, team_id, visibility, created_by,
-                created_from_ip, created_user_agent, created_via, enabled, created_at, updated_at, version)
+                created_from_ip, created_user_agent, created_via, import_batch_id, federation_source,
+                enabled, created_at, updated_at, version)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,", $tags, ",", $extension, ",
-                $16,$17,$18,$19,$20,$21,'api',TRUE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,1)"
+                $16,$17,$18,$19,$20,$21,$22,$23,$24,TRUE,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,1)"
         )
     };
 }
@@ -55,13 +56,29 @@ macro_rules! resource_update {
                 text_content=COALESCE($12,text_content), binary_content=COALESCE($13,binary_content),
                 tags=", $tags, ", extension_metadata=", $extension, ",
                 owner_email=$16, team_id=$17, visibility=$18, modified_by=$19,
-                modified_from_ip=$20, modified_user_agent=$21, modified_via='api',
+                modified_from_ip=$20, modified_user_agent=$21, modified_via=$22,
                 updated_at=CURRENT_TIMESTAMP, version=COALESCE(version,0)+1 WHERE id=$1"
         )
     };
 }
 
 impl Database {
+    pub(crate) async fn import_resource_candidates(
+        &self,
+        scope: CatalogScope<'_>,
+        uri: &str,
+    ) -> Result<Vec<ResourceRecord>, sqlx::Error> {
+        fetch_catalog_entries!(
+            self,
+            ResourceRecord,
+            scope,
+            CatalogEntryFilters::associated(true),
+            resource_select!(),
+            "r.gateway_id IS NULL AND r.uri = $13",
+            uri
+        )
+    }
+
     pub(crate) async fn save_managed_resource(
         &self,
         previous: Option<&ResourceRecord>,
@@ -94,12 +111,13 @@ impl Database {
                 {
                     return Err(ResourceWriteError::Duplicate { id, enabled });
                 }
-                let (query, actor, ip, agent) = if previous.is_some() {
+                let (statement, actor, ip, agent, via) = if previous.is_some() {
                     (
                         resource_update!($tags, $extension),
                         &resource.modified_by,
                         &resource.modified_from_ip,
                         &resource.modified_user_agent,
+                        &resource.modified_via,
                     )
                 } else {
                     (
@@ -107,9 +125,10 @@ impl Database {
                         &resource.created_by,
                         &resource.created_from_ip,
                         &resource.created_user_agent,
+                        &resource.created_via,
                     )
                 };
-                sqlx::query(query)
+                let query = sqlx::query(statement)
                     .bind(&resource.id)
                     .bind(&resource.uri)
                     .bind(&resource.name)
@@ -131,8 +150,15 @@ impl Database {
                     .bind(actor.as_deref())
                     .bind(ip.as_deref())
                     .bind(agent.as_deref())
-                    .execute(&mut *$tx)
-                    .await?;
+                    .bind(via.as_deref().unwrap_or("api"));
+                let query = if previous.is_none() {
+                    query
+                        .bind(resource.import_batch_id.as_deref())
+                        .bind(resource.federation_source.as_deref())
+                } else {
+                    query
+                };
+                query.execute(&mut *$tx).await?;
                 let updated = sqlx::query_as::<_, ResourceRecord>(RESOURCE_BY_ID)
                     .bind(&resource.id)
                     .fetch_one(&mut *$tx)

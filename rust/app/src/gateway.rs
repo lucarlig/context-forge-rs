@@ -1225,7 +1225,34 @@ async fn register(
     Extension(principal): Extension<Principal>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    Json(mut input): Json<RegisterGateway>,
+    Json(input): Json<RegisterGateway>,
+) -> Result<Response, RegistrationResponse> {
+    let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    register_gateway(
+        &service,
+        &principal,
+        input,
+        GatewayRegistrationSource::Api { address, agent },
+    )
+    .await
+}
+
+enum GatewayRegistrationSource<'a> {
+    Api {
+        address: Option<String>,
+        agent: Option<&'a str>,
+    },
+    Import(&'a import_api::ImportScope<'a>),
+}
+
+async fn register_gateway(
+    service: &GatewayService,
+    principal: &Principal,
+    mut input: RegisterGateway,
+    source: GatewayRegistrationSource<'_>,
 ) -> Result<Response, RegistrationResponse> {
     let name = input.name.trim();
     let slug = slugify(name);
@@ -1259,32 +1286,69 @@ async fn register(
         }
     };
 
-    let visibility = input.visibility.as_deref().unwrap_or("public");
-    if !matches!(visibility, "public" | "team" | "private") {
-        return Err(RegistrationResponse::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Invalid gateway visibility",
-        ));
-    }
-    let team =
-        registration_team(&service, &principal, visibility, input.team_id.as_deref()).await?;
-    let context = team
-        .as_deref()
-        .map_or(RoleContext::AnyTeam, RoleContext::Team);
-    let allowed = service
-        .access
-        .allows(&principal, "gateways.create", context, true)
-        .await?;
-    if !allowed {
-        return Err(RegistrationResponse::new(
-            StatusCode::FORBIDDEN,
-            "Access denied",
-        ));
-    }
+    let (visibility, team, created_via, batch_id, address, agent) = match source {
+        GatewayRegistrationSource::Api { address, agent } => {
+            let visibility = input.visibility.as_deref().unwrap_or("public");
+            if !matches!(visibility, "public" | "team" | "private") {
+                return Err(RegistrationResponse::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Invalid gateway visibility",
+                ));
+            }
+            let team =
+                registration_team(service, principal, visibility, input.team_id.as_deref()).await?;
+            let context = team
+                .as_deref()
+                .map_or(RoleContext::AnyTeam, RoleContext::Team);
+            if !service
+                .access
+                .allows(principal, "gateways.create", context, true)
+                .await?
+            {
+                return Err(RegistrationResponse::new(
+                    StatusCode::FORBIDDEN,
+                    "Access denied",
+                ));
+            }
+            (visibility, team, "api", None, address, agent)
+        }
+        GatewayRegistrationSource::Import(scope) => {
+            if scope.principal.email != principal.email
+                || !service
+                    .access
+                    .allows_global_only(principal, "admin.import")
+                    .await?
+            {
+                return Err(RegistrationResponse::new(
+                    StatusCode::FORBIDDEN,
+                    "Access denied",
+                ));
+            }
+            if let Some(team) = scope.team_id
+                && !service.database.active_team(team).await?
+            {
+                return Err(RegistrationResponse::new(
+                    StatusCode::FORBIDDEN,
+                    "Access denied",
+                ));
+            }
+            (
+                scope.visibility(),
+                scope.team_id.map(str::to_owned),
+                "import",
+                Some(scope.batch_id),
+                None,
+                None,
+            )
+        }
+    };
 
     let url = input.url.trim();
     let one_time_auth = input.one_time_auth || input.auth.is_one_time_marker();
-    let lifecycle = service.lifecycle.as_ref().filter(|_| !one_time_auth);
+    let lifecycle = service
+        .lifecycle
+        .as_ref()
+        .filter(|_| !one_time_auth && created_via == "api");
     service.upstream.check_endpoint(url).map_err(|_| {
         RegistrationResponse::new(
             StatusCode::BAD_REQUEST,
@@ -1533,10 +1597,6 @@ async fn register(
             definition: &tools[index],
         })
         .collect();
-    let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
-    let agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok());
     let created = service
         .database
         .register_discovered_gateway(
@@ -1560,6 +1620,8 @@ async fn register(
                 },
                 created_from_ip: address.as_deref(),
                 created_user_agent: agent,
+                created_via: Some(created_via),
+                import_batch_id: batch_id,
             },
         )
         .await;
@@ -1604,6 +1666,8 @@ async fn register(
     }
     service.subscriptions.registered(&registration);
     let mut response = registration_response(&registration, address, agent);
+    response["createdVia"] = json!(created_via);
+    response["importBatchId"] = json!(batch_id);
     response["gatewayMode"] = mode.name().into();
     response["refreshIntervalSeconds"] = json!(input.refresh_interval_seconds);
     response["caCertificate"] = json!(input.ca_certificate);

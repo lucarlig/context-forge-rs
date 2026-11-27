@@ -11,6 +11,8 @@ use super::{
     *,
 };
 use crate::catalog::ResourceWriteError;
+use crate::gateway::import_api::{ImportScope, Outcome, Strategy};
+use serde_json::Map;
 
 static UNSAFE_HTML: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)</?(?:script|iframe|object|embed|link|meta|base|form|img|svg|video|audio|source|track|area|map|canvas|applet|frame|frameset|html|head|body|style)\b")
@@ -86,6 +88,104 @@ pub(super) struct CreateRequest {
     #[serde(alias = "teamId")]
     team_id: Option<String>,
     visibility: Option<String>,
+}
+
+pub(in crate::gateway) async fn import_resource(
+    service: &GatewayService,
+    import: &ImportScope<'_>,
+    mut data: Map<String, Value>,
+) -> Result<Outcome, ResourceError> {
+    data.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "uri" | "name" | "description" | "mime_type" | "content" | "tags"
+        )
+    });
+    let mut fields: ResourceFields = serde_json::from_value(Value::Object(data))
+        .map_err(|_| invalid("Invalid imported resource"))?;
+    let mut uri = validate_uri(fields.uri.take().as_deref().unwrap_or_default())?;
+    let name = validate_name(fields.name.take().as_deref().unwrap_or_default())?;
+    let scope = access::catalog_scope(Some(import.principal));
+    let candidates = service
+        .database
+        .import_resource_candidates(scope, &uri)
+        .await?;
+    let previous = if candidates.is_empty() {
+        None
+    } else {
+        match import.strategy {
+            Strategy::Skip => return Ok(Outcome::Skipped),
+            Strategy::Fail => {
+                return Err(ResourceError::detail(
+                    StatusCode::CONFLICT,
+                    format!("Resource URI conflict: {uri}"),
+                ));
+            }
+            Strategy::Rename => {
+                uri = validate_uri(&format!("{uri}_imported_{}", Timestamp::now().as_second()))?;
+                None
+            }
+            Strategy::Update => {
+                let previous = candidates
+                    .iter()
+                    .find(|record| {
+                        record.owner_email.as_deref() == Some(import.principal.email.as_str())
+                    })
+                    .or_else(|| (candidates.len() == 1).then(|| &candidates[0]));
+                Some(
+                    previous
+                        .filter(|record| import.owns(record.owner_email.as_deref()))
+                        .ok_or_else(|| {
+                            ResourceError::detail(
+                                StatusCode::FORBIDDEN,
+                                format!("Permission denied: cannot update resource {uri}"),
+                            )
+                        })?,
+                )
+            }
+        }
+    };
+
+    let actor = &import.principal.email;
+    let mut record = previous.cloned().unwrap_or_else(|| ResourceRecord {
+        id: Uuid::new_v4().simple().to_string(),
+        uri,
+        original_name: Some(name.clone()),
+        tags: "[]".into(),
+        owner_email: Some(actor.clone()),
+        team_id: import.team_id.map(str::to_owned),
+        visibility: import.visibility().into(),
+        created_by: Some(actor.clone()),
+        created_via: Some("import".into()),
+        import_batch_id: Some(import.batch_id.into()),
+        federation_source: Some(format!("imported-by-{actor}")),
+        ..ResourceRecord::default()
+    });
+    if previous.is_some() {
+        record.modified_by = Some(actor.clone());
+        record.modified_via = Some("import".into());
+    }
+    record.custom_name_slug = Some(slugify(&name));
+    record.name = name;
+    let body = fields.content.take();
+    let body = if previous.is_some() {
+        body.as_deref()
+    } else {
+        Some(body.as_deref().unwrap_or_default().trim())
+    };
+    apply_metadata(&service.resource_limits, &mut record, fields, body)?;
+    let saved = service
+        .database
+        .save_managed_resource(previous, &record, body)
+        .await
+        .map_err(|error| persistence_error(error, &record))?;
+    Ok(if previous.is_some() {
+        publish(service, &saved, ResourceEvent::Updated);
+        Outcome::Updated
+    } else {
+        publish(service, &saved, ResourceEvent::Added);
+        Outcome::Created
+    })
 }
 
 pub(super) async fn create(
@@ -260,6 +360,7 @@ pub(super) async fn update(
         record.custom_name_slug = Some(slug);
     }
     record.modified_by = Some(principal.email.clone());
+    record.modified_via = Some("api".into());
     if let Some(ip) = client_address(peer) {
         record.modified_from_ip = Some(ip);
     }

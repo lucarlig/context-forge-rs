@@ -1,0 +1,106 @@
+{
+  "dry-run": {
+    "import_id": "[..]",
+    "status": "completed",
+    "progress": {
+      "total": 1,
+      "processed": 1,
+      "created": 0,
+      "updated": 0,
+      "skipped": 0,
+      "failed": 0
+    },
+    "errors": [],
+    "warnings": [
+      "Would import gateway: Gateway export import fixture"
+    ],
+    "started_at": "[..]",
+    "completed_at": "[..]"
+  },
+  "create": {
+    "import_id": "[..]",
+    "status": "completed",
+    "progress": {
+      "total": 1,
+      "processed": 1,
+      "created": 1,
+      "updated": 0,
+      "skipped": 0,
+      "failed": 0
+    },
+    "errors": [],
+    "warnings": [],
+    "started_at": "[..]",
+    "completed_at": "[..]"
+  },
+  "skip": {
+    "import_id": "[..]",
+    "status": "completed",
+    "progress": {
+      "total": 1,
+      "processed": 1,
+      "created": 0,
+      "updated": 0,
+      "skipped": 1,
+      "failed": 0
+    },
+    "errors": [],
+    "warnings": [
+      "Skipped existing gateway: Existing public gateway"
+    ],
+    "started_at": "[..]",
+    "completed_at": "[..]"
+  },
+  "conflict": {
+    "import_id": "[..]",
+    "status": "completed",
+    "progress": {
+      "total": 1,
+      "processed": 0,
+      "created": 0,
+      "updated": 0,
+      "skipped": 0,
+      "failed": 1
+    },
+    "errors": [
+      "Failed to process gateways entity: Failed to process gateways: Failed to process gateway Existing public gateway: Gateway name conflict: Existing public gateway"
+    ],
+    "warnings": [],
+    "started_at": "[..]",
+    "completed_at": "[..]"
+  },
+  "update": {
+    "import_id": "[..]",
+    "status": "completed",
+    "progress": {
+      "total": 1,
+      "processed": 1,
+      "created": 0,
+      "updated": 1,
+      "skipped": 0,
+      "failed": 0
+    },
+    "errors": [],
+    "warnings": [],
+    "started_at": "[..]",
+    "completed_at": "[..]"
+  },
+  "rename": {
+    "import_id": "[..]",
+    "status": "completed",
+    "progress": {
+      "total": 1,
+      "processed": 1,
+      "created": 1,
+      "updated": 0,
+      "skipped": 0,
+      "failed": 0
+    },
+    "errors": [],
+    "warnings": [
+      "Renamed gateway Existing public gateway to Existing public gateway[..]"
+    ],
+    "started_at": "[..]",
+    "completed_at": "[..]"
+  }
+}

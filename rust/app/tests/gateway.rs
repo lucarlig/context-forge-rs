@@ -38,8 +38,12 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+#[path = "gateway/catalog_configuration_import.rs"]
+mod catalog_configuration_import;
 #[path = "gateway/configuration_import.rs"]
 mod configuration_import;
+#[path = "gateway/configuration_server_import.rs"]
+mod configuration_server_import;
 
 const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";

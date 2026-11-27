@@ -4,7 +4,12 @@ use serde::Deserializer;
 use serde_json::Map;
 
 use super::*;
-use crate::catalog::{ServerInterfaceInput, ServerLinkUpdate, ServerWriteError};
+use crate::{
+    catalog::{
+        CatalogEntryFilters, CatalogScope, ServerInterfaceInput, ServerLinkUpdate, ServerWriteError,
+    },
+    gateway::import_api::{ImportScope, Outcome, Strategy},
+};
 
 #[derive(Deserialize)]
 pub(super) struct CreateServer {
@@ -78,6 +83,147 @@ pub(super) struct DeleteQuery {
 #[derive(Deserialize)]
 pub(super) struct ApprovalInput {
     version: i32,
+}
+
+pub(in crate::gateway) async fn import_server(
+    service: &GatewayService,
+    import: &ImportScope<'_>,
+    mut data: Map<String, Value>,
+) -> Result<Outcome, CatalogApiError> {
+    let principal = import.principal;
+    let scope = access::catalog_scope(Some(principal));
+    let mut name = validate_name(data["name"].as_str().unwrap_or_default())?;
+    let matches = service
+        .database
+        .managed_servers(scope, CatalogEntryFilters::associated(true))
+        .await?;
+    let mut matching = matches.iter().filter(|server| server.name == name);
+    let first = matching.next();
+    let duplicate = if let Some(candidate) = first {
+        match import.strategy {
+            Strategy::Skip => return Ok(Outcome::Skipped),
+            Strategy::Fail => {
+                return Err(CatalogApiError::detail(
+                    StatusCode::CONFLICT,
+                    format!("Server name conflict: {name}"),
+                ));
+            }
+            Strategy::Rename => {
+                let suffix = format!("_imported_{}", Timestamp::now().as_second());
+                let base: String = name.chars().take(255 - suffix.len()).collect();
+                name = format!("{base}{suffix}");
+                None
+            }
+            Strategy::Update => {
+                if matching.next().is_some() || !import.owns(candidate.owner_email.as_deref()) {
+                    return Err(CatalogApiError::detail(
+                        StatusCode::FORBIDDEN,
+                        format!("Permission denied: cannot update server {name}"),
+                    ));
+                }
+                Some(candidate)
+            }
+        }
+    } else {
+        None
+    };
+
+    let tool_ids = import_tool_links(service, import, scope, &mut data).await?;
+    data.retain(|field, _| matches!(field.as_str(), "description" | "instructions" | "tags"));
+    let fields: ServerFields = serde_json::from_value(Value::Object(data))
+        .map_err(|_| invalid("Invalid imported server"))?;
+    let mut server = duplicate.cloned().unwrap_or_else(|| ServerRecord {
+        id: Uuid::new_v4().simple().to_string(),
+        name: name.clone(),
+        owner_email: Some(principal.email.clone()),
+        team_id: import.team_id.map(str::to_owned),
+        visibility: import.visibility().into(),
+        created_by: Some(principal.email.clone()),
+        created_via: Some("import".into()),
+        import_batch_id: Some(import.batch_id.into()),
+        federation_source: Some(format!("imported-by-{}", principal.email)),
+        tags: "[]".into(),
+        ..ServerRecord::default()
+    });
+    let create = duplicate.is_none();
+    let mut links = apply_fields(service, principal, &mut server, fields, create).await?;
+    if !tool_ids.is_empty() {
+        links.tools = Some(tool_ids);
+    }
+    if !create {
+        server.modified_by = Some(principal.email.clone());
+        server.modified_via = Some("import".into());
+    }
+    let saved = service
+        .database
+        .save_managed_server(duplicate, &server, &links, scope)
+        .await
+        .map_err(|error| persistence_error(error, &server, create))?;
+    publish(service, &saved);
+    Ok(if !create {
+        Outcome::Updated
+    } else if first.is_some() {
+        Outcome::Renamed(name)
+    } else {
+        Outcome::Created
+    })
+}
+
+async fn import_tool_links(
+    service: &GatewayService,
+    import: &ImportScope<'_>,
+    scope: CatalogScope<'_>,
+    data: &mut Map<String, Value>,
+) -> Result<Vec<String>, CatalogApiError> {
+    let mut references = Vec::new();
+    for field in ["tool_ids", "associated_tools", "associatedTools"] {
+        if let Some(value) = data.remove(field) {
+            let ids = serde_json::from_value::<Option<Vec<String>>>(value)
+                .map_err(|_| invalid("Invalid imported server tool references"))?
+                .unwrap_or_default();
+            if references.is_empty() {
+                references = ids;
+            }
+        }
+    }
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tools = service
+        .database
+        .managed_tools(scope, CatalogEntryFilters::associated(true))
+        .await?;
+    let mut resolved = HashSet::new();
+    for reference in references {
+        let canonical_id = Uuid::parse_str(&reference).ok();
+        let exact = tools.iter().find(|tool| {
+            tool.id == reference
+                || canonical_id.is_some_and(|id| Uuid::parse_str(&tool.id) == Ok(id))
+        });
+        let linked = exact.or_else(|| {
+            let mut matching = tools
+                .iter()
+                .filter(|tool| tool.original_name == reference || tool.name == reference);
+            let first = matching.next()?;
+            let from_batch = |tool: &&crate::catalog::ToolRecord| {
+                tool.import_batch_id.as_deref() == Some(import.batch_id)
+                    && tool.owner_email.as_deref() == Some(import.principal.email.as_str())
+            };
+            if from_batch(&first) {
+                Some(first)
+            } else if let Some(second) = matching.next() {
+                std::iter::once(second).chain(matching).find(from_batch)
+            } else {
+                Some(first)
+            }
+        });
+        if let Some(tool) = linked {
+            resolved.insert(tool.id.clone());
+        }
+    }
+    let mut resolved = resolved.into_iter().collect::<Vec<_>>();
+    resolved.sort_unstable();
+    Ok(resolved)
 }
 
 pub(super) async fn create(
@@ -199,6 +345,7 @@ pub(super) async fn update(
     }
     let links = apply_fields(&service, &principal, &mut server, fields, false).await?;
     server.modified_by = Some(principal.email.clone());
+    server.modified_via = Some("api".into());
     server.modified_from_ip = client_address(peer).or(server.modified_from_ip);
     server.modified_user_agent = user_agent(&headers).or(server.modified_user_agent);
     let server = service

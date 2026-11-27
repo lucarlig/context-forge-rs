@@ -289,7 +289,7 @@ macro_rules! apply_gateway_metadata {
             ", passthrough_headers = ", json_parameter!($dialect, "$8"),
             ", identity_propagation = ", json_parameter!($dialect, "$9"),
             ", refresh_interval_seconds = $10, gateway_mode = $11,
-            modified_by = $12, modified_from_ip = $13, modified_via = 'api', modified_user_agent = $14,
+            modified_by = $12, modified_from_ip = $13, modified_via = $30, modified_user_agent = $14,
             url = $15, transport = $16, reachable = $17, auth_type = $18,
             auth_value = ", json_parameter!($dialect, "$19"),
             ", auth_query_params = ", json_parameter!($dialect, "$20"),
@@ -316,6 +316,7 @@ macro_rules! apply_gateway_metadata {
             .bind($after.signing_algorithm.as_deref()).bind($after.client_cert.as_deref())
             .bind($client_key.is_some()).bind($client_key.flatten())
             .bind(&$after.status)
+            .bind($after.modified_via.as_deref())
             .execute(&mut *$tx).await?;
         if ($after.url != $before.url || $after.auth_type != $before.auth_type
             || $after.oauth_config != $before.oauth_config)

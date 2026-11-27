@@ -67,10 +67,9 @@ The pinned 14-case suite matched native SQLite, SQLite initialized by the pinned
 gateway, and PostgreSQL. Live checks covered authorization, scoped server links,
 and credential masking. [Export recordings](replay/export-import/export/README.md)
 
-Configuration import handles dry runs, tool and root writes, job status, and
-cleanup at both API prefixes. Live checks covered scoped ownership on SQLite
-and credential rekeying on PostgreSQL. The remaining entity writers and CLI
-import are pending. [Import recordings](replay/export-import/import/README.md)
+Configuration import handles all six entity families, dry runs, job status,
+and cleanup at both API prefixes. Live checks cover scoped writes, conflict
+strategies, virtual-server tool links, and credential rekeying. [Import recordings](replay/export-import/import/README.md)
 
 ## Gateway and protocol verification
 

@@ -260,6 +260,8 @@ pub(crate) struct RegistrationOptions<'a> {
     pub(crate) tls: RegisteredTls<'a>,
     pub(crate) created_from_ip: Option<&'a str>,
     pub(crate) created_user_agent: Option<&'a str>,
+    pub(crate) created_via: Option<&'a str>,
+    pub(crate) import_batch_id: Option<&'a str>,
 }
 
 #[derive(Default)]
@@ -755,14 +757,14 @@ macro_rules! insert_gateway {
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
                 updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility,
                 gateway_mode, status, status_message, refresh_interval_seconds,
-                created_from_ip, created_via, created_user_agent,
+                created_from_ip, created_via, created_user_agent, import_batch_id,
                 auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation,
                 ca_certificate, ca_certificate_sig, signing_algorithm, client_cert, client_key, sigv4_config, oauth_config
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CASE WHEN $27 THEN NULL ELSE CURRENT_TIMESTAMP END,
                 NOT $27, $8, $8, $9, $10, $17, CASE WHEN $27 THEN 'pending' ELSE 'active' END,
                 CASE WHEN $27 THEN 'Gateway registration accepted and pending initialization' END, $28,
-                $25, 'api', $26,
+                $25, COALESCE($29, 'api'), $26, $30,
                 $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ", $18, $19, $20, $21, $22, ", $sigv4, ", ", $oauth, ")"
         )
     };
@@ -1370,6 +1372,8 @@ impl Database {
                     .bind(options.created_user_agent)
                     .bind(options.pending)
                     .bind(options.refresh_interval_seconds)
+                    .bind(options.created_via)
+                    .bind(options.import_batch_id)
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {

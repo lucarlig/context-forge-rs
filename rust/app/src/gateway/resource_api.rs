@@ -17,6 +17,7 @@ mod events;
 mod write;
 pub(crate) use events::ResourceEvents;
 pub use write::ResourceLimits;
+pub(super) use write::import_resource;
 
 pub(super) fn router(max_resource_bytes: usize) -> Router<Arc<GatewayService>> {
     let mut routes = Router::new();

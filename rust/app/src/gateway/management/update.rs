@@ -6,6 +6,7 @@ use axum::extract::ConnectInfo;
 use serde::Deserializer;
 
 use super::*;
+use crate::gateway::{catalog_api::CatalogApiError, import_api::ImportScope};
 use crate::{
     catalog::{GatewayConnectionRow, GatewayMode},
     credentials::UpdateAuthError,
@@ -128,7 +129,60 @@ pub(crate) async fn update(
         "Only the owner can update this gateway",
     )
     .await?;
-    if previous.status == "pending"
+    let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    update_existing(&service, &principal, previous, input, "api", address, agent).await
+}
+
+pub(in crate::gateway) async fn import_update(
+    service: &GatewayService,
+    scope: &ImportScope<'_>,
+    previous: GatewayRecord,
+    input: GatewayUpdate,
+) -> Result<(), CatalogApiError> {
+    let principal = scope.principal;
+    if !scope.owns(previous.owner_email.as_deref())
+        || !access::catalog_scope(Some(principal)).visible(
+            &previous.visibility,
+            previous.team_id.as_deref(),
+            previous.owner_email.as_deref(),
+        )
+        || !service
+            .access
+            .allows_global_only(principal, "admin.import")
+            .await?
+    {
+        return Err(CatalogApiError::detail(
+            StatusCode::FORBIDDEN,
+            "Access denied",
+        ));
+    }
+    update_existing(service, principal, previous, input, "import", None, None)
+        .await
+        .map(|_| ())
+        .map_err(|UpdateError(status, body)| {
+            CatalogApiError::detail(
+                status,
+                body["message"]
+                    .as_str()
+                    .unwrap_or("Invalid imported gateway"),
+            )
+        })
+}
+
+async fn update_existing(
+    service: &GatewayService,
+    principal: &Principal,
+    previous: GatewayRecord,
+    input: GatewayUpdate,
+    via: &'static str,
+    address: Option<String>,
+    agent: Option<&str>,
+) -> Result<Response, UpdateError> {
+    if via == "api"
+        && previous.status == "pending"
         && let Some(lifecycle) = &service.lifecycle
     {
         return Ok(lifecycle.accepted(response(&previous, service.credential_cipher.as_ref())));
@@ -138,16 +192,17 @@ pub(crate) async fn update(
     }
     let mut gateway = previous.clone();
     let (mut auth, one_time_auth, tls) =
-        apply_fields(&service, &principal, &mut gateway, input).await?;
-    let lifecycle = service.lifecycle.as_ref().filter(|_| !one_time_auth);
+        apply_fields(service, principal, &mut gateway, input).await?;
+    let lifecycle = service
+        .lifecycle
+        .as_ref()
+        .filter(|_| !one_time_auth && via == "api");
     gateway.modified_by = Some(principal.email.clone());
-    if let Some(Extension(ConnectInfo(address))) = peer {
-        gateway.modified_from_ip = Some(address.ip().to_string());
+    gateway.modified_via = Some(via.to_owned());
+    if let Some(address) = address {
+        gateway.modified_from_ip = Some(address);
     }
-    if let Some(agent) = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-    {
+    if let Some(agent) = agent {
         gateway.modified_user_agent = Some(agent.to_owned());
     }
 
@@ -171,7 +226,7 @@ pub(crate) async fn update(
         .await
         .map_err(ManagementError::from)?;
     let client_key = tls
-        .apply(&service, &mut gateway, connection.as_mut())
+        .apply(service, &mut gateway, connection.as_mut())
         .await?;
     let tls_changed = gateway.ca_certificate != previous.ca_certificate
         || gateway.client_cert != previous.client_cert
@@ -243,7 +298,7 @@ pub(crate) async fn update(
         None
     } else {
         discover_updated_gateway(
-            &service,
+            service,
             &gateway,
             transport,
             connection,

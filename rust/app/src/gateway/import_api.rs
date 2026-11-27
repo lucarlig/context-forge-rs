@@ -10,6 +10,8 @@ use serde_json::Map;
 
 use super::{catalog_api::CatalogApiError, *};
 
+mod gateway;
+
 const ORDER: [Entity; 6] = [
     Entity::Roots,
     Entity::Gateways,
@@ -67,8 +69,8 @@ impl Entity {
         }
     }
 
-    fn dry_run_counts_processed(self) -> bool {
-        matches!(self, Self::Roots | Self::Gateways | Self::Servers)
+    fn bulk(self) -> bool {
+        matches!(self, Self::Tools | Self::Resources | Self::Prompts)
     }
 }
 
@@ -162,17 +164,22 @@ impl Job {
             Ok(Outcome::Updated) => self.progress.updated += 1,
             Ok(Outcome::Skipped) => {
                 self.progress.skipped += 1;
-                if kind != Entity::Tools {
+                if !kind.bulk() {
                     self.warnings
                         .push(format!("Skipped existing {}: {name}", kind.singular()));
+                }
+            }
+            Ok(Outcome::Renamed(new_name)) => {
+                self.progress.created += 1;
+                if !kind.bulk() {
+                    self.warnings
+                        .push(format!("Renamed {} {name} to {new_name}", kind.singular()));
                 }
             }
             Err(error) => {
                 self.progress.failed += 1;
                 let detail = error.1["detail"].as_str().unwrap_or("Import failed");
-                if kind == Entity::Tools
-                    && matches!(error.0, StatusCode::FORBIDDEN | StatusCode::CONFLICT)
-                {
+                if kind.bulk() && matches!(error.0, StatusCode::FORBIDDEN | StatusCode::CONFLICT) {
                     self.errors.push(detail.to_owned());
                 } else {
                     self.errors
@@ -193,6 +200,7 @@ pub(super) enum Outcome {
     Created,
     Updated,
     Skipped,
+    Renamed(String),
 }
 
 #[derive(Default)]
@@ -288,7 +296,7 @@ async fn import(
     service.imports.save(&job);
     let rekey = request.rekey_secret.map(Zeroizing::new);
     let batch_id = job.import_id.clone();
-    let team_id = if !request.dry_run && entries.iter().any(|entry| entry.kind == Entity::Tools) {
+    let team_id = if !request.dry_run && entries.iter().any(|entry| entry.kind != Entity::Roots) {
         match service
             .database
             .personal_import_team(&principal.email)
@@ -328,7 +336,7 @@ async fn import(
                 format!("Would import {}: {name}", kind.singular())
             };
             job.warnings.push(warning);
-            job.progress.processed += usize::from(kind.dry_run_counts_processed());
+            job.progress.processed += usize::from(!kind.bulk());
         } else {
             for field in [
                 "owner_email",
@@ -350,10 +358,16 @@ async fn import(
                     .roots
                     .import_root(&name, entry["name"].as_str(), strategy),
                 Entity::Tools => super::tool_api::import_tool(&service, &context, entry).await,
-                _ => Err(CatalogApiError::detail(
-                    StatusCode::NOT_IMPLEMENTED,
-                    format!("Import for {} is pending", kind.key()),
-                )),
+                Entity::Resources => {
+                    super::resource_api::import_resource(&service, &context, entry).await
+                }
+                Entity::Prompts => {
+                    super::prompt_api::import_prompt(&service, &context, entry).await
+                }
+                Entity::Servers => {
+                    super::server_api::import_server(&service, &context, entry).await
+                }
+                Entity::Gateways => gateway::import_gateway(&service, &context, entry).await,
             };
             job.report(kind, &name, result);
         }
@@ -370,6 +384,20 @@ pub(super) struct ImportScope<'a> {
     pub(super) strategy: Strategy,
     pub(super) rekey: Option<&'a str>,
     pub(super) batch_id: &'a str,
+}
+
+impl ImportScope<'_> {
+    pub(super) fn visibility(&self) -> &'static str {
+        if self.team_id.is_some() {
+            "team"
+        } else {
+            "private"
+        }
+    }
+
+    pub(super) fn owns(&self, owner: Option<&str>) -> bool {
+        self.principal.is_global_admin() || owner == Some(self.principal.email.as_str())
+    }
 }
 
 fn entries(service: &GatewayService, request: &Request) -> Result<Vec<Entry>, String> {

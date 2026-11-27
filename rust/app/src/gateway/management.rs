@@ -21,7 +21,7 @@ use crate::{
 use super::*;
 
 mod update;
-pub(super) use update::update;
+pub(super) use update::{import_update, update};
 
 const MASKED: &str = "*****";
 

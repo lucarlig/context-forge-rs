@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::*;
+use super::{entry_filters::fetch_catalog_entries, *};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PromptWriteError {
@@ -48,9 +48,10 @@ macro_rules! insert_prompt {
         concat!(
             "INSERT INTO prompts (id,name,original_name,custom_name,custom_name_slug,display_name,
                 title,description,template,argument_schema,tags,gateway_id,team_id,owner_email,visibility,
-                created_by,created_from_ip,created_user_agent,created_via,created_at,updated_at,enabled,version)
+                created_by,created_from_ip,created_user_agent,created_via,import_batch_id,federation_source,
+                created_at,updated_at,enabled,version)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,", $schema, ",", $tags, ",$12,$13,$14,$15,
-                $16,$17,$18,'api',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,TRUE,1)"
+                $16,$17,$18,$19,$20,$21,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,TRUE,1)"
         )
     };
 }
@@ -61,13 +62,29 @@ macro_rules! update_prompt {
             "UPDATE prompts SET name=$2,original_name=$3,custom_name=$4,custom_name_slug=$5,
                 display_name=$6,title=$7,description=$8,template=$9,argument_schema=", $schema, ",tags=", $tags, ",
                 gateway_id=$12,team_id=$13,owner_email=$14,visibility=$15,modified_by=$16,
-                modified_from_ip=$17,modified_user_agent=$18,modified_via='api',updated_at=CURRENT_TIMESTAMP,
+                modified_from_ip=$17,modified_user_agent=$18,modified_via=$19,updated_at=CURRENT_TIMESTAMP,
                 version=COALESCE(version,0)+1 WHERE id=$1"
         )
     };
 }
 
 impl Database {
+    pub(crate) async fn import_prompt_candidates(
+        &self,
+        scope: CatalogScope<'_>,
+        name: &str,
+    ) -> Result<Vec<PromptRecord>, sqlx::Error> {
+        fetch_catalog_entries!(
+            self,
+            PromptRecord,
+            scope,
+            CatalogEntryFilters::associated(true),
+            prompt_select!(),
+            "r.gateway_id IS NULL AND r.name = $13",
+            name
+        )
+    }
+
     pub(crate) async fn managed_prompt(
         &self,
         id: &str,
@@ -129,12 +146,13 @@ impl Database {
                 {
                     return Err(PromptWriteError::Duplicate { id, enabled });
                 }
-                let (statement, actor, ip, agent) = if previous.is_some() {
+                let (statement, actor, ip, agent, via) = if previous.is_some() {
                     (
                         update_prompt!($schema, $tags),
                         &prompt.modified_by,
                         &prompt.modified_from_ip,
                         &prompt.modified_user_agent,
+                        &prompt.modified_via,
                     )
                 } else {
                     (
@@ -142,9 +160,10 @@ impl Database {
                         &prompt.created_by,
                         &prompt.created_from_ip,
                         &prompt.created_user_agent,
+                        &prompt.created_via,
                     )
                 };
-                sqlx::query(statement)
+                let query = sqlx::query(statement)
                     .bind(&prompt.id)
                     .bind(&prompt.name)
                     .bind(&prompt.original_name)
@@ -163,8 +182,15 @@ impl Database {
                     .bind(actor.as_deref())
                     .bind(ip.as_deref())
                     .bind(agent.as_deref())
-                    .execute(&mut *$tx)
-                    .await?;
+                    .bind(via.as_deref().unwrap_or("api"));
+                let query = if previous.is_none() {
+                    query
+                        .bind(prompt.import_batch_id.as_deref())
+                        .bind(prompt.federation_source.as_deref())
+                } else {
+                    query
+                };
+                query.execute(&mut *$tx).await?;
                 let updated = sqlx::query_as(PROMPT_BY_ID)
                     .bind(&prompt.id)
                     .fetch_one(&mut *$tx)

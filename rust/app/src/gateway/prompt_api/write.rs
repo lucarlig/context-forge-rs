@@ -2,6 +2,8 @@
 
 use super::*;
 use crate::catalog::{PromptWriteError, slugify};
+use crate::gateway::import_api::{ImportScope, Outcome, Strategy};
+use serde_json::Map;
 
 #[derive(Deserialize)]
 pub(super) struct CreatePrompt {
@@ -47,6 +49,145 @@ pub(super) struct StateQuery {
 #[derive(Deserialize)]
 pub(super) struct DeleteQuery {
     purge_metrics: Option<String>,
+}
+
+pub(in crate::gateway) async fn import_prompt(
+    service: &GatewayService,
+    import: &ImportScope<'_>,
+    mut data: Map<String, Value>,
+) -> Result<Outcome, CatalogApiError> {
+    if let Some(name) = data
+        .remove("original_name")
+        .filter(|name| !name.is_null() && name.as_str() != Some(""))
+    {
+        data.insert("name".into(), name);
+    }
+    let arguments = import_arguments(data.remove("input_schema"))?;
+    data.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "name" | "custom_name" | "display_name" | "description" | "template" | "tags"
+        )
+    });
+    let mut fields: PromptFields = serde_json::from_value(Value::Object(data))
+        .map_err(|_| invalid("Invalid imported prompt"))?;
+    if fields.template.is_none() {
+        return Err(invalid("Prompt template is required"));
+    }
+    fields.arguments = Some(arguments);
+    let original_name = validate_name(fields.name.as_deref().unwrap_or_default())?;
+    let mut custom_name = match fields.custom_name.as_deref() {
+        Some(name) => validate_name(name)?,
+        None => original_name.clone(),
+    };
+    let scope = access::catalog_scope(Some(import.principal));
+    let slug = slugify(&custom_name);
+    if slug.is_empty() || slug.len() > 255 {
+        return Err(invalid("Invalid prompt name"));
+    }
+    let candidates = service
+        .database
+        .import_prompt_candidates(scope, &slug)
+        .await?;
+    let previous = if candidates.is_empty() {
+        None
+    } else {
+        match import.strategy {
+            Strategy::Skip => return Ok(Outcome::Skipped),
+            Strategy::Fail => {
+                return Err(CatalogApiError::detail(
+                    StatusCode::CONFLICT,
+                    format!("Prompt name conflict: {original_name}"),
+                ));
+            }
+            Strategy::Rename => {
+                let suffix = format!("_imported_{}", Timestamp::now().as_second());
+                let base: String = original_name.chars().take(255 - suffix.len()).collect();
+                custom_name = format!("{base}{suffix}");
+                fields.display_name = Some(custom_name.clone());
+                None
+            }
+            Strategy::Update => {
+                let previous = candidates
+                    .iter()
+                    .find(|record| {
+                        record.owner_email.as_deref() == Some(import.principal.email.as_str())
+                    })
+                    .or_else(|| (candidates.len() == 1).then(|| &candidates[0]));
+                Some(
+                    previous
+                        .filter(|record| import.owns(record.owner_email.as_deref()))
+                        .ok_or_else(|| {
+                            CatalogApiError::detail(
+                                StatusCode::FORBIDDEN,
+                                format!("Permission denied: cannot update prompt {original_name}"),
+                            )
+                        })?,
+                )
+            }
+        }
+    };
+
+    let actor = &import.principal.email;
+    let mut record = previous.cloned().unwrap_or_else(|| PromptRecord {
+        id: Uuid::new_v4().simple().to_string(),
+        original_name,
+        display_name: Some(custom_name.clone()),
+        tags: "[]".into(),
+        owner_email: Some(actor.clone()),
+        team_id: import.team_id.map(str::to_owned),
+        visibility: import.visibility().into(),
+        created_by: Some(actor.clone()),
+        created_via: Some("import".into()),
+        import_batch_id: Some(import.batch_id.into()),
+        federation_source: Some(format!("imported-by-{actor}")),
+        ..PromptRecord::default()
+    });
+    if previous.is_some() {
+        record.modified_by = Some(actor.clone());
+        record.modified_via = Some("import".into());
+    }
+    record.custom_name = custom_name;
+    set_names(&mut record)?;
+    apply_fields(service, &mut record, fields, true)?;
+    let saved = service
+        .database
+        .save_managed_prompt(previous, &record)
+        .await
+        .map_err(|error| persistence_error(error, &record))?;
+    publish(service, &saved);
+    Ok(if previous.is_some() {
+        Outcome::Updated
+    } else {
+        Outcome::Created
+    })
+}
+
+fn import_arguments(schema: Option<Value>) -> Result<Vec<Argument>, CatalogApiError> {
+    let Some(Value::Object(mut schema)) = schema else {
+        return Ok(Vec::new());
+    };
+    let Some(properties) = schema.remove("properties") else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(properties) = properties else {
+        return Err(invalid("Invalid imported prompt input schema properties"));
+    };
+    properties
+        .into_iter()
+        .map(|(name, property)| {
+            let Value::Object(mut property) = property else {
+                return Err(invalid("Invalid imported prompt input schema property"));
+            };
+            let description = match property.remove("description") {
+                Some(Value::String(description)) => Some(description),
+                Some(Value::Null) => None,
+                None => Some(String::new()),
+                _ => return Err(invalid("Invalid imported prompt argument description")),
+            };
+            Ok(Argument { name, description })
+        })
+        .collect()
 }
 
 pub(super) async fn create(
@@ -197,6 +338,7 @@ pub(super) async fn update(
         record.visibility = visibility.to_owned();
     }
     record.modified_by = Some(principal.email.clone());
+    record.modified_via = Some("api".into());
     record.modified_from_ip = client_address(peer).or(record.modified_from_ip);
     record.modified_user_agent = user_agent(&headers).or(record.modified_user_agent);
     apply_fields(&service, &mut record, fields, false)?;
