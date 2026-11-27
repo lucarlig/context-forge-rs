@@ -48,3 +48,12 @@ administrator. The browser callback and authenticated profile matched on
 SQLite and PostgreSQL. Rust also revoked the previous native session
 when it changed the provider binding. The pinned release still
 accepted that session after the change.
+
+## Startup configuration
+
+The startup fixture registered eight environment-configured providers
+and matched their public listing on SQLite and PostgreSQL. Keycloak
+discovery used separate browser and gateway authorities. After a
+restart, the generic provider retained the administrator's metadata,
+custom scope, and team mappings. A manually registered provider
+remained available until the explicit disable policy was enabled.

@@ -16,6 +16,7 @@ use crate::{secret_envelope::SecretEnvelope, upstream::UpstreamClient};
 pub use external::ExternalIdentitySettings;
 pub(crate) use grants::SsoIdentityPolicy;
 pub(crate) use oidc::{is_id_token, unverified_jwt_claims, verify as verify_oidc_jwt};
+pub(super) use providers::bootstrap::bootstrap;
 
 pub(crate) struct SsoSettings {
     pub(crate) upstream: UpstreamClient,

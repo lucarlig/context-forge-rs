@@ -582,3 +582,5 @@ impl Database {
         }
     }
 }
+
+pub(in crate::local_auth) mod bootstrap;

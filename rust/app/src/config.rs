@@ -1143,7 +1143,7 @@ fn parse_networks(name: &str) -> Result<Vec<ipnet::IpNet>, Box<dyn Error + Send 
         })
         .collect()
 }
-fn allowlist(name: &str) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+pub(crate) fn allowlist(name: &str) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
     let raw = value(name, "")?;
     let raw = raw.trim();
     let items = match raw.as_bytes().first() {
@@ -1163,7 +1163,7 @@ fn allowlist(name: &str) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>
         })
         .collect())
 }
-fn flag(name: &str) -> Result<Option<bool>, Box<dyn Error + Send + Sync>> {
+pub(crate) fn flag(name: &str) -> Result<Option<bool>, Box<dyn Error + Send + Sync>> {
     match env::var(name) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "on" | "t" | "y" | "yes" => Ok(Some(true)),
@@ -1174,7 +1174,7 @@ fn flag(name: &str) -> Result<Option<bool>, Box<dyn Error + Send + Sync>> {
         Err(env::VarError::NotUnicode(_)) => Err(format!("invalid Unicode in {name}").into()),
     }
 }
-fn value(name: &str, default: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+pub(crate) fn value(name: &str, default: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
     match env::var(name) {
         Ok(value) => Ok(value),
         Err(env::VarError::NotPresent) => Ok(default.to_owned()),
@@ -1182,7 +1182,7 @@ fn value(name: &str, default: &str) -> Result<String, Box<dyn Error + Send + Syn
     }
 }
 
-fn parse<T: FromStr>(name: &str, default: T) -> Result<T, Box<dyn Error + Send + Sync>> {
+pub(crate) fn parse<T: FromStr>(name: &str, default: T) -> Result<T, Box<dyn Error + Send + Sync>> {
     match env::var(name) {
         Ok(value) => value.parse().map_err(|_| format!("invalid {name}").into()),
         Err(env::VarError::NotPresent) => Ok(default),

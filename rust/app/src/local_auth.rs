@@ -228,6 +228,7 @@ pub async fn router(
             "Authentication required",
         ));
     if let Some(settings) = state.settings.sso.as_ref() {
+        sso::bootstrap(&state.database, settings).await;
         let (sso_public, sso_admin) = sso::routers(settings);
         router = router.merge(sso_public.with_state(state.clone())).merge(
             state.access.protect_api_with_message(
