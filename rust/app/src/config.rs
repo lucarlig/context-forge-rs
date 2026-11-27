@@ -13,8 +13,8 @@ use crate::{
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     local_auth::{
-        AccountSettings, ExternalIdentitySettings, ResetSettings, SsoSettings, TeamSettings,
-        UserProvisioning,
+        AccountSettings, ExternalIdentitySettings, ResetSettings, SsoIdentityPolicy, SsoSettings,
+        TeamSettings, UserProvisioning,
         mail::{MailSettings, MailTls, Mailer},
     },
     mcp::{
@@ -477,7 +477,7 @@ impl Settings {
             upstream: Self::upstream_client()?,
             provisioning: Self::user_provisioning()?,
             internal_issuer: value("JWT_ISSUER", "mcpgateway")?,
-            approval_required: flag("SSO_REQUIRE_ADMIN_APPROVAL")?.unwrap_or(false),
+            identity_policy: Self::sso_identity_policy()?,
         }))
     }
 
@@ -506,9 +506,22 @@ impl Settings {
             secure_cookies: flag("SECURE_COOKIES")?.unwrap_or(true)
                 || value("ENVIRONMENT", "development")? == "production",
             same_site: value("COOKIE_SAMESITE", "lax")?,
-            approval_required: flag("SSO_REQUIRE_ADMIN_APPROVAL")?.unwrap_or(false),
+            identity_policy: Self::sso_identity_policy()?,
             admin_api_enabled: flag("MCPGATEWAY_ADMIN_API_ENABLED")?.unwrap_or(false),
         }))
+    }
+
+    fn sso_identity_policy() -> Result<SsoIdentityPolicy, Box<dyn Error + Send + Sync>> {
+        Ok(SsoIdentityPolicy {
+            approval_required: flag("SSO_REQUIRE_ADMIN_APPROVAL")?.unwrap_or(false),
+            teams: Self::account_teams()?,
+            admin_domains: allowlist("SSO_AUTO_ADMIN_DOMAINS")?,
+            github_admin_orgs: allowlist("SSO_GITHUB_ADMIN_ORGS")?,
+            google_admin_domains: allowlist("SSO_GOOGLE_ADMIN_DOMAINS")?,
+            entra_admin_groups: allowlist("SSO_ENTRA_ADMIN_GROUPS")?,
+            generic_provider: value("SSO_GENERIC_PROVIDER_ID", "")?,
+            generic_admin_groups: allowlist("SSO_GENERIC_ADMIN_GROUPS")?,
+        })
     }
 
     fn account_teams() -> Result<TeamSettings, Box<dyn Error + Send + Sync>> {

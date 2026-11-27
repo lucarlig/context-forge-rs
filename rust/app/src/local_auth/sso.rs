@@ -3,6 +3,7 @@
 mod approvals;
 mod external;
 mod flow;
+mod grants;
 mod identity;
 mod oidc;
 mod providers;
@@ -13,6 +14,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::{secret_envelope::SecretEnvelope, upstream::UpstreamClient};
 pub use external::ExternalIdentitySettings;
+pub(crate) use grants::SsoIdentityPolicy;
 
 pub(crate) struct SsoSettings {
     pub(crate) upstream: UpstreamClient,
@@ -24,7 +26,7 @@ pub(crate) struct SsoSettings {
     pub(crate) root_path: String,
     pub(crate) secure_cookies: bool,
     pub(crate) same_site: String,
-    pub(crate) approval_required: bool,
+    pub(crate) identity_policy: SsoIdentityPolicy,
     pub(crate) admin_api_enabled: bool,
 }
 

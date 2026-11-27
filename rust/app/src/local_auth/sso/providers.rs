@@ -216,7 +216,7 @@ pub(super) struct ProviderConfig {
     #[serde(default = "yes")]
     pub(super) auto_create_users: bool,
     #[serde(default)]
-    team_mapping: DbJson<Map<String, Value>>,
+    pub(super) team_mapping: DbJson<Map<String, Value>>,
     #[serde(default)]
     pub(super) provider_metadata: DbJson<Map<String, Value>>,
 }

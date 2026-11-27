@@ -2,14 +2,14 @@
 
 use serde_json::Map;
 
-use super::{providers::Provider, *};
+use super::{grants::MappedAccess, providers::Provider, *};
 
 pub(super) async fn authenticate_identity(
     database: &Database,
     provisioning: &UserProvisioning,
     provider: &Provider,
     claims: &Map<String, Value>,
-    approval_required: bool,
+    policy: &SsoIdentityPolicy,
 ) -> Result<Option<storage::LocalUser>, sqlx::Error> {
     let raw_email = match provider
         .config
@@ -51,53 +51,72 @@ pub(super) async fn authenticate_identity(
     {
         return Ok(None);
     }
-    if let Some(user) = database.local_user(&email).await? {
-        if user.auth_provider != provider.id || !user.is_active || user.locked(Timestamp::now()) {
-            return Ok(None);
-        }
-        return database.record_successful_login(&user).await;
-    }
-    if !provider.config.auto_create_users {
-        return Ok(None);
-    }
-    let name: String = claims
+    let groups = groups(provider, claims);
+    let mapped = MappedAccess::from_claims(provider, policy, provisioning, &email, &groups, claims);
+    let name: Option<String> = claims
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or(&email)
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(255)
-        .collect();
-    if approval_required {
-        let mut metadata = json!({
-            "email":email,"full_name":name,"avatar_url":claims.get("picture"),
-            "provider":provider.id,"provider_id":claims.get("sub"),
-            "groups":groups(provider, claims),
-            "username":claims.get("preferred_username").and_then(Value::as_str)
-                .or_else(||email.split_once('@').map(|(local,_)|local)),
+        .map(|name| {
+            name.chars()
+                .filter(|ch| !ch.is_control())
+                .take(255)
+                .collect()
         });
-        if let Some(verified) = verified {
-            metadata["email_verified"] = verified.into();
+    let mut user = database.local_user(&email).await?;
+    let mut created = false;
+    if user.is_none() {
+        if !provider.config.auto_create_users {
+            return Ok(None);
         }
+        let full_name = name.as_deref().unwrap_or(&email);
+        if policy.approval_required {
+            let mut metadata = json!({
+                "email":email,"full_name":full_name,"avatar_url":claims.get("picture"),
+                "provider":provider.id,"provider_id":claims.get("sub"),
+                "groups":groups,
+                "username":claims.get("preferred_username").and_then(Value::as_str)
+                    .or_else(||email.split_once('@').map(|(local,_)|local)),
+            });
+            if let Some(verified) = verified {
+                metadata["email_verified"] = verified.into();
+            }
+            database
+                .queue_sso_approval(&email, full_name, &provider.id, metadata)
+                .await?;
+        }
+        let new_user = storage::NewUser {
+            email: email.clone(),
+            full_name: Some(full_name.to_owned()),
+            is_admin: mapped.admin,
+            is_active: true,
+            password_hash: None,
+            auth_provider: provider.id.clone(),
+            approval_required: policy.approval_required,
+            email_verified: false,
+            password_change_required: false,
+            granted_by: None,
+            admin_origin: mapped.admin.then_some("sso"),
+        };
+        created = database.create_local_user(&new_user, provisioning).await?;
+        user = database.local_user(&email).await?;
+    }
+    let Some(user) = user.filter(|user| {
+        user.auth_provider == provider.id && user.is_active && !user.locked(Timestamp::now())
+    }) else {
+        return Ok(None);
+    };
+    if !database
+        .sync_sso_roles_and_profile(&user, &mapped, provisioning, name.as_deref(), !created)
+        .await?
+    {
+        return Ok(None);
+    }
+    if let Some(teams) = &mapped.teams {
         database
-            .queue_sso_approval(&email, &name, &provider.id, metadata)
+            .sync_sso_memberships(&email, teams, &policy.teams, provisioning)
             .await?;
     }
-    let user = storage::NewUser {
-        email: email.clone(),
-        full_name: Some(name),
-        is_admin: false,
-        is_active: true,
-        password_hash: None,
-        auth_provider: provider.id.clone(),
-        approval_required,
-        email_verified: false,
-        password_change_required: false,
-        granted_by: None,
-        admin_origin: None,
-    };
-    database.create_local_user(&user, provisioning).await?;
     Ok(database.local_user(&email).await?.filter(|user| {
         user.auth_provider == provider.id && user.is_active && !user.locked(Timestamp::now())
     }))

@@ -32,3 +32,8 @@ responses on SQLite and PostgreSQL. It handled disabled and unknown
 providers, the Entra alias, passwordless creation, duplicate users, and
 malformed requests. Provisioned users could not sign in with a local
 password.
+
+The group mapping fixture used a custom OIDC groups claim on both
+databases. It granted the configured team membership and RBAC role,
+promoted the user when an administrator group appeared, and removed
+those grants when the groups disappeared.

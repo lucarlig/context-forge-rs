@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
+
 use super::*;
+
+struct MemberSettings<'a> {
+    teams: &'a TeamSettings,
+    provisioning: &'a UserProvisioning,
+    sso: bool,
+}
 
 pub(in crate::local_auth::teams) enum MemberMutation<'a> {
     Add(&'a str),
@@ -168,10 +176,85 @@ impl Database {
         operation: MemberMutation<'_>,
         settings: &AccountSettings,
     ) -> Result<Member, AccountError> {
+        self.write_membership(
+            id,
+            email,
+            actor,
+            operation,
+            &MemberSettings {
+                teams: &settings.teams,
+                provisioning: &settings.provisioning,
+                sso: false,
+            },
+        )
+        .await
+    }
+
+    pub(in crate::local_auth) async fn sync_sso_memberships(
+        &self,
+        email: &str,
+        desired: &BTreeMap<String, String>,
+        teams: &TeamSettings,
+        provisioning: &UserProvisioning,
+    ) -> Result<(), sqlx::Error> {
+        const SELECT: &str = "SELECT team_id FROM email_team_members WHERE user_email=$1
+            AND is_active AND grant_source='sso' ORDER BY team_id";
+        let existing: Vec<String> = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar(SELECT)
+                    .bind(email)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar(SELECT)
+                    .bind(email)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        let options = MemberSettings {
+            teams,
+            provisioning,
+            sso: true,
+        };
+        for team in existing.iter().filter(|team| !desired.contains_key(*team)) {
+            if let Err(error) = self
+                .write_membership(team, email, email, MemberMutation::Remove, &options)
+                .await
+            {
+                tracing::warn!(status=%error.0, "could not remove SSO team membership");
+            }
+        }
+        for (team, role) in desired {
+            if existing.contains(team) {
+                continue;
+            }
+            if let Err(error) = self
+                .write_membership(team, email, email, MemberMutation::Add(role), &options)
+                .await
+                && error.0 != StatusCode::CONFLICT
+            {
+                tracing::warn!(status=%error.0, "could not add SSO team membership");
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_membership(
+        &self,
+        id: &str,
+        email: &str,
+        actor: &str,
+        operation: MemberMutation<'_>,
+        settings: &MemberSettings<'_>,
+    ) -> Result<Member, AccountError> {
         macro_rules! write {
             ($tx:ident,$postgres:tt) => {{
                 let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_team)?;
-                team_permission!($tx,id,actor, matches!(operation,MemberMutation::Remove) && actor==email);
+                if !settings.sso {
+                    team_permission!($tx,id,actor, matches!(operation,MemberMutation::Remove) && actor==email);
+                }
                 if team.is_personal {
                     return Err(match operation {
                         MemberMutation::Add(_)=>AccountError::bad_request("Cannot add members to personal teams"),
@@ -185,11 +268,20 @@ impl Database {
                         if !user {
                             return Err(AccountError::detail(StatusCode::NOT_FOUND,"User not found or inactive"));
                         }
-                        insert_member!($tx,team,email,role,Some(actor),actor,settings,false)
+                        let mut member = insert_member!($tx,team,email,role,Some(actor),actor,settings,false);
+                        if settings.sso {
+                            sqlx::query("UPDATE email_team_members SET grant_source='sso' WHERE id=$1")
+                                .bind(&member.id).execute(&mut *$tx).await?;
+                            member.grant_source = Some("sso".to_owned());
+                        }
+                        member
                     }
                     MemberMutation::Role(_) | MemberMutation::Remove=>{
                         let mut member:Member=sqlx::query_as(MEMBER_ANY_STATE).bind(id).bind(email)
                             .fetch_optional(&mut *$tx).await?.filter(|member:&Member|member.is_active).ok_or_else(missing_member)?;
+                        if settings.sso && member.grant_source.as_deref()!=Some("sso") {
+                            return Err(missing_member());
+                        }
                         let role=match operation {MemberMutation::Role(role)=>Some(role),_=>None};
                         if member.role=="owner" && role!=Some("owner") {
                             let other_owner:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_team_members WHERE

@@ -38,7 +38,7 @@ use crate::{
 
 pub(crate) use password_reset::ResetSettings;
 pub use sso::ExternalIdentitySettings;
-pub(crate) use sso::SsoSettings;
+pub(crate) use sso::{SsoIdentityPolicy, SsoSettings};
 pub(crate) use storage::{POSTGRES_MIGRATION, SQLITE_MIGRATION};
 pub(crate) use teams::TeamSettings;
 

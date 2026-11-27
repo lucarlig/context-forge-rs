@@ -176,7 +176,7 @@ macro_rules! insert_member {
             "INSERT INTO email_team_members(id,team_id,user_email,role,invited_by,joined_at,is_active)
             VALUES($1,$2,$3,$4,$5,CURRENT_TIMESTAMP,TRUE)
             ON CONFLICT(team_id,user_email) DO UPDATE SET role=excluded.role,invited_by=excluded.invited_by,
-                joined_at=excluded.joined_at,is_active=TRUE RETURNING ",member_fields!()))
+                joined_at=excluded.joined_at,is_active=TRUE,grant_source=NULL RETURNING ",member_fields!()))
             .bind(Uuid::new_v4().simple().to_string()).bind(&team.id).bind(email).bind($role).bind($inviter)
             .fetch_one(&mut *$tx).await?;
         sync_member_role!($tx,member,actor,settings,true);

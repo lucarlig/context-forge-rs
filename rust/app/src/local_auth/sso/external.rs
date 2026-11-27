@@ -10,7 +10,7 @@ pub struct ExternalIdentitySettings {
     pub(crate) upstream: UpstreamClient,
     pub(crate) provisioning: UserProvisioning,
     pub(crate) internal_issuer: String,
-    pub(crate) approval_required: bool,
+    pub(crate) identity_policy: SsoIdentityPolicy,
 }
 
 impl ExternalIdentitySettings {
@@ -98,7 +98,7 @@ impl ExternalIdentitySettings {
             &self.provisioning,
             &provider,
             &claims,
-            self.approval_required,
+            &self.identity_policy,
         )
         .await?
         .map(|user| (user.email, expiry)))
