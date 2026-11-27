@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{error::Error, net::SocketAddr, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use context_forge_rs::{
     access::Authorizer,
@@ -160,7 +160,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .merge(accounts)
         .merge(service.gateway_oauth_callback())
         .merge(service.server_oauth_router());
-    let app = http_boundary.apply(app);
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     let background = catalog_available.then(|| {
         [
@@ -175,22 +174,16 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
     tracing::info!(address = %listener.local_addr()?, "gateway listening");
     let stop = shutdown.clone();
-    let result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    tokio::spawn(async move {
         shutdown_signal().await;
         stop.cancel();
-    })
-    .await;
-    shutdown.cancel();
+    });
+    http_boundary.serve(listener, app, shutdown).await;
     if let Some(tasks) = background {
         for task in tasks {
             task.await?;
         }
     }
-    result?;
     Ok(())
 }
 

@@ -99,14 +99,15 @@ or missing authentication. The Rust check also verified Unix output mode `0600`.
 ## HTTP request boundary
 
 The gateway enables correlation IDs and request header limits by default.
-Eleven live Rust Anything cases match the pinned gateway for correlation ID
+Fifteen live Rust Anything cases match the pinned gateway for correlation ID
 generation, preservation, response headers, and HTTP 431 errors. They cover
 disabled middleware, duplicate request fields, and limits at the boundary.
 
-The Hyper HTTP/1 parser still rejects requests above 100 header fields before
-the middleware runs. A live request with 101 fields and `MAX_HEADER_COUNT=120`
-returns 431 in Rust and 200 in the pinned gateway. Outbound correlation ID
-propagation remains open.
+The HTTP/1 listener uses the configured count to size the parser. At
+`MAX_HEADER_COUNT=120`, the live replay accepts 120 fields and returns a JSON
+431 at 121. The transport retains its own bounds for larger requests.
+An authenticated WebSocket upgrade and ping pass on both gateways.
+Outbound correlation ID propagation remains open.
 
 ## Gateway and protocol verification
 

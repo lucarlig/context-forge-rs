@@ -1,19 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::error::Error;
+use std::{error::Error, pin::pin};
 
 use axum::{
-    Json, Router,
-    extract::{Request, State},
+    Extension, Json, Router,
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::CONNECTION},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    serve::Listener,
+};
+use hyper::server::conn::http1;
+use hyper_util::{
+    rt::{TokioIo, TokioTimer},
+    service::TowerToHyperService,
 };
 use serde_json::json;
+use tokio::net::TcpListener;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower::ServiceBuilder;
 use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::config::{flag, parse, value};
+
+// HeaderMap can hold 24,576 distinct names at its largest table capacity.
+const HTTP1_HEADER_CAPACITY: usize = 24_576;
 
 pub struct HttpBoundary {
     header_limits: Option<HeaderLimits>,
@@ -47,7 +59,57 @@ impl HttpBoundary {
         })
     }
 
-    pub fn apply(self, mut router: Router) -> Router {
+    pub async fn serve(
+        self,
+        mut listener: TcpListener,
+        router: Router,
+        shutdown: CancellationToken,
+    ) {
+        let count = self.header_limits.map_or(HTTP1_HEADER_CAPACITY, |limits| {
+            // Let the middleware describe ordinary excess counts in its JSON response.
+            limits
+                .count
+                .max(100)
+                .saturating_add(1)
+                .min(HTTP1_HEADER_CAPACITY)
+        });
+        let mut http = http1::Builder::new();
+        http.max_headers(count).timer(TokioTimer::new());
+        let app = self.apply(router);
+        let connections = TaskTracker::new();
+        loop {
+            let (socket, address) = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                accepted = Listener::accept(&mut listener) => accepted,
+            };
+            let service = ServiceBuilder::new()
+                .layer(Extension(ConnectInfo(address)))
+                .service(app.clone());
+            let connection = http
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .with_upgrades();
+            let stop = shutdown.clone();
+            connections.spawn(async move {
+                let mut connection = pin!(connection);
+                let result = tokio::select! {
+                    result = connection.as_mut() => result,
+                    () = stop.cancelled() => {
+                        connection.as_mut().graceful_shutdown();
+                        connection.await
+                    }
+                };
+                if let Err(error) = result {
+                    tracing::trace!(%error, "HTTP connection closed with an error");
+                }
+            });
+        }
+        drop(listener);
+        connections.close();
+        connections.wait().await;
+    }
+
+    fn apply(self, mut router: Router) -> Router {
         if let Some(limits) = self.header_limits {
             router = router.layer(middleware::from_fn_with_state(limits, limit_headers));
         }
@@ -166,9 +228,57 @@ async fn correlate(State(settings): State<Correlation>, request: Request, next: 
 #[cfg(test)]
 mod tests {
     use axum::{body::Body, body::to_bytes, routing::get};
+    use std::net::SocketAddr;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn configured_header_count_reaches_the_gateway_over_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let boundary = HttpBoundary {
+            header_limits: Some(HeaderLimits {
+                total: 16_384,
+                field: 8_192,
+                count: 120,
+            }),
+            correlation: None,
+        };
+        let router = Router::new().route(
+            "/",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
+        );
+        let gateway = tokio::spawn(boundary.serve(listener, router, stop.clone()));
+
+        async fn response(address: SocketAddr, count: usize) -> String {
+            let mut request =
+                "GET / HTTP/1.1\r\nHost: fixture.test\r\nConnection: close\r\n".to_owned();
+            for index in 0..count - 2 {
+                request.push_str(&format!("X-Fixture-{index}: 1\r\n"));
+            }
+            request.push_str("\r\n");
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            socket.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            socket.read_to_string(&mut response).await.unwrap();
+            response
+        }
+
+        let accepted = response(address, 120).await;
+        assert!(accepted.starts_with("HTTP/1.1 200") && accepted.ends_with("127.0.0.1"));
+        let rejected = response(address, 121).await;
+        assert!(rejected.starts_with("HTTP/1.1 431"));
+        assert!(rejected.contains("Too many header fields (121 > 120)"));
+
+        stop.cancel();
+        gateway.await.unwrap();
+    }
 
     #[tokio::test]
     async fn rejects_duplicate_fields_before_dispatch_with_the_request_id() {
