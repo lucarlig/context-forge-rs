@@ -20,7 +20,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Gateway update, delete, refresh, health lifecycle, and full catalog APIs
 - [x] Virtual-server management and OAuth resource metadata
 - [x] API token issuance, usage limits, and lifecycle
-- [ ] User, team, role, and local login management
+- [x] User, team, role, and local login management
 - [ ] OAuth, SSO, dynamic registration, and external identities
 - [ ] Encrypted credential storage and rotation
 - [ ] Remaining database schema, migration history, import, and export

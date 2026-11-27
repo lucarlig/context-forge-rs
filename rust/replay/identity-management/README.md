@@ -51,3 +51,16 @@ PostgreSQL. The fixture covered the permissions catalog, built-in roles,
 inherited role creation, assignment, permission checks, revocation, and
 soft deletion. It also checked that a regular account cannot list roles for
 administration and that built-in roles cannot be edited.
+
+The team fixture compared 38 requests on SQLite and PostgreSQL. It covered
+seeded membership, public discovery, role changes, join approval and rejection,
+invitation acceptance, decline and cancellation, leaving, and soft deletion.
+Thirty-seven normalized responses matched exactly on both databases. The
+member's team list contained the same entries in a different order. The pinned
+list changed order across source runs. Rust orders by team creation time and ID.
+
+Concurrent additions filled one available team slot once. A pending invitation
+reserved its slot, and concurrent submissions of its token produced one
+successful acceptance. Both databases also rejected removal of the last
+owner and preserved inactive memberships when the administrator restored a
+deleted team.

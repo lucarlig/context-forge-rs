@@ -12,7 +12,7 @@ use crate::{
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     local_auth::{
-        AccountSettings, ResetSettings,
+        AccountSettings, ResetSettings, TeamSettings,
         mail::{MailSettings, MailTls, Mailer},
     },
     mcp::{
@@ -307,6 +307,8 @@ impl Settings {
             default_password: Zeroizing::new(value("DEFAULT_USER_PASSWORD", "changeme")?),
             public_registration: enabled("PUBLIC_REGISTRATION_ENABLED", false)?,
             personal_teams: enabled("AUTO_CREATE_PERSONAL_TEAMS", true)?,
+            personal_team_prefix: value("PERSONAL_TEAM_PREFIX", "")?,
+            teams: Self::account_teams()?,
             enforce_password_change: enabled("PASSWORD_CHANGE_ENFORCEMENT_ENABLED", true)?,
             detect_default_password: enabled("DETECT_DEFAULT_PASSWORD_ON_LOGIN", true)?,
             require_change_for_default: enabled(
@@ -339,6 +341,27 @@ impl Settings {
             page_size,
             max_page_size,
             kdf: Self::secret_kdf()?,
+        })
+    }
+
+    fn account_teams() -> Result<TeamSettings, Box<dyn Error + Send + Sync>> {
+        let max_members = parse("MAX_MEMBERS_PER_TEAM", 100)?;
+        let max_teams = parse("MAX_TEAMS_PER_USER", 50)?;
+        let max_seeds = parse("MAX_TEAM_MEMBER_SEEDS", 500)?;
+        let expires: i64 = parse("INVITATION_EXPIRY_DAYS", 7)?;
+        if max_members < 1 || max_teams < 1 || !(1..=365).contains(&expires) {
+            return Err("invalid team management settings".into());
+        }
+        Ok(TeamSettings {
+            allow_creation: flag("ALLOW_TEAM_CREATION")?.unwrap_or(true),
+            allow_join_requests: flag("ALLOW_TEAM_JOIN_REQUESTS")?.unwrap_or(true),
+            allow_invitations: flag("ALLOW_TEAM_INVITATIONS")?.unwrap_or(true),
+            verify_invite_email: flag("REQUIRE_EMAIL_VERIFICATION_FOR_INVITES")?.unwrap_or(true),
+            max_members,
+            max_teams,
+            max_seeds,
+            expires_in_seconds: expires * 86_400,
+            member_role: value("DEFAULT_TEAM_MEMBER_ROLE", "viewer")?,
         })
     }
 

@@ -200,7 +200,11 @@ pub(super) fn notify_lockout(accounts: &Arc<Accounts>, email: String, full_name:
         );
         if let Some(mailer) = accounts.settings.mailer.as_ref() {
             mailer
-                .send(&email, "Your ContextForge account has been locked", body)
+                .send(
+                    &email,
+                    "Your ContextForge account was temporarily locked",
+                    body,
+                )
                 .await;
         }
     });

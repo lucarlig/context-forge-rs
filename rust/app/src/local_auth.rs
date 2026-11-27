@@ -5,6 +5,7 @@ mod password_reset;
 mod passwords;
 mod rbac;
 mod storage;
+mod teams;
 mod user_lifecycle;
 
 use std::{
@@ -36,6 +37,7 @@ use crate::{
 
 pub(crate) use password_reset::ResetSettings;
 pub(crate) use storage::{POSTGRES_MIGRATION, SQLITE_MIGRATION};
+pub(crate) use teams::TeamSettings;
 
 pub struct AccountSettings {
     pub(crate) bootstrap_email: String,
@@ -45,6 +47,8 @@ pub struct AccountSettings {
     pub(crate) default_password: Zeroizing<String>,
     pub(crate) public_registration: bool,
     pub(crate) personal_teams: bool,
+    pub(crate) personal_team_prefix: String,
+    pub(crate) teams: TeamSettings,
     pub(crate) enforce_password_change: bool,
     pub(crate) detect_default_password: bool,
     pub(crate) require_change_for_default: bool,
@@ -203,7 +207,7 @@ pub async fn router(
                 post(user_lifecycle::unlock_user),
             );
     }
-    let protected = protected.merge(rbac::router());
+    let protected = protected.merge(rbac::router()).merge(teams::router());
     Ok(public
         .with_state(state.clone())
         .merge(state.access.protect_api_with_message(

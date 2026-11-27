@@ -255,7 +255,13 @@ impl Database {
             .filter(|name| !name.is_empty())
             .unwrap_or(nickname);
         let team_name = format!("{display_name}'s Team");
-        let slug = team_slug(&team_name);
+        let prefix = crate::catalog::slugify(settings.personal_team_prefix.trim());
+        let slug = if prefix.is_empty() {
+            crate::catalog::slugify(&team_name)
+        } else {
+            format!("{prefix}-{}", user.email.replace(['@', '.'], "-"))
+        };
+        let slug: String = slug.chars().take(240).collect();
         let role = if user.is_admin {
             &settings.admin_role
         } else {
@@ -486,18 +492,6 @@ impl Database {
         }
         Ok(())
     }
-}
-
-fn team_slug(name: &str) -> String {
-    let ascii = name.to_ascii_lowercase().replace('\'', "");
-    ascii
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-        .chars()
-        .take(240)
-        .collect()
 }
 
 mod reset;
