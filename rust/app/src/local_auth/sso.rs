@@ -6,6 +6,7 @@ mod flow;
 mod grants;
 mod identity;
 mod oidc;
+mod provider_claims;
 mod providers;
 mod provisioning;
 

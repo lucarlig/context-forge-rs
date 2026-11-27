@@ -1075,7 +1075,11 @@ impl UpstreamClient {
             if let Some(authorization) = authorization {
                 request = request.header(AUTHORIZATION, authorization.clone());
             }
-            let response = request.header(ACCEPT, "application/json").send().await?;
+            let response = request
+                .header(ACCEPT, "application/json")
+                .header(reqwest::header::USER_AGENT, "ContextForge")
+                .send()
+                .await?;
             let status = response.status().as_u16();
             if status != 200 && (body.is_none() || status != 201) {
                 return Err(UpstreamError::Status(status));

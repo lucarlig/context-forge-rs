@@ -11,7 +11,7 @@ pub(super) async fn authenticate_identity(
     claims: &Map<String, Value>,
     policy: &SsoIdentityPolicy,
 ) -> Result<Option<storage::LocalUser>, sqlx::Error> {
-    let raw_email = match provider
+    let mut email = match provider
         .config
         .provider_metadata
         .get("email_claim")
@@ -21,12 +21,22 @@ pub(super) async fn authenticate_identity(
         None => ["email", "preferred_username", "upn", "unique_name", "mail"]
             .into_iter()
             .filter_map(|claim| claims.get(claim).and_then(Value::as_str))
-            .find(|value| value.contains('@')),
-    };
-    let Some(email) = raw_email
-        .map(|email| email.trim().to_ascii_lowercase())
-        .filter(|email| valid_email(email))
-    else {
+            .find(|value| !value.is_empty() && (provider.id == "adfs" || value.contains('@'))),
+    }
+    .map(|email| email.trim().to_ascii_lowercase());
+    if provider.id == "adfs"
+        && let Some(raw) = email.as_mut().filter(|email| !email.contains('@'))
+        && let Some(domain) = provider
+            .config
+            .provider_metadata
+            .get("default_email_domain")
+            .and_then(Value::as_str)
+            .or(policy.adfs_default_email_domain.as_deref())
+    {
+        let username = raw.rsplit('\\').next().unwrap_or_default();
+        *raw = format!("{username}@{}", domain.trim().to_ascii_lowercase());
+    }
+    let Some(email) = email.filter(|email| valid_email(email)) else {
         return Ok(None);
     };
     let verified = [
@@ -132,10 +142,9 @@ pub(super) async fn authenticate_identity(
     }))
 }
 
-fn groups<'a>(provider: &Provider, claims: &'a Map<String, Value>) -> Vec<&'a str> {
-    let claim = provider
-        .config
-        .provider_metadata
+fn groups(provider: &Provider, claims: &Map<String, Value>) -> Vec<String> {
+    let metadata = &provider.config.provider_metadata;
+    let claim = metadata
         .get("groups_claim")
         .and_then(Value::as_str)
         .unwrap_or("groups");
@@ -145,14 +154,17 @@ fn groups<'a>(provider: &Provider, claims: &'a Map<String, Value>) -> Vec<&'a st
         .flatten()
     {
         match value {
-            Value::String(group) => groups.push(group.as_str()),
-            Value::Array(names) => groups.extend(names.iter().filter_map(Value::as_str)),
+            Value::String(group) => groups.push(group.clone()),
+            Value::Array(names) => {
+                groups.extend(names.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
             Value::Object(buckets) => {
                 for values in buckets.values() {
                     match values {
-                        Value::String(group) => groups.push(group.as_str()),
+                        Value::String(group) => groups.push(group.clone()),
                         Value::Array(names) => {
-                            groups.extend(names.iter().filter_map(Value::as_str))
+                            groups
+                                .extend(names.iter().filter_map(Value::as_str).map(str::to_owned));
                         }
                         _ => {}
                     }
@@ -161,8 +173,36 @@ fn groups<'a>(provider: &Provider, claims: &'a Map<String, Value>) -> Vec<&'a st
             _ => {}
         }
     }
+    if provider.id == "keycloak" {
+        if metadata.get("map_realm_roles").and_then(Value::as_bool) == Some(true)
+            && let Some(realm_roles) = claims
+                .get("realm_access")
+                .and_then(|realm| realm["roles"].as_array())
+        {
+            groups.extend(
+                realm_roles
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned),
+            );
+        }
+        if metadata.get("map_client_roles").and_then(Value::as_bool) == Some(true)
+            && let Some(clients) = claims.get("resource_access").and_then(Value::as_object)
+        {
+            for (client, access) in clients {
+                if let Some(roles) = access["roles"].as_array() {
+                    groups.extend(
+                        roles
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|role| format!("{client}:{role}")),
+                    );
+                }
+            }
+        }
+    }
     let mut seen = HashSet::new();
-    groups.retain(|group| seen.insert(*group));
+    groups.retain(|group| seen.insert(group.clone()));
     groups
 }
 

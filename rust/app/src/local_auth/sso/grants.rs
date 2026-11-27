@@ -17,6 +17,7 @@ pub(crate) struct SsoIdentityPolicy {
     pub(crate) entra_admin_groups: HashSet<String>,
     pub(crate) generic_provider: String,
     pub(crate) generic_admin_groups: HashSet<String>,
+    pub(crate) adfs_default_email_domain: Option<String>,
 }
 
 pub(super) struct MappedAccess<'a> {
@@ -34,7 +35,7 @@ impl<'a> MappedAccess<'a> {
         policy: &SsoIdentityPolicy,
         defaults: &UserProvisioning,
         email: &str,
-        groups: &[&str],
+        groups: &[String],
         claims: &Map<String, Value>,
     ) -> Self {
         let metadata = &provider.config.provider_metadata;

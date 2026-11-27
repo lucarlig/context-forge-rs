@@ -516,6 +516,7 @@ impl Settings {
     }
 
     fn sso_identity_policy() -> Result<SsoIdentityPolicy, Box<dyn Error + Send + Sync>> {
+        let adfs_domain = value("SSO_ADFS_DEFAULT_EMAIL_DOMAIN", "")?;
         Ok(SsoIdentityPolicy {
             approval_required: flag("SSO_REQUIRE_ADMIN_APPROVAL")?.unwrap_or(false),
             allow_provider_linking: flag("SSO_ALLOW_PROVIDER_LINKING")?.unwrap_or(false),
@@ -526,6 +527,7 @@ impl Settings {
             entra_admin_groups: allowlist("SSO_ENTRA_ADMIN_GROUPS")?,
             generic_provider: value("SSO_GENERIC_PROVIDER_ID", "")?,
             generic_admin_groups: allowlist("SSO_GENERIC_ADMIN_GROUPS")?,
+            adfs_default_email_domain: (!adfs_domain.trim().is_empty()).then_some(adfs_domain),
         })
     }
 

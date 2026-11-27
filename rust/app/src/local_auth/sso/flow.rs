@@ -255,7 +255,7 @@ async fn exchange_identity(
             .extend_pairs(fields)
             .finish(),
     );
-    let (response, _) = settings
+    let (response, is_form) = settings
         .upstream
         .oauth_token_response(
             &config.token_url,
@@ -265,7 +265,17 @@ async fn exchange_identity(
         )
         .await
         .ok()?;
-    let tokens: ProviderToken = serde_json::from_slice(&response).ok()?;
+    let tokens = if is_form && config.provider_type == "oauth2" {
+        ProviderToken {
+            access_token: url::form_urlencoded::parse(&response)
+                .find(|(name, _)| name == "access_token")?
+                .1
+                .into_owned(),
+            id_token: None,
+        }
+    } else {
+        serde_json::from_slice::<ProviderToken>(&response).ok()?
+    };
     let oidc_claims = if config.provider_type == "oidc" {
         Some(
             oidc::id_token_claims(
@@ -280,12 +290,17 @@ async fn exchange_identity(
     } else {
         None
     };
+    if provider.id == "adfs" {
+        let mut claims = oidc_claims?;
+        super::provider_claims::normalize_adfs(&mut claims);
+        return Some(claims);
+    }
     if tokens.access_token.is_empty() {
         return None;
     }
     let bearer = Zeroizing::new(format!("Bearer {}", tokens.access_token));
     let authorization = sensitive_header(&bearer)?;
-    let mut user_info = settings
+    let user_info = settings
         .upstream
         .oauth_document::<Map<String, Value>>(
             &config.userinfo_url,
@@ -293,13 +308,31 @@ async fn exchange_identity(
             Some(&authorization),
             None,
         )
-        .await
-        .ok()?;
+        .await;
+    let mut user_info = match user_info {
+        Ok(user_info) => user_info,
+        Err(crate::upstream::UpstreamError::Status(401))
+            if super::provider_claims::keycloak_split_host(provider) =>
+        {
+            oidc_claims.clone()?
+        }
+        Err(_) => return None,
+    };
     if let Some(claims) = oidc_claims {
         if user_info.get("sub").and_then(Value::as_str) != claims.get("sub").and_then(Value::as_str)
         {
             return None;
         }
+        super::provider_claims::enrich_oidc(
+            settings,
+            provider,
+            &claims,
+            &mut user_info,
+            &tokens.access_token,
+            &authorization,
+            tls.as_ref(),
+        )
+        .await;
         for (name, value) in claims {
             if name == "email_verified" && !email_verified(&value) {
                 user_info.insert(name, value);
@@ -307,6 +340,16 @@ async fn exchange_identity(
                 user_info.entry(name).or_insert(value);
             }
         }
+    }
+    if provider.id == "github" {
+        super::provider_claims::enrich_github(
+            settings,
+            provider,
+            &mut user_info,
+            &authorization,
+            tls.as_ref(),
+        )
+        .await;
     }
     Some(user_info)
 }

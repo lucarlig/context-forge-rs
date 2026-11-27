@@ -57,3 +57,18 @@ discovery used separate browser and gateway authorities. After a
 restart, the generic provider retained the administrator's metadata,
 custom scope, and team mappings. A manually registered provider
 remained available until the explicit disable policy was enabled.
+
+## Provider-specific sign-in
+
+Thirteen checks matched on SQLite and PostgreSQL. ADFS verified the ID
+token and used the configured domain to normalize a Windows account
+name. It rejected a mismatched nonce. Rust requires a valid signature
+for this flow. The pinned release also supports a fallback without a
+signature check when the provider does not expose keys.
+
+With split Keycloak authorities, the gateway used signed claims after a
+401 from the userinfo endpoint. It mapped realm and client roles from
+the signed access token, preserved ordinary access without those roles,
+and rejected a 403 from userinfo. The OAuth2 fixture also verified
+GitHub profile normalization. GitHub organization and Microsoft Graph
+group lookups remain unverified against live provider accounts.
