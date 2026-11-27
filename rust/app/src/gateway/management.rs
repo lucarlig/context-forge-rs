@@ -554,20 +554,28 @@ async fn manageable(
     {
         return Err(ManagementError::Denied);
     }
-    let owned = record.owner_email.as_deref() == Some(principal.email.as_str())
-        || principal.is_global_admin();
-    let team_owned = if !owned
-        && record.visibility == "team"
-        && let Some(team) = team
-    {
-        service.database.team_owner(&principal.email, team).await?
-    } else {
-        false
-    };
-    if !owned && !team_owned {
+    if !owns_gateway(&service.database, principal, &record).await? {
         return Err(ManagementError::Ownership(ownership_error));
     }
     Ok(record)
+}
+
+pub(in crate::gateway) async fn owns_gateway(
+    database: &Database,
+    principal: &Principal,
+    gateway: &GatewayRecord,
+) -> Result<bool, sqlx::Error> {
+    if gateway.owner_email.as_deref() == Some(principal.email.as_str())
+        || principal.is_global_admin()
+    {
+        return Ok(true);
+    }
+    if gateway.visibility == "team"
+        && let Some(team) = gateway.team_id.as_deref()
+    {
+        return database.team_owner(&principal.email, team).await;
+    }
+    Ok(false)
 }
 
 async fn lookup(

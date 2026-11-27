@@ -21,7 +21,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Virtual-server management and OAuth resource metadata
 - [x] API token issuance, usage limits, and lifecycle
 - [x] User, team, role, and local login management
-- [ ] OAuth, SSO, dynamic registration, and external identities
+- [x] OAuth, SSO, dynamic registration, and external identities
 - [ ] Encrypted credential storage and rotation
 - [ ] Remaining database schema, migration history, import, and export
 - [ ] REST tool federation

@@ -382,6 +382,9 @@ impl Settings {
             cimd,
             request_timeout: positive_seconds("OAUTH_REQUEST_TIMEOUT", 30.0)?,
             issuer_metadata: Default::default(),
+            handshake_registered_only: flag("GATEWAY_TEST_ALLOW_REGISTERED_ONLY")?.unwrap_or(true),
+            handshake_public_only: flag("SSRF_PROTECTION_ENABLED")?.unwrap_or(true),
+            handshake_allowed_hosts: allowlist("GATEWAY_TEST_ALLOWED_HOSTS")?,
         })
     }
 

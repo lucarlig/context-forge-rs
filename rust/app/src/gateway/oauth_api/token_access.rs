@@ -291,6 +291,36 @@ async fn open_current(
     })
 }
 
+pub(super) async fn read_validation_token(
+    service: &GatewayService,
+    id: &str,
+    version: i32,
+    email: &str,
+) -> Result<Zeroizing<String>, &'static str> {
+    let stored = service
+        .database
+        .user_oauth_token(id, email, version)
+        .await
+        .map_err(|_| "token_storage_unavailable")?
+        .ok_or("authorization_missing")?;
+    if !bearer_type(&stored) {
+        return Err("invalid_token");
+    }
+    if let Some(expiration) = stored.expires_at.as_deref() {
+        let expiration = parse_time(expiration).ok_or("invalid_token")?;
+        if expiration <= Timestamp::now() {
+            return Err("token_expired");
+        }
+    }
+    let access = open_token(service, stored.access_token)
+        .await
+        .map_err(|_| "invalid_token")?;
+    if access.is_empty() || access.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err("invalid_token");
+    }
+    Ok(access)
+}
+
 pub(super) async fn write_user_token(
     service: &GatewayService,
     gateway: &str,

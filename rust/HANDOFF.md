@@ -12,6 +12,17 @@ verified through the versioned and legacy HTTP routes. The team checks covered
 capacity enforcement and single-use invitations under concurrent requests.
 [Identity management verification](replay/identity-management/README.md)
 
+OAuth authorization and refresh, caller-bound token exchange, dynamic
+client registration, and client ID metadata are verified through the
+gateway and MCP endpoints. The post-authorization connection probe tests
+live tools access with the caller's stored credential. Browser SSO and
+external bearer authentication cover provider setup, verification,
+account binding, approvals, and group-based access on SQLite and
+PostgreSQL. Virtual-server OAuth checks the approved issuer and resource
+audience. [Gateway OAuth](replay/gateway-oauth/README.md) ·
+[SSO](replay/sso/README.md) ·
+[Virtual-server OAuth](replay/server-management/write.md#virtual-server-oauth-access-tokens)
+
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.
 
 Legacy MCP fixtures live under `rust/replay/mcp-legacy`. Enable legacy inbound mode and stateless JSON responses in the original launcher. Disable MCP authentication for the fixture. Register a deterministic public MCP gateway named `fixture-echo` with an `echo` tool that returns `echo: <message>`. Replay against a Rust gateway with the same fixture database and live upstream.

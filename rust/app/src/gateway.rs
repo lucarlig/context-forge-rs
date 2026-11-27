@@ -428,6 +428,10 @@ impl GatewayService {
                 .route(route, get(management::list).post(register))
                 .route(&format!("{route}/"), get(management::list).post(register))
                 .route(
+                    &format!("{route}/test-handshake"),
+                    post(oauth_api::test_handshake),
+                )
+                .route(
                     &format!("{route}/{{key}}"),
                     get(management::detail)
                         .put(management::update)

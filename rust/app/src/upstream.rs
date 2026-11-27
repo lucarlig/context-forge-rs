@@ -26,9 +26,9 @@ use rmcp::model::{
     DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetMeta, Implementation,
     InitializeRequest, InitializeRequestParams, InitializedNotification, JsonRpcMessage,
     JsonRpcRequest, ListPromptsRequest, ListResourceTemplatesRequest, ListResourcesRequest,
-    ListToolsRequest, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt,
-    ProtocolVersion, RequestId, RequestMetaObject, Resource, ResourceTemplate,
-    ServerJsonRpcMessage, ServerNotification, ServerRequest, SubscriptionFilter,
+    ListToolsRequest, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    ProgressToken, Prompt, ProtocolVersion, RequestId, RequestMetaObject, Resource,
+    ResourceTemplate, ServerJsonRpcMessage, ServerNotification, ServerRequest, SubscriptionFilter,
     SubscriptionsListenRequest, SubscriptionsListenRequestParams,
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -220,6 +220,8 @@ pub enum UpstreamError {
     Transport,
     #[error("upstream returned HTTP {0}")]
     Status(u16),
+    #[error("upstream rejected the OAuth credential")]
+    OAuthRejected(&'static str),
     #[error("upstream message exceeded a size or pagination limit")]
     LimitExceeded,
     #[error("Upstream MCP catalog contains duplicate identifiers")]
@@ -424,6 +426,17 @@ pub struct DiscoveredCatalog {
     pub tools: Vec<Value>,
 }
 
+struct Negotiation {
+    method: &'static str,
+    result: Value,
+}
+
+pub(crate) enum HandshakeFailure {
+    Negotiation(UpstreamError),
+    ToolsUnsupported(&'static str),
+    ToolsList(&'static str, UpstreamError),
+}
+
 #[derive(Default)]
 pub(crate) struct DiscoveredMetadata {
     pub(crate) resources: Vec<Resource>,
@@ -523,6 +536,21 @@ impl UpstreamClient {
         }
     }
 
+    pub(crate) fn public_targets_only(&self) -> Self {
+        let mut client = self.clone();
+        client.policy.allow_localhost = false;
+        client.policy.allow_private_networks = false;
+        client.policy.allowed_networks.clear();
+        client
+    }
+
+    pub(crate) async fn check_pinned_endpoint(&self, endpoint: &str) -> Result<(), UpstreamError> {
+        timeout(CONNECT_TIMEOUT, self.pinned_client(endpoint, None, None))
+            .await
+            .map_err(|_| UpstreamError::Timeout)?
+            .map(|_| ())
+    }
+
     pub fn new(policy: EgressPolicy, timeout: Duration) -> Self {
         Self {
             policy,
@@ -608,6 +636,26 @@ impl UpstreamClient {
         let session = self.open_session(endpoint, deadline).await?;
         session.close().await;
         Ok(())
+    }
+
+    pub(crate) async fn test_handshake(
+        &self,
+        endpoint: UpstreamEndpoint<'_>,
+        strict: bool,
+    ) -> Result<Value, HandshakeFailure> {
+        let deadline = self.deadline().map_err(HandshakeFailure::Negotiation)?;
+        let (session, negotiation) = self
+            .open_negotiated_session(endpoint, deadline)
+            .await
+            .map_err(HandshakeFailure::Negotiation)?;
+        let result = timeout_at(deadline, session.handshake_details(&negotiation, strict))
+            .await
+            .unwrap_or(Err(HandshakeFailure::ToolsList(
+                negotiation.method,
+                UpstreamError::Timeout,
+            )));
+        session.close().await;
+        result
     }
 
     pub(crate) async fn discover_selected_catalog(
@@ -965,6 +1013,16 @@ impl UpstreamClient {
         endpoint: UpstreamEndpoint<'_>,
         deadline: Instant,
     ) -> Result<Session, UpstreamError> {
+        self.open_negotiated_session(endpoint, deadline)
+            .await
+            .map(|(session, _)| session)
+    }
+
+    async fn open_negotiated_session(
+        &self,
+        endpoint: UpstreamEndpoint<'_>,
+        deadline: Instant,
+    ) -> Result<(Session, Negotiation), UpstreamError> {
         let mut session = timeout_at(deadline, self.connect(endpoint))
             .await
             .map_err(|_| UpstreamError::Timeout)??;
@@ -982,11 +1040,13 @@ impl UpstreamClient {
         })
         .await
         .unwrap_or(Err(UpstreamError::Timeout));
-        if let Err(error) = result {
-            session.close().await;
-            return Err(error);
+        match result {
+            Ok(negotiation) => Ok((session, negotiation)),
+            Err(error) => {
+                session.close().await;
+                Err(error)
+            }
         }
-        Ok(session)
     }
 
     async fn connect(&self, endpoint: UpstreamEndpoint<'_>) -> Result<Session, UpstreamError> {
@@ -1220,11 +1280,11 @@ impl Session {
         Err(UpstreamError::InvalidResponse)
     }
 
-    async fn negotiate(&mut self) -> Result<(), UpstreamError> {
+    async fn negotiate(&mut self) -> Result<Negotiation, UpstreamError> {
         for first_attempt in [true, false] {
             match timeout(DISCOVERY_TIMEOUT, self.discover()).await {
-                Ok(Ok(true)) => return Ok(()),
-                Ok(Ok(false)) => return self.initialize().await,
+                Ok(Ok(Some(negotiation))) => return Ok(negotiation),
+                Ok(Ok(None)) => return self.initialize().await,
                 Ok(Err(error)) => {
                     if let Some(supported) = supported_versions(&error) {
                         if first_attempt && supported.contains(&MODERN_VERSION) {
@@ -1264,7 +1324,7 @@ impl Session {
         Err(UpstreamError::InvalidResponse)
     }
 
-    async fn discover(&mut self) -> Result<bool, UpstreamError> {
+    async fn discover(&mut self) -> Result<Option<Negotiation>, UpstreamError> {
         let (response, id) = self
             .send_request(
                 DiscoverRequest::new(DiscoverRequestParams {}).into(),
@@ -1274,7 +1334,7 @@ impl Session {
             .await?;
         let mut reply = read_reply(self, response, id, None, None).await?;
         let Some(fields) = reply.result.as_object_mut() else {
-            return Ok(false);
+            return Ok(None);
         };
         fields
             .entry("resultType")
@@ -1287,10 +1347,10 @@ impl Session {
             *ttl = 0.into();
         }
         let Ok(discovery) = DiscoverResult::deserialize(&reply.result) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !discovery.supported_versions.contains(&MODERN_VERSION) {
-            return Ok(false);
+            return Ok(None);
         }
         self.capabilities = reply
             .result
@@ -1298,10 +1358,13 @@ impl Session {
             .cloned()
             .ok_or(UpstreamError::InvalidResponse)?;
         self.protocol_version = Some(MODERN_VERSION);
-        Ok(true)
+        Ok(Some(Negotiation {
+            method: "server_discover",
+            result: reply.result,
+        }))
     }
 
-    async fn initialize(&mut self) -> Result<(), UpstreamError> {
+    async fn initialize(&mut self) -> Result<Negotiation, UpstreamError> {
         let params = InitializeRequestParams::new(ClientCapabilities::default(), client_info())
             .with_protocol_version(PROTOCOL_VERSION);
         let request = InitializeRequest::new(params);
@@ -1328,7 +1391,71 @@ impl Session {
             Some(version),
         )
         .await?;
-        Ok(())
+        Ok(Negotiation {
+            method: "initialize",
+            result: reply.result,
+        })
+    }
+
+    async fn handshake_details(
+        &self,
+        negotiation: &Negotiation,
+        strict: bool,
+    ) -> Result<Value, HandshakeFailure> {
+        let path = negotiation.method;
+        if strict && !self.capabilities["tools"].is_object() {
+            return Err(HandshakeFailure::ToolsUnsupported(path));
+        }
+        let mut counts = serde_json::Map::new();
+        let mut partial = false;
+        for (key, request) in [
+            ("tools", ClientRequest::from(ListToolsRequest::default())),
+            ("resources", ListResourcesRequest::default().into()),
+            ("prompts", ListPromptsRequest::default().into()),
+        ] {
+            if !self.capabilities[key].is_object() || strict && key != "tools" {
+                continue;
+            }
+            let outcome = async {
+                let (response, id) = self
+                    .send_request(request, self.protocol_version.as_ref(), false)
+                    .await?;
+                let reply = read_reply(self, response, id, None, None).await?;
+                if strict {
+                    ListToolsResult::deserialize(&reply.result)
+                        .map_err(|_| UpstreamError::InvalidResponse)?;
+                }
+                Ok::<_, UpstreamError>(reply.result)
+            }
+            .await;
+            match outcome {
+                Ok(reply) => {
+                    if let Some(items) = reply[key].as_array() {
+                        counts.insert(key.to_owned(), items.len().into());
+                    }
+                    partial |= reply["nextCursor"]
+                        .as_str()
+                        .is_some_and(|cursor| !cursor.is_empty());
+                }
+                Err(error) if strict => return Err(HandshakeFailure::ToolsList(path, error)),
+                Err(_) => {}
+            }
+        }
+        let document = &negotiation.result;
+        let info = document
+            .pointer("/_meta/io.modelcontextprotocol~1serverInfo")
+            .filter(|info| info.is_object())
+            .unwrap_or(&document["serverInfo"]);
+        let preview =
+            (!strict).then(|| document.to_string().chars().take(4096).collect::<String>());
+        Ok(serde_json::json!({
+            "negotiationPath":path,
+            "protocolVersion":self.protocol_version.as_ref().map(ProtocolVersion::as_str),
+            "serverName":info["name"],"serverVersion":info["version"],
+            "capabilities":self.capabilities,
+            "componentCounts":(!counts.is_empty()).then_some(counts),
+            "countsPartial":partial,"rawPreview":preview,
+        }))
     }
 
     async fn list_tools(&self) -> Result<DiscoveredCatalog, UpstreamError> {
@@ -1903,6 +2030,28 @@ async fn read_json_body(mut response: Response) -> Result<Vec<u8>, UpstreamError
 
 async fn http_error(response: Response) -> UpstreamError {
     let status = response.status();
+    let oauth_status = matches!(status.as_u16(), 401 | 403);
+    if oauth_status
+        && let Some(error) = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|header| header.to_str().ok())
+            .and_then(|challenge| {
+                let scheme = challenge.get(..7)?;
+                if !scheme.eq_ignore_ascii_case("bearer ") {
+                    return None;
+                }
+                challenge[7..].split(',').find_map(|value| {
+                    let (name, value) = value.trim().split_once('=')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("error")
+                        .then(|| credential_error_code(value.trim().trim_matches('"')))
+                        .flatten()
+                })
+            })
+    {
+        return UpstreamError::OAuthRejected(error);
+    }
     if (status.is_client_error() || status.is_server_error())
         && response_media_type(&response)
             .is_some_and(|media| media.eq_ignore_ascii_case("application/json"))
@@ -1911,6 +2060,12 @@ async fn http_error(response: Response) -> UpstreamError {
             Ok(body) => body,
             Err(error) => return error,
         };
+        if oauth_status
+            && let Ok(body) = serde_json::from_slice::<Value>(&body)
+            && let Some(code) = body["error"].as_str().and_then(credential_error_code)
+        {
+            return UpstreamError::OAuthRejected(code);
+        }
         if let Ok(JsonRpcMessage::Error(response)) =
             serde_json::from_slice::<JsonRpcMessage<Value, Value, Value>>(&body)
         {
@@ -1918,6 +2073,14 @@ async fn http_error(response: Response) -> UpstreamError {
         }
     }
     UpstreamError::Status(status.as_u16())
+}
+
+fn credential_error_code(code: &str) -> Option<&'static str> {
+    match code {
+        "invalid_token" => Some("invalid_token"),
+        "insufficient_scope" => Some("insufficient_scope"),
+        _ => None,
+    }
 }
 
 type WireMessage = JsonRpcMessage<Value, Value, Value>;

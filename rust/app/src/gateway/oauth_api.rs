@@ -3,12 +3,14 @@
 mod cimd;
 mod clients;
 mod flow;
+mod handshake;
 mod registration;
 mod storage;
 mod token_access;
 
 pub use cimd::CimdSettings;
 pub(crate) use cimd::DOCUMENT_PATH as CIMD_DOCUMENT_PATH;
+pub(super) use handshake::test as test_handshake;
 pub(super) use token_access::{TokenTarget, authorization_header};
 
 use std::collections::BTreeSet;
@@ -33,6 +35,9 @@ pub struct GatewayOAuthSettings {
     pub(crate) cimd: CimdSettings,
     pub(crate) request_timeout: Duration,
     pub(crate) issuer_metadata: IssuerMetadataCache,
+    pub(crate) handshake_registered_only: bool,
+    pub(crate) handshake_public_only: bool,
+    pub(crate) handshake_allowed_hosts: HashSet<String>,
 }
 
 pub struct DcrSettings {
@@ -87,6 +92,9 @@ impl Default for GatewayOAuthSettings {
             cimd: CimdSettings::default(),
             request_timeout: Duration::from_secs(30),
             issuer_metadata: IssuerMetadataCache::default(),
+            handshake_registered_only: true,
+            handshake_public_only: true,
+            handshake_allowed_hosts: HashSet::new(),
         }
     }
 }

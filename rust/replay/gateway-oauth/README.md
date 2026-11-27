@@ -64,3 +64,12 @@ caller used a separate cache entry. The fixture inspected the stored
 values to verify that they contain no plaintext access tokens. Shared
 entries are encrypted and bound to the gateway revision and caller
 credential, and each worker has a bounded fallback cache.
+
+The post-authorization handshake matched 14 checks using MCP
+`initialize` and 15 using `server/discover` on SQLite and PostgreSQL.
+It used the caller's exact gateway credential without refreshing it,
+listed one live page of tools, and redacted the access token from
+upstream metadata. The checks covered access and target matching,
+missing and expired tokens, missing tools capability, insufficient
+scope, and invalid list responses. A separate check matched the
+default rejection of a private destination.
