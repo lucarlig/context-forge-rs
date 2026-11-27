@@ -20,7 +20,7 @@ const A2A_PUSH_CONFIGS: &str = include_str!("../migrations/007_a2a_push_configs.
 const A2A_CARDS: &str = include_str!("../migrations/008_a2a_cards.sql");
 const A2A_UAID: &str = include_str!("../migrations/009_a2a_uaid.sql");
 const A2A_METRICS: &str = include_str!("../migrations/010_a2a_metrics.sql");
-const MIGRATIONS: [&str; 12] = [
+const MIGRATIONS: [&str; 13] = [
     "identity",
     "catalog",
     "legacy_sse",
@@ -33,6 +33,7 @@ const MIGRATIONS: [&str; 12] = [
     "a2a_cards",
     "a2a_uaid",
     "a2a_metrics",
+    "historical_a2a",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -326,6 +327,20 @@ impl Database {
                         11 => {
                             sqlx::raw_sql($metrics).execute(&mut *$transaction).await?;
                         }
+                        12 => {
+                            add_columns!(
+                                $transaction,
+                                $columns,
+                                "a2a_agents",
+                                [("protocol_binding", "VARCHAR(20)"), ("skills", "JSON")]
+                            );
+                            add_columns!(
+                                $transaction,
+                                $columns,
+                                "a2a_agent_cards",
+                                [("kind", "VARCHAR(20) NOT NULL DEFAULT 'public'")]
+                            );
+                        }
                         _ => unreachable!("unknown migration implementation"),
                     }
                     sqlx::query(RECORD)
@@ -515,6 +530,47 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(binding, None);
+    }
+
+    #[tokio::test]
+    async fn upgrades_existing_agents_and_cards_from_revision_twelve() {
+        let (database, pool) = database().await;
+        database.migrate_schema().await.unwrap();
+        sqlx::raw_sql(
+            "DELETE FROM context_forge_schema_migrations WHERE version > 12;
+             ALTER TABLE a2a_agents DROP COLUMN protocol_binding;
+             ALTER TABLE a2a_agents DROP COLUMN skills;
+             ALTER TABLE a2a_agent_cards DROP COLUMN kind;
+             INSERT INTO a2a_agents (id, name, slug, endpoint_url)
+             VALUES ('agent', 'Legacy agent', 'legacy-agent', 'https://peer.example.test/a2a');
+             INSERT INTO a2a_agent_cards (id, a2a_agent_id, version, card, detected_version, source_url)
+             VALUES ('card', 'agent', 1, '{\"name\":\"Legacy card\"}', '0.3.0', 'https://peer.example.test/card');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        database.migrate_schema().await.unwrap();
+        database.require_current_schema().await.unwrap();
+        let (name, binding, skills, kind, card): (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT a.name, a.protocol_binding, a.skills, c.kind, c.card
+                 FROM a2a_agents a JOIN a2a_agent_cards c ON a.id = c.a2a_agent_id
+                 WHERE a.id = 'agent' AND c.id = 'card'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(name, "Legacy agent");
+        assert_eq!(binding, None);
+        assert_eq!(skills, None);
+        assert_eq!(kind, "public");
+        assert_eq!(card, "{\"name\":\"Legacy card\"}");
     }
 
     #[tokio::test]

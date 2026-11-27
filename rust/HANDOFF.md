@@ -75,6 +75,13 @@ Eight SQLite and PostgreSQL replays match the pinned Alembic upgrade, including
 the treatment of expressions that require a manual rewrite. Additional upstream
 tables remain open.
 
+Native revision 13 adds missing A2A protocol bindings and skills as nullable
+columns. It preserves stored cards and assigns the public kind to legacy rows.
+Eight Rust Anything cases match the pinned Alembic upgrade on SQLite and
+PostgreSQL. They cover live agent and stored-card reads after migration.
+The native command preserves the original Alembic head and its own ledger on
+repeated runs.
+
 Configuration export supports full and selective requests at both API prefixes.
 The pinned 14-case suite matched native SQLite, SQLite initialized by the pinned
 gateway, and PostgreSQL. Live checks covered authorization, scoped server links,
