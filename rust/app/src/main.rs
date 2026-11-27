@@ -50,7 +50,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .init();
 
     let settings = Settings::from_env()?;
-    let http_boundary = HttpBoundary::from_env()?;
+    let http_boundary = HttpBoundary::from_env(settings.port)?;
     let database = Database::from_settings(&settings)?;
     let redis = settings.redis.as_ref().map(RedisProbe::new).transpose()?;
     let verifier = Settings::jwt_verifier()?;

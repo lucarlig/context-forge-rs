@@ -125,6 +125,11 @@ which peers can set the client address and request scheme. Public URL
 construction uses valid forwarded host and protocol values even when the
 peer falls outside that list, as in the reference gateway.
 
+Thirty-one live response-policy replays match the reference security and CORS
+headers. They cover unique CSP nonces, cache exemptions, frame and HSTS flags,
+CORS defaults by environment, and preflight denials. The profiles disable
+response compression and compare the fields in `Vary` without regard to order.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

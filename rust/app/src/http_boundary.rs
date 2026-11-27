@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::config::{flag, parse, value};
 
 mod proxy;
+mod response_policy;
 
 pub(crate) use proxy::public_scheme;
 
@@ -35,10 +36,11 @@ pub struct HttpBoundary {
     header_limits: Option<HeaderLimits>,
     correlation: Option<Correlation>,
     proxies: proxy::ProxyHeaders,
+    responses: response_policy::ResponsePolicy,
 }
 
 impl HttpBoundary {
-    pub fn from_env() -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub fn from_env(port: u16) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let header_limits = if flag("HEADER_SIZE_VALIDATION_ENABLED")?.unwrap_or(true) {
             Some(HeaderLimits {
                 total: parse("MAX_HEADER_TOTAL_SIZE_BYTES", 16_384)?,
@@ -62,6 +64,7 @@ impl HttpBoundary {
             header_limits,
             correlation,
             proxies: proxy::ProxyHeaders::from_env()?,
+            responses: response_policy::ResponsePolicy::from_env(port)?,
         })
     }
 
@@ -116,6 +119,7 @@ impl HttpBoundary {
     }
 
     fn apply(self, mut router: Router) -> Router {
+        router = self.responses.apply(router);
         if let Some(limits) = self.header_limits {
             router = router.layer(middleware::from_fn_with_state(limits, limit_headers));
         }
@@ -294,6 +298,7 @@ mod tests {
             }),
             correlation: None,
             proxies: proxy::ProxyHeaders::parse("").unwrap(),
+            responses: response_policy::ResponsePolicy::from_env(4444).unwrap(),
         };
         let router = Router::new().route(
             "/",
@@ -339,6 +344,7 @@ mod tests {
                 respond: true,
             }),
             proxies: proxy::ProxyHeaders::parse("").unwrap(),
+            responses: response_policy::ResponsePolicy::from_env(4444).unwrap(),
         }
         .apply(Router::new().route("/", get(|| async { StatusCode::UNAUTHORIZED })));
         let request = || {
