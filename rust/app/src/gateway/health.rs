@@ -97,7 +97,7 @@ impl GatewayService {
         };
         let Some(connection) = self
             .database
-            .gateway_connection(&record.id, &record.url, true, Some(record.version))
+            .gateway_connection(&record.id, &record.url, true, Some(record.version), None)
             .await?
         else {
             return Ok(0);

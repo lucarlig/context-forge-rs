@@ -6,7 +6,7 @@ use jsonwebtoken::EncodingKey;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    gateway::{CatalogRefresh, GatewayHealth, Pagination},
+    gateway::{CatalogRefresh, GatewayHealth, GatewayLifecycle, Pagination},
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
@@ -605,6 +605,18 @@ impl Settings {
             concurrency,
             auto_refresh: flag("AUTO_REFRESH_SERVERS")?.unwrap_or(false),
         })
+    }
+
+    pub fn gateway_lifecycle() -> Result<Option<GatewayLifecycle>, Box<dyn Error + Send + Sync>> {
+        if !flag("GATEWAY_ASYNC_LIFECYCLE_ENABLED")?.unwrap_or(false) {
+            return Ok(None);
+        }
+        Ok(Some(GatewayLifecycle {
+            poll_interval: positive_seconds("GATEWAY_ASYNC_LIFECYCLE_POLL_INTERVAL", 5.0)?,
+            attempt_timeout: positive_seconds("GATEWAY_ASYNC_LIFECYCLE_ATTEMPT_TIMEOUT", 30.0)?,
+            lease: positive_seconds("GATEWAY_ASYNC_LIFECYCLE_LEASE_SECONDS", 90.0)?,
+            concurrency: parse("MAX_CONCURRENT_HEALTH_CHECKS", 10usize)?.max(1),
+        }))
     }
 
     pub fn invalidate_sessions_on_password_change() -> Result<bool, Box<dyn Error + Send + Sync>> {

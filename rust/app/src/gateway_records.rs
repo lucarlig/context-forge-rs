@@ -175,7 +175,8 @@ macro_rules! locked_gateway_query {
             "SELECT id FROM gateways WHERE id = $1 AND version = $2
                AND CAST(updated_at AS TEXT) = $3 AND visibility = $4
                AND owner_email IS NOT DISTINCT FROM $5 AND team_id IS NOT DISTINCT FROM $6
-               AND status = $7 AND enabled = $8 AND reachable = $9",
+               AND status = $7 AND enabled = $8 AND reachable = $9
+               AND lifecycle_claimed_by IS NOT DISTINCT FROM $10",
             $lock
         )
     };
@@ -193,6 +194,7 @@ macro_rules! lock_gateway {
             .bind(&$expected.status)
             .bind($expected.enabled)
             .bind($expected.reachable)
+            .bind($expected.lifecycle_claimed_by.as_deref())
             .fetch_optional(&mut *$transaction)
             .await?
     };
@@ -275,6 +277,7 @@ macro_rules! delete_catalog_rows {
     }};
 }
 
+mod lifecycle;
 mod refresh;
 pub(crate) use refresh::{CatalogChanges, CatalogRefreshCompletion, CatalogRefreshInput};
 

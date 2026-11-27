@@ -159,8 +159,8 @@ pub(super) async fn delete(
     State(service): State<Arc<GatewayService>>,
     Extension(principal): Extension<Principal>,
     Path(key): Path<String>,
-) -> Result<Json<Value>, ManagementError> {
-    let record = manageable(
+) -> Result<Response, ManagementError> {
+    let mut record = manageable(
         &service,
         &principal,
         key,
@@ -168,7 +168,16 @@ pub(super) async fn delete(
         "Only the owner can delete this gateway",
     )
     .await?;
-    if !service.database.delete_gateway(&record).await? {
+    let lifecycle = service.lifecycle.as_ref();
+    let changed = if let Some(lifecycle) = lifecycle {
+        if record.status == "deleting" {
+            return Ok(lifecycle.accepted(response(&record, service.credential_cipher.as_ref())));
+        }
+        service.database.queue_gateway_deletion(&record).await?
+    } else {
+        service.database.delete_gateway(&record).await?
+    };
+    if !changed {
         return Err(ManagementError::ConcurrentChange);
     }
     service.subscriptions.removed(
@@ -177,9 +186,21 @@ pub(super) async fn delete(
         record.team_id.as_deref(),
         record.owner_email.as_deref(),
     );
-    Ok(Json(
-        json!({"status":"success","message":format!("Gateway {} deleted", record.id)}),
-    ))
+    if let Some(lifecycle) = lifecycle {
+        record.status = "deleting".to_owned();
+        record.status_message = Some("Gateway deletion accepted and pending cleanup".to_owned());
+        record.reachable = false;
+        record.next_retry_at = None;
+        record.last_error = None;
+        record.lifecycle_claimed_by = None;
+        record.lifecycle_claimed_at = None;
+        record.lifecycle_claim_expires_at = None;
+        return Ok(lifecycle.accepted(response(&record, service.credential_cipher.as_ref())));
+    }
+    Ok(
+        Json(json!({"status":"success","message":format!("Gateway {} deleted", record.id)}))
+            .into_response(),
+    )
 }
 
 pub(super) async fn refresh(
@@ -379,7 +400,7 @@ async fn activate_catalog(
     };
     let Some(connection) = service
         .database
-        .gateway_connection(&record.id, &record.url, true, Some(record.version))
+        .gateway_connection(&record.id, &record.url, true, Some(record.version), None)
         .await?
     else {
         return Ok(false);
@@ -586,7 +607,7 @@ fn flag(value: Option<&str>) -> Result<bool, ManagementError> {
     }
 }
 
-fn response(record: &GatewayRecord, cipher: Option<&CredentialCipher>) -> Value {
+pub(super) fn response(record: &GatewayRecord, cipher: Option<&CredentialCipher>) -> Value {
     let mut response = json!(record);
     for key in [
         "createdAt",

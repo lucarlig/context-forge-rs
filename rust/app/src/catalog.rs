@@ -231,6 +231,8 @@ pub(crate) struct RegistrationOptions<'a> {
     pub(crate) identity: Option<&'a Value>,
     pub(crate) mode: GatewayMode,
     pub(crate) one_time_auth: bool,
+    pub(crate) pending: bool,
+    pub(crate) refresh_interval_seconds: Option<i32>,
     pub(crate) tls: RegisteredTls<'a>,
     pub(crate) created_from_ip: Option<&'a str>,
     pub(crate) created_user_agent: Option<&'a str>,
@@ -664,7 +666,8 @@ const CONNECTION_CONFIG: &str = concat!(
         CAST(g.oauth_config AS TEXT) AS oauth,
         CAST(g.passthrough_headers AS TEXT) AS passthrough, CAST(g.identity_propagation AS TEXT) AS identity,
         g.ca_certificate, g.client_cert, g.client_key FROM gateways g
-    WHERE g.id = $1 AND g.url = $2 AND (g.enabled = TRUE OR $3) AND g.status = 'active'
+    WHERE g.id = $1 AND g.url = $2 AND (g.enabled = TRUE OR $3)
+        AND (g.status = 'active' OR (g.status = 'pending' AND g.lifecycle_claimed_by = $5))
         AND (CAST($4 AS INTEGER) IS NULL OR g.version = $4)
         AND g.gateway_mode IN ('cache', 'direct_proxy') AND NOT ",
     gateway_policy!()
@@ -720,12 +723,15 @@ macro_rules! insert_gateway {
         concat!(
             "INSERT INTO gateways (
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
-                updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status,
+                updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility,
+                gateway_mode, status, status_message, refresh_interval_seconds,
                 created_from_ip, created_via, created_user_agent,
                 auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation,
                 ca_certificate, ca_certificate_sig, signing_algorithm, client_cert, client_key, sigv4_config, oauth_config
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
-                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, $17, 'active',
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CASE WHEN $27 THEN NULL ELSE CURRENT_TIMESTAMP END,
+                NOT $27, $8, $8, $9, $10, $17, CASE WHEN $27 THEN 'pending' ELSE 'active' END,
+                CASE WHEN $27 THEN 'Gateway registration accepted and pending initialization' END, $28,
                 $25, 'api', $26,
                 $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ", $18, $19, $20, $21, $22, ", $sigv4, ", ", $oauth, ")"
         )
@@ -1324,6 +1330,8 @@ impl Database {
                     .bind(auth.and_then(|auth| auth.encoded_oauth.as_deref()))
                     .bind(options.created_from_ip)
                     .bind(options.created_user_agent)
+                    .bind(options.pending)
+                    .bind(options.refresh_interval_seconds)
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1440,6 +1448,7 @@ impl Database {
         url: &str,
         allow_disabled: bool,
         version: Option<i32>,
+        lifecycle_claim: Option<&str>,
     ) -> Result<Option<GatewayConnectionRow>, sqlx::Error> {
         macro_rules! fetch {
             ($pool:expr) => {
@@ -1448,6 +1457,7 @@ impl Database {
                     .bind(url)
                     .bind(allow_disabled)
                     .bind(version)
+                    .bind(lifecycle_claim)
                     .fetch_optional($pool)
                     .await
             };

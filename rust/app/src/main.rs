@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Settings::mcp_pagination()?,
             catalog_refresh,
         )
+        .with_gateway_lifecycle(Settings::gateway_lifecycle()?)
         .with_logging_filter(handle)
         .with_management_page_sizes(management_page_size, management_max_page_size)
         .with_credential_secret(Settings::auth_encryption_secret()?.as_deref())
@@ -82,8 +83,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse).merge(websocket)))
         .merge(service.registration_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
-    let health = catalog_available
-        .then(|| tokio::spawn(service.run_gateway_health(health_settings, shutdown.clone())));
+    let background = catalog_available.then(|| {
+        [
+            tokio::spawn(
+                service
+                    .clone()
+                    .run_gateway_health(health_settings, shutdown.clone()),
+            ),
+            tokio::spawn(service.run_gateway_lifecycle(shutdown.clone())),
+        ]
+    });
     tracing::info!(address = %listener.local_addr()?, "gateway listening");
     let stop = shutdown.clone();
     let result = axum::serve(
@@ -96,8 +105,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     })
     .await;
     shutdown.cancel();
-    if let Some(health) = health {
-        health.await?;
+    if let Some(tasks) = background {
+        for task in tasks {
+            task.await?;
+        }
     }
     result?;
     Ok(())

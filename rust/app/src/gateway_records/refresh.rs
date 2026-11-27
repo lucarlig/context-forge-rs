@@ -34,6 +34,7 @@ pub(crate) enum CatalogRefreshCompletion {
     Automatic,
     Activate,
     Recover,
+    Initialize,
 }
 
 #[derive(Default, Serialize)]
@@ -296,6 +297,11 @@ macro_rules! apply_gateway_metadata {
             ", oauth_config = ", json_parameter!($dialect, "$22"), ",
             ca_certificate = $23, ca_certificate_sig = $24, signing_algorithm = $25,
             client_cert = $26, client_key = CASE WHEN $27 THEN $28 ELSE client_key END,
+            status = $29,
+            status_message = CASE WHEN $29 = 'pending' THEN 'Gateway update accepted and pending initialization' ELSE status_message END,
+            registration_attempts = CASE WHEN $29 = 'pending' THEN 0 ELSE registration_attempts END,
+            next_retry_at = CASE WHEN $29 = 'pending' THEN NULL ELSE next_retry_at END,
+            last_error = CASE WHEN $29 = 'pending' THEN NULL ELSE last_error END,
             updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE id = $1"))
             .bind(&$after.id).bind(&$after.name).bind(&$after.slug).bind($after.description.as_deref())
             .bind(&$after.visibility).bind($after.team_id.as_deref()).bind(&$after.tags)
@@ -309,6 +315,7 @@ macro_rules! apply_gateway_metadata {
             .bind($after.ca_certificate.as_deref()).bind($after.ca_certificate_sig.as_deref())
             .bind($after.signing_algorithm.as_deref()).bind($after.client_cert.as_deref())
             .bind($client_key.is_some()).bind($client_key.flatten())
+            .bind(&$after.status)
             .execute(&mut *$tx).await?;
         if renamed {
             for statement in RENAMED_CATALOG_ITEMS {
@@ -536,7 +543,7 @@ impl Database {
                 }
                 refresh_metadata!($transaction, $exists, $dialect, gateway, input, changes);
                 let now = Timestamp::now().to_string();
-                let stamp_seen = updating || input.completion == CatalogRefreshCompletion::Activate;
+                let stamp_seen = updating || matches!(input.completion, CatalogRefreshCompletion::Activate | CatalogRefreshCompletion::Initialize);
                 let stamp_refresh = !updating && matches!(input.completion, CatalogRefreshCompletion::Refresh | CatalogRefreshCompletion::Automatic);
                 sqlx::query(concat!("UPDATE gateways SET capabilities = ", json_parameter!($dialect, "$2"),
                     ", last_refresh_at = CASE WHEN $5 THEN ", $now, " ELSE last_refresh_at END,
@@ -551,6 +558,19 @@ impl Database {
                         write_gateway_health!($transaction, &gateway.id, true, &now, None::<&str>, $now),
                     CatalogRefreshCompletion::Refresh if updating =>
                         write_gateway_health!($transaction, &gateway.id, true, &now, None::<&str>, $now),
+                    CatalogRefreshCompletion::Initialize => {
+                        sqlx::query("UPDATE gateways SET status = 'active', status_message = NULL,
+                            reachable = TRUE, registration_attempts = 0, next_retry_at = NULL, last_error = NULL,
+                            lifecycle_claimed_by = NULL, lifecycle_claimed_at = NULL, lifecycle_claim_expires_at = NULL
+                            WHERE id = $1")
+                            .bind(&gateway.id).execute(&mut *$transaction).await?;
+                        if gateway.enabled {
+                            write_gateway_health!($transaction, &gateway.id, true, &now, None::<&str>, $now);
+                        } else {
+                            // An update can finish while the gateway is administratively disabled.
+                            set_gateway_state!($transaction, &gateway.id, false, &now, $now);
+                        }
+                    }
                     CatalogRefreshCompletion::Refresh => {}
                 }
                 $transaction.commit().await?;

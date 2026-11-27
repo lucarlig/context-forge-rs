@@ -2,6 +2,7 @@
 
 mod content;
 mod health;
+mod lifecycle;
 mod management;
 mod proxy;
 
@@ -55,12 +56,16 @@ use crate::{
     sessions::Session,
     sigv4::SigV4Config,
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
-    upstream::{ToolContext, UpstreamClient, UpstreamEndpoint, UpstreamError, UpstreamTransport},
+    upstream::{
+        DiscoveredCatalog, DiscoveredMetadata, ToolContext, UpstreamClient, UpstreamEndpoint,
+        UpstreamError, UpstreamTransport,
+    },
     upstream_tls::TlsMaterial,
 };
 use proxy::DirectTarget;
 
 pub use health::GatewayHealth;
+pub use lifecycle::GatewayLifecycle;
 pub(crate) use proxy::GATEWAY_ID_HEADER;
 
 pub struct GatewayService {
@@ -71,6 +76,7 @@ pub struct GatewayService {
     management_page_size: u32,
     management_max_page_size: u32,
     refresh: CatalogRefresh,
+    lifecycle: Option<GatewayLifecycle>,
     active_refreshes: Mutex<HashSet<String>>,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
@@ -143,6 +149,7 @@ impl GatewayService {
             management_page_size: 50,
             management_max_page_size: 500,
             refresh,
+            lifecycle: None,
             active_refreshes: Mutex::default(),
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
@@ -169,6 +176,11 @@ impl GatewayService {
 
     pub fn with_listen_settings(mut self, settings: ListenSettings) -> Self {
         self.subscriptions = CatalogSubscriptions::new(settings);
+        self
+    }
+
+    pub fn with_gateway_lifecycle(mut self, lifecycle: Option<GatewayLifecycle>) -> Self {
+        self.lifecycle = lifecycle;
         self
     }
 
@@ -574,7 +586,7 @@ impl GatewayService {
         }
         let connection = self
             .database
-            .gateway_connection(id, url, false, None)
+            .gateway_connection(id, url, false, None, None)
             .await?
             .ok_or(ToolError::Unavailable)?;
         self.connection_credentials(id, url, connection, incoming, principal)
@@ -760,6 +772,19 @@ fn tool_result_error(message: impl Into<String>) -> Result<Value, ToolError> {
     serde_json::to_value(result).map_err(|_| ToolError::Unavailable)
 }
 
+fn endpoint_for_error(value: &str) -> String {
+    url::Url::parse(value)
+        .ok()
+        .map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_default()
+}
+
 fn input_error_result(message: &str, code: Option<i64>) -> Result<Value, ToolError> {
     let mut result = CallToolResult::error(vec![ContentBlock::text(format!(
         "MCP server error: {message}"
@@ -891,6 +916,8 @@ struct RegisterGateway {
     client_key: Option<String>,
     #[serde(default, alias = "oneTimeAuth")]
     one_time_auth: bool,
+    #[serde(alias = "refreshIntervalSeconds")]
+    refresh_interval_seconds: Option<i32>,
     #[serde(flatten)]
     auth: AuthInput,
 }
@@ -901,7 +928,7 @@ async fn register(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(input): Json<RegisterGateway>,
-) -> Result<Json<Value>, RegistrationResponse> {
+) -> Result<Response, RegistrationResponse> {
     let name = input.name.trim();
     let slug = slugify(name);
     if name.len() > 255 || slug.is_empty() {
@@ -959,6 +986,22 @@ async fn register(
 
     let url = input.url.trim();
     let one_time_auth = input.one_time_auth || input.auth.is_one_time_marker();
+    let lifecycle = service.lifecycle.as_ref().filter(|_| !one_time_auth);
+    service.upstream.check_endpoint(url).map_err(|_| {
+        RegistrationResponse::new(
+            StatusCode::BAD_REQUEST,
+            "Gateway URL is invalid or disallowed",
+        )
+    })?;
+    if input
+        .refresh_interval_seconds
+        .is_some_and(|interval| interval < 60)
+    {
+        return Err(RegistrationResponse::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Refresh interval must be at least 60 seconds",
+        ));
+    }
     if let Some(identity) = &input.identity_propagation {
         service
             .identity_forwarding
@@ -1049,67 +1092,80 @@ async fn register(
             .store(service.vault.as_ref().ok_or_else(encryption_error)?)
             .await
             .map_err(|_| encryption_error())?;
-        let authorization = config
-            .authorization(&service.upstream, tls.as_ref())
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "upstream gateway OAuth token request failed");
-                match error {
-                    UpstreamError::InvalidUrl | UpstreamError::BlockedDestination => {
-                        RegistrationResponse::new(
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "OAuth token endpoint is invalid or disallowed",
-                        )
-                    }
-                    UpstreamError::InvalidCredentials => RegistrationResponse::new(
-                        StatusCode::BAD_REQUEST,
-                        "Invalid OAuth client credentials",
-                    ),
-                    _ => RegistrationResponse::new(
-                        StatusCode::BAD_GATEWAY,
-                        "OAuth authentication failed",
-                    ),
-                }
-            })?;
         auth.encoded_oauth = Some(encoded);
         auth.masked["oauthConfig"] = masked;
-        auth.credentials
-            .headers
-            .insert(header::AUTHORIZATION, authorization);
+        if lifecycle.is_none() {
+            let authorization = config
+                .authorization(&service.upstream, tls.as_ref())
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "upstream gateway OAuth token request failed");
+                    match error {
+                        UpstreamError::InvalidUrl | UpstreamError::BlockedDestination => {
+                            RegistrationResponse::new(
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                "OAuth token endpoint is invalid or disallowed",
+                            )
+                        }
+                        UpstreamError::InvalidCredentials => RegistrationResponse::new(
+                            StatusCode::BAD_REQUEST,
+                            "Invalid OAuth client credentials",
+                        ),
+                        _ => RegistrationResponse::new(
+                            StatusCode::BAD_GATEWAY,
+                            "OAuth authentication failed",
+                        ),
+                    }
+                })?;
+            auth.credentials
+                .headers
+                .insert(header::AUTHORIZATION, authorization);
+        }
     }
     let mut anonymous_credentials = UpstreamCredentials::default();
     let discovery_credentials = auth
         .as_mut()
         .map_or(&mut anonymous_credentials, |auth| &mut auth.credentials);
     discovery_credentials.tls = tls;
-    let (discovery, metadata) = service
-        .upstream
-        .discover_catalog(UpstreamEndpoint {
-            url,
-            transport,
-            credentials: Some(discovery_credentials),
-        })
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "upstream gateway discovery failed");
-            match error {
-                UpstreamError::Status(401 | 403) if discovery_credentials.sigv4.is_some() => {
-                    RegistrationResponse::new(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "Upstream rejected the SigV4 credentials",
-                    )
+    let (discovery, metadata) = if lifecycle.is_some() {
+        (
+            DiscoveredCatalog {
+                capabilities: json!({}),
+                tools: Vec::new(),
+            },
+            DiscoveredMetadata::default(),
+        )
+    } else {
+        service
+            .upstream
+            .discover_catalog(UpstreamEndpoint {
+                url,
+                transport,
+                credentials: Some(discovery_credentials),
+            })
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "upstream gateway discovery failed");
+                match error {
+                    UpstreamError::Status(401 | 403) if discovery_credentials.sigv4.is_some() => {
+                        RegistrationResponse::new(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "Upstream rejected the SigV4 credentials",
+                        )
+                    }
+                    UpstreamError::InvalidUrl | UpstreamError::BlockedDestination => {
+                        RegistrationResponse::new(
+                            StatusCode::BAD_REQUEST,
+                            "Gateway URL is invalid or disallowed",
+                        )
+                    }
+                    _ => RegistrationResponse::new(
+                        StatusCode::BAD_GATEWAY,
+                        "Failed to discover gateway",
+                    ),
                 }
-                UpstreamError::InvalidUrl | UpstreamError::BlockedDestination => {
-                    RegistrationResponse::new(
-                        StatusCode::BAD_REQUEST,
-                        "Gateway URL is invalid or disallowed",
-                    )
-                }
-                _ => {
-                    RegistrationResponse::new(StatusCode::BAD_GATEWAY, "Failed to discover gateway")
-                }
-            }
-        })?;
+            })?
+    };
     let tools: Vec<ToolDefinition> = discovery
         .tools
         .into_iter()
@@ -1155,7 +1211,7 @@ async fn register(
     let agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
-    service
+    let created = service
         .database
         .register_discovered_gateway(
             &registration,
@@ -1167,6 +1223,8 @@ async fn register(
                 identity: input.identity_propagation.as_ref(),
                 mode,
                 one_time_auth,
+                pending: lifecycle.is_some(),
+                refresh_interval_seconds: input.refresh_interval_seconds,
                 tls: RegisteredTls {
                     ca_certificate: input.ca_certificate.as_deref(),
                     ca_certificate_sig: input.ca_certificate_sig.as_deref(),
@@ -1178,10 +1236,50 @@ async fn register(
                 created_user_agent: agent,
             },
         )
-        .await?;
+        .await;
+    if let Some(lifecycle) = lifecycle
+        && matches!(created, Err(RegistrationError::NameConflict))
+        && let Some(existing) = service
+            .database
+            .gateway_records(&slug)
+            .await?
+            .into_iter()
+            .find(|record| {
+                record.status == "pending"
+                    && record.slug == slug
+                    && record.visibility == visibility
+                    && record.owner_email.as_deref() == Some(principal.email.as_str())
+                    && (visibility != "team" || record.team_id == team)
+            })
+    {
+        return Ok(lifecycle.accepted(management::response(
+            &existing,
+            service.credential_cipher.as_ref(),
+        )));
+    }
+    created?;
+    if let Some(lifecycle) = lifecycle {
+        let record = service
+            .database
+            .gateway_records(&id)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                RegistrationResponse::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Gateway registry unavailable",
+                )
+            })?;
+        return Ok(lifecycle.accepted(management::response(
+            &record,
+            service.credential_cipher.as_ref(),
+        )));
+    }
     service.subscriptions.registered(&registration);
     let mut response = registration_response(&registration, address, agent);
     response["gatewayMode"] = mode.name().into();
+    response["refreshIntervalSeconds"] = json!(input.refresh_interval_seconds);
     response["caCertificate"] = json!(input.ca_certificate);
     response["caCertificateSig"] = json!(input.ca_certificate_sig);
     response["clientCert"] = json!(input.client_cert);
@@ -1207,7 +1305,7 @@ async fn register(
             .expect("registration response object")
             .extend(masked);
     }
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 async fn registration_team(

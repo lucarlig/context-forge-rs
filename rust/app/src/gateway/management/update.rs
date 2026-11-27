@@ -119,7 +119,7 @@ pub(crate) async fn update(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(input): Json<GatewayUpdate>,
-) -> Result<Json<Value>, UpdateError> {
+) -> Result<Response, UpdateError> {
     let previous = manageable(
         &service,
         &principal,
@@ -128,12 +128,18 @@ pub(crate) async fn update(
         "Only the owner can update this gateway",
     )
     .await?;
+    if previous.status == "pending"
+        && let Some(lifecycle) = &service.lifecycle
+    {
+        return Ok(lifecycle.accepted(response(&previous, service.credential_cipher.as_ref())));
+    }
     if previous.status != "active" {
         return Err(ManagementError::LifecycleInProgress.into());
     }
     let mut gateway = previous.clone();
     let (mut auth, one_time_auth, tls) =
         apply_fields(&service, &principal, &mut gateway, input).await?;
+    let lifecycle = service.lifecycle.as_ref().filter(|_| !one_time_auth);
     gateway.modified_by = Some(principal.email.clone());
     if let Some(Extension(ConnectInfo(address))) = peer {
         gateway.modified_from_ip = Some(address.ip().to_string());
@@ -155,7 +161,13 @@ pub(crate) async fn update(
         gateway.url != previous.url || gateway.transport != previous.transport;
     let mut connection = service
         .database
-        .gateway_connection(&previous.id, &previous.url, true, Some(previous.version))
+        .gateway_connection(
+            &previous.id,
+            &previous.url,
+            true,
+            Some(previous.version),
+            None,
+        )
         .await
         .map_err(ManagementError::from)?;
     let client_key = tls
@@ -174,6 +186,10 @@ pub(crate) async fn update(
                 &gateway.url,
             )
             .await?;
+        if destination_changed && connection.kind == "query_param" {
+            validate_query_host(service.query_auth_hosts.as_ref(), &gateway.url)
+                .map_err(UpdateAuthError::from)?;
+        }
         if changed && !one_time_auth {
             gateway.auth_type = Some(connection.kind.clone());
             gateway.auth_value.clone_from(&connection.headers);
@@ -188,14 +204,20 @@ pub(crate) async fn update(
         }
         false
     };
-    let discovered = discover_updated_gateway(
-        &service,
-        &gateway,
-        transport,
-        connection,
-        destination_changed || auth_changed || tls_changed,
-    )
-    .await?;
+    let discovered = if lifecycle.is_some() {
+        gateway.status = "pending".to_owned();
+        gateway.reachable = false;
+        None
+    } else {
+        discover_updated_gateway(
+            &service,
+            &gateway,
+            transport,
+            connection,
+            destination_changed || auth_changed || tls_changed,
+        )
+        .await?
+    };
     if one_time_auth {
         gateway.auth_type = Some("one_time_auth".into());
         gateway.auth_value = None;
@@ -253,7 +275,8 @@ pub(crate) async fn update(
             ));
         }
     }
-    if destination_changed
+    if lifecycle.is_some()
+        || destination_changed
         || auth_changed
         || tls_changed
         || previous.visibility != gateway.visibility
@@ -279,7 +302,11 @@ pub(crate) async fn update(
         .into_iter()
         .next()
         .ok_or(ManagementError::ConcurrentChange)?;
-    Ok(Json(response(&updated, service.credential_cipher.as_ref())))
+    let payload = response(&updated, service.credential_cipher.as_ref());
+    Ok(match lifecycle {
+        Some(lifecycle) => lifecycle.accepted(payload),
+        None => Json(payload).into_response(),
+    })
 }
 
 async fn apply_fields(
@@ -589,14 +616,7 @@ async fn discover_updated_gateway(
 }
 
 fn failed_endpoint(gateway: &GatewayRecord, status: StatusCode, detail: String) -> UpdateError {
-    let endpoint = url::Url::parse(&gateway.url)
-        .ok()
-        .map(|mut url| {
-            url.set_query(None);
-            url.set_fragment(None);
-            url.to_string()
-        })
-        .unwrap_or_default();
+    let endpoint = endpoint_for_error(&gateway.url);
     UpdateError::message(
         status,
         format!("Failed to initialize gateway at {endpoint}: {detail}"),
