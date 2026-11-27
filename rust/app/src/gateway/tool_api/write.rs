@@ -641,6 +641,17 @@ async fn apply_fields(
         apply_passthrough(service, tool, &mut fields, create)?;
     }
     authentication::apply(service, tool, fields.auth.take(), fields.credential_fields)?;
+    if tool.auth_type.as_deref() == Some("sigv4")
+        && tool
+            .url
+            .as_deref()
+            .and_then(|url| url::Url::parse(url).ok())
+            .is_some_and(|url| crate::sigv4::has_query_signature(&url))
+    {
+        return Err(invalid(
+            "A presigned URL cannot be combined with auth_type 'sigv4'",
+        ));
+    }
     Ok(())
 }
 

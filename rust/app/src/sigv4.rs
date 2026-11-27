@@ -195,6 +195,11 @@ pub(crate) struct SigV4 {
     service: String,
 }
 
+pub(crate) fn has_query_signature(url: &url::Url) -> bool {
+    url.query_pairs()
+        .any(|(name, _)| name.eq_ignore_ascii_case("x-amz-signature"))
+}
+
 impl SigV4 {
     pub(crate) fn matches_stored(&self, encoded: &str) -> bool {
         serde_json::from_str::<SigV4Config>(encoded).is_ok_and(|stored| {

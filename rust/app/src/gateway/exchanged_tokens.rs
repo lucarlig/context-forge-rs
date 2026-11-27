@@ -15,6 +15,11 @@ const REDIS_PAUSE: Duration = Duration::from_secs(30);
 
 type Entry = Arc<tokio::sync::Mutex<Option<(Instant, CachedExchange)>>>;
 
+pub(super) enum ExchangeMode {
+    Cached,
+    Refresh,
+}
+
 #[derive(Default)]
 pub(super) struct ExchangedTokens {
     local: Mutex<HashMap<String, Entry>>,
@@ -55,6 +60,7 @@ impl ExchangedTokens {
         connection: ExchangeConnection<'_>,
         principal: &Principal,
         subject: &str,
+        mode: ExchangeMode,
     ) -> Result<HeaderValue, UpstreamError> {
         let subject_lifetime = || {
             principal
@@ -86,19 +92,30 @@ impl ExchangedTokens {
         let mut entry = entry.lock().await;
         subject_lifetime()?;
         let shared = self.redis.as_ref().zip(connection.cipher);
-        let read = match shared {
-            Some((redis, cipher)) => redis.read(&key, cipher).await,
-            None => Err(()),
-        };
-        subject_lifetime()?;
-        if let Ok(Some(cached)) = read {
-            return cached.into_authorization();
-        }
-        if read.is_err()
-            && let Some((until, cached)) = &*entry
-            && *until > Instant::now()
-        {
-            return cached.clone().into_authorization();
+        match mode {
+            ExchangeMode::Cached => {
+                let read = match shared {
+                    Some((redis, cipher)) => redis.read(&key, cipher).await,
+                    None => Err(()),
+                };
+                subject_lifetime()?;
+                if let Ok(Some(cached)) = read {
+                    return cached.into_authorization();
+                }
+                if read.is_err()
+                    && let Some((until, cached)) = &*entry
+                    && *until > Instant::now()
+                {
+                    return cached.clone().into_authorization();
+                }
+            }
+            ExchangeMode::Refresh => {
+                *entry = None;
+                if let Some((redis, _)) = shared {
+                    let _ = redis.query::<u64>(redis::cmd("DEL").arg(&key)).await;
+                }
+                subject_lifetime()?;
+            }
         }
         let exchange = connection
             .config

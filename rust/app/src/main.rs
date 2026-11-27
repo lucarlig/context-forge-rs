@@ -93,6 +93,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let health_settings = Settings::gateway_health(&catalog_refresh)?;
     let gateway_listeners = settings.gateway_listeners()?;
     let (well_known, cache_max_age, allow_oauth_loopback) = Settings::server_oauth_metadata()?;
+    let (rest_timeout, rest_response_text_limit) = Settings::rest_tool_limits()?;
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
@@ -107,6 +108,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_max_prompt_bytes(Settings::max_prompt_bytes()?)
         .with_tool_preview(Settings::tool_preview_enabled()?)
         .with_response_filters(Settings::response_filters()?)
+        .with_rest_tool_limits(rest_timeout, rest_response_text_limit)
         .with_token_issuer(email_auth_enabled, issuer)
         .with_gateway_oauth(Settings::gateway_oauth()?)
         .with_virtual_server_base(Settings::virtual_server_base()?)

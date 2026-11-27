@@ -136,6 +136,15 @@ impl Default for HeaderForwarding {
 }
 
 impl Settings {
+    pub fn rest_tool_limits() -> Result<(Duration, usize), Box<dyn Error + Send + Sync>> {
+        let timeout = positive_seconds("TOOL_TIMEOUT", 60.0)?;
+        let chars = parse("REST_RESPONSE_TEXT_MAX_LENGTH", 5000)?;
+        if !(1000..=100_000).contains(&chars) {
+            return Err("invalid REST_RESPONSE_TEXT_MAX_LENGTH".into());
+        }
+        Ok((timeout, chars))
+    }
+
     pub fn response_filters()
     -> Result<crate::response_filter::ResponseFilters, Box<dyn Error + Send + Sync>> {
         let workers = parse("CEL_FILTER_WORKERS", 2)?;

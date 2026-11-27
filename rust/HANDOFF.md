@@ -159,8 +159,17 @@ form data, and multipart bodies. The Rust client pins the upstream destination.
 Fourteen scenarios matched the pinned gateway's results and outbound requests
 on SQLite and PostgreSQL. A Rust integration test verifies that wrong-team
 tokens, read-only tokens, and invalid URL arguments stop before outbound dispatch.
-Gateway credential inheritance remains open. The pinned release stores REST
-passthrough settings as tool configuration.
+The pinned release stores REST passthrough settings as tool configuration.
+MCP REST calls use `TOOL_TIMEOUT` and `REST_RESPONSE_TEXT_MAX_LENGTH`.
+
+REST tools that select SigV4 can use their linked gateway's signer. A 401 triggers
+one re-sign or one OAuth token exchange, depending on the authentication flow.
+Linked credentials apply only to the gateway's origin. REST calls also honor
+stored gateway identity settings. Ten scenarios verify signatures, retry counts,
+request bodies, and response limits on SQLite and PostgreSQL. A live check
+verifies that only the token endpoint receives the caller's JWT during exchange,
+even with authorization forwarding enabled. Exact output-schema validation
+diagnostics remain open.
 
 `POST /v1/tools/generate-schemas-from-openapi` generates schemas for a selected
 operation. It requires `tools.create` and accepts an explicit document URL or

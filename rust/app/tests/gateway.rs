@@ -46,6 +46,8 @@ mod configuration_import;
 mod configuration_server_import;
 #[path = "gateway/openapi.rs"]
 mod openapi;
+#[path = "gateway/rest_credentials.rs"]
+mod rest_credentials;
 
 const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";

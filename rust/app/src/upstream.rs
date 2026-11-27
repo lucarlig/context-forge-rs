@@ -530,8 +530,12 @@ impl UpstreamAssociation {
 
 impl UpstreamClient {
     pub(crate) fn with_timeout_cap(&self, timeout: Duration) -> Self {
+        self.with_timeout(self.timeout.min(timeout))
+    }
+
+    pub(crate) fn with_timeout(&self, timeout: Duration) -> Self {
         Self {
-            timeout: self.timeout.min(timeout),
+            timeout,
             ..self.clone()
         }
     }
@@ -1126,12 +1130,14 @@ impl UpstreamClient {
                 .pinned_client(request.url().as_str(), None, None)
                 .await?;
             *request.url_mut() = url;
-            if let Some(signer) = signer {
-                signer
-                    .sign(&mut request)
-                    .map_err(|_| UpstreamError::Transport)?;
+            let retry = signer.and_then(|_| request.try_clone());
+            let mut response = send_rest_request(&client, request, signer).await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && let Some(retry) = retry
+            {
+                drop(response);
+                response = send_rest_request(&client, retry, signer).await?;
             }
-            let response = client.execute(request).await?;
             let status = response.status();
             Ok((status, read_json_body(response).await?))
         })
@@ -2061,6 +2067,19 @@ pub(crate) async fn read_bounded_body(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+async fn send_rest_request(
+    client: &Client,
+    mut request: reqwest::Request,
+    signer: Option<&SigV4>,
+) -> Result<Response, UpstreamError> {
+    if let Some(signer) = signer {
+        signer
+            .sign(&mut request)
+            .map_err(|_| UpstreamError::Transport)?;
+    }
+    Ok(client.execute(request).await?)
 }
 
 async fn http_error(response: Response) -> UpstreamError {

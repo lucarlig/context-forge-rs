@@ -8,14 +8,17 @@ use serde_json::Map;
 use url::{Url, form_urlencoded};
 
 use super::*;
-use crate::{catalog::RestTool, forward_headers::hop_header_name, sigv4::SigV4Config};
+use crate::{
+    catalog::RestTool,
+    forward_headers::hop_header_name,
+    sigv4::{SigV4Config, has_query_signature},
+};
 
 const URL_VALUE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
-const TEXT_LIMIT: usize = 5000;
 type Mapping = BTreeMap<String, String>;
 
 pub(super) async fn execute(
@@ -26,14 +29,61 @@ pub(super) async fn execute(
     principal: Option<&Principal>,
     incoming: Option<&HeaderMap>,
 ) -> Result<Value, ToolError> {
-    if config.pending_policy || tool.needs_upstream_config {
+    if config.pending_policy {
         return tool_result_error("REST tool requires an unavailable invocation policy");
     }
+    let connection = if tool.needs_upstream_config {
+        let version = tool.gateway_version.ok_or(ToolError::Unavailable)?;
+        Some(
+            service
+                .database
+                .gateway_connection(
+                    &tool.gateway_id,
+                    &tool.gateway_url,
+                    false,
+                    Some(version),
+                    None,
+                )
+                .await?
+                .ok_or(ToolError::Unavailable)?,
+        )
+    } else {
+        None
+    };
+    let gateway_signer = connection
+        .as_ref()
+        .filter(|gateway| gateway.kind == "sigv4")
+        .and_then(|gateway| stored_sigv4(gateway.sigv4.as_deref()));
+    let uses_signer = config
+        .auth_type
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("sigv4"));
+    let inherited_signer = uses_signer && stored_sigv4(config.sigv4_config.as_deref()).is_none();
+    if inherited_signer && gateway_signer.is_none() {
+        return tool_result_error("Tool invocation failed: SigV4 tool has no stored credentials");
+    }
     let arguments = params.arguments.clone().unwrap_or_default();
-    let (mut credentials, managed) = match stored_credentials(service, config) {
+    let (mut credentials, managed) = match stored_credentials(service, config, gateway_signer) {
         Ok(config) => config,
+        Err(_) if uses_signer => {
+            return tool_result_error(
+                "Tool invocation failed: Stored SigV4 credentials could not be loaded",
+            );
+        }
         Err(error) => return tool_result_error(error.to_string()),
     };
+    let exchange = connection
+        .as_ref()
+        .filter(|gateway| gateway.kind == "oauth")
+        .and_then(|gateway| {
+            gateway
+                .oauth
+                .as_deref()
+                .filter(|encoded| {
+                    credentials.sigv4.is_none() && oauth_api::is_token_exchange(encoded)
+                })
+                .map(|encoded| (gateway, encoded))
+        });
     if let Some(incoming) = incoming {
         service
             .header_forwarding
@@ -42,7 +92,7 @@ pub(super) async fn execute(
                 &mut credentials.headers,
                 incoming,
                 None,
-                managed,
+                managed || exchange.is_some(),
             )
             .await?;
     }
@@ -50,6 +100,16 @@ pub(super) async fn execute(
         Ok(request) => request,
         Err(message) => return tool_result_error(format!("Tool invocation failed: {message}")),
     };
+    if (inherited_signer || exchange.is_some())
+        && !Url::parse(&tool.gateway_url).is_ok_and(|url| url.origin() == request.url().origin())
+    {
+        return tool_result_error(
+            "Tool invocation failed: REST tool URL must share the linked gateway's origin to use its credentials",
+        );
+    }
+    if credentials.sigv4.is_some() && has_query_signature(request.url()) {
+        return tool_result_error("A presigned URL cannot be combined with auth_type 'sigv4'");
+    }
     let audience = if tool.gateway_id.is_empty() {
         &tool.id
     } else {
@@ -57,23 +117,45 @@ pub(super) async fn execute(
     };
     service
         .identity_forwarding
-        .apply(&mut credentials, principal, audience, None)
+        .apply(
+            &mut credentials,
+            principal,
+            audience,
+            connection
+                .as_ref()
+                .and_then(|gateway| gateway.identity.as_deref()),
+        )
         .map_err(|_| ToolError::Unavailable)?;
     *request.headers_mut() = credentials.headers;
-    let upstream = config
-        .timeout_ms
-        .and_then(|ms| u64::try_from(ms).ok())
-        .filter(|ms| *ms > 0)
-        .map(|ms| service.upstream.with_timeout_cap(Duration::from_millis(ms)));
-    let result = upstream
-        .as_ref()
-        .unwrap_or(&service.upstream)
+    let upstream = service.upstream.with_timeout(service.rest_timeout);
+    let retry = exchange.and_then(|_| request.try_clone());
+    let initial = upstream
         .rest_response(request, credentials.sigv4.as_deref())
         .await;
+    let result = match (initial, exchange, retry) {
+        (Ok((StatusCode::UNAUTHORIZED, _)), Some((gateway, encoded)), Some(mut retry)) => {
+            let authorization = match refreshed_exchange(
+                service, tool, gateway, encoded, principal, incoming,
+            )
+            .await
+            {
+                Ok(header) => header,
+                Err(message) => {
+                    return tool_result_error(format!("Tool invocation failed: {message}"));
+                }
+            };
+            retry
+                .headers_mut()
+                .insert(header::AUTHORIZATION, authorization);
+            upstream.rest_response(retry, None).await
+        }
+        (result, _, _) => result,
+    };
     match result {
         Ok((status, body)) => Ok(response_result(
             &service.response_filters,
             &tool.response_filter,
+            service.rest_response_text_limit,
             status,
             &body,
             tool.definition.output_schema.as_ref(),
@@ -82,14 +164,88 @@ pub(super) async fn execute(
         Err(UpstreamError::BlockedDestination | UpstreamError::InvalidUrl) => {
             tool_result_error("Tool invocation failed: Outbound URL blocked by URL policy")
         }
-        Err(UpstreamError::Timeout) => tool_result_error("Tool invocation timed out"),
+        Err(UpstreamError::Timeout) => tool_result_error(format!(
+            "Tool invocation timed out after {}s",
+            service.rest_timeout.as_secs_f64()
+        )),
         Err(_) => tool_result_error("Tool invocation failed: REST upstream request failed"),
     }
+}
+
+async fn refreshed_exchange(
+    service: &GatewayService,
+    tool: &CatalogTool,
+    gateway: &GatewayConnectionRow,
+    encoded: &str,
+    principal: Option<&Principal>,
+    incoming: Option<&HeaderMap>,
+) -> Result<HeaderValue, String> {
+    let principal = principal.ok_or(
+        "Token exchange requires an authenticated user identity. Contact your administrator.",
+    )?;
+    let subject = incoming
+        .and_then(|headers| principal.verified_bearer(headers))
+        .ok_or_else(|| {
+            format!(
+                "User authentication required for token-exchange gateway '{}'.",
+                tool.gateway_name
+            )
+        })?;
+    let failed = || {
+        format!(
+            "Token exchange failed for gateway '{}'. Contact your administrator.",
+            tool.gateway_name
+        )
+    };
+    let vault = service.vault.as_ref().ok_or_else(failed)?;
+    let config = OAuthConfig::load(vault, encoded)
+        .await
+        .map_err(|_| failed())?;
+    let tls = service
+        .connection_tls(gateway)
+        .await
+        .map_err(|_| failed())?;
+    let upstream = service
+        .upstream
+        .with_timeout_cap(service.gateway_oauth.request_timeout);
+    let correlation_id = incoming
+        .and_then(|headers| headers.get("x-correlation-id"))
+        .and_then(|header| header.to_str().ok())
+        .filter(|value| {
+            value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        });
+    let refreshed = service
+        .exchanged_tokens
+        .authorization(
+            ExchangeConnection {
+                gateway_id: &tool.gateway_id,
+                version: gateway.version,
+                upstream: &upstream,
+                config: &config,
+                tls: tls.as_ref(),
+                cipher: service.credential_cipher.as_ref(),
+            },
+            principal,
+            subject,
+            ExchangeMode::Refresh,
+        )
+        .await;
+    tracing::info!(gateway = %tool.gateway_id, correlation_id, success = refreshed.is_ok(), "REST tool OAuth token exchange");
+    refreshed.map_err(|_| failed())
+}
+
+fn stored_sigv4(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim)
+        .filter(|value| !matches!(*value, "" | "null" | "{}"))
 }
 
 fn stored_credentials(
     service: &GatewayService,
     config: &RestTool,
+    gateway_sigv4: Option<&str>,
 ) -> Result<(UpstreamCredentials, bool), CredentialError> {
     let cipher = service.credential_cipher.as_ref();
     let mut credentials = UpstreamCredentials::default();
@@ -122,19 +278,25 @@ fn stored_credentials(
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let auth_value = config
+        .auth_value
+        .as_deref()
+        .filter(|value| !value.is_empty());
     let managed = match auth_type.as_str() {
-        "" | "none" | "one_time_auth" if config.auth_value.is_none() => false,
+        "" | "none" | "one_time_auth" if auth_value.is_none() => false,
         "sigv4" => {
             credentials.sigv4 = Some(SigV4Config::load(
                 cipher.ok_or(CredentialError)?,
-                config.sigv4_config.as_deref().ok_or(CredentialError)?,
+                stored_sigv4(config.sigv4_config.as_deref())
+                    .or(gateway_sigv4)
+                    .ok_or(CredentialError)?,
             )?);
             true
         }
         "" | "basic" | "bearer" | "authheaders" => {
             let auth = tool_api::decode_stored_auth(
                 cipher.ok_or(CredentialError)?,
-                config.auth_value.as_deref().ok_or(CredentialError)?,
+                auth_value.ok_or(CredentialError)?,
             )?;
             for (name, value) in auth {
                 insert_stored_header(&mut credentials.headers, &name, &value)?;
@@ -401,6 +563,7 @@ fn multipart(headers: &mut HeaderMap, fields: Map<String, Value>) -> String {
 async fn response_result(
     filters: &crate::response_filter::ResponseFilters,
     expression: &str,
+    text_limit: usize,
     status: StatusCode,
     body: &[u8],
     output_schema: Option<&Value>,
@@ -409,7 +572,7 @@ async fn response_result(
         return text_result("Request completed successfully (No Content)", false);
     }
     let text = String::from_utf8_lossy(body);
-    let bounded: String = text.chars().take(TEXT_LIMIT).collect();
+    let bounded: String = text.chars().take(text_limit).collect();
     let json_body: Result<Value, _> = serde_json::from_slice(body);
     let success = matches!(status.as_u16(), 200 | 201 | 202 | 206);
     if !success {
@@ -421,7 +584,7 @@ async fn response_result(
                     value["error"]
                         .to_string()
                         .chars()
-                        .take(TEXT_LIMIT)
+                        .take(text_limit)
                         .collect()
                 }),
             Ok(_) if status.is_success() => "Tool error encountered".into(),

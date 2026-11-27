@@ -77,7 +77,7 @@ use crate::{
     },
     upstream_tls::TlsMaterial,
 };
-use exchanged_tokens::{ExchangeConnection, ExchangedTokens};
+use exchanged_tokens::{ExchangeConnection, ExchangeMode, ExchangedTokens};
 use proxy::DirectTarget;
 
 const TOKEN_EXCHANGE_ADMIN_REQUIRED: &str =
@@ -133,6 +133,8 @@ pub struct GatewayService {
     direct_proxy_timeout: Option<Duration>,
     proxy_catalog: ProxyCatalogCache,
     response_filters: crate::response_filter::ResponseFilters,
+    rest_timeout: Duration,
+    rest_response_text_limit: usize,
     openapi: openapi::Documents,
     export: ExportSettings,
     imports: import_api::Imports,
@@ -237,6 +239,8 @@ impl GatewayService {
             direct_proxy_timeout: None,
             proxy_catalog: ProxyCatalogCache::new(ProxyCatalogSettings::default()),
             response_filters: crate::response_filter::ResponseFilters::default(),
+            rest_timeout: Duration::from_secs(60),
+            rest_response_text_limit: 5000,
             openapi: openapi::Documents::default(),
             export: ExportSettings::default(),
             imports: import_api::Imports::default(),
@@ -253,6 +257,12 @@ impl GatewayService {
         filters: crate::response_filter::ResponseFilters,
     ) -> Self {
         self.response_filters = filters;
+        self
+    }
+
+    pub fn with_rest_tool_limits(mut self, timeout: Duration, response_text_limit: usize) -> Self {
+        self.rest_timeout = timeout;
+        self.rest_response_text_limit = response_text_limit;
         self
     }
 
@@ -1010,7 +1020,7 @@ impl GatewayService {
                     Some(self.exchanged_tokens.authorization(
                         ExchangeConnection {gateway_id:id,version:connection.version,
                             upstream:&upstream,config:&config,tls:credentials.tls.as_ref(),cipher},
-                        principal, subject,
+                        principal, subject, ExchangeMode::Cached,
                     ).await.map_err(|error| {
                         tracing::warn!(gateway=%id, %error, "upstream OAuth exchange failed");
                             ToolError::OAuthExchangeFailed
