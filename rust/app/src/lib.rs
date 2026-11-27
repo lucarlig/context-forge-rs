@@ -4,6 +4,7 @@ pub mod access;
 mod affinity;
 pub mod auth;
 pub mod catalog;
+mod client_assertion;
 pub mod config;
 mod credentials;
 pub mod database;

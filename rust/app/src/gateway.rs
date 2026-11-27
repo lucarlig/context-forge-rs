@@ -999,19 +999,21 @@ async fn register(
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "upstream gateway OAuth token request failed");
-                if matches!(
-                    error,
-                    UpstreamError::InvalidUrl | UpstreamError::BlockedDestination
-                ) {
-                    RegistrationResponse::new(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "OAuth token endpoint is invalid or disallowed",
-                    )
-                } else {
-                    RegistrationResponse::new(
+                match error {
+                    UpstreamError::InvalidUrl | UpstreamError::BlockedDestination => {
+                        RegistrationResponse::new(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "OAuth token endpoint is invalid or disallowed",
+                        )
+                    }
+                    UpstreamError::InvalidCredentials => RegistrationResponse::new(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid OAuth client credentials",
+                    ),
+                    _ => RegistrationResponse::new(
                         StatusCode::BAD_GATEWAY,
                         "OAuth authentication failed",
-                    )
+                    ),
                 }
             })?;
         auth.encoded_oauth = Some(encoded);

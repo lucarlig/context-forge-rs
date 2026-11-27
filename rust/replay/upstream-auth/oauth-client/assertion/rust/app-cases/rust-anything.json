@@ -1,0 +1,21 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-rs",
+  "run": [
+    "context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "input-001-post-mcp",
+    "input-002-post-mcp",
+    "input-003-post-mcp",
+    "input-004-post-mcp",
+    "input-005-post-mcp",
+    "input-006-post-mcp",
+    "input-007-post-mcp"
+  ]
+}

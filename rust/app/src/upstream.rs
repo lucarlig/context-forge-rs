@@ -204,6 +204,8 @@ impl EgressPolicy {
 pub enum UpstreamError {
     #[error("invalid upstream HTTP URL")]
     InvalidUrl,
+    #[error("invalid upstream client credentials")]
+    InvalidCredentials,
     #[error("upstream destination is blocked by egress policy")]
     BlockedDestination,
     #[error("upstream hostname could not be resolved")]
