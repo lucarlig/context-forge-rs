@@ -273,21 +273,10 @@ impl Authorizer {
         headers: &HeaderMap,
         peer: Option<IpAddr>,
     ) -> Option<(String, Option<String>)> {
-        let token = bearer(headers).ok().flatten().or_else(|| {
-            let cookies = || {
-                headers
-                    .get_all(header::COOKIE)
-                    .iter()
-                    .filter_map(|cookie| cookie.to_str().ok())
-                    .flat_map(|value| value.split(';'))
-                    .filter_map(|value| value.trim().split_once('='))
-            };
-            ["jwt_token", "access_token"].into_iter().find_map(|name| {
-                cookies()
-                    .find(|(key, value)| *key == name && !value.trim().is_empty())
-                    .map(|(_, value)| value.trim())
-            })
-        })?;
+        let token = bearer(headers)
+            .ok()
+            .flatten()
+            .or_else(|| auth_cookie(headers))?;
         let principal = self
             .authenticate_for(token, peer, ServerTarget::RpcParameters)
             .await
@@ -305,6 +294,16 @@ impl Authorizer {
             _ => None,
         };
         Some((principal.email, team))
+    }
+
+    pub(crate) async fn csrf_identity(&self, token: &str) -> Option<(String, String)> {
+        let jwt = self.verifier.as_ref()?.verify(token).ok()?;
+        let session = jwt.jti().filter(|jti| !jti.is_empty())?.to_owned();
+        let email = match self.resolve_identity(&jwt).await {
+            Ok(identity) => identity.email,
+            Err(_) => claimed_email(&jwt)?.to_owned(),
+        };
+        Some((email, session))
     }
 
     async fn authenticate_for(
@@ -452,20 +451,9 @@ impl Authorizer {
     }
 
     async fn resolve_identity(&self, jwt: &VerifiedJwt) -> Result<Identity, AuthError> {
-        let payload = jwt.payload();
-        let email = [
-            payload.get("user").and_then(|user| user.get("email")),
-            payload.get("email"),
-            payload.get("sub"),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .find(|identity| identity.contains('@'));
         let identity = self
             .database
-            .active_identity(email, jwt.subject(), jwt.jti())
+            .active_identity(claimed_email(jwt), jwt.subject(), jwt.jti())
             .await?
             .ok_or(AuthError::Invalid)?;
         if self.invalidate_sessions_on_password_change
@@ -785,6 +773,37 @@ impl Principal {
         let data = data.to_string();
         Sha256::digest(data.as_bytes()).into()
     }
+}
+
+fn claimed_email(jwt: &VerifiedJwt) -> Option<&str> {
+    let payload = jwt.payload();
+    [
+        payload.get("user").and_then(|user| user.get("email")),
+        payload.get("email"),
+        payload.get("sub"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|identity| identity.contains('@'))
+}
+
+pub(crate) fn auth_cookie(headers: &HeaderMap) -> Option<&str> {
+    cookie(headers, "jwt_token").or_else(|| cookie(headers, "access_token"))
+}
+
+pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|cookie| cookie.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|value| value.trim().split_once('='))
+        .find_map(|(key, value)| {
+            let value = value.trim();
+            (key == name && !value.is_empty()).then_some(value)
+        })
 }
 
 fn bearer(headers: &HeaderMap) -> Result<Option<&str>, AuthError> {

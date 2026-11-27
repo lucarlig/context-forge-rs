@@ -148,6 +148,12 @@ IP, user, or team produces its own event. Native revision 14 preserves existing
 security events and Alembic history when adopting a pinned SQLite database.
 Redis certificate verification stays enabled. SIEM delivery remains open.
 
+Nine CSRF replays match the pinned gateway across 35 live requests. Cookie
+proofs bind to the verified user and JWT session, and the gateway accepts the
+current and previous token windows. The replays cover the login cookie, missing
+or forged proofs, Bearer requests, origin checks, and configured headers and path
+exemptions. Admin route CSRF checks remain open.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

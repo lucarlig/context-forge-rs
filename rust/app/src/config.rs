@@ -510,17 +510,7 @@ impl Settings {
         if !(5..=1440).contains(&expiry) || attempts < 1 || !(1..=525_600).contains(&lockout) {
             return Err("invalid local authentication settings".into());
         }
-        let csrf_seconds = parse("CSRF_TOKEN_EXPIRY", 3600)?;
         let (page_size, max_page_size) = Self::management_page_sizes()?;
-        let csrf_secret = Zeroizing::new(
-            env::var("CSRF_SECRET_KEY")
-                .ok()
-                .filter(|secret| !secret.is_empty())
-                .unwrap_or(value("JWT_SECRET_KEY", "")?),
-        );
-        if csrf_seconds < 1 {
-            return Err("invalid CSRF token expiry".into());
-        }
         Ok(AccountSettings {
             bootstrap_email: value("PLATFORM_ADMIN_EMAIL", "admin@example.com")?,
             bootstrap_name: value("PLATFORM_ADMIN_FULL_NAME", "Platform Administrator")?,
@@ -552,12 +542,10 @@ impl Settings {
             lockout_seconds: lockout * 60,
             failure_floor: Duration::from_millis(parse("FAILED_LOGIN_MIN_RESPONSE_MS", 250)?),
             token_seconds: expiry * 60,
-            csrf_secret,
-            csrf_name: value("CSRF_COOKIE_NAME", "mcpgateway_csrf_token")?,
+            csrf: crate::http_boundary::csrf::CsrfTokens::from_env()?,
             csrf_samesite: value("CSRF_COOKIE_SAMESITE", "Strict")?,
             csrf_secure: enabled("CSRF_COOKIE_SECURE", true)?,
             csrf_httponly: enabled("CSRF_COOKIE_HTTPONLY", false)?,
-            csrf_seconds,
             a2a_enabled: enabled("MCPGATEWAY_A2A_ENABLED", true)?,
             page_size,
             max_page_size,

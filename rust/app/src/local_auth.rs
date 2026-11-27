@@ -33,6 +33,7 @@ use crate::{
     access::{Authorizer, Principal, RoleContext},
     config::SecretKdf,
     database::Database,
+    http_boundary::csrf::CsrfTokens,
     jwt::JwtIssuer,
 };
 
@@ -69,12 +70,10 @@ pub struct AccountSettings {
     pub(crate) lockout_seconds: i64,
     pub(crate) failure_floor: Duration,
     pub(crate) token_seconds: i64,
-    pub(crate) csrf_secret: Zeroizing<String>,
-    pub(crate) csrf_name: String,
+    pub(crate) csrf: CsrfTokens,
     pub(crate) csrf_samesite: String,
     pub(crate) csrf_secure: bool,
     pub(crate) csrf_httponly: bool,
-    pub(crate) csrf_seconds: i64,
     pub(crate) a2a_enabled: bool,
     pub(crate) page_size: u32,
     pub(crate) max_page_size: u32,
@@ -758,17 +757,8 @@ fn csrf_cookie(
     now: i64,
 ) -> Option<HeaderValue> {
     use std::fmt::Write as _;
-    if settings.csrf_secret.is_empty() {
-        return None;
-    }
-    let window = now - now.rem_euclid(settings.csrf_seconds);
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, settings.csrf_secret.as_bytes());
-    let message = format!("{email}:{session}:{window}");
-    let signature = ring::hmac::sign(&key, message.as_bytes());
-    let mut cookie = format!("{}=", settings.csrf_name);
-    for byte in signature.as_ref() {
-        write!(cookie, "{byte:02x}").ok()?;
-    }
+    let token = settings.csrf.issue(email, session, now)?;
+    let mut cookie = format!("{}={token}", settings.csrf.cookie_name);
     let same_site = match settings.csrf_samesite.to_ascii_lowercase().as_str() {
         "none" => "None",
         "lax" => "Lax",
@@ -777,7 +767,7 @@ fn csrf_cookie(
     write!(
         cookie,
         "; Max-Age={}; Path=/; SameSite={same_site}",
-        settings.csrf_seconds
+        settings.csrf.seconds
     )
     .ok()?;
     if settings.csrf_secure {
