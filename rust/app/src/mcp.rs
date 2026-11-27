@@ -380,6 +380,7 @@ async fn forward_remote(state: &McpState, request: Request) -> Result<Request, B
             worker,
             request,
             sessions.affinity_forward_timeout(),
+            state.service.header_forwarding_enabled(),
         )
         .await,
     ))
@@ -782,6 +783,7 @@ async fn handle_post(state: &Arc<McpState>, request: Request) -> Response {
         .is_some_and(|version| version == ProtocolVersion::V_2025_11_25.as_str());
     let principal = parts.extensions.remove::<Principal>();
     let server = parts.extensions.remove::<CatalogServer>();
+    let headers = parts.headers.clone();
     let bytes = match Bytes::from_request(Request::from_parts(parts, body), &()).await {
         Ok(bytes) => bytes,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
@@ -795,7 +797,18 @@ async fn handle_post(state: &Arc<McpState>, request: Request) -> Response {
     };
 
     match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => dispatch(state, principal, server, session_id, value, prime).await,
+        Ok(value) => {
+            dispatch(
+                state,
+                principal,
+                server,
+                session_id,
+                value,
+                prime,
+                Some(headers),
+            )
+            .await
+        }
         Err(error) => rpc_error(
             StatusCode::BAD_REQUEST,
             &Value::Null,
@@ -839,6 +852,7 @@ async fn dispatch(
     session_id: Option<HeaderValue>,
     value: Value,
     prime: bool,
+    request_headers: Option<HeaderMap>,
 ) -> Response {
     let Value::Object(mut message) = value else {
         return invalid_envelope();
@@ -986,7 +1000,7 @@ async fn dispatch(
                         session,
                         &id,
                         params,
-                        progress.as_ref(),
+                        (progress.as_ref(), request_headers.as_ref()),
                     )
                     .await
                 }
@@ -1011,6 +1025,7 @@ async fn dispatch(
                         progress: progress.as_ref(),
                         notifications: None,
                         client_capabilities: None,
+                        request_headers: request_headers.as_ref(),
                     };
                     let result = service
                         .read_resource(params, principal, server, context, session.as_deref())
@@ -1052,6 +1067,7 @@ async fn dispatch(
                         progress: progress.as_ref(),
                         notifications: None,
                         client_capabilities: None,
+                        request_headers: request_headers.as_ref(),
                     };
                     let result = service
                         .get_prompt(params, principal, server, context, session.as_deref())
@@ -1088,6 +1104,7 @@ async fn dispatch(
                         progress: progress.as_ref(),
                         notifications: None,
                         client_capabilities: None,
+                        request_headers: request_headers.as_ref(),
                     };
                     let result = service
                         .complete(params, principal, server, context, session.as_deref())
@@ -1358,7 +1375,7 @@ async fn call_tool(
     session: Option<Arc<Session>>,
     id: &Value,
     params: Option<&Value>,
-    progress: Option<&ToolProgress>,
+    (progress, request_headers): (Option<&ToolProgress>, Option<&HeaderMap>),
 ) -> Response {
     let Some(Ok(params)) = params.map(CallToolRequestParams::deserialize) else {
         return invalid_params(id);
@@ -1384,6 +1401,7 @@ async fn call_tool(
                 progress,
                 notifications: None,
                 client_capabilities: None,
+                request_headers,
             },
             session.as_deref(),
         )
@@ -1580,6 +1598,7 @@ pub(crate) async fn legacy_transport_reply(
         None,
         request,
         false,
+        None,
     )
     .await;
     let payload = match to_bytes(reply.into_body(), MAX_REQUEST_BODY_BYTES * 2).await {

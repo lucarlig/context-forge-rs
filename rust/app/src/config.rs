@@ -31,6 +31,34 @@ pub struct RedisSettings {
     pub response_timeout: Duration,
 }
 
+pub struct HeaderForwarding {
+    pub(crate) enabled: bool,
+    pub(crate) sensitive: bool,
+    pub(crate) overwrite: bool,
+    pub(crate) max_value_length: usize,
+    pub(crate) source: HeaderSource,
+    pub(crate) defaults: HashSet<String>,
+}
+
+pub(crate) enum HeaderSource {
+    Environment,
+    Database,
+    Merge,
+}
+
+impl Default for HeaderForwarding {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sensitive: false,
+            overwrite: false,
+            max_value_length: 4096,
+            source: HeaderSource::Database,
+            defaults: ["X-Tenant-Id".to_owned(), "X-Trace-Id".to_owned()].into(),
+        }
+    }
+}
+
 impl Settings {
     pub fn from_env() -> Result<Self, Box<dyn Error + Send + Sync>> {
         let redis = match value("CACHE_TYPE", "database")?.as_str() {
@@ -126,6 +154,40 @@ impl Settings {
             .unwrap_or(false)
             .then(|| allowlist("INSECURE_QUERYPARAM_AUTH_ALLOWED_HOSTS"))
             .transpose()
+    }
+
+    pub fn header_forwarding() -> Result<HeaderForwarding, Box<dyn Error + Send + Sync>> {
+        let defaults = HeaderForwarding::default();
+        let source = match value("PASSTHROUGH_HEADERS_SOURCE", "db")?.as_str() {
+            "env" => HeaderSource::Environment,
+            "db" => HeaderSource::Database,
+            "merge" => HeaderSource::Merge,
+            _ => return Err("invalid PASSTHROUGH_HEADERS_SOURCE".into()),
+        };
+        let configured = if env::var_os("DEFAULT_PASSTHROUGH_HEADERS").is_some() {
+            allowlist("DEFAULT_PASSTHROUGH_HEADERS")?
+        } else {
+            defaults.defaults
+        };
+        let max_value_length = parse("MAX_HEADER_VALUE_LENGTH", defaults.max_value_length)?;
+        if max_value_length == 0 {
+            return Err("MAX_HEADER_VALUE_LENGTH must be positive".into());
+        }
+        let enabled = flag("ENABLE_HEADER_PASSTHROUGH")?.unwrap_or(false);
+        let sensitive = flag("ENABLE_SENSITIVE_HEADER_PASSTHROUGH")?.unwrap_or(false);
+        if sensitive && !enabled {
+            return Err(
+                "ENABLE_SENSITIVE_HEADER_PASSTHROUGH requires ENABLE_HEADER_PASSTHROUGH".into(),
+            );
+        }
+        Ok(HeaderForwarding {
+            enabled,
+            sensitive,
+            overwrite: flag("ENABLE_OVERWRITE_BASE_HEADERS")?.unwrap_or(false),
+            max_value_length,
+            source,
+            defaults: configured,
+        })
     }
 
     pub fn mcp_requires_auth() -> Result<bool, Box<dyn Error + Send + Sync>> {

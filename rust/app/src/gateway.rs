@@ -7,7 +7,7 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -31,6 +31,7 @@ use crate::{
         CatalogList, CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool,
         RegistrationError, ToolDefinition, slugify,
     },
+    config::HeaderForwarding,
     credentials::{
         AuthError, AuthInput, CredentialCipher, CredentialError, UpstreamCredentials,
         decode_headers, decode_query, validate_query_host,
@@ -52,6 +53,7 @@ pub struct GatewayService {
     subscriptions: CatalogSubscriptions,
     credential_cipher: Option<CredentialCipher>,
     query_auth_hosts: Option<HashSet<String>>,
+    header_forwarding: HeaderForwarding,
 }
 
 pub struct CatalogRefresh {
@@ -116,6 +118,7 @@ impl GatewayService {
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
             credential_cipher: None,
             query_auth_hosts: None,
+            header_forwarding: HeaderForwarding::default(),
         }
     }
 
@@ -137,6 +140,15 @@ impl GatewayService {
     pub fn with_query_auth_hosts(mut self, hosts: Option<HashSet<String>>) -> Self {
         self.query_auth_hosts = hosts;
         self
+    }
+
+    pub fn with_header_forwarding(mut self, forwarding: HeaderForwarding) -> Self {
+        self.header_forwarding = forwarding;
+        self
+    }
+
+    pub(crate) fn header_forwarding_enabled(&self) -> bool {
+        self.header_forwarding.enabled
     }
 
     pub(crate) async fn prepare_subscription(
@@ -382,6 +394,7 @@ impl GatewayService {
                 &tool.gateway_id,
                 &tool.gateway_url,
                 tool.needs_upstream_auth,
+                context.request_headers,
             )
             .await?;
         let endpoint = UpstreamEndpoint {
@@ -423,17 +436,22 @@ impl GatewayService {
         id: &str,
         url: &str,
         needs_upstream_auth: bool,
+        request_headers: Option<&HeaderMap>,
     ) -> Result<Option<UpstreamCredentials>, ToolError> {
-        if !needs_upstream_auth {
+        let incoming =
+            request_headers.filter(|headers| self.header_forwarding.needs_config(headers));
+        if !needs_upstream_auth && incoming.is_none() {
             return Ok(None);
         }
-        let (kind, stored_headers, stored_query) = self
+        let (kind, stored_headers, stored_query, passthrough) = self
             .database
-            .gateway_auth(id, url)
+            .gateway_connection(id, url)
             .await?
             .ok_or(ToolError::Unavailable)?;
         let cipher = self.credential_cipher.as_ref();
-        let credentials = if kind == "query_param" {
+        let mut credentials = if matches!(kind.as_str(), "" | "none") {
+            Ok(UpstreamCredentials::default())
+        } else if kind == "query_param" {
             validate_query_host(self.query_auth_hosts.as_ref(), url)
                 .map_err(|_| ToolError::Unavailable)?;
             decode_query(
@@ -458,7 +476,22 @@ impl GatewayService {
             tracing::warn!(gateway = %id, "could not load upstream authentication");
             ToolError::Unavailable
         })?;
-        Ok(Some(credentials))
+        if let Some(incoming) = incoming {
+            let managed = matches!(kind.as_str(), "basic" | "bearer" | "authheaders");
+            self.header_forwarding
+                .apply(
+                    &self.database,
+                    &mut credentials.headers,
+                    incoming,
+                    passthrough.as_deref(),
+                    managed,
+                )
+                .await?;
+        }
+        Ok(
+            (!credentials.headers.is_empty() || !credentials.query.is_empty())
+                .then_some(credentials),
+        )
     }
 
     pub(crate) async fn tool_definition(
@@ -619,6 +652,8 @@ struct RegisterGateway {
     tags: Option<Vec<String>>,
     #[serde(alias = "gatewayMode")]
     gateway_mode: Option<String>,
+    #[serde(alias = "passthroughHeaders")]
+    passthrough_headers: Option<Vec<String>>,
     #[serde(flatten)]
     auth: AuthInput,
 }
@@ -680,6 +715,16 @@ async fn register(
     }
 
     let url = input.url.trim();
+    if input.passthrough_headers.as_ref().is_some_and(|headers| {
+        headers
+            .iter()
+            .any(|name| HeaderName::from_bytes(name.as_bytes()).is_err())
+    }) {
+        return Err(RegistrationResponse::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid passthrough header name",
+        ));
+    }
     let auth = input
         .auth
         .prepare(service.credential_cipher.as_ref(), service.query_auth_hosts.as_ref(), url)
@@ -766,7 +811,13 @@ async fn register(
         .collect();
     service
         .database
-        .register_discovered_gateway(&registration, &registered_tools, &metadata, auth.as_ref())
+        .register_discovered_gateway(
+            &registration,
+            &registered_tools,
+            &metadata,
+            auth.as_ref(),
+            input.passthrough_headers.as_deref(),
+        )
         .await?;
     service.subscriptions.registered(&registration);
     let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
@@ -774,6 +825,9 @@ async fn register(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
     let mut response = registration_response(&registration, address, agent);
+    if let Some(headers) = input.passthrough_headers {
+        response["passthroughHeaders"] = json!(headers);
+    }
     if let Some(auth) = auth
         && let Value::Object(masked) = auth.masked
     {

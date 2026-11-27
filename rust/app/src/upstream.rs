@@ -18,7 +18,7 @@ use ipnet::IpNet;
 use reqwest::{
     Client, Method, Response,
     dns::{Name, Resolve, Resolving},
-    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
@@ -72,6 +72,7 @@ pub(crate) struct ToolContext<'a> {
     pub(crate) progress: Option<&'a ToolProgress>,
     pub(crate) notifications: Option<Arc<PassiveEvents>>,
     pub(crate) client_capabilities: Option<&'a ClientCapabilities>,
+    pub(crate) request_headers: Option<&'a HeaderMap>,
 }
 
 pub(crate) struct ToolProgress {
@@ -517,6 +518,7 @@ impl UpstreamClient {
                 progress: None,
                 notifications: None,
                 client_capabilities: None,
+                request_headers: None,
             },
             None,
         )

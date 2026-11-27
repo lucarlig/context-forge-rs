@@ -293,7 +293,12 @@ impl GatewayService {
             .filter(|_| gateway.available)
             .ok_or_else(|| ErrorData::internal_error("Upstream gateway unavailable", None))?;
         let credentials = self
-            .configured_auth(&gateway.id, &gateway.url, gateway.needs_upstream_auth)
+            .configured_auth(
+                &gateway.id,
+                &gateway.url,
+                gateway.needs_upstream_auth,
+                context.request_headers,
+            )
             .await
             .map_err(|_| ErrorData::internal_error("Upstream gateway unavailable", None))?;
         let endpoint = UpstreamEndpoint {

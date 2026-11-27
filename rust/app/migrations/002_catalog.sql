@@ -1,5 +1,10 @@
 -- SPDX-License-Identifier: Apache-2.0
 
+CREATE TABLE IF NOT EXISTS global_config (
+    id INTEGER PRIMARY KEY NOT NULL,
+    passthrough_headers JSON
+);
+
 CREATE TABLE IF NOT EXISTS gateways (
     id VARCHAR(36) PRIMARY KEY NOT NULL,
     name VARCHAR(255) NOT NULL,

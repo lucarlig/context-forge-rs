@@ -6,6 +6,8 @@ Set `AUTH_ENCRYPTION_SECRET` to the secret used to seal the database values. Rus
 
 Query parameter authentication additionally requires `INSECURE_ALLOW_QUERYPARAM_AUTH=true`. Set `INSECURE_QUERYPARAM_AUTH_ALLOWED_HOSTS` to limit the feature to specific hosts. The gateway validates the host during registration and invocation, and stores the configured parameter value encrypted in `auth_query_params`.
 
+Configured header forwarding and explicit upstream authorization use the same destination checks as stored credentials. [Header forwarding recordings](headers/README.md)
+
 For replay, register four public Streamable HTTP servers named `basic`, `bearer`, `headers`, and `query` in the fixture database. Each exposes an `echo` tool and prefixes its result with the gateway name. Use synthetic credentials that the upstream fixture requires and that the gateway stores using the configured encryption secret.
 
 ```sh

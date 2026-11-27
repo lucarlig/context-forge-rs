@@ -302,9 +302,6 @@ macro_rules! gateway_policy {
             non_empty_json!("g.identity_propagation"),
             "
             OR ",
-            non_empty_json!("g.passthrough_headers"),
-            "
-            OR ",
             non_empty_json!("g.add_headers"),
             "
             OR ",
@@ -558,15 +555,14 @@ const AUTH_CONFLICT_QUERY: &str = "
             OR (visibility = 'team' AND $2 = 'team' AND team_id = $3)
             OR (visibility = 'private' AND $2 = 'private' AND owner_email = $4))";
 
-const GATEWAY_AUTH_QUERY: &str = concat!(
-    "SELECT LOWER(CAST(g.auth_type AS TEXT)), CAST(g.auth_value AS TEXT), CAST(g.auth_query_params AS TEXT) FROM gateways g
+const CONNECTION_CONFIG: &str = concat!(
+    "SELECT LOWER(COALESCE(g.auth_type, '')), CAST(g.auth_value AS TEXT), CAST(g.auth_query_params AS TEXT),
+        CAST(g.passthrough_headers AS TEXT) FROM gateways g
     WHERE g.id = $1 AND g.url = $2 AND g.enabled = TRUE AND g.status = 'active'
-        AND g.gateway_mode = 'cache' AND ",
-    configured_auth!(),
-    " AND NOT ",
+        AND g.gateway_mode = 'cache' AND NOT ",
     gateway_policy!()
 );
-pub(crate) type GatewayAuthRow = (String, Option<String>, Option<String>);
+pub(crate) type GatewayConnectionRow = (String, Option<String>, Option<String>, Option<String>);
 
 macro_rules! tool_conflict_query {
     ($names:literal) => {
@@ -584,15 +580,15 @@ macro_rules! tool_conflict_query {
 }
 
 macro_rules! insert_gateway {
-    ($capabilities:literal, $tags:literal, $auth_value:literal, $auth_query:literal) => {
+    ($capabilities:literal, $tags:literal, $auth_value:literal, $auth_query:literal, $passthrough:literal) => {
         concat!(
             "INSERT INTO gateways (
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
                 updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status,
-                auth_type, auth_value, auth_query_params
+                auth_type, auth_value, auth_query_params, passthrough_headers
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, 'cache', 'active',
-                $12, ", $auth_value, ", ", $auth_query, ")"
+                $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ")"
         )
     };
 }
@@ -1080,7 +1076,7 @@ impl Database {
         gateway: &GatewayRegistration<'_>,
         tools: &[RegisteredTool<'_>],
     ) -> Result<(), RegistrationError> {
-        self.register_discovered_gateway(gateway, tools, &DiscoveredMetadata::default(), None)
+        self.register_discovered_gateway(gateway, tools, &DiscoveredMetadata::default(), None, None)
             .await
     }
 
@@ -1090,11 +1086,13 @@ impl Database {
         tools: &[RegisteredTool<'_>],
         metadata: &DiscoveredMetadata,
         auth: Option<&PreparedAuth<'_>>,
+        passthrough_headers: Option<&[String]>,
     ) -> Result<(), RegistrationError> {
         validate_registration(gateway, tools)?;
         let capabilities = gateway.capabilities.to_string();
         let tags = serde_json::to_string(gateway.tags)
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        let passthrough = passthrough_headers.map(|headers| json!(headers).to_string());
         let names: Vec<_> = tools.iter().map(|tool| tool.name).collect();
         if names.iter().copied().collect::<HashSet<_>>().len() != names.len() {
             return Err(RegistrationError::ToolNameConflict);
@@ -1158,6 +1156,7 @@ impl Database {
                     .bind(auth.map(|auth| auth.kind))
                     .bind(auth.and_then(|auth| auth.encoded_headers.as_deref()))
                     .bind(auth.and_then(|auth| auth.encoded_query.as_deref()))
+                    .bind(passthrough)
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1240,7 +1239,13 @@ impl Database {
                 register!(
                     transaction,
                     tool_conflict_query!("SELECT value FROM json_each($1)"),
-                    insert_gateway!("json($6)", "json($7)", "json($13)", "json($14)"),
+                    insert_gateway!(
+                        "json($6)",
+                        "json($7)",
+                        "json($13)",
+                        "json($14)",
+                        "json($15)"
+                    ),
                     insert_tool!("json($8)", "json($9)", "json($10)"),
                     "json($7)"
                 );
@@ -1255,7 +1260,8 @@ impl Database {
                         "CAST($6 AS JSON)",
                         "CAST($7 AS JSON)",
                         "CAST($13 AS JSON)",
-                        "CAST($14 AS JSON)"
+                        "CAST($14 AS JSON)",
+                        "CAST($15 AS JSON)"
                     ),
                     insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)"),
                     "CAST($7 AS JSON)"
@@ -1265,14 +1271,14 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn gateway_auth(
+    pub(crate) async fn gateway_connection(
         &self,
         id: &str,
         url: &str,
-    ) -> Result<Option<GatewayAuthRow>, sqlx::Error> {
+    ) -> Result<Option<GatewayConnectionRow>, sqlx::Error> {
         macro_rules! fetch {
             ($pool:expr) => {
-                sqlx::query_as::<_, GatewayAuthRow>(GATEWAY_AUTH_QUERY)
+                sqlx::query_as::<_, GatewayConnectionRow>(CONNECTION_CONFIG)
                     .bind(id)
                     .bind(url)
                     .fetch_optional($pool)
@@ -1283,6 +1289,24 @@ impl Database {
             Self::Sqlite(pool) => fetch!(pool),
             Self::Postgres(pool) => fetch!(pool),
         }
+    }
+
+    pub(crate) async fn global_passthrough_headers(&self) -> Result<Option<String>, sqlx::Error> {
+        const QUERY: &str =
+            "SELECT CAST(passthrough_headers AS TEXT) FROM global_config ORDER BY id LIMIT 1";
+        let headers = match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar::<_, Option<String>>(QUERY)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar::<_, Option<String>>(QUERY)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        Ok(headers.flatten())
     }
 }
 
@@ -1723,12 +1747,10 @@ mod tests {
                 "annotations": {}
             })
         );
-        sqlx::query(
-            "UPDATE gateways SET passthrough_headers = '[\"Authorization\"]' WHERE id = 'fort'",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE gateways SET remove_headers = '[\"Authorization\"]' WHERE id = 'fort'")
+            .execute(pool)
+            .await
+            .unwrap();
         assert!(
             database
                 .find_mcp_tool(member, Some("fort-server"), "fort-echo")

@@ -30,7 +30,11 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use crate::{mcp::MAX_REQUEST_BODY_BYTES, redis_sessions::RedisSessionDirectory};
+use crate::{
+    forward_headers::{hop_header_name, nominated_hop_header},
+    mcp::MAX_REQUEST_BODY_BYTES,
+    redis_sessions::RedisSessionDirectory,
+};
 
 const HEADERS: u8 = 1;
 const DATA: u8 = 2;
@@ -38,13 +42,18 @@ const END: u8 = 3;
 const MAX_CHUNK: usize = 64 * 1024;
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ACTIVE_FORWARDS: usize = 8192;
-const FORWARDED_HEADERS: &[&str] = &[
+fn forwardable_header(name: &str) -> bool {
+    !hop_header_name(name) && !matches!(name, "host" | "content-length" | "expect")
+}
+
+const CORE_HEADERS: &[&str] = &[
     "accept",
     "authorization",
     "content-type",
     "last-event-id",
     "mcp-protocol-version",
     "mcp-session-id",
+    "x-upstream-authorization",
 ];
 
 #[derive(Clone)]
@@ -99,7 +108,7 @@ impl WireRequest {
             .ok()?;
         for (name, value) in self.headers {
             let name = HeaderName::try_from(name).ok()?;
-            if !FORWARDED_HEADERS.contains(&name.as_str()) {
+            if !forwardable_header(name.as_str()) {
                 return None;
             }
             request
@@ -162,8 +171,9 @@ pub(crate) async fn forward(
     worker: Uuid,
     request: Request,
     wait: Duration,
+    client_headers: bool,
 ) -> Response {
-    match exchange(directory, worker, request, wait).await {
+    match exchange(directory, worker, request, wait, client_headers).await {
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(%error, "MCP affinity forwarding failed");
@@ -180,6 +190,7 @@ async fn exchange(
     worker: Uuid,
     request: Request,
     wait: Duration,
+    client_headers: bool,
 ) -> io::Result<Response> {
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
@@ -196,7 +207,10 @@ async fn exchange(
             .iter()
             .filter_map(|(name, value)| {
                 let header = name.as_str();
-                if !FORWARDED_HEADERS.contains(&header) {
+                if (!client_headers && !CORE_HEADERS.contains(&header))
+                    || !forwardable_header(header)
+                    || nominated_hop_header(&parts.headers, header)
+                {
                     return None;
                 }
                 Some((header.to_owned(), value.to_str().ok()?.to_owned()))

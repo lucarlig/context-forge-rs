@@ -8,6 +8,7 @@ pub mod config;
 mod credentials;
 pub mod database;
 mod events;
+mod forward_headers;
 pub mod gateway;
 mod identity;
 pub mod jwt;

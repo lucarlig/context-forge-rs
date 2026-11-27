@@ -482,6 +482,7 @@ impl ServerHandler for GatewayHandler {
                 progress: relay.as_ref(),
                 notifications: None,
                 client_capabilities: Some(&capabilities),
+                request_headers: Some(&parts.headers),
             },
             None,
         );
@@ -523,6 +524,7 @@ impl ServerHandler for GatewayHandler {
                 progress: relay.as_ref(),
                 notifications: None,
                 client_capabilities: Some(&capabilities),
+                request_headers: Some(&parts.headers),
             },
             None,
         );
@@ -567,6 +569,7 @@ impl ServerHandler for GatewayHandler {
                 progress: relay.as_ref(),
                 notifications: None,
                 client_capabilities: Some(&capabilities),
+                request_headers: Some(&parts.headers),
             },
             None,
         );
@@ -604,6 +607,7 @@ impl ServerHandler for GatewayHandler {
                 progress: relay.as_ref(),
                 notifications: None,
                 client_capabilities: Some(&capabilities),
+                request_headers: Some(&parts.headers),
             },
             None,
         );
