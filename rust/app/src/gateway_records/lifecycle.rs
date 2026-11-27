@@ -30,6 +30,34 @@ macro_rules! due_gateways {
 const CLAIMED_GATEWAY: &str = concat!(gateway_select!(), " WHERE g.id = $1");
 
 impl Database {
+    pub(crate) async fn finish_deferred_gateway(
+        &self,
+        record: &GatewayRecord,
+    ) -> Result<bool, sqlx::Error> {
+        let now = Timestamp::now().to_string();
+        macro_rules! finish {
+            ($tx:ident, $lock:literal, $date:literal) => {{
+                if lock_gateway!($tx, record, $lock).is_none() {
+                    return Ok(false);
+                }
+                finish_gateway_initialization!($tx, record, &now, $date);
+                $tx.commit().await?;
+                Ok(true)
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                finish!(tx, "", "$3")
+            }
+            Self::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                finish!(tx, " FOR UPDATE", "CAST(CAST($3 AS TEXT) AS TIMESTAMPTZ)")
+            }
+        }
+    }
+
     pub(crate) async fn queue_gateway_deletion(
         &self,
         expected: &GatewayRecord,

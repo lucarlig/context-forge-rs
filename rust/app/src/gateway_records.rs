@@ -254,6 +254,21 @@ macro_rules! write_gateway_health {
     }};
 }
 
+macro_rules! finish_gateway_initialization {
+    ($tx:ident, $gateway:ident, $now:expr, $date:literal) => {{
+        sqlx::query(concat!("UPDATE gateways SET status = $2, status_message = NULL,
+            reachable = TRUE, registration_attempts = 0, next_retry_at = NULL, last_error = NULL,
+            lifecycle_claimed_by = NULL, lifecycle_claimed_at = NULL, lifecycle_claim_expires_at = NULL,
+            last_seen = ", $date, ", updated_at = ", $date, " WHERE id = $1"))
+            .bind(&$gateway.id).bind("active").bind($now).execute(&mut *$tx).await?;
+        if $gateway.enabled {
+            write_gateway_health!($tx, &$gateway.id, true, $now, None::<&str>, $date);
+        } else {
+            set_gateway_state!($tx, &$gateway.id, false, $now, $date);
+        }
+    }};
+}
+
 macro_rules! delete_catalog_rows {
     ($transaction:ident, $value:expr, $table_exists:literal, $optional:expr, $required:expr) => {{
         for (table, statement) in $optional {

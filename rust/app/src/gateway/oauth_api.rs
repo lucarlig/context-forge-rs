@@ -2,10 +2,13 @@
 
 mod flow;
 mod storage;
+mod token_access;
+
+pub(super) use token_access::{TokenTarget, authorization_header};
 
 use std::collections::BTreeSet;
 
-use axum::extract::{OriginalUri, Path};
+use axum::extract::{OriginalUri, Path, Query};
 use jiff::Timestamp;
 use serde_json::Map;
 
@@ -40,11 +43,54 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
         .route("/oauth/status", get(status_batch))
         .route("/oauth/status/{id}", get(status))
         .route("/oauth/authorize/{id}", get(flow::authorize))
-        .route("/oauth/token/{id}", get(flow::token))
+        .route("/oauth/token/{id}", get(token_access::token))
+        .route("/oauth/fetch-tools/{id}", post(fetch_tools))
 }
 
 pub(super) fn callback_router() -> Router<Arc<GatewayService>> {
     Router::new().route("/oauth/callback", get(flow::callback))
+}
+
+async fn fetch_tools(
+    State(service): State<Arc<GatewayService>>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    match visible_gateway(&service, &principal, &id).await {
+        Ok(gateway) if gateway.oauth_config.is_some() => {}
+        Ok(_) => {
+            return CatalogApiError::detail(StatusCode::BAD_REQUEST, "Failed to fetch tools")
+                .into_response();
+        }
+        Err(error) => return error.into_response(),
+    }
+    let response = super::management::refresh(
+        State(service.clone()),
+        Extension(principal),
+        Path(id.clone()),
+        Query(super::management::RefreshParameters::default()),
+        headers,
+    )
+    .await;
+    match response {
+        Ok(Json(value)) if value["success"] == true => {
+            let count = match service.database.gateway_records(&id).await {
+                Ok(rows) => match rows.into_iter().find(|row| row.id == id) {
+                    Some(row) => row.tool_count,
+                    None => {
+                        return CatalogApiError::detail(StatusCode::NOT_FOUND, "Gateway not found")
+                            .into_response();
+                    }
+                },
+                Err(error) => return CatalogApiError::from(error).into_response(),
+            };
+            Json(json!({"success":true,"message":format!("Successfully fetched and created {count} tools")})).into_response()
+        }
+        Ok(_) => CatalogApiError::detail(StatusCode::BAD_REQUEST, "Failed to fetch tools")
+            .into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn status(
@@ -212,4 +258,17 @@ fn unknown_token() -> Value {
 fn parse_time(text: &str) -> Option<Timestamp> {
     let iso = text.replacen(' ', "T", 1);
     iso.parse().or_else(|_| format!("{iso}Z").parse()).ok()
+}
+
+pub(super) fn requires_user(encoded: &str) -> bool {
+    serde_json::from_str::<Value>(encoded)
+        .ok()
+        .is_some_and(|value| value["grant_type"] == "authorization_code")
+}
+
+fn resource_origin(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.origin().ascii_serialization())
 }

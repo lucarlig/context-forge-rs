@@ -657,7 +657,7 @@ impl GatewayService {
             .transport
             .filter(|_| gateway.available)
             .ok_or(ToolError::Unavailable)?;
-        let credentials = self
+        let credentials = match self
             .configured_upstream(
                 &gateway.id,
                 &gateway.url,
@@ -665,7 +665,24 @@ impl GatewayService {
                 context.request_headers,
                 principal,
             )
-            .await?;
+            .await
+        {
+            Ok(credentials) => credentials,
+            Err(ToolError::OAuthRequired(_)) => {
+                let name = self
+                    .database
+                    .gateway_records(&gateway.id)
+                    .await?
+                    .into_iter()
+                    .find(|record| record.id == gateway.id)
+                    .map_or_else(|| gateway.id.clone(), |record| record.name);
+                return tool_result_error(format!(
+                    "Tool invocation failed: Please authorize {name} first. Visit /oauth/authorize/{} to complete OAuth flow.",
+                    gateway.id
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let endpoint = UpstreamEndpoint {
             url: &gateway.url,
             transport,
@@ -723,8 +740,64 @@ impl GatewayService {
             .gateway_connection(id, url, false, None, None)
             .await?
             .ok_or(ToolError::Unavailable)?;
+        if principal.is_none()
+            && connection.kind == "oauth"
+            && connection
+                .oauth
+                .as_deref()
+                .is_some_and(oauth_api::requires_user)
+        {
+            return Err(ToolError::OAuthRequired(id.to_owned()));
+        }
         self.connection_credentials(id, url, connection, incoming, principal)
             .await
+    }
+
+    async fn oauth_connection_tls(
+        &self,
+        id: &str,
+        url: &str,
+        version: i32,
+    ) -> Result<Option<TlsMaterial>, ToolError> {
+        let connection = self
+            .database
+            .gateway_connection(id, url, true, Some(version), None)
+            .await?
+            .ok_or(ToolError::Unavailable)?;
+        self.connection_tls(&connection).await
+    }
+
+    async fn connection_tls(
+        &self,
+        connection: &GatewayConnectionRow,
+    ) -> Result<Option<TlsMaterial>, ToolError> {
+        let key = match connection
+            .client_key
+            .as_ref()
+            .filter(|key| !key.trim().is_empty())
+        {
+            Some(key) if key.trim_start().starts_with("-----BEGIN ") => {
+                Some(Zeroizing::new(key.clone()))
+            }
+            Some(key) => Some(
+                self.vault
+                    .as_ref()
+                    .ok_or(ToolError::Unavailable)?
+                    .open(key.clone())
+                    .await
+                    .map_err(|_| ToolError::Unavailable)?,
+            ),
+            None => None,
+        };
+        TlsMaterial::from_pem(
+            connection.ca_certificate.as_deref(),
+            connection
+                .client_cert
+                .as_deref()
+                .filter(|cert| !cert.trim().is_empty()),
+            key.as_ref().map(|key| key.as_str()),
+        )
+        .map_err(|_| ToolError::Unavailable)
     }
 
     async fn connection_credentials(
@@ -776,27 +849,7 @@ impl GatewayService {
             tracing::warn!(gateway = %id, "could not load upstream authentication");
             ToolError::Unavailable
         })?;
-        let client_key = match connection.client_key.filter(|key| !key.trim().is_empty()) {
-            Some(key) if key.trim_start().starts_with("-----BEGIN ") => Some(Zeroizing::new(key)),
-            Some(key) => Some(
-                self.vault
-                    .as_ref()
-                    .ok_or(ToolError::Unavailable)?
-                    .open(key)
-                    .await
-                    .map_err(|_| ToolError::Unavailable)?,
-            ),
-            None => None,
-        };
-        credentials.tls = TlsMaterial::from_pem(
-            connection.ca_certificate.as_deref(),
-            connection
-                .client_cert
-                .as_deref()
-                .filter(|cert| !cert.trim().is_empty()),
-            client_key.as_ref().map(|key| key.as_str()),
-        )
-        .map_err(|_| {
+        credentials.tls = self.connection_tls(&connection).await.map_err(|_| {
             tracing::warn!(gateway = %id, "could not load upstream TLS material");
             ToolError::Unavailable
         })?;
@@ -807,16 +860,30 @@ impl GatewayService {
             )
             .await
             .map_err(|_| ToolError::Unavailable)?;
-            let authorization = config
-                .authorization(&self.upstream, credentials.tls.as_ref())
-                .await
-                .map_err(|error| {
+            let authorization = if config.is_authorization_code() {
+                if let Some(principal) = principal {
+                    let target = oauth_api::TokenTarget {
+                        gateway_id: id,
+                        gateway_url: url,
+                        version: connection.version,
+                        tls: credentials.tls.as_ref(),
+                        config: &config,
+                    };
+                    Some(oauth_api::authorization_header(self, target, &principal.email).await?)
+                } else {
+                    None
+                }
+            } else {
+                Some(config.authorization(&self.upstream, credentials.tls.as_ref()).await.map_err(|error| {
                     tracing::warn!(gateway = %id, %error, "could not obtain upstream OAuth token");
                     ToolError::Unavailable
-                })?;
-            credentials
-                .headers
-                .insert(header::AUTHORIZATION, authorization);
+                })?)
+            };
+            if let Some(authorization) = authorization {
+                credentials
+                    .headers
+                    .insert(header::AUTHORIZATION, authorization);
+            }
         }
         if let Some(incoming) = incoming {
             let managed = matches!(kind, "basic" | "bearer" | "authheaders" | "sigv4" | "oauth");
@@ -941,6 +1008,8 @@ pub(crate) enum ToolError {
     NotFound,
     #[error("Tool service unavailable")]
     Unavailable,
+    #[error("OAuth authorization required. Visit /oauth/authorize/{0} to complete the flow.")]
+    OAuthRequired(String),
     #[error("Request cancelled")]
     Cancelled,
     #[error("Invalid cursor")]

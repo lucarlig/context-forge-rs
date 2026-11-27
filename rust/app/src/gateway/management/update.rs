@@ -540,6 +540,14 @@ async fn discover_updated_gateway(
         return Ok(None);
     };
     let oauth = connection.kind == "oauth";
+    if oauth
+        && connection
+            .oauth
+            .as_deref()
+            .is_some_and(oauth_api::requires_user)
+    {
+        return Ok(None);
+    }
     let Ok(credentials) = service
         .connection_credentials(&gateway.id, &gateway.url, connection, None, None)
         .await

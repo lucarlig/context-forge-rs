@@ -17,3 +17,14 @@ and replay of a consumed state. Token retrieval remained scoped to the
 authorizing user and refreshed the token near expiry. The database stored
 encrypted access and refresh tokens. A native SQLite run also retrieved a
 token written by the pinned gateway.
+
+`POST /oauth/fetch-tools/{id}` discovered a protected tool with the caller's
+access token. The MCP tool call and the authorization prompt for another
+caller matched the pinned gateway on SQLite and PostgreSQL. The second
+caller did not reach the upstream provider. Two workers sharing either
+database performed one provider refresh for concurrent token requests.
+
+Queued registration deferred discovery until a user authorized. A queued
+description edit preserved the catalog and the existing grant. Changing
+the upstream destination or OAuth configuration invalidates stored user
+grants and pending authorization states.

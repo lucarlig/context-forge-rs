@@ -6,10 +6,10 @@ use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 
 use super::{
-    storage::{NewOAuthState, OAuthGateway, OAuthTokenWrite, StoredOAuthToken},
+    storage::{NewOAuthState, OAuthGateway},
     *,
 };
-use crate::{oauth_client::UserOAuthTokens, tokens::hash_token};
+use crate::tokens::hash_token;
 
 #[derive(Deserialize)]
 pub(super) struct AuthorizeQuery {
@@ -49,7 +49,7 @@ pub(super) async fn authorize(
     let redirect = config
         .redirect_uri()
         .unwrap_or(&service.gateway_oauth.redirect_uri);
-    let parsed = valid_redirect(redirect).ok_or_else(|| {
+    valid_redirect(redirect).ok_or_else(|| {
         CatalogApiError::detail(StatusCode::BAD_REQUEST, "OAuth callback URL is invalid")
     })?;
     let origin = gateway.resource_origin();
@@ -67,16 +67,17 @@ pub(super) async fn authorize(
                 "OAuth endpoints are invalid or disallowed",
             )
         })?;
-    let cookie_path = callback_path(&service.gateway_oauth, Some(&parsed));
+    let cookie_path = &service.gateway_oauth.callback_path;
     let hash = hash_token(&binding);
     let team_id = match &principal.visibility {
         TeamVisibility::Teams(teams) if teams.len() == 1 => teams.first().map(String::as_str),
         _ => None,
     };
-    service
+    let saved = service
         .database
         .put_oauth_state(NewOAuthState {
             gateway_id: &gateway.id,
+            gateway_version: gateway.version,
             state: &state,
             verifier: &verifier,
             email: &principal.email,
@@ -85,6 +86,12 @@ pub(super) async fn authorize(
             browser_binding_hash: &hash,
         })
         .await?;
+    if !saved {
+        return Err(CatalogApiError::detail(
+            StatusCode::CONFLICT,
+            "Gateway changed during authorization",
+        ));
+    }
     let cookie = transaction_cookie(&service.gateway_oauth, &state, &binding, cookie_path, 300)
         .ok_or_else(CatalogApiError::unavailable)?;
     let location =
@@ -201,6 +208,7 @@ async fn callback_inner(
         .await
         .map_err(|_| CallbackFailure::Storage)?
         .pop()
+        .filter(|gateway| gateway.version == transaction.gateway_version)
         .ok_or(CallbackFailure::InvalidState)?;
     let config = code_config(service, &gateway)
         .await
@@ -247,10 +255,14 @@ async fn callback_inner(
         .or(config.redirect_uri())
         .unwrap_or(&service.gateway_oauth.redirect_uri);
     let origin = gateway.resource_origin();
+    let tls = service
+        .oauth_connection_tls(&gateway.id, &gateway.url, gateway.version)
+        .await
+        .map_err(|_| CallbackFailure::Storage)?;
     let token = config
         .exchange_user_code(
             &service.upstream,
-            None,
+            tls.as_ref(),
             code,
             &verifier,
             redirect,
@@ -258,111 +270,23 @@ async fn callback_inner(
         )
         .await
         .map_err(|_| CallbackFailure::Exchange)?;
-    write_user_token(service, &gateway.id, &email, &token, false)
-        .await
-        .map_err(|_| CallbackFailure::Storage)?;
+    let saved = super::token_access::write_user_token(
+        service,
+        &gateway.id,
+        gateway.version,
+        &email,
+        &token,
+        None,
+    )
+    .await
+    .map_err(|_| CallbackFailure::Storage)?;
+    if !saved {
+        return Err(CallbackFailure::InvalidState);
+    }
     Ok(gateway)
 }
 
-pub(super) async fn token(
-    State(service): State<Arc<GatewayService>>,
-    Extension(principal): Extension<Principal>,
-    Path(id): Path<String>,
-) -> Result<Response, CatalogApiError> {
-    if !service.gateway_oauth.token_retrieval {
-        return Err(CatalogApiError::detail(StatusCode::NOT_FOUND, "Not Found"));
-    }
-    if !service
-        .access
-        .allows(
-            &principal,
-            "gateways.token_read",
-            RoleContext::AnyTeam,
-            true,
-        )
-        .await?
-    {
-        return Err(CatalogApiError::detail(
-            StatusCode::FORBIDDEN,
-            "Access denied",
-        ));
-    }
-    let gateway = visible_gateway(&service, &principal, &id).await?;
-    let config = code_config(&service, &gateway).await?;
-    let stored=service.database.user_oauth_token(&id,&principal.email).await?
-        .ok_or_else(||CatalogApiError::detail(StatusCode::NOT_FOUND,
-            "No OAuth token found for this gateway and user. Complete the OAuth flow at /oauth/authorize/{gateway_id} first."))?;
-    let body = token_payload(&service, &gateway, &config, &principal.email, stored).await?;
-    Ok((
-        [
-            (header::CACHE_CONTROL, "no-store"),
-            (header::PRAGMA, "no-cache"),
-        ],
-        Json(body),
-    )
-        .into_response())
-}
-
-async fn token_payload(
-    service: &GatewayService,
-    gateway: &OAuthGateway,
-    config: &OAuthConfig,
-    email: &str,
-    stored: StoredOAuthToken,
-) -> Result<Value, CatalogApiError> {
-    let now = Timestamp::now();
-    let expiry = stored.expires_at.as_deref().and_then(parse_time);
-    let expired = expiry.is_some_and(|expiry| expiry <= now);
-    if stored
-        .token_type
-        .as_deref()
-        .is_some_and(|ty| !ty.eq_ignore_ascii_case("bearer"))
-    {
-        return Err(reauthorize());
-    }
-    let scopes = stored
-        .scopes
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<Value>(value).ok());
-    if let Some(refresh) = stored.refresh_token
-        && expiry.is_some_and(|expiry| {
-            expiry.as_second() - now.as_second() <= service.gateway_oauth.refresh_threshold
-        })
-    {
-        let clear = open_token(service, refresh).await?;
-        let origin = gateway.resource_origin();
-        match config
-            .refresh_user_token(&service.upstream, None, &clear, origin.as_deref())
-            .await
-        {
-            Ok(new) => {
-                write_user_token(service, &gateway.id, email, &new, true).await?;
-                return Ok(
-                    json!({"gateway_id":gateway.id,"access_token":new.access_token.as_str(),"token_type":"Bearer",
-                    "expires_at":new.expires_at.map(|value|value.to_string()),"scopes":new.scopes.as_ref().map(|scopes|json!(scopes)).or(scopes)}),
-                );
-            }
-            Err(UpstreamError::Status(400 | 401)) => return Err(reauthorize()),
-            Err(_) if expired => {
-                return Err(CatalogApiError::detail(
-                    StatusCode::BAD_GATEWAY,
-                    "OAuth provider could not refresh the access token",
-                ));
-            }
-            Err(_) => {}
-        }
-    }
-    if expired {
-        return Err(reauthorize());
-    }
-    let access = open_token(service, stored.access_token).await?;
-    Ok(
-        json!({"gateway_id":gateway.id,"access_token":access.as_str(),"token_type":"Bearer",
-        "expires_at":stored.expires_at.map(|value|value.replacen(' ',"T",1)),"scopes":scopes}),
-    )
-}
-
-async fn code_config(
+pub(super) async fn code_config(
     service: &GatewayService,
     gateway: &OAuthGateway,
 ) -> Result<OAuthConfig, CatalogApiError> {
@@ -398,78 +322,6 @@ async fn code_config(
         .map_err(|_| CatalogApiError::unavailable())
 }
 
-async fn write_user_token(
-    service: &GatewayService,
-    gateway: &str,
-    email: &str,
-    tokens: &UserOAuthTokens,
-    preserve_refresh: bool,
-) -> Result<(), CatalogApiError> {
-    let vault = service
-        .vault
-        .as_ref()
-        .ok_or_else(CatalogApiError::unavailable)?;
-    let access = vault
-        .seal(tokens.access_token.clone())
-        .await
-        .map_err(|_| CatalogApiError::unavailable())?;
-    let refresh = if let Some(refresh) = tokens.refresh_token.as_ref() {
-        Some(
-            vault
-                .seal(refresh.clone())
-                .await
-                .map_err(|_| CatalogApiError::unavailable())?,
-        )
-    } else {
-        None
-    };
-    if !service
-        .database
-        .write_oauth_tokens(OAuthTokenWrite {
-            gateway_id: gateway,
-            email,
-            subject: &tokens.subject,
-            access_token: &access,
-            refresh_token: refresh.as_deref(),
-            expires_at: tokens.expires_at,
-            scopes: tokens.scopes.as_deref(),
-            learned_aud: tokens.learned_aud.as_ref(),
-            learned_iss: tokens.learned_iss.as_deref(),
-            preserve_refresh,
-        })
-        .await?
-    {
-        return Err(CatalogApiError::detail(
-            StatusCode::FORBIDDEN,
-            "User authentication required",
-        ));
-    }
-    Ok(())
-}
-
-async fn open_token(
-    service: &GatewayService,
-    encrypted: String,
-) -> Result<Zeroizing<String>, CatalogApiError> {
-    let vault = service
-        .vault
-        .as_ref()
-        .ok_or_else(CatalogApiError::unavailable)?;
-    vault.open(encrypted).await.map_err(|_| {
-        CatalogApiError::detail(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Stored OAuth token is unreadable",
-        )
-    })
-}
-
-fn reauthorize() -> CatalogApiError {
-    CatalogApiError::detail(
-        StatusCode::CONFLICT,
-        "OAuth reauthorization required for this gateway and user",
-    )
-}
-
 fn random_secret<const N: usize>() -> Option<String> {
     let mut random = Zeroizing::new([0_u8; N]);
     SystemRandom::new().fill(random.as_mut()).ok()?;
@@ -484,13 +336,6 @@ fn valid_redirect(url: &str) -> Option<url::Url> {
             && url.password().is_none()
             && url.fragment().is_none()
     })
-}
-
-fn callback_path<'a>(
-    settings: &'a GatewayOAuthSettings,
-    redirect: Option<&'a url::Url>,
-) -> &'a str {
-    redirect.map_or(settings.callback_path.as_str(), url::Url::path)
 }
 
 fn cookie_name(state: &str) -> String {

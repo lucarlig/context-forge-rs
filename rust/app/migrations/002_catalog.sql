@@ -292,3 +292,13 @@ CREATE TABLE IF NOT EXISTS oauth_states (
 
 CREATE INDEX IF NOT EXISTS idx_oauth_state_lookup ON oauth_states(gateway_id,state);
 CREATE INDEX IF NOT EXISTS idx_oauth_states_expiry ON oauth_states(expires_at);
+
+CREATE TABLE IF NOT EXISTS cf_oauth_refresh_claims (
+    gateway_id VARCHAR(36) NOT NULL,
+    app_user_email VARCHAR(255) NOT NULL,
+    claim VARCHAR(36) NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (gateway_id,app_user_email),
+    FOREIGN KEY (gateway_id,app_user_email)
+        REFERENCES oauth_tokens(gateway_id,app_user_email) ON DELETE CASCADE
+);

@@ -1537,6 +1537,9 @@ fn tool_error(id: &Value, error: ToolError) -> Response {
         ToolError::NotFound => (0, "Unknown tool"),
         ToolError::Cursor => (INVALID_PARAMS, "Invalid cursor"),
         ToolError::Unavailable => (0, "Tool service unavailable"),
+        error @ ToolError::OAuthRequired(_) => {
+            return rpc_error(StatusCode::OK, id, 0, &error.to_string(), None::<()>);
+        }
         ToolError::Cancelled => (REQUEST_CANCELLED, "Request cancelled"),
         ToolError::Database(error) => {
             tracing::error!(%error, "MCP tool database operation failed");

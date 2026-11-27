@@ -25,7 +25,7 @@ pub(super) use update::update;
 
 const MASKED: &str = "*****";
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub(super) struct RefreshParameters {
     include_resources: Option<String>,
     include_prompts: Option<String>,

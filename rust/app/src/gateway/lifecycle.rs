@@ -130,6 +130,13 @@ impl GatewayService {
         &self,
         record: &GatewayRecord,
     ) -> Result<bool, LifecycleError> {
+        if record
+            .oauth_config
+            .as_deref()
+            .is_some_and(oauth_api::requires_user)
+        {
+            return Ok(self.database.finish_deferred_gateway(record).await?);
+        }
         let transport = UpstreamTransport::from_name(&record.transport)
             .ok_or(RegistrationError::Invalid("Unsupported gateway transport"))?;
         let connection = self

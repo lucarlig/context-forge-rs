@@ -160,8 +160,13 @@ impl GatewayService {
             }
         };
         let recovering = record.enabled && !record.reachable;
+        let user_oauth = record
+            .oauth_config
+            .as_deref()
+            .is_some_and(oauth_api::requires_user);
         let should_refresh = record.enabled
             && authenticated
+            && !user_oauth
             && (recovering || settings.auto_refresh && self.auto_refresh_due(record));
         let endpoint = UpstreamEndpoint {
             url: &record.url,

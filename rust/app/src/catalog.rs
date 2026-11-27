@@ -695,7 +695,7 @@ const CONNECTION_CONFIG: &str = concat!(
         CAST(g.auth_query_params AS TEXT) AS query, CAST(g.sigv4_config AS TEXT) AS sigv4,
         CAST(g.oauth_config AS TEXT) AS oauth,
         CAST(g.passthrough_headers AS TEXT) AS passthrough, CAST(g.identity_propagation AS TEXT) AS identity,
-        g.ca_certificate, g.client_cert, g.client_key FROM gateways g
+        g.ca_certificate, g.client_cert, g.client_key, g.version FROM gateways g
     WHERE g.id = $1 AND g.url = $2 AND (g.enabled = TRUE OR $3)
         AND (g.status = 'active' OR (g.status = 'pending' AND g.lifecycle_claimed_by = $5))
         AND (CAST($4 AS INTEGER) IS NULL OR g.version = $4)
@@ -722,6 +722,7 @@ type DirectGatewayRow = (
 #[derive(sqlx::FromRow)]
 pub(crate) struct GatewayConnectionRow {
     pub(crate) kind: String,
+    pub(crate) version: i32,
     pub(crate) headers: Option<String>,
     pub(crate) query: Option<String>,
     pub(crate) sigv4: Option<String>,

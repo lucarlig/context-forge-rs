@@ -317,6 +317,17 @@ macro_rules! apply_gateway_metadata {
             .bind($client_key.is_some()).bind($client_key.flatten())
             .bind(&$after.status)
             .execute(&mut *$tx).await?;
+        if ($after.url != $before.url || $after.auth_type != $before.auth_type
+            || $after.oauth_config != $before.oauth_config)
+            && ($after.oauth_config.is_some() || $before.oauth_config.is_some())
+        {
+            for statement in [
+                "DELETE FROM oauth_states WHERE gateway_id = $1",
+                "DELETE FROM oauth_tokens WHERE gateway_id = $1",
+            ] {
+                sqlx::query(statement).bind(&$after.id).execute(&mut *$tx).await?;
+            }
+        }
         if renamed {
             for statement in RENAMED_CATALOG_ITEMS {
                 sqlx::query(*statement).bind(&$after.id).bind(&$after.slug).bind(&$before.slug)
@@ -558,19 +569,8 @@ impl Database {
                         write_gateway_health!($transaction, &gateway.id, true, &now, None::<&str>, $now),
                     CatalogRefreshCompletion::Refresh if updating =>
                         write_gateway_health!($transaction, &gateway.id, true, &now, None::<&str>, $now),
-                    CatalogRefreshCompletion::Initialize => {
-                        sqlx::query("UPDATE gateways SET status = 'active', status_message = NULL,
-                            reachable = TRUE, registration_attempts = 0, next_retry_at = NULL, last_error = NULL,
-                            lifecycle_claimed_by = NULL, lifecycle_claimed_at = NULL, lifecycle_claim_expires_at = NULL
-                            WHERE id = $1")
-                            .bind(&gateway.id).execute(&mut *$transaction).await?;
-                        if gateway.enabled {
-                            write_gateway_health!($transaction, &gateway.id, true, &now, None::<&str>, $now);
-                        } else {
-                            // An update can finish while the gateway is administratively disabled.
-                            set_gateway_state!($transaction, &gateway.id, false, &now, $now);
-                        }
-                    }
+                    CatalogRefreshCompletion::Initialize =>
+                        finish_gateway_initialization!($transaction, gateway, &now, $now),
                     CatalogRefreshCompletion::Refresh => {}
                 }
                 $transaction.commit().await?;
