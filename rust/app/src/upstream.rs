@@ -23,12 +23,12 @@ use reqwest::{
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
     ClientCapabilities, ClientJsonRpcMessage, ClientRequest, ClientResult, DiscoverRequest,
-    DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetExtensions, GetMeta,
-    Implementation, InitializeRequest, InitializeRequestParams, InitializedNotification,
-    JsonRpcMessage, JsonRpcRequest, ListPromptsRequest, ListResourceTemplatesRequest,
-    ListResourcesRequest, ListToolsRequest, PaginatedRequestParams, ProgressNotificationParam,
-    ProgressToken, Prompt, ProtocolVersion, RequestId, RequestMetaObject, Resource,
-    ResourceTemplate, ServerJsonRpcMessage, ServerNotification, ServerRequest, SubscriptionFilter,
+    DiscoverRequestParams, DiscoverResult, ErrorCode, ErrorData, GetMeta, Implementation,
+    InitializeRequest, InitializeRequestParams, InitializedNotification, JsonRpcMessage,
+    JsonRpcRequest, ListPromptsRequest, ListResourceTemplatesRequest, ListResourcesRequest,
+    ListToolsRequest, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt,
+    ProtocolVersion, RequestId, RequestMetaObject, Resource, ResourceTemplate,
+    ServerJsonRpcMessage, ServerNotification, ServerRequest, SubscriptionFilter,
     SubscriptionsListenRequest, SubscriptionsListenRequestParams,
 };
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -310,7 +310,9 @@ impl<'a> UpstreamEndpoint<'a> {
     }
 
     pub(crate) fn credential_fingerprint(self) -> Option<[u8; 32]> {
-        let credentials = self.credentials?;
+        let credentials = self.credentials.filter(|credentials| {
+            !credentials.headers.is_empty() || !credentials.query.is_empty()
+        })?;
         let mut entries: Vec<_> = credentials.headers.iter().collect();
         entries.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
         let mut hash = Sha256::new();
@@ -546,13 +548,21 @@ impl UpstreamClient {
     pub(crate) async fn request_with_context(
         &self,
         endpoint: UpstreamEndpoint<'_>,
-        request: ClientRequest,
+        mut request: ClientRequest,
         context: ToolContext<'_>,
         association: Option<&UpstreamAssociation>,
     ) -> Result<Value, UpstreamError> {
         let cancellation = context.cancellation;
         if cancellation.is_cancelled() {
             return Err(UpstreamError::Cancelled);
+        }
+        if let Some(identity) = endpoint
+            .credentials
+            .and_then(|credentials| credentials.identity_meta.as_ref())
+        {
+            request
+                .get_meta_mut()
+                .insert("user".into(), identity.clone());
         }
         let deadline = self.deadline()?;
         let _operation = if let Some(association) = association {
@@ -1102,13 +1112,12 @@ impl Session {
         client_capabilities: Option<&ClientCapabilities>,
     ) -> Result<Response, UpstreamError> {
         if let Some(version) = version.filter(|version| !version.has_initialize()) {
-            request
-                .extensions_mut()
-                .insert(RequestMetaObject::with_client_context(
-                    version.clone(),
-                    client_info(),
-                    client_capabilities.cloned().unwrap_or_default(),
-                ));
+            let client = RequestMetaObject::with_client_context(
+                version.clone(),
+                client_info(),
+                client_capabilities.cloned().unwrap_or_default(),
+            );
+            request.get_meta_mut().extend(client);
         }
         if report_progress {
             request

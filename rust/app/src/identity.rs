@@ -9,12 +9,13 @@ const ACTIVE_MEMBERSHIPS: &str = "
     JOIN email_teams t ON t.id = m.team_id AND t.is_active = TRUE
     WHERE m.user_email = $1 AND m.is_active = TRUE ORDER BY m.id";
 
-type IdentityRow = (String, bool, Option<i64>);
+type IdentityRow = (String, Option<String>, bool, Option<i64>);
 type GrantRow = (String, Option<String>, bool, String);
 
 #[derive(Debug)]
 pub(crate) struct Identity {
     pub(crate) email: String,
+    pub(crate) full_name: Option<String>,
     pub(crate) is_admin: bool,
     pub(crate) password_changed_at: Option<i64>,
 }
@@ -57,7 +58,7 @@ impl Database {
         macro_rules! query {
             ($changed_at:literal, $unlocked:literal) => {
                 concat!(
-                    "SELECT u.email, u.is_admin, ", $changed_at, "
+                    "SELECT u.email, u.full_name, u.is_admin, ", $changed_at, "
                     FROM email_users u
                     WHERE ((CAST($1 AS TEXT) IS NOT NULL AND u.email = $1)
                         OR (CAST($1 AS TEXT) IS NULL AND u.id = $2))
@@ -91,11 +92,14 @@ impl Database {
                 .await?
             }
         };
-        Ok(row.map(|(email, is_admin, password_changed_at)| Identity {
-            email,
-            is_admin,
-            password_changed_at,
-        }))
+        Ok(row.map(
+            |(email, full_name, is_admin, password_changed_at)| Identity {
+                email,
+                full_name,
+                is_admin,
+                password_changed_at,
+            },
+        ))
     }
 
     pub(crate) async fn memberships(&self, email: &str) -> Result<Vec<String>, sqlx::Error> {

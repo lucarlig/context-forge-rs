@@ -78,6 +78,8 @@ pub(crate) type QueryValues = BTreeMap<String, String>;
 pub(crate) struct UpstreamCredentials {
     pub(crate) headers: HeaderMap,
     pub(crate) query: QueryValues,
+    pub(crate) identity_meta: Option<Value>,
+    pub(crate) request_bound_headers: bool,
 }
 
 #[derive(Deserialize)]

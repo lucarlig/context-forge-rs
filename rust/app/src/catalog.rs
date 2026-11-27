@@ -109,7 +109,7 @@ pub struct CatalogTool {
     pub gateway_transport: String,
     pub request_type: String,
     pub requires_gateway_policy: bool,
-    pub(crate) needs_upstream_auth: bool,
+    pub(crate) needs_upstream_config: bool,
     pub definition: ToolDefinition,
 }
 
@@ -125,7 +125,7 @@ pub(crate) struct ContentGateway {
     pub(crate) url: String,
     pub(crate) transport: Option<UpstreamTransport>,
     pub(crate) available: bool,
-    pub(crate) needs_upstream_auth: bool,
+    pub(crate) needs_upstream_config: bool,
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
@@ -299,9 +299,6 @@ macro_rules! gateway_policy {
             non_empty_json!("g.sigv4_config"),
             "
             OR ",
-            non_empty_json!("g.identity_propagation"),
-            "
-            OR ",
             non_empty_json!("g.add_headers"),
             "
             OR ",
@@ -314,6 +311,18 @@ macro_rules! gateway_policy {
 macro_rules! configured_auth {
     () => {
         "LOWER(COALESCE(g.auth_type, '')) IN ('basic', 'bearer', 'authheaders', 'query_param')"
+    };
+}
+
+macro_rules! connection_configured {
+    () => {
+        concat!(
+            "(",
+            configured_auth!(),
+            " OR ",
+            non_empty_json!("g.identity_propagation"),
+            ")"
+        )
     };
 }
 
@@ -337,7 +346,7 @@ macro_rules! tool_query {
                     OR ", non_empty_json!("t.plugin_chain_pre"), "
                     OR ", non_empty_json!("t.plugin_chain_post"), "
                 ),
-                ", configured_auth!(), ", t.name, t.title, COALESCE(t.description, ''), CAST(t.input_schema AS TEXT),
+                ", connection_configured!(), ", t.name, t.title, COALESCE(t.description, ''), CAST(t.input_schema AS TEXT),
                 CAST(t.output_schema AS TEXT), CAST(t.annotations AS TEXT)
              FROM tools t
              JOIN gateways g ON g.id = t.gateway_id
@@ -398,7 +407,7 @@ macro_rules! metadata_query {
 
 macro_rules! content_gateway_columns {
     () => {
-        concat!("g.id, g.url, g.transport, COALESCE(UPPER(g.transport) IN ('SSE', 'STREAMABLEHTTP') AND g.gateway_mode = 'cache' AND NOT ", gateway_policy!(), ", FALSE), ", configured_auth!())
+        concat!("g.id, g.url, g.transport, COALESCE(UPPER(g.transport) IN ('SSE', 'STREAMABLEHTTP') AND g.gateway_mode = 'cache' AND NOT ", gateway_policy!(), ", FALSE), ", connection_configured!())
     };
 }
 
@@ -557,12 +566,18 @@ const AUTH_CONFLICT_QUERY: &str = "
 
 const CONNECTION_CONFIG: &str = concat!(
     "SELECT LOWER(COALESCE(g.auth_type, '')), CAST(g.auth_value AS TEXT), CAST(g.auth_query_params AS TEXT),
-        CAST(g.passthrough_headers AS TEXT) FROM gateways g
+        CAST(g.passthrough_headers AS TEXT), CAST(g.identity_propagation AS TEXT) FROM gateways g
     WHERE g.id = $1 AND g.url = $2 AND g.enabled = TRUE AND g.status = 'active'
         AND g.gateway_mode = 'cache' AND NOT ",
     gateway_policy!()
 );
-pub(crate) type GatewayConnectionRow = (String, Option<String>, Option<String>, Option<String>);
+pub(crate) type GatewayConnectionRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 macro_rules! tool_conflict_query {
     ($names:literal) => {
@@ -580,15 +595,15 @@ macro_rules! tool_conflict_query {
 }
 
 macro_rules! insert_gateway {
-    ($capabilities:literal, $tags:literal, $auth_value:literal, $auth_query:literal, $passthrough:literal) => {
+    ($capabilities:literal, $tags:literal, $auth_value:literal, $auth_query:literal, $passthrough:literal, $identity:literal) => {
         concat!(
             "INSERT INTO gateways (
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
                 updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status,
-                auth_type, auth_value, auth_query_params, passthrough_headers
+                auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, 'cache', 'active',
-                $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ")"
+                $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ")"
         )
     };
 }
@@ -994,7 +1009,7 @@ impl Database {
             url,
             transport,
             available,
-            needs_upstream_auth,
+            needs_upstream_config,
         )) = rows.pop()
         else {
             return Ok(None);
@@ -1009,7 +1024,7 @@ impl Database {
                 url,
                 transport.as_deref(),
                 available,
-                needs_upstream_auth,
+                needs_upstream_config,
             ),
         }))
     }
@@ -1076,8 +1091,15 @@ impl Database {
         gateway: &GatewayRegistration<'_>,
         tools: &[RegisteredTool<'_>],
     ) -> Result<(), RegistrationError> {
-        self.register_discovered_gateway(gateway, tools, &DiscoveredMetadata::default(), None, None)
-            .await
+        self.register_discovered_gateway(
+            gateway,
+            tools,
+            &DiscoveredMetadata::default(),
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn register_discovered_gateway(
@@ -1087,12 +1109,14 @@ impl Database {
         metadata: &DiscoveredMetadata,
         auth: Option<&PreparedAuth<'_>>,
         passthrough_headers: Option<&[String]>,
+        identity: Option<&Value>,
     ) -> Result<(), RegistrationError> {
         validate_registration(gateway, tools)?;
         let capabilities = gateway.capabilities.to_string();
         let tags = serde_json::to_string(gateway.tags)
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
         let passthrough = passthrough_headers.map(|headers| json!(headers).to_string());
+        let identity = identity.map(Value::to_string);
         let names: Vec<_> = tools.iter().map(|tool| tool.name).collect();
         if names.iter().copied().collect::<HashSet<_>>().len() != names.len() {
             return Err(RegistrationError::ToolNameConflict);
@@ -1157,6 +1181,7 @@ impl Database {
                     .bind(auth.and_then(|auth| auth.encoded_headers.as_deref()))
                     .bind(auth.and_then(|auth| auth.encoded_query.as_deref()))
                     .bind(passthrough)
+                    .bind(identity)
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1244,7 +1269,8 @@ impl Database {
                         "json($7)",
                         "json($13)",
                         "json($14)",
-                        "json($15)"
+                        "json($15)",
+                        "json($16)"
                     ),
                     insert_tool!("json($8)", "json($9)", "json($10)"),
                     "json($7)"
@@ -1261,7 +1287,8 @@ impl Database {
                         "CAST($7 AS JSON)",
                         "CAST($13 AS JSON)",
                         "CAST($14 AS JSON)",
-                        "CAST($15 AS JSON)"
+                        "CAST($15 AS JSON)",
+                        "CAST($16 AS JSON)"
                     ),
                     insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)"),
                     "CAST($7 AS JSON)"
@@ -1319,7 +1346,8 @@ fn visible_team_ids(scope: CatalogScope<'_>) -> Result<String, sqlx::Error> {
 }
 
 fn resource_content_record(row: ResourceContentRow) -> ResourceContentRecord {
-    let (_, _, _, _, _, mime, text, blob, id, url, transport, available, needs_upstream_auth) = row;
+    let (_, _, _, _, _, mime, text, blob, id, url, transport, available, needs_upstream_config) =
+        row;
     ResourceContentRecord {
         mime,
         text,
@@ -1329,7 +1357,7 @@ fn resource_content_record(row: ResourceContentRow) -> ResourceContentRecord {
             url,
             transport.as_deref(),
             available,
-            needs_upstream_auth,
+            needs_upstream_config,
         ),
     }
 }
@@ -1339,14 +1367,14 @@ fn content_gateway(
     url: Option<String>,
     transport: Option<&str>,
     available: bool,
-    needs_upstream_auth: bool,
+    needs_upstream_config: bool,
 ) -> Option<ContentGateway> {
     Some(ContentGateway {
         id: id?,
         url: url?,
         transport: transport.and_then(UpstreamTransport::from_name),
         available,
-        needs_upstream_auth,
+        needs_upstream_config,
     })
 }
 
@@ -1463,7 +1491,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         gateway_transport,
         request_type,
         requires_gateway_policy,
-        needs_upstream_auth,
+        needs_upstream_config,
         name,
         title,
         description,
@@ -1481,7 +1509,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         gateway_transport,
         request_type,
         requires_gateway_policy,
-        needs_upstream_auth,
+        needs_upstream_config,
         definition: ToolDefinition {
             name,
             title,

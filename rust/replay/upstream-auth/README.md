@@ -8,6 +8,8 @@ Query parameter authentication additionally requires `INSECURE_ALLOW_QUERYPARAM_
 
 Configured header forwarding and explicit upstream authorization use the same destination checks as stored credentials. [Header forwarding recordings](headers/README.md)
 
+Set `IDENTITY_PROPAGATION_ENABLED=true` to forward authenticated user identity. The `IDENTITY_PROPAGATION_MODE` setting selects `headers`, `meta`, or `both`. Gateways may override the setting with `identityPropagation`. Claim signing uses a dedicated `IDENTITY_CLAIMS_SECRET` and binds the HS256 token to the gateway ID for 60 seconds. [Identity forwarding observations](identity.md)
+
 For replay, register four public Streamable HTTP servers named `basic`, `bearer`, `headers`, and `query` in the fixture database. Each exposes an `echo` tool and prefixes its result with the gateway name. Use synthetic credentials that the upstream fixture requires and that the gateway stores using the configured encryption secret.
 
 ```sh

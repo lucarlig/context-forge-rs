@@ -9,6 +9,7 @@ mod credentials;
 pub mod database;
 mod events;
 mod forward_headers;
+mod forward_identity;
 pub mod gateway;
 mod identity;
 pub mod jwt;

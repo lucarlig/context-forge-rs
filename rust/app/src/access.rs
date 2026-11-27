@@ -44,6 +44,7 @@ pub struct Authorizer {
 pub struct Principal {
     pub email: String,
     pub visibility: TeamVisibility,
+    pub(crate) full_name: Option<String>,
     pub(crate) expires_at: Option<i64>,
     is_admin: bool,
     scopes: Vec<String>,
@@ -179,6 +180,7 @@ impl Authorizer {
         Ok(Principal {
             email: identity.email,
             visibility,
+            full_name: identity.full_name,
             expires_at: jwt.payload().get("exp").and_then(Value::as_i64),
             is_admin: identity.is_admin,
             scopes,

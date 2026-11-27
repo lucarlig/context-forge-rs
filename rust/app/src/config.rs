@@ -2,6 +2,7 @@
 
 use std::{collections::HashSet, env, error::Error, str::FromStr, time::Duration};
 
+use jsonwebtoken::EncodingKey;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -38,6 +39,34 @@ pub struct HeaderForwarding {
     pub(crate) max_value_length: usize,
     pub(crate) source: HeaderSource,
     pub(crate) defaults: HashSet<String>,
+}
+
+pub struct IdentityForwarding {
+    pub(crate) enabled: bool,
+    pub(crate) mode: IdentityMode,
+    pub(crate) headers_prefix: String,
+    pub(crate) sign_claims: bool,
+    pub(crate) signing_key: Option<EncodingKey>,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum IdentityMode {
+    Headers,
+    Meta,
+    Both,
+}
+
+impl Default for IdentityForwarding {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: IdentityMode::Both,
+            headers_prefix: "X-Forwarded-User".to_owned(),
+            sign_claims: false,
+            signing_key: None,
+        }
+    }
 }
 
 pub(crate) enum HeaderSource {
@@ -187,6 +216,34 @@ impl Settings {
             max_value_length,
             source,
             defaults: configured,
+        })
+    }
+
+    pub fn identity_forwarding() -> Result<IdentityForwarding, Box<dyn Error + Send + Sync>> {
+        let enabled = flag("IDENTITY_PROPAGATION_ENABLED")?.unwrap_or(false);
+        let mode = match value("IDENTITY_PROPAGATION_MODE", "both")?.as_str() {
+            "headers" => IdentityMode::Headers,
+            "meta" => IdentityMode::Meta,
+            "both" => IdentityMode::Both,
+            _ => return Err("invalid IDENTITY_PROPAGATION_MODE".into()),
+        };
+        let headers_prefix = value("IDENTITY_PROPAGATION_HEADERS_PREFIX", "X-Forwarded-User")?;
+        crate::forward_identity::validate_prefix(&headers_prefix)?;
+        let sign_claims = flag("IDENTITY_SIGN_CLAIMS")?.unwrap_or(false);
+        let secret = value("IDENTITY_CLAIMS_SECRET", "")?;
+        let jwt = value("JWT_SECRET_KEY", "")?;
+        let signing_key = (!secret.is_empty() && secret != jwt)
+            .then(|| EncodingKey::from_secret(secret.as_bytes()))
+            .transpose()?;
+        if sign_claims && signing_key.is_none() {
+            return Err("IDENTITY_SIGN_CLAIMS requires a dedicated IDENTITY_CLAIMS_SECRET".into());
+        }
+        Ok(IdentityForwarding {
+            enabled,
+            mode,
+            headers_prefix,
+            sign_claims,
+            signing_key,
         })
     }
 

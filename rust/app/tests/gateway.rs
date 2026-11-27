@@ -183,7 +183,13 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
                     "serverInfo":{"name":"Authenticated fixture","version":"1"}})
                 }
                 "tools/list" => json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}),
-                "tools/call" => json!({"content":[{"type":"text","text":"Authorized tool"}]}),
+                "tools/call" => {
+                    assert!(!headers.contains_key("x-forwarded-user-id"));
+                    assert_eq!(message["params"]["_meta"]["user"], json!({
+                        "id":"admin@example.test", "email":"admin@example.test", "auth_method":"jwt", "is_admin":true
+                    }));
+                    json!({"content":[{"type":"text","text":"Authorized tool"}]})
+                }
                 "resources/list" => {
                     json!({"resources":[{"name":"note","uri":"fixture://auth/note"}]})
                 }
@@ -228,7 +234,7 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
         .unwrap();
     let admin = token("admin", Value::Null, json!({"is_admin":true}));
     let mut registration = json!({"name":"protected","url":upstream.url("/mcp"),"transport":"STREAMABLEHTTP",
-        "authType":"bearer","authToken":"upstream-fixture"});
+        "authType":"bearer","authToken":"upstream-fixture","identityPropagation":{"enabled":true,"mode":"meta"}});
     let (status, response) = send(
         &client,
         app.url("/gateways"),
@@ -262,7 +268,7 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
     for (method, params, text) in [
         (
             "tools/call",
-            json!({"name":"protected-echo","arguments":{}}),
+            json!({"name":"protected-echo","arguments":{},"_meta":{"user":{"id":"caller-supplied"}}}),
             "Authorized tool",
         ),
         (
@@ -275,7 +281,7 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
             &client,
             app.url("/mcp"),
             json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}),
-            None,
+            Some(&admin),
         )
         .await;
         assert_eq!(status, StatusCode::OK);

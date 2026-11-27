@@ -339,6 +339,12 @@ impl Session {
         endpoint: UpstreamEndpoint<'_>,
         authorization: Option<[u8; 32]>,
     ) -> Option<Arc<UpstreamAssociation>> {
+        if endpoint
+            .credentials
+            .is_some_and(|credentials| credentials.request_bound_headers)
+        {
+            return None;
+        }
         let key = UpstreamKey {
             gateway: gateway.to_owned(),
             endpoint: endpoint.url.to_owned(),

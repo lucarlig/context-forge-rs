@@ -31,12 +31,13 @@ use crate::{
         CatalogList, CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool,
         RegistrationError, ToolDefinition, slugify,
     },
-    config::HeaderForwarding,
+    config::{HeaderForwarding, IdentityForwarding},
     credentials::{
         AuthError, AuthInput, CredentialCipher, CredentialError, UpstreamCredentials,
         decode_headers, decode_query, validate_query_host,
     },
     database::Database,
+    forward_identity::IdentityError,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     sessions::Session,
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
@@ -54,6 +55,7 @@ pub struct GatewayService {
     credential_cipher: Option<CredentialCipher>,
     query_auth_hosts: Option<HashSet<String>>,
     header_forwarding: HeaderForwarding,
+    identity_forwarding: IdentityForwarding,
 }
 
 pub struct CatalogRefresh {
@@ -119,6 +121,7 @@ impl GatewayService {
             credential_cipher: None,
             query_auth_hosts: None,
             header_forwarding: HeaderForwarding::default(),
+            identity_forwarding: IdentityForwarding::default(),
         }
     }
 
@@ -149,6 +152,11 @@ impl GatewayService {
 
     pub(crate) fn header_forwarding_enabled(&self) -> bool {
         self.header_forwarding.enabled
+    }
+
+    pub fn with_identity_forwarding(mut self, forwarding: IdentityForwarding) -> Self {
+        self.identity_forwarding = forwarding;
+        self
     }
 
     pub(crate) async fn prepare_subscription(
@@ -390,11 +398,12 @@ impl GatewayService {
             return Err(ToolError::Unavailable);
         }
         let credentials = self
-            .configured_auth(
+            .configured_upstream(
                 &tool.gateway_id,
                 &tool.gateway_url,
-                tool.needs_upstream_auth,
+                tool.needs_upstream_config,
                 context.request_headers,
+                principal,
             )
             .await?;
         let endpoint = UpstreamEndpoint {
@@ -431,19 +440,20 @@ impl GatewayService {
         }
     }
 
-    async fn configured_auth(
+    async fn configured_upstream(
         &self,
         id: &str,
         url: &str,
-        needs_upstream_auth: bool,
+        needs_upstream_config: bool,
         request_headers: Option<&HeaderMap>,
+        principal: Option<&Principal>,
     ) -> Result<Option<UpstreamCredentials>, ToolError> {
         let incoming =
             request_headers.filter(|headers| self.header_forwarding.needs_config(headers));
-        if !needs_upstream_auth && incoming.is_none() {
+        if !needs_upstream_config && incoming.is_none() && !self.identity_forwarding.enabled {
             return Ok(None);
         }
-        let (kind, stored_headers, stored_query, passthrough) = self
+        let (kind, stored_headers, stored_query, passthrough, identity) = self
             .database
             .gateway_connection(id, url)
             .await?
@@ -488,10 +498,16 @@ impl GatewayService {
                 )
                 .await?;
         }
-        Ok(
-            (!credentials.headers.is_empty() || !credentials.query.is_empty())
-                .then_some(credentials),
-        )
+        self.identity_forwarding
+            .apply(&mut credentials, principal, id, identity.as_deref())
+            .map_err(|error| {
+                tracing::warn!(gateway = %id, %error, "could not propagate upstream identity");
+                ToolError::Unavailable
+            })?;
+        Ok((!credentials.headers.is_empty()
+            || !credentials.query.is_empty()
+            || credentials.identity_meta.is_some())
+        .then_some(credentials))
     }
 
     pub(crate) async fn tool_definition(
@@ -654,6 +670,8 @@ struct RegisterGateway {
     gateway_mode: Option<String>,
     #[serde(alias = "passthroughHeaders")]
     passthrough_headers: Option<Vec<String>>,
+    #[serde(alias = "identityPropagation")]
+    identity_propagation: Option<Value>,
     #[serde(flatten)]
     auth: AuthInput,
 }
@@ -715,6 +733,21 @@ async fn register(
     }
 
     let url = input.url.trim();
+    if let Some(identity) = &input.identity_propagation {
+        service
+            .identity_forwarding
+            .validate(identity)
+            .map_err(|error| match error {
+                IdentityError::Config => RegistrationResponse::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Invalid upstream identity propagation configuration",
+                ),
+                IdentityError::Signing => RegistrationResponse::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Identity claim signing requires a dedicated IDENTITY_CLAIMS_SECRET",
+                ),
+            })?;
+    }
     if input.passthrough_headers.as_ref().is_some_and(|headers| {
         headers
             .iter()
@@ -817,6 +850,7 @@ async fn register(
             &metadata,
             auth.as_ref(),
             input.passthrough_headers.as_deref(),
+            input.identity_propagation.as_ref(),
         )
         .await?;
     service.subscriptions.registered(&registration);
@@ -827,6 +861,9 @@ async fn register(
     let mut response = registration_response(&registration, address, agent);
     if let Some(headers) = input.passthrough_headers {
         response["passthroughHeaders"] = json!(headers);
+    }
+    if let Some(identity) = input.identity_propagation {
+        response["identityPropagation"] = identity;
     }
     if let Some(auth) = auth
         && let Value::Object(masked) = auth.masked
