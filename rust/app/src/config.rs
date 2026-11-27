@@ -507,6 +507,7 @@ impl Settings {
                 || value("ENVIRONMENT", "development")? == "production",
             same_site: value("COOKIE_SAMESITE", "lax")?,
             approval_required: flag("SSO_REQUIRE_ADMIN_APPROVAL")?.unwrap_or(false),
+            admin_api_enabled: flag("MCPGATEWAY_ADMIN_API_ENABLED")?.unwrap_or(false),
         }))
     }
 

@@ -26,3 +26,9 @@ databases. An eligible caller entered the pending queue, a reviewer could
 approve or reject the request, and a rejected request stayed closed.
 Account creation consumed approval in the same transaction and required
 the same provider that requested it.
+
+The optional administrator provisioning endpoint matched 12 normalized
+responses on SQLite and PostgreSQL. It handled disabled and unknown
+providers, the Entra alias, passwordless creation, duplicate users, and
+malformed requests. Provisioned users could not sign in with a local
+password.

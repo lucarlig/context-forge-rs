@@ -6,6 +6,7 @@ mod flow;
 mod identity;
 mod oidc;
 mod providers;
+mod provisioning;
 
 use std::collections::HashSet;
 
@@ -24,9 +25,10 @@ pub(crate) struct SsoSettings {
     pub(crate) secure_cookies: bool,
     pub(crate) same_site: String,
     pub(crate) approval_required: bool,
+    pub(crate) admin_api_enabled: bool,
 }
 
-pub(super) fn routers() -> (Router<Arc<Accounts>>, Router<Arc<Accounts>>) {
+pub(super) fn routers(settings: &SsoSettings) -> (Router<Arc<Accounts>>, Router<Arc<Accounts>>) {
     let mut public = Router::new();
     let mut protected = Router::new();
     for base in ["/auth/sso", "/v1/auth/sso"] {
@@ -50,6 +52,9 @@ pub(super) fn routers() -> (Router<Arc<Accounts>>, Router<Arc<Accounts>>) {
                 &format!("{base}/pending-approvals/{{id}}/action"),
                 post(approvals::review),
             );
+    }
+    if settings.admin_api_enabled {
+        protected = protected.route("/v1/admin/users/sso", post(provisioning::create_user));
     }
     (public, protected)
 }

@@ -92,6 +92,7 @@ pub(super) async fn authenticate_identity(
         password_hash: None,
         auth_provider: provider.id.clone(),
         approval_required,
+        email_verified: false,
         password_change_required: false,
         granted_by: None,
         admin_origin: None,

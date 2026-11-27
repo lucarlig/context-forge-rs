@@ -61,6 +61,7 @@ pub(super) struct NewUser {
     pub(super) password_hash: Option<String>,
     pub(super) auth_provider: String,
     pub(super) approval_required: bool,
+    pub(super) email_verified: bool,
     pub(super) password_change_required: bool,
     pub(super) granted_by: Option<String>,
     pub(super) admin_origin: Option<&'static str>,
@@ -284,7 +285,7 @@ impl Database {
                 let inserted=sqlx::query(CREATE_LOCAL_USER).bind(Uuid::new_v4().to_string())
                     .bind(&user.email).bind(user.password_hash.as_deref()).bind(user.full_name.as_deref())
                     .bind(user.is_admin).bind(user.is_active).bind(user.admin_origin)
-                    .bind(user.password_change_required).bind(user.granted_by.is_some()).bind(&user.auth_provider)
+                    .bind(user.password_change_required).bind(user.email_verified).bind(&user.auth_provider)
                     .execute(&mut *$tx).await?;
                 if inserted.rows_affected()==0 {
                     return Ok(false);

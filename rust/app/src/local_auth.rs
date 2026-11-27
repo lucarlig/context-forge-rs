@@ -170,6 +170,7 @@ pub async fn router(
                 password_hash: Some(password_hash),
                 auth_provider: "local".to_owned(),
                 approval_required: false,
+                email_verified: true,
                 password_change_required,
                 granted_by: Some(bootstrap_email),
                 admin_origin: Some("bootstrap"),
@@ -224,8 +225,8 @@ pub async fn router(
             protected.with_state(state.clone()),
             "Authentication required",
         ));
-    if state.settings.sso.is_some() {
-        let (sso_public, sso_admin) = sso::routers();
+    if let Some(settings) = state.settings.sso.as_ref() {
+        let (sso_public, sso_admin) = sso::routers(settings);
         router = router.merge(sso_public.with_state(state.clone())).merge(
             state.access.protect_api_with_message(
                 sso_admin.with_state(state.clone()),
@@ -521,6 +522,7 @@ async fn create_account(
         password_hash: Some(hash),
         auth_provider: "local".to_owned(),
         approval_required: false,
+        email_verified: actor.is_some(),
         password_change_required: require_change,
         granted_by: actor.map(str::to_owned),
         admin_origin: input.is_admin.then_some("api"),
