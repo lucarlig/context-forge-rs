@@ -11,6 +11,7 @@ use crate::{
         Pagination, ResourceLimits, RootSettings,
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
+    local_auth::AccountSettings,
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
         SessionSettings, SseBackend, SseSettings, WebSocketSettings,
@@ -269,6 +270,69 @@ impl Settings {
 
     pub fn token_usage_logging() -> Result<bool, Box<dyn Error + Send + Sync>> {
         Ok(flag("TOKEN_USAGE_LOGGING_ENABLED")?.unwrap_or(true))
+    }
+
+    pub fn local_accounts() -> Result<AccountSettings, Box<dyn Error + Send + Sync>> {
+        use zeroize::Zeroizing;
+        let enabled =
+            |name, default| Ok::<_, Box<dyn Error + Send + Sync>>(flag(name)?.unwrap_or(default));
+        let expiry: i64 = parse("TOKEN_EXPIRY", 20)?;
+        let attempts = parse("MAX_FAILED_LOGIN_ATTEMPTS", 5)?;
+        let lockout: i64 = parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 60)?;
+        if !(5..=1440).contains(&expiry) || attempts < 1 || !(1..=525_600).contains(&lockout) {
+            return Err("invalid local authentication settings".into());
+        }
+        let csrf_seconds = parse("CSRF_TOKEN_EXPIRY", 3600)?;
+        let (page_size, max_page_size) = Self::management_page_sizes()?;
+        let csrf_secret = Zeroizing::new(
+            env::var("CSRF_SECRET_KEY")
+                .ok()
+                .filter(|secret| !secret.is_empty())
+                .unwrap_or(value("JWT_SECRET_KEY", "")?),
+        );
+        if csrf_seconds < 1 {
+            return Err("invalid CSRF token expiry".into());
+        }
+        Ok(AccountSettings {
+            bootstrap_email: value("PLATFORM_ADMIN_EMAIL", "admin@example.com")?,
+            bootstrap_name: value("PLATFORM_ADMIN_FULL_NAME", "Platform Administrator")?,
+            bootstrap_password: env::var("PLATFORM_ADMIN_PASSWORD")
+                .ok()
+                .filter(|password| !password.is_empty())
+                .map(Zeroizing::new),
+            bootstrap_require_change: enabled("ADMIN_REQUIRE_PASSWORD_CHANGE_ON_BOOTSTRAP", true)?,
+            default_password: Zeroizing::new(value("DEFAULT_USER_PASSWORD", "changeme")?),
+            public_registration: enabled("PUBLIC_REGISTRATION_ENABLED", false)?,
+            personal_teams: enabled("AUTO_CREATE_PERSONAL_TEAMS", true)?,
+            enforce_password_change: enabled("PASSWORD_CHANGE_ENFORCEMENT_ENABLED", true)?,
+            detect_default_password: enabled("DETECT_DEFAULT_PASSWORD_ON_LOGIN", true)?,
+            require_change_for_default: enabled(
+                "REQUIRE_PASSWORD_CHANGE_FOR_DEFAULT_PASSWORD",
+                true,
+            )?,
+            password_max_age_days: parse("PASSWORD_MAX_AGE_DAYS", 90)?,
+            password_min_user: parse("PASSWORD_MIN_LENGTH_USER", 12)?,
+            password_min_admin: parse("PASSWORD_MIN_LENGTH_PRIVILEGED", 22)?,
+            password_policy: enabled("PASSWORD_POLICY_ENABLED", true)?,
+            protect_admins: enabled("PROTECT_ALL_ADMINS", true)?,
+            lockout_attempts: attempts,
+            lockout_seconds: lockout * 60,
+            failure_floor: Duration::from_millis(parse("FAILED_LOGIN_MIN_RESPONSE_MS", 250)?),
+            token_seconds: expiry * 60,
+            csrf_secret,
+            csrf_name: value("CSRF_COOKIE_NAME", "mcpgateway_csrf_token")?,
+            csrf_samesite: value("CSRF_COOKIE_SAMESITE", "Strict")?,
+            csrf_secure: enabled("CSRF_COOKIE_SECURE", true)?,
+            csrf_httponly: enabled("CSRF_COOKIE_HTTPONLY", false)?,
+            csrf_seconds,
+            a2a_enabled: enabled("MCPGATEWAY_A2A_ENABLED", true)?,
+            admin_role: value("DEFAULT_ADMIN_ROLE", "platform_admin")?,
+            user_role: value("DEFAULT_USER_ROLE", "platform_viewer")?,
+            owner_role: value("DEFAULT_TEAM_OWNER_ROLE", "team_admin")?,
+            page_size,
+            max_page_size,
+            kdf: Self::secret_kdf()?,
+        })
     }
 
     pub fn query_auth_hosts() -> Result<Option<HashSet<String>>, Box<dyn Error + Send + Sync>> {

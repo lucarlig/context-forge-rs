@@ -1,0 +1,712 @@
+// SPDX-License-Identifier: Apache-2.0
+
+mod passwords;
+mod storage;
+
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use axum::{
+    Extension, Json, Router,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use crate::{
+    access::{Authorizer, Principal, RoleContext},
+    config::SecretKdf,
+    database::Database,
+    jwt::JwtIssuer,
+};
+
+pub(crate) use storage::{POSTGRES_MIGRATION, SQLITE_MIGRATION};
+
+pub struct AccountSettings {
+    pub(crate) bootstrap_email: String,
+    pub(crate) bootstrap_name: String,
+    pub(crate) bootstrap_password: Option<Zeroizing<String>>,
+    pub(crate) bootstrap_require_change: bool,
+    pub(crate) default_password: Zeroizing<String>,
+    pub(crate) public_registration: bool,
+    pub(crate) personal_teams: bool,
+    pub(crate) enforce_password_change: bool,
+    pub(crate) detect_default_password: bool,
+    pub(crate) require_change_for_default: bool,
+    pub(crate) password_max_age_days: i64,
+    pub(crate) password_min_user: usize,
+    pub(crate) password_min_admin: usize,
+    pub(crate) password_policy: bool,
+    pub(crate) protect_admins: bool,
+    pub(crate) lockout_attempts: i32,
+    pub(crate) lockout_seconds: i64,
+    pub(crate) failure_floor: Duration,
+    pub(crate) token_seconds: i64,
+    pub(crate) csrf_secret: Zeroizing<String>,
+    pub(crate) csrf_name: String,
+    pub(crate) csrf_samesite: String,
+    pub(crate) csrf_secure: bool,
+    pub(crate) csrf_httponly: bool,
+    pub(crate) csrf_seconds: i64,
+    pub(crate) a2a_enabled: bool,
+    pub(crate) admin_role: String,
+    pub(crate) user_role: String,
+    pub(crate) owner_role: String,
+    pub(crate) page_size: u32,
+    pub(crate) max_page_size: u32,
+    pub(crate) kdf: SecretKdf,
+}
+
+struct Accounts {
+    database: Database,
+    access: Arc<Authorizer>,
+    signer: JwtIssuer,
+    settings: AccountSettings,
+    dummy_hash: String,
+}
+
+#[derive(Debug)]
+struct AccountError(StatusCode, Value);
+
+impl AccountError {
+    fn detail(status: StatusCode, message: impl Into<String>) -> Self {
+        Self(status, json!({"detail":message.into()}))
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::detail(StatusCode::BAD_REQUEST, message)
+    }
+
+    fn unavailable() -> Self {
+        Self::detail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Authentication service unavailable",
+        )
+    }
+
+    fn missing() -> Self {
+        Self::detail(StatusCode::NOT_FOUND, "User not found")
+    }
+}
+
+impl From<sqlx::Error> for AccountError {
+    fn from(error: sqlx::Error) -> Self {
+        tracing::error!(%error, "local account storage failed");
+        Self::unavailable()
+    }
+}
+
+impl IntoResponse for AccountError {
+    fn into_response(self) -> Response {
+        (self.0, Json(self.1)).into_response()
+    }
+}
+
+pub async fn router(
+    database: Database,
+    access: Arc<Authorizer>,
+    signer: JwtIssuer,
+    mut settings: AccountSettings,
+) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
+    let bootstrap = settings.bootstrap_password.take();
+    let dummy_hash = passwords::hash(Zeroizing::new(Uuid::new_v4().to_string()), settings.kdf)
+        .await
+        .map_err(|_| "could not initialize local password verification")?;
+    let state = Arc::new(Accounts {
+        database,
+        access,
+        signer,
+        settings,
+        dummy_hash,
+    });
+    let bootstrap_email = state.settings.bootstrap_email.trim().to_ascii_lowercase();
+    if let Some(password) = bootstrap {
+        if !valid_email(&bootstrap_email) {
+            return Err("invalid PLATFORM_ADMIN_EMAIL".into());
+        }
+        if state.database.local_user(&bootstrap_email).await?.is_none() {
+            let password_change_required = state.settings.enforce_password_change
+                && state.settings.bootstrap_require_change
+                && *password == *state.settings.default_password;
+            let password_hash = passwords::hash(password, state.settings.kdf)
+                .await
+                .map_err(|_| "could not hash the platform administrator password")?;
+            let user = storage::NewUser {
+                email: bootstrap_email.clone(),
+                full_name: Some(state.settings.bootstrap_name.clone()),
+                is_admin: true,
+                is_active: true,
+                password_hash,
+                password_change_required,
+                granted_by: Some(bootstrap_email),
+                admin_origin: Some("bootstrap"),
+            };
+            state
+                .database
+                .create_local_user(&user, &state.settings)
+                .await?;
+        }
+    }
+    let mut public = Router::new();
+    let mut protected = Router::new();
+    for base in ["/auth/email", "/v1/auth/email"] {
+        public = public
+            .route(&format!("{base}/login"), post(login))
+            .route(&format!("{base}/register"), post(register));
+        protected = protected
+            .route(&format!("{base}/me"), get(profile))
+            .route(&format!("{base}/events"), get(events))
+            .route(&format!("{base}/admin/events"), get(admin_events))
+            .route(
+                &format!("{base}/admin/users"),
+                get(list_users).post(create_user),
+            )
+            .route(&format!("{base}/admin/users/{{email}}"), get(get_user));
+    }
+    Ok(public
+        .with_state(state.clone())
+        .merge(state.access.protect_api_with_message(
+            protected.with_state(state.clone()),
+            "Authentication required",
+        )))
+}
+
+#[derive(Deserialize)]
+struct Login {
+    email: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct ManagedUser {
+    email: String,
+    password: String,
+    full_name: Option<String>,
+    #[serde(default)]
+    is_admin: bool,
+    is_active: Option<bool>,
+    #[serde(default)]
+    password_change_required: bool,
+}
+
+#[derive(Deserialize)]
+struct Registration {
+    email: String,
+    password: String,
+    full_name: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct UserQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+    #[serde(default)]
+    include_pagination: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct UserCursor {
+    created_at: String,
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct EventQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    user_email: Option<String>,
+}
+
+#[derive(Clone)]
+struct Client {
+    address: Option<String>,
+    user_agent: Option<String>,
+}
+
+impl Client {
+    fn new(address: Option<SocketAddr>, headers: &HeaderMap) -> Self {
+        Self {
+            address: address.map(|peer| peer.ip().to_string()),
+            user_agent: headers
+                .get(header::USER_AGENT)
+                .and_then(|agent| agent.to_str().ok())
+                .map(str::to_owned),
+        }
+    }
+}
+
+async fn login(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(input): Json<Login>,
+) -> Result<Response, AccountError> {
+    let commenced = Instant::now();
+    let email = input.email.trim().to_ascii_lowercase();
+    let password = Zeroizing::new(input.password);
+    if !valid_email(&email) {
+        return Err(AccountError::detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid email format",
+        ));
+    }
+    let client = Client::new(Some(peer), &headers);
+    let now = Timestamp::now();
+    let initial = accounts.database.local_user(&email).await?;
+    let mut failure = match initial.as_ref() {
+        None => Some("User not found"),
+        Some(user) if !user.is_active => Some("Account is disabled"),
+        Some(user) if user.locked(now) && !(user.is_admin && accounts.settings.protect_admins) => {
+            Some("Account is locked")
+        }
+        Some(user) if user.password_hash.is_none() => {
+            Some("Local password authentication disabled")
+        }
+        Some(_) => None,
+    };
+    let hash = initial
+        .as_ref()
+        .filter(|_| failure.is_none())
+        .and_then(|user| user.password_hash.clone())
+        .unwrap_or_else(|| accounts.dummy_hash.clone());
+    let using_default = *password == *accounts.settings.default_password;
+    let verified = passwords::verify(password, hash).await?;
+    let Some(user) = initial.as_ref().filter(|_| failure.is_none() && verified) else {
+        if let Some(user) = initial.as_ref().filter(|_| failure.is_none()) {
+            let lockout = accounts
+                .database
+                .record_login_failure(user, &accounts.settings)
+                .await?;
+            failure = Some(if lockout {
+                "Account locked due to too many failed attempts"
+            } else {
+                "Invalid password"
+            });
+            if lockout {
+                accounts
+                    .database
+                    .local_event(&email, "ACCOUNT_LOCKED", true, &client, None)
+                    .await?;
+            }
+        }
+        accounts
+            .database
+            .local_event(&email, "login", false, &client, failure)
+            .await?;
+        tokio::time::sleep(
+            accounts
+                .settings
+                .failure_floor
+                .saturating_sub(commenced.elapsed()),
+        )
+        .await;
+        return Err(AccountError::detail(
+            StatusCode::UNAUTHORIZED,
+            "Invalid email or password",
+        ));
+    };
+    let Some(user) = accounts.database.record_successful_login(user).await? else {
+        return Err(AccountError::detail(
+            StatusCode::UNAUTHORIZED,
+            "Invalid email or password",
+        ));
+    };
+    accounts
+        .database
+        .local_event(&email, "login", true, &client, None)
+        .await?;
+    if accounts.settings.enforce_password_change {
+        let flagged = user.password_change_required;
+        let age = user
+            .password_changed_at
+            .as_deref()
+            .and_then(parse_timestamp)
+            .map(|changed| (now.as_second() - changed.as_second()) / 86_400);
+        let expired = age.is_some_and(|age| age >= accounts.settings.password_max_age_days);
+        let is_default = accounts.settings.detect_default_password
+            && accounts.settings.require_change_for_default
+            && using_default;
+        if flagged || expired || is_default {
+            if is_default && !flagged && !expired {
+                accounts
+                    .database
+                    .require_local_password_change(&email)
+                    .await?;
+            }
+            let mut hint =
+                "Use the Admin UI at /admin/change-password-required to set a new password."
+                    .to_owned();
+            if flagged {
+                hint.push_str(" If this is a headless deployment locked out at bootstrap, set ADMIN_REQUIRE_PASSWORD_CHANGE_ON_BOOTSTRAP=false and restart.");
+            }
+            return Ok((
+                StatusCode::FORBIDDEN,
+                [("x-password-change-required", "true")],
+                Json(json!({"detail":"Password change required. Please change your password before continuing.", "hint":hint})),
+            ).into_response());
+        }
+    }
+    session_response(&accounts, &user, true).await
+}
+
+async fn register(
+    State(accounts): State<Arc<Accounts>>,
+    Json(value): Json<Value>,
+) -> Result<Response, AccountError> {
+    if let Some(extra) = value.as_object().and_then(|object| {
+        object
+            .keys()
+            .find(|key| !matches!(key.as_str(), "email" | "password" | "full_name"))
+    }) {
+        return Err(AccountError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"detail":[{"loc":["body", extra], "msg":"Extra inputs are not permitted", "type":"extra_forbidden"}]}),
+        ));
+    }
+    let input: Registration = serde_json::from_value(value).map_err(|_| {
+        AccountError::detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid registration request",
+        )
+    })?;
+    if !accounts.settings.public_registration {
+        return Err(AccountError::detail(
+            StatusCode::FORBIDDEN,
+            "Public registration is disabled. Please contact an administrator to create an account.",
+        ));
+    }
+    let user = create_account(
+        &accounts,
+        ManagedUser {
+            email: input.email,
+            password: input.password,
+            full_name: input.full_name,
+            is_admin: false,
+            is_active: Some(true),
+            password_change_required: false,
+        },
+        None,
+    )
+    .await?;
+    session_response(&accounts, &user, false).await
+}
+
+async fn create_user(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(principal): Extension<Principal>,
+    Json(input): Json<ManagedUser>,
+) -> Result<(StatusCode, Json<Value>), AccountError> {
+    require_user_admin(&accounts, &principal).await?;
+    let user = create_account(&accounts, input, Some(&principal.email)).await?;
+    Ok((StatusCode::CREATED, Json(user.metadata())))
+}
+
+async fn create_account(
+    accounts: &Accounts,
+    input: ManagedUser,
+    actor: Option<&str>,
+) -> Result<storage::LocalUser, AccountError> {
+    let email = input.email.trim().to_ascii_lowercase();
+    if !valid_email(&email) {
+        return Err(AccountError::bad_request("Invalid email format"));
+    }
+    if input
+        .full_name
+        .as_ref()
+        .is_some_and(|name| name.chars().count() > 255)
+    {
+        return Err(AccountError::detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Full name is too long",
+        ));
+    }
+    if accounts.database.local_user(&email).await?.is_some() {
+        return Err(duplicate_user(&email));
+    }
+    let password = Zeroizing::new(input.password);
+    passwords::validate(&accounts.settings, &password, &email, input.is_admin)?;
+    let require_change = input.password_change_required
+        || (actor.is_some()
+            && accounts.settings.enforce_password_change
+            && accounts.settings.require_change_for_default
+            && *password == *accounts.settings.default_password);
+    let hash = passwords::hash(password, accounts.settings.kdf).await?;
+    let new = storage::NewUser {
+        email: email.clone(),
+        full_name: input.full_name,
+        is_admin: input.is_admin,
+        is_active: input.is_active.unwrap_or(true),
+        password_hash: hash,
+        password_change_required: require_change,
+        granted_by: actor.map(str::to_owned),
+        admin_origin: input.is_admin.then_some("api"),
+    };
+    if !accounts
+        .database
+        .create_local_user(&new, &accounts.settings)
+        .await?
+    {
+        return Err(duplicate_user(&email));
+    }
+    accounts
+        .database
+        .local_user(&email)
+        .await?
+        .ok_or_else(AccountError::unavailable)
+}
+
+async fn profile(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Value>, AccountError> {
+    let user = accounts
+        .database
+        .local_user(&principal.email)
+        .await?
+        .ok_or_else(AccountError::missing)?;
+    let mut data = user.metadata();
+    data["features"] = json!({"a2a": accounts.settings.a2a_enabled});
+    Ok(Json(data))
+}
+
+async fn get_user(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(principal): Extension<Principal>,
+    Path(email): Path<String>,
+) -> Result<Json<Value>, AccountError> {
+    require_user_admin(&accounts, &principal).await?;
+    let user = accounts
+        .database
+        .local_user(&email.trim().to_ascii_lowercase())
+        .await?
+        .ok_or_else(AccountError::missing)?;
+    Ok(Json(user.metadata()))
+}
+
+async fn list_users(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<UserQuery>,
+) -> Result<Json<Value>, AccountError> {
+    require_user_admin(&accounts, &principal).await?;
+    let limit = query.limit.unwrap_or(accounts.settings.page_size);
+    if limit > accounts.settings.max_page_size {
+        return Err(AccountError::detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid user pagination limit",
+        ));
+    }
+    let cursor = query
+        .cursor
+        .as_ref()
+        .and_then(|cursor| URL_SAFE.decode(cursor).ok())
+        .and_then(|json| serde_json::from_slice::<UserCursor>(&json).ok())
+        .filter(|cursor| {
+            parse_timestamp(&cursor.created_at).is_some() && valid_email(&cursor.email)
+        });
+    let fetch = if limit == 0 { -1 } else { i64::from(limit) + 1 };
+    let mut users = accounts
+        .database
+        .local_users(cursor.as_ref(), fetch)
+        .await?;
+    let next = if limit != 0 && users.len() > limit as usize {
+        users.truncate(limit as usize);
+        users.last().and_then(|user| {
+            serde_json::to_vec(&UserCursor {
+                created_at: user.created_at.replacen(' ', "T", 1),
+                email: user.email.clone(),
+            })
+            .ok()
+            .map(|json| URL_SAFE.encode(json))
+        })
+    } else {
+        None
+    };
+    let users = users
+        .iter()
+        .map(storage::LocalUser::metadata)
+        .collect::<Vec<_>>();
+    Ok(Json(if query.include_pagination {
+        json!({"users":users,"nextCursor":next})
+    } else {
+        json!(users)
+    }))
+}
+
+async fn events(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<Value>, AccountError> {
+    list_events(
+        &accounts,
+        Some(&principal.email),
+        query.limit.unwrap_or(50),
+        query.offset.unwrap_or(0),
+    )
+    .await
+}
+
+async fn admin_events(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<Value>, AccountError> {
+    require_user_admin(&accounts, &principal).await?;
+    list_events(
+        &accounts,
+        query.user_email.as_deref(),
+        query.limit.unwrap_or(100),
+        query.offset.unwrap_or(0),
+    )
+    .await
+}
+
+async fn list_events(
+    accounts: &Accounts,
+    email: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Json<Value>, AccountError> {
+    if limit < 0 || offset < 0 {
+        return Err(AccountError::detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid event pagination",
+        ));
+    }
+    let rows = accounts.database.local_events(email, limit, offset).await?;
+    Ok(Json(json!(rows)))
+}
+
+async fn require_user_admin(
+    accounts: &Accounts,
+    principal: &Principal,
+) -> Result<(), AccountError> {
+    if !accounts
+        .access
+        .allows(
+            principal,
+            "admin.user_management",
+            RoleContext::Global,
+            principal.is_global_admin(),
+        )
+        .await?
+    {
+        return Err(AccountError::detail(StatusCode::FORBIDDEN, "Access denied"));
+    }
+    Ok(())
+}
+
+fn duplicate_user(email: &str) -> AccountError {
+    AccountError::detail(
+        StatusCode::CONFLICT,
+        format!("User with email {email} already exists"),
+    )
+}
+
+async fn session_response(
+    accounts: &Accounts,
+    user: &storage::LocalUser,
+    set_csrf: bool,
+) -> Result<Response, AccountError> {
+    let now = Timestamp::now().as_second();
+    let jti = Uuid::new_v4().to_string();
+    let expires = now + accounts.settings.token_seconds;
+    let claims = json!({
+        "sub":user.id, "jti":jti, "iat":now, "exp":expires, "last_activity":now,
+        "token_use":"session", "auth_provider":user.auth_provider,
+        "scopes":{"server_id":null,"permissions":["*"],"ip_restrictions":[],"time_restrictions":{}},
+    });
+    let token = Zeroizing::new(
+        accounts
+            .signer
+            .sign(claims)
+            .map_err(|_| AccountError::unavailable())?,
+    );
+    if !accounts
+        .database
+        .remember_local_session(user, &jti, expires)
+        .await?
+    {
+        return Err(AccountError::detail(
+            StatusCode::UNAUTHORIZED,
+            "Invalid authentication credentials",
+        ));
+    }
+    let mut response = Json(json!({
+        "access_token":token.as_str(),
+        "token_type":"bearer",
+        "expires_in":accounts.settings.token_seconds,
+        "user":user.metadata(),
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if set_csrf && let Some(cookie) = csrf_cookie(&accounts.settings, &user.email, &jti, now) {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    Ok(response)
+}
+
+fn csrf_cookie(
+    settings: &AccountSettings,
+    email: &str,
+    session: &str,
+    now: i64,
+) -> Option<HeaderValue> {
+    use std::fmt::Write as _;
+    if settings.csrf_secret.is_empty() {
+        return None;
+    }
+    let window = now - now.rem_euclid(settings.csrf_seconds);
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, settings.csrf_secret.as_bytes());
+    let message = format!("{email}:{session}:{window}");
+    let signature = ring::hmac::sign(&key, message.as_bytes());
+    let mut cookie = format!("{}=", settings.csrf_name);
+    for byte in signature.as_ref() {
+        write!(cookie, "{byte:02x}").ok()?;
+    }
+    let same_site = match settings.csrf_samesite.to_ascii_lowercase().as_str() {
+        "none" => "None",
+        "lax" => "Lax",
+        _ => "Strict",
+    };
+    write!(
+        cookie,
+        "; Max-Age={}; Path=/; SameSite={same_site}",
+        settings.csrf_seconds
+    )
+    .ok()?;
+    if settings.csrf_secure {
+        cookie.push_str("; Secure");
+    }
+    if settings.csrf_httponly {
+        cookie.push_str("; HttpOnly");
+    }
+    HeaderValue::from_str(&cookie).ok()
+}
+
+fn parse_timestamp(value: &str) -> Option<Timestamp> {
+    let iso = value.replacen(' ', "T", 1);
+    iso.parse().or_else(|_| format!("{iso}Z").parse()).ok()
+}
+
+fn valid_email(email: &str) -> bool {
+    use std::sync::LazyLock;
+    static PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+            .expect("valid email pattern")
+    });
+    email.len() <= 255 && PATTERN.is_match(email)
+}

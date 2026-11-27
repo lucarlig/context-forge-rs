@@ -1,0 +1,28 @@
+# Local identity management
+
+The live bootstrap fixture exercised both local authentication API prefixes.
+It covered administrator login, self-registration, duplicate user rejection,
+administrator user reads, scoped authorization, authentication events, and
+user pagination. It ran against the pinned release and three Rust setups:
+a fresh SQLite database, a fresh PostgreSQL database, and a SQLite database
+initialized by the pinned gateway.
+
+Fifteen of the 18 pinned responses matched on every Rust setup after
+normalizing generated timestamps and identifiers. The remaining cases were
+the following.
+
+- The native profile reads the persisted last-login timestamp immediately.
+  The pinned profile returned null after reporting the new timestamp at login.
+- Native pagination returns a cursor when a second page exists. The pinned
+  response returned a null cursor for a one-user page with two users in the
+  database.
+- The pinned role-list endpoint returned the account's two grants. The native
+  bootstrap stores the same global and personal-team grants. Its role-list
+  endpoint belongs to the role-management slice.
+
+The native runs authenticated a registered user's session against the token
+management API, issued a scoped API token, and used it to read the tool
+catalog. They also verified that administrator login survives switching from
+the pinned gateway to Rust with the same database and JWT configuration.
+Fresh native databases bootstrap a local administrator when
+`PLATFORM_ADMIN_PASSWORD` is set. Subsequent boots preserve the stored hash.

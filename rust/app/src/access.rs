@@ -165,7 +165,18 @@ impl Authorizer {
     }
 
     pub fn protect_api(self: &Arc<Self>, router: Router) -> Router {
-        router.route_layer(middleware::from_fn_with_state(self.clone(), authorize_api))
+        self.protect_api_with_message(router, "Authorization token required")
+    }
+
+    pub(crate) fn protect_api_with_message(
+        self: &Arc<Self>,
+        router: Router,
+        missing: &'static str,
+    ) -> Router {
+        router.route_layer(middleware::from_fn_with_state(
+            (self.clone(), missing),
+            authorize_api,
+        ))
     }
 
     pub(crate) async fn websocket_principal(
@@ -177,7 +188,7 @@ impl Authorizer {
         let credential = bearer(headers)?;
         let Some(credential) = credential else {
             return if require_auth {
-                Err(AuthError::ApiRequired)
+                Err(AuthError::ApiRequired("Authorization token required"))
             } else {
                 Ok(None)
             };
@@ -474,7 +485,7 @@ fn managed_token_scopes(
 #[derive(Debug)]
 pub(crate) enum AuthError {
     Required,
-    ApiRequired,
+    ApiRequired(&'static str),
     Invalid,
     Revoked,
     Inactive,
@@ -498,7 +509,7 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Authentication required for MCP endpoints",
             ),
-            Self::ApiRequired => (StatusCode::UNAUTHORIZED, "Authorization token required"),
+            Self::ApiRequired(message) => (StatusCode::UNAUTHORIZED, message),
             Self::Invalid => (
                 StatusCode::UNAUTHORIZED,
                 "Invalid authentication credentials",
@@ -635,7 +646,7 @@ async fn authorize_mcp(
     let principal = match credential {
         None if access.require_auth => {
             return Err(if access.legacy_transport {
-                AuthError::ApiRequired
+                AuthError::ApiRequired("Authorization token required")
             } else {
                 AuthError::Required
             });
@@ -696,11 +707,11 @@ struct ServerPath {
 }
 
 async fn authorize_api(
-    State(access): State<Arc<Authorizer>>,
+    State((access, missing)): State<(Arc<Authorizer>, &'static str)>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
-    let token = bearer(request.headers())?.ok_or(AuthError::ApiRequired)?;
+    let token = bearer(request.headers())?.ok_or(AuthError::ApiRequired(missing))?;
     let principal = access.authenticate(token, peer(&request), None).await?;
     request.extensions_mut().insert(principal);
     dispatch_with_usage(&access, request, next).await

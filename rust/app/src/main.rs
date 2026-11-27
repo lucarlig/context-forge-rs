@@ -7,6 +7,7 @@ use context_forge_rs::{
     config::Settings,
     database::Database,
     gateway::GatewayService,
+    local_auth,
     mcp::SseBackend,
     probes::{self, RedisProbe},
 };
@@ -48,6 +49,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .with_token_usage_logging(Settings::token_usage_logging()?),
     );
+    let email_auth_enabled = Settings::email_auth_enabled()?;
+    let issuer = Settings::jwt_issuer()?;
+    let accounts = match issuer
+        .as_ref()
+        .filter(|_| email_auth_enabled && catalog_available)
+    {
+        Some(issuer) => {
+            local_auth::router(
+                database.clone(),
+                access.clone(),
+                issuer.clone(),
+                Settings::local_accounts()?,
+            )
+            .await?
+        }
+        None => axum::Router::new(),
+    };
     let (management_page_size, management_max_page_size) = Settings::management_page_sizes()?;
     let catalog_refresh = Settings::catalog_refresh()?;
     let health_settings = Settings::gateway_health(&catalog_refresh)?;
@@ -66,7 +84,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_resource_limits(Settings::resource_limits()?)
         .with_max_prompt_bytes(Settings::max_prompt_bytes()?)
         .with_tool_preview(Settings::tool_preview_enabled()?)
-        .with_token_issuer(Settings::email_auth_enabled()?, Settings::jwt_issuer()?)
+        .with_token_issuer(email_auth_enabled, issuer)
         .with_virtual_server_base(Settings::virtual_server_base()?)
         .with_server_oauth_metadata(well_known, cache_max_age, allow_oauth_loopback)
         .with_logging_filter(handle)
@@ -97,6 +115,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let app = probes::router(database, redis)
         .merge(transport)
         .merge(management)
+        .merge(accounts)
         .merge(service.server_oauth_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     let background = catalog_available.then(|| {

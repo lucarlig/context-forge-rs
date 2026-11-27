@@ -113,6 +113,7 @@ pub struct JwtVerifier {
     environment: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct JwtIssuer {
     key: EncodingKey,
     header: Header,
