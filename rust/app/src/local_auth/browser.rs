@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod forms;
+mod recovery;
 mod sessions;
 
 use std::error::Error;
@@ -38,6 +39,7 @@ pub(crate) struct BrowserSettings {
     auth_header: HeaderName,
     ui: bool,
     password_error_limit: usize,
+    reset_form_minimum: usize,
     preserve_admin_auth: bool,
 }
 
@@ -79,6 +81,7 @@ impl BrowserSettings {
                 .map_err(|_| "invalid AUTH_HEADER_NAME")?,
             ui: flag("MCPGATEWAY_UI_ENABLED")?.unwrap_or(false),
             password_error_limit: parse("PASSWORD_ERROR_MESSAGE_MAX_LENGTH", 200)?,
+            reset_form_minimum: parse("PASSWORD_MIN_LENGTH", 8)?,
             preserve_admin_auth: flag("SSO_ENABLED")?.unwrap_or(false)
                 && flag("SSO_PRESERVE_ADMIN_AUTH")?.unwrap_or(true),
         }))
@@ -89,6 +92,7 @@ impl BrowserSettings {
     }
 
     fn error(&self, page: &str, error: &str, query: Option<(&str, &str)>) -> Response {
+        let error = utf8_percent_encode(error, &forms::QUERY_ENCODE);
         let mut path = format!("{page}?error={error}");
         if let Some((name, value)) = query.filter(|(_, value)| !value.is_empty()) {
             use std::fmt::Write as _;
@@ -116,6 +120,14 @@ pub(super) fn router(accounts: Arc<Accounts>, settings: &BrowserSettings) -> Rou
         router = router
             .route(&format!("{path}/login"), get(login_page).post(login))
             .route(&format!("{path}/logout"), get(logout).post(logout))
+            .route(
+                &format!("{path}/forgot-password"),
+                get(recovery::forgot_page).post(recovery::forgot),
+            )
+            .route(
+                &format!("{path}/reset-password/{{token}}"),
+                get(recovery::reset_page).post(recovery::reset),
+            )
             .route(
                 &format!("{path}/change-password-required"),
                 get(password_page).post(change_password),
@@ -178,6 +190,8 @@ async fn login_page(
         proof => proof,
         email => query.get("email"),
         error => forms::login_error(query.get("error").map(String::as_str)),
+        password_reset => accounts.settings.reset.enabled,
+        notice => recovery::notice(query.get("notice").map(String::as_str)),
     })?;
     sessions::set_proof(
         &mut response,

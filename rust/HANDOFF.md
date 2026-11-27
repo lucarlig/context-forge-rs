@@ -169,8 +169,15 @@ A Rust integration test covers cross-origin sign-in and missing logout proof.
 The pinned SQLite profile writes a revocation row and still accepts the last
 session after logout. The native gateway stores the revoking user's email and
 rejects that session immediately. Live checks verify the native result on SQLite
-and PostgreSQL. Dashboard management sections, recovery views, and Keycloak
-sign-out redirects remain open.
+and PostgreSQL. Dashboard management sections and Keycloak sign-out redirects
+remain open.
+
+The browser password reset forms share the API's token storage, password
+policy, rate limits, and session revocation. Six Rust Anything scenarios match
+the pinned reference for recovery redirects, SMTP delivery, session CSRF checks,
+and disabled, superseded, expired, and used links. Chromium completes email
+recovery and sign-in with the replacement password on SQLite and PostgreSQL.
+A Rust integration test verifies that a reset link can change the password once.
 
 ## Gateway and protocol verification
 

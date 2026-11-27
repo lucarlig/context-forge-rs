@@ -8,6 +8,9 @@ use super::{
 };
 use crate::tokens::hash_token;
 
+pub(super) const INVALID_LINK: &str = "This reset link is invalid";
+pub(super) const USED_LINK: &str = "This reset link has already been used";
+
 pub(crate) struct ResetSettings {
     pub(crate) enabled: bool,
     pub(crate) lifetime: i64,
@@ -36,7 +39,6 @@ pub(super) async fn forgot(
     Json(input): Json<ForgotPassword>,
 ) -> Result<Json<Value>, AccountError> {
     enabled(&accounts)?;
-    let start = Instant::now();
     let email = input.email.trim().to_ascii_lowercase();
     if !valid_email(&email) {
         return Err(AccountError::detail(
@@ -44,16 +46,29 @@ pub(super) async fn forgot(
             "Invalid email format",
         ));
     }
+    let client = Client::new(Some(peer), &headers);
+    request(&accounts, email, &client).await?;
+    Ok(success(
+        "If this email is registered, you will receive a reset link.",
+    ))
+}
+
+pub(super) async fn request(
+    accounts: &Arc<Accounts>,
+    email: String,
+    client: &Client,
+) -> Result<(), AccountError> {
+    enabled(accounts)?;
+    let start = Instant::now();
     let mut random = [0_u8; 48];
     SystemRandom::new()
         .fill(&mut random)
         .map_err(|_| AccountError::unavailable())?;
     let token = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random));
     let hash = hash_token(&token);
-    let client = Client::new(Some(peer), &headers);
     let outcome = accounts
         .database
-        .request_local_password_reset(&email, &hash, &client, &accounts.settings.reset)
+        .request_local_password_reset(&email, &hash, client, &accounts.settings.reset)
         .await?;
     let limited = match outcome {
         storage::ResetRequest::Limited => true,
@@ -94,9 +109,7 @@ pub(super) async fn forgot(
             "Too many requests. Please try again later.",
         ));
     }
-    Ok(success(
-        "If this email is registered, you will receive a reset link.",
-    ))
+    Ok(())
 }
 
 pub(super) async fn validate(
@@ -105,7 +118,7 @@ pub(super) async fn validate(
 ) -> Result<Json<Value>, AccountError> {
     enabled(&accounts)?;
     let token = Zeroizing::new(token);
-    let reset = find(&accounts, &hash_token(&token)).await?;
+    let reset = check_link(&accounts, &token).await?;
     Ok(Json(
         json!({"valid":true,"message":"Reset token is valid","expires_at":reset.expires_at.replacen(' ',"T",1)}),
     ))
@@ -135,21 +148,35 @@ pub(super) async fn complete(
         ));
     }
     let token = Zeroizing::new(token);
-    let hash = hash_token(&token);
-    let reset = find(&accounts, &hash).await?;
+    let client = Client::new(Some(peer), &headers);
+    reset(
+        &accounts,
+        &token,
+        Zeroizing::new(password.to_owned()),
+        &client,
+    )
+    .await?;
+    Ok(success(
+        "Password reset successful. Please sign in with your new password.",
+    ))
+}
+
+pub(super) async fn reset(
+    accounts: &Arc<Accounts>,
+    token: &str,
+    password: Zeroizing<String>,
+    client: &Client,
+) -> Result<(), AccountError> {
+    enabled(accounts)?;
+    let hash = hash_token(token);
+    let reset = find(accounts, &hash).await?;
     let user = accounts
         .database
         .local_user(&reset.user_email)
         .await?
         .filter(|user| user.is_active && user.password_hash.is_some())
         .ok_or_else(invalid)?;
-    let password_hash = prepare_password(
-        &accounts,
-        &user,
-        user.is_admin,
-        Zeroizing::new(password.to_owned()),
-    )
-    .await?;
+    let password_hash = prepare_password(accounts, &user, user.is_admin, password).await?;
     accounts
         .database
         .edit_local_user(
@@ -164,12 +191,12 @@ pub(super) async fn complete(
             &accounts.settings,
         )
         .await?;
-    let client = Client::new(Some(peer), &headers);
     accounts
         .database
-        .local_event(&user.email, "PASSWORD_RESET_COMPLETED", true, &client, None)
+        .local_event(&user.email, "PASSWORD_RESET_COMPLETED", true, client, None)
         .await?;
     if accounts.settings.mailer.is_some() {
+        let accounts = accounts.clone();
         tokio::spawn(async move {
             let name = display_name(&user.email, user.full_name.as_deref());
             let body = format!(
@@ -182,9 +209,7 @@ pub(super) async fn complete(
             }
         });
     }
-    Ok(success(
-        "Password reset successful. Please sign in with your new password.",
-    ))
+    Ok(())
 }
 
 pub(super) fn notify_lockout(accounts: &Arc<Accounts>, email: String, full_name: Option<String>) {
@@ -226,11 +251,22 @@ fn enabled(accounts: &Accounts) -> Result<(), AccountError> {
 }
 
 pub(super) fn invalid() -> AccountError {
-    AccountError::bad_request("This reset link is invalid")
+    AccountError::bad_request(INVALID_LINK)
+}
+
+pub(super) fn used() -> AccountError {
+    AccountError::bad_request(USED_LINK)
 }
 
 pub(super) fn expired() -> AccountError {
     AccountError::detail(StatusCode::GONE, "This reset link has expired")
+}
+
+pub(super) async fn check_link(
+    accounts: &Accounts,
+    token: &str,
+) -> Result<storage::ResetToken, AccountError> {
+    find(accounts, &hash_token(token)).await
 }
 
 async fn find(accounts: &Accounts, hash: &str) -> Result<storage::ResetToken, AccountError> {
@@ -238,8 +274,10 @@ async fn find(accounts: &Accounts, hash: &str) -> Result<storage::ResetToken, Ac
         .database
         .local_password_reset(hash)
         .await?
-        .filter(|token| !token.used)
         .ok_or_else(invalid)?;
+    if reset.used {
+        return Err(used());
+    }
     if parse_timestamp(&reset.expires_at).is_none_or(|expires| expires <= Timestamp::now()) {
         return Err(expired());
     }

@@ -20,12 +20,14 @@
     {% if page == "login" %}
     <h1>Sign in to ContextForge</h1>
     {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+    {% if notice %}<p role="status">{{ notice }}</p>{% endif %}
     <form method="post" action="{{ root }}/admin/login">
       <input type="hidden" name="csrf_token" value="{{ proof }}">
       <label>Email <input name="email" type="email" autocomplete="username" value="{{ email|default('', true) }}" required></label>
       <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
       <button type="submit">Sign in</button>
     </form>
+    {% if password_reset %}<p><a href="{{ root }}/admin/forgot-password">Forgot your password?</a></p>{% endif %}
     {% elif page == "password" %}
     <h1>Password change required</h1>
     {% if error %}<p role="alert">{{ error }}{% if details %} {{ details }}{% endif %}</p>{% endif %}
@@ -37,6 +39,36 @@
       <label>Confirm new password <input name="confirm_password" type="password" autocomplete="new-password" required></label>
       <button type="submit">Change password</button>
     </form>
+    {% elif page == "forgot" %}
+    <h1>Forgot your password?</h1>
+    {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+    {% if enabled %}
+    <p>Enter your account email to request a reset link.</p>
+    <form method="post" action="{{ root }}/admin/forgot-password">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Email <input name="email" type="email" autocomplete="username" required></label>
+      <button type="submit">Send reset link</button>
+    </form>
+    {% else %}
+    <p>Password reset is currently disabled by the administrator.</p>
+    {% endif %}
+    <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
+    {% elif page == "reset" %}
+    <h1>Reset password</h1>
+    {% if link_error %}
+    <p role="alert">{{ link_error }}</p>
+    <p><a href="{{ root }}/admin/forgot-password">Request a new link</a></p>
+    {% else %}
+    {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+    <p>Use at least {{ minimum }} characters.</p>
+    <form method="post" action="{{ root }}{{ path }}">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>New password <input name="password" type="password" autocomplete="new-password" minlength="{{ minimum }}" required></label>
+      <label>Confirm new password <input name="confirm_password" type="password" autocomplete="new-password" minlength="{{ minimum }}" required></label>
+      <button type="submit">Reset password</button>
+    </form>
+    {% endif %}
+    <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
     {% else %}
     <h1>ContextForge</h1>
     <p>Signed in as {{ email }}.</p>

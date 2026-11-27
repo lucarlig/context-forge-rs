@@ -3,7 +3,8 @@
 use std::{net::TcpListener, path::PathBuf, process::Stdio, time::Duration};
 
 use reqwest::{Client, Response, StatusCode, header, redirect::Policy};
-use tokio::process::Command;
+use sha2::{Digest, Sha256};
+use tokio::process::{Child, Command};
 use uuid::Uuid;
 
 struct FixtureDirectory(PathBuf);
@@ -14,18 +15,24 @@ impl Drop for FixtureDirectory {
     }
 }
 
-#[tokio::test]
-async fn browser_login_rejects_cross_origin_and_logout_revokes_the_session() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .unwrap();
+const EMAIL: &str = "admin@example.com";
+
+struct BrowserGateway {
+    process: Child,
+    fixture: FixtureDirectory,
+    client: Client,
+    origin: String,
+    password: String,
+}
+
+async fn gateway() -> BrowserGateway {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let fixture = FixtureDirectory(std::env::temp_dir().join(Uuid::new_v4().simple().to_string()));
     std::fs::create_dir(&fixture.0).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let origin = format!("http://127.0.0.1:{port}");
-    let email = "admin@example.com";
     let password = format!("Fixture!{}", Uuid::new_v4().simple());
     let key = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let mut gateway = Command::new(env!("CARGO_BIN_EXE_context-forge-rs"))
@@ -35,7 +42,7 @@ async fn browser_login_rejects_cross_origin_and_logout_revokes_the_session() {
         .env("PORT", port.to_string())
         .env("JWT_SECRET_KEY", &key)
         .env("AUTH_ENCRYPTION_SECRET", &key)
-        .env("PLATFORM_ADMIN_EMAIL", email)
+        .env("PLATFORM_ADMIN_EMAIL", EMAIL)
         .env("PLATFORM_ADMIN_PASSWORD", &password)
         .env("MCPGATEWAY_ADMIN_API_ENABLED", "true")
         .env("SECURE_COOKIES", "false")
@@ -50,25 +57,45 @@ async fn browser_login_rejects_cross_origin_and_logout_revokes_the_session() {
         .no_proxy()
         .build()
         .unwrap();
-    let login_url = format!("{origin}/admin/login");
-    let login = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             assert!(
                 gateway.try_wait().unwrap().is_none(),
                 "gateway exited before login"
             );
-            if let Ok(response) = client.get(&login_url).send().await {
-                break response;
+            if let Ok(response) = client.get(format!("{origin}/health")).send().await {
+                assert_eq!(response.status(), StatusCode::OK);
+                break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .unwrap();
+    BrowserGateway {
+        process: gateway,
+        fixture,
+        client,
+        origin,
+        password,
+    }
+}
+
+#[tokio::test]
+async fn browser_login_rejects_cross_origin_and_logout_revokes_the_session() {
+    let mut gateway = gateway().await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let login_url = format!("{origin}/admin/login");
+    let login = client.get(&login_url).send().await.unwrap();
     assert_eq!(login.status(), StatusCode::OK);
     let csrf = cookie(&login, "mcpgateway_csrf_token");
     let csrf_cookie = format!("mcpgateway_csrf_token={csrf}");
-    let login_form = format!("email={email}&password={password}&csrf_token={csrf}");
+    let login_form = format!("email={EMAIL}&password={password}&csrf_token={csrf}");
     let sign_in = |site: &str| {
         client
             .post(&login_url)
@@ -90,7 +117,7 @@ async fn browser_login_rejects_cross_origin_and_logout_revokes_the_session() {
             .contains("CSRF origin validation failed")
     );
 
-    let accepted = sign_in(&origin).send().await.unwrap();
+    let accepted = sign_in(origin).send().await.unwrap();
     assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
     let jwt = cookie(&accepted, "jwt_token");
     let csrf = cookie(&accepted, "mcpgateway_csrf_token");
@@ -105,7 +132,7 @@ async fn browser_login_rejects_cross_origin_and_logout_revokes_the_session() {
     let logout = || {
         client
             .post(format!("{origin}/admin/logout"))
-            .header(header::ORIGIN, &origin)
+            .header(header::ORIGIN, origin)
             .header(header::COOKIE, &cookies)
     };
     assert_eq!(
@@ -124,7 +151,65 @@ async fn browser_login_rejects_cross_origin_and_logout_revokes_the_session() {
         stale.headers()[header::LOCATION],
         "/admin/login?error=token_revoked"
     );
-    gateway.kill().await.unwrap();
+    gateway.process.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_password_reset_consumes_a_link_once() {
+    let mut gateway = gateway().await;
+    let token = Uuid::new_v4().simple().to_string();
+    let digest: String = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        gateway.fixture.0.join("mcp.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO password_reset_tokens(id,user_email,token_hash,created_at,expires_at)
+         VALUES(?,?,?,CURRENT_TIMESTAMP,datetime('now','+5 minutes'))",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(EMAIL)
+    .bind(digest)
+    .execute(&database)
+    .await
+    .unwrap();
+    database.close().await;
+
+    let reset_url = format!("{}/admin/reset-password/{token}", gateway.origin);
+    let page = || gateway.client.get(&reset_url).send();
+    let form = page().await.unwrap().text().await.unwrap();
+    assert!(form.contains("name=\"confirm_password\""));
+
+    let password = "N3w%21Fixture_q7X4_sT62p";
+    let submit = || {
+        gateway
+            .client
+            .post(&reset_url)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(format!("password={password}&confirm_password={password}"))
+            .send()
+    };
+    let changed = submit().await.unwrap();
+    assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        changed.headers()[header::LOCATION],
+        "/admin/login?notice=password_reset_success"
+    );
+    let used = submit().await.unwrap();
+    assert_eq!(used.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        used.headers()[header::LOCATION],
+        "/admin/forgot-password?error=reset_link_used"
+    );
+    let used_form = page().await.unwrap().text().await.unwrap();
+    assert!(used_form.contains("This reset link has already been used"));
+    assert!(!used_form.contains("name=\"confirm_password\""));
+    gateway.process.kill().await.unwrap();
 }
 
 fn cookie<'a>(response: &'a Response, name: &str) -> &'a str {

@@ -94,11 +94,15 @@ impl Database {
                         WHERE token_hash=$1 AND user_email=$2 AND used_at IS NULL AND ",$not_expired))
                         .bind(hash).bind(email).execute(&mut *$tx).await?;
                     if updated.rows_affected()==0 {
-                        let expiry:Option<String>=sqlx::query_scalar("SELECT CAST(expires_at AS TEXT)
-                            FROM password_reset_tokens WHERE token_hash=$1 AND user_email=$2 AND used_at IS NULL")
+                        let link:Option<(bool,String)>=sqlx::query_as("SELECT used_at IS NOT NULL,CAST(expires_at AS TEXT)
+                            FROM password_reset_tokens WHERE token_hash=$1 AND user_email=$2")
                             .bind(hash).bind(email).fetch_optional(&mut *$tx).await?;
-                        return Err(if expiry.as_deref().and_then(parse_timestamp)
-                            .is_some_and(|expires|expires<=Timestamp::now()) { password_reset::expired() } else { password_reset::invalid() });
+                        return Err(match link {
+                            Some((true,_)) => password_reset::used(),
+                            Some((false,expiry)) if parse_timestamp(&expiry)
+                                .is_some_and(|expires|expires<=Timestamp::now()) => password_reset::expired(),
+                            _ => password_reset::invalid(),
+                        });
                     }
                 }
                 if current.id!=before.id
