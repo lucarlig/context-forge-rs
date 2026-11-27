@@ -335,13 +335,13 @@ macro_rules! non_empty_json {
 macro_rules! gateway_policy {
     () => {
         concat!(
-            "(LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth', 'basic', 'bearer', 'authheaders', 'query_param', 'sigv4')
+            "(LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth', 'basic', 'bearer', 'authheaders', 'query_param', 'sigv4', 'oauth')
             OR (LOWER(COALESCE(g.auth_type, 'none')) IN ('', 'none', 'one_time_auth') AND ",
             non_empty_json!("g.auth_value"),
             ")
-            OR ",
+            OR (LOWER(COALESCE(g.auth_type, '')) <> 'oauth' AND ",
             non_empty_json!("g.oauth_config"),
-            "
+            ")
             OR (LOWER(COALESCE(g.auth_type, '')) <> 'query_param' AND ",
             non_empty_json!("g.auth_query_params"),
             ")
@@ -360,7 +360,7 @@ macro_rules! gateway_policy {
 
 macro_rules! configured_auth {
     () => {
-        "LOWER(COALESCE(g.auth_type, '')) IN ('basic', 'bearer', 'authheaders', 'query_param', 'sigv4')"
+        "LOWER(COALESCE(g.auth_type, '')) IN ('basic', 'bearer', 'authheaders', 'query_param', 'sigv4', 'oauth')"
     };
 }
 
@@ -613,8 +613,8 @@ const CONFLICT_QUERY: &str = concat!(
 );
 
 const AUTH_CONFLICT_QUERY: &str = "
-    SELECT CAST(auth_value AS TEXT), CAST(auth_query_params AS TEXT), CAST(sigv4_config AS TEXT) FROM gateways
-    WHERE url = $1 AND (auth_value IS NOT NULL OR auth_query_params IS NOT NULL OR sigv4_config IS NOT NULL)
+    SELECT CAST(auth_value AS TEXT), CAST(auth_query_params AS TEXT), CAST(sigv4_config AS TEXT), CAST(oauth_config AS TEXT) FROM gateways
+    WHERE url = $1 AND (auth_value IS NOT NULL OR auth_query_params IS NOT NULL OR sigv4_config IS NOT NULL OR oauth_config IS NOT NULL)
         AND ((visibility = 'public' AND $2 = 'public')
             OR (visibility = 'team' AND $2 = 'team' AND team_id = $3)
             OR (visibility = 'private' AND $2 = 'private' AND owner_email = $4))";
@@ -622,6 +622,7 @@ const AUTH_CONFLICT_QUERY: &str = "
 const CONNECTION_CONFIG: &str = concat!(
     "SELECT LOWER(COALESCE(g.auth_type, '')) AS kind, CAST(g.auth_value AS TEXT) AS headers,
         CAST(g.auth_query_params AS TEXT) AS query, CAST(g.sigv4_config AS TEXT) AS sigv4,
+        CAST(g.oauth_config AS TEXT) AS oauth,
         CAST(g.passthrough_headers AS TEXT) AS passthrough, CAST(g.identity_propagation AS TEXT) AS identity,
         g.ca_certificate, g.client_cert, g.client_key FROM gateways g
     WHERE g.id = $1 AND g.url = $2 AND g.enabled = TRUE AND g.status = 'active'
@@ -650,6 +651,7 @@ pub(crate) struct GatewayConnectionRow {
     pub(crate) headers: Option<String>,
     pub(crate) query: Option<String>,
     pub(crate) sigv4: Option<String>,
+    pub(crate) oauth: Option<String>,
     pub(crate) passthrough: Option<String>,
     pub(crate) identity: Option<String>,
     pub(crate) ca_certificate: Option<String>,
@@ -673,16 +675,16 @@ macro_rules! tool_conflict_query {
 }
 
 macro_rules! insert_gateway {
-    ($capabilities:literal, $tags:literal, $auth_value:literal, $auth_query:literal, $passthrough:literal, $identity:literal, $sigv4:literal) => {
+    ($capabilities:literal, $tags:literal, $auth_value:literal, $auth_query:literal, $passthrough:literal, $identity:literal, $sigv4:literal, $oauth:literal) => {
         concat!(
             "INSERT INTO gateways (
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
                 updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status,
                 auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation,
-                ca_certificate, ca_certificate_sig, signing_algorithm, client_cert, client_key, sigv4_config
+                ca_certificate, ca_certificate_sig, signing_algorithm, client_cert, client_key, sigv4_config, oauth_config
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, $17, 'active',
-                $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ", $18, $19, $20, $21, $22, ", $sigv4, ")"
+                $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ", $18, $19, $20, $21, $22, ", $sigv4, ", ", $oauth, ")"
         )
     };
 }
@@ -1225,14 +1227,14 @@ impl Database {
                     _ => {}
                 }
                 if let Some(auth) = auth {
-                    let existing = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(AUTH_CONFLICT_QUERY)
+                    let existing = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, Option<String>)>(AUTH_CONFLICT_QUERY)
                         .bind(gateway.url)
                         .bind(gateway.visibility)
                         .bind(gateway.team_id)
                         .bind(gateway.owner_email)
                         .fetch_all(&mut *$tx)
                         .await?;
-                    if existing.iter().any(|(headers, query, sigv4)| auth.matches_stored(headers.as_deref(), query.as_deref(), sigv4.as_deref())) {
+                    if existing.iter().any(|(headers, query, sigv4, oauth)| auth.matches_stored(headers.as_deref(), query.as_deref(), sigv4.as_deref(), oauth.as_deref())) {
                         return Err(RegistrationError::UrlConflict);
                     }
                 }
@@ -1272,6 +1274,7 @@ impl Database {
                     .bind(options.tls.client_cert)
                     .bind(options.tls.client_key)
                     .bind(auth.and_then(|auth| auth.encoded_sigv4.as_deref()))
+                    .bind(auth.and_then(|auth| auth.encoded_oauth.as_deref()))
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1361,7 +1364,8 @@ impl Database {
                         "json($14)",
                         "json($15)",
                         "json($16)",
-                        "json($23)"
+                        "json($23)",
+                        "json($24)"
                     ),
                     insert_tool!("json($8)", "json($9)", "json($10)"),
                     "json($7)"
@@ -1380,7 +1384,8 @@ impl Database {
                         "CAST($14 AS JSON)",
                         "CAST($15 AS JSON)",
                         "CAST($16 AS JSON)",
-                        "CAST($23 AS JSON)"
+                        "CAST($23 AS JSON)",
+                        "CAST($24 AS JSON)"
                     ),
                     insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)"),
                     "CAST($7 AS JSON)"

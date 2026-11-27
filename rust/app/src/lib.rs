@@ -19,6 +19,7 @@ mod legacy_sse_database;
 pub mod mcp;
 mod modern;
 mod modern_validation;
+mod oauth_client;
 pub mod probes;
 mod proxy_catalog_cache;
 mod redis_events;

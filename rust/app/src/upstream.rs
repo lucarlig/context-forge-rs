@@ -18,7 +18,7 @@ use ipnet::IpNet;
 use reqwest::{
     Client, Method, Response,
     dns::{Name, Resolve, Resolving},
-    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
@@ -42,6 +42,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
+use zeroize::Zeroizing;
 
 use crate::{
     credentials::{QueryValues, UpstreamCredentials},
@@ -49,6 +50,7 @@ use crate::{
     sessions::SessionLifetime,
     sigv4::SigV4,
     upstream_tls,
+    upstream_tls::TlsMaterial,
 };
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
@@ -885,43 +887,22 @@ impl UpstreamClient {
     }
 
     async fn connect(&self, endpoint: UpstreamEndpoint<'_>) -> Result<Session, UpstreamError> {
-        let url = self.policy.validate_url(endpoint.url)?;
         let tls = endpoint
             .credentials
             .and_then(|credentials| credentials.tls.as_ref());
-        let mut builder = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .pool_max_idle_per_host(0)
-            .connect_timeout(CONNECT_TIMEOUT.min(self.timeout))
-            .dns_resolver(Arc::new(DenyDns))
-            .tls_backend_preconfigured(
-                upstream_tls::client_config(tls).map_err(|_| UpstreamError::Transport)?,
-            );
         let sigv4 = endpoint.credentials.and_then(|credentials| {
             credentials.sigv4.as_ref().map(|signer| RequestSigning {
                 signer: signer.clone(),
                 headers: credentials.headers.clone(),
             })
         });
-        if let Some(credentials) = endpoint.credentials
-            && sigv4.is_none()
-        {
-            builder = builder.default_headers(credentials.headers.clone());
-        }
-        if let Some(domain) = url.domain() {
-            let port = url
-                .port_or_known_default()
-                .ok_or(UpstreamError::InvalidUrl)?;
-            let addresses = lookup_host((domain, port))
-                .await
-                .map_err(|_| UpstreamError::Resolve)?;
-            let addresses = check_addresses(&self.policy, addresses)?;
-            builder = builder.resolve_to_addrs(domain, &addresses);
-        }
+        let defaults = endpoint
+            .credentials
+            .filter(|_| sigv4.is_none())
+            .map(|credentials| &credentials.headers);
+        let (client, url) = self.pinned_client(endpoint.url, tls, defaults).await?;
         Ok(Session {
-            client: builder.build()?,
+            client,
             url,
             capabilities: Value::Null,
             protocol_version: None,
@@ -933,6 +914,86 @@ impl UpstreamClient {
             sigv4,
             next_id: AtomicI64::new(1),
         })
+    }
+
+    async fn pinned_client(
+        &self,
+        endpoint: &str,
+        tls: Option<&TlsMaterial>,
+        defaults: Option<&HeaderMap>,
+    ) -> Result<(Client, Url), UpstreamError> {
+        let url = self.policy.validate_url(endpoint)?;
+        let mut builder = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .pool_max_idle_per_host(0)
+            .connect_timeout(CONNECT_TIMEOUT.min(self.timeout))
+            .dns_resolver(Arc::new(DenyDns))
+            .tls_backend_preconfigured(
+                upstream_tls::client_config(tls).map_err(|_| UpstreamError::Transport)?,
+            );
+        if let Some(headers) = defaults {
+            builder = builder.default_headers(headers.clone());
+        }
+        if let Some(domain) = url.domain() {
+            let port = url
+                .port_or_known_default()
+                .ok_or(UpstreamError::InvalidUrl)?;
+            let addresses = lookup_host((domain, port))
+                .await
+                .map_err(|_| UpstreamError::Resolve)?;
+            let addresses = check_addresses(&self.policy, addresses)?;
+            builder = builder.resolve_to_addrs(domain, &addresses);
+        }
+        Ok((builder.build()?, url))
+    }
+
+    pub(crate) async fn exchange_oauth_token(
+        &self,
+        endpoint: &str,
+        tls: Option<&TlsMaterial>,
+        form: &str,
+        basic: Option<&HeaderValue>,
+    ) -> Result<Zeroizing<String>, UpstreamError> {
+        timeout_at(self.deadline()?, async {
+            let (client, url) = self.pinned_client(endpoint, tls, None).await?;
+            let mut request = client
+                .post(url)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(ACCEPT, "application/json")
+                .body(form.to_owned());
+            if let Some(basic) = basic {
+                request = request.header(AUTHORIZATION, basic.clone());
+            }
+            let response = request.send().await?;
+            if !response.status().is_success() {
+                return Err(UpstreamError::Status(response.status().as_u16()));
+            }
+            let is_form = response_media_type(&response).is_some_and(|media| {
+                media.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            });
+            let bytes = read_json_body(response).await?;
+            let token = if is_form {
+                url::form_urlencoded::parse(&bytes)
+                    .find(|(name, _)| name == "access_token")
+                    .map(|(_, value)| value.into_owned())
+            } else {
+                #[derive(Deserialize)]
+                struct TokenResponse {
+                    access_token: String,
+                }
+                serde_json::from_slice::<TokenResponse>(&bytes)
+                    .ok()
+                    .map(|response| response.access_token)
+            };
+            token
+                .filter(|value| !value.is_empty())
+                .map(Zeroizing::new)
+                .ok_or(UpstreamError::InvalidResponse)
+        })
+        .await
+        .map_err(|_| UpstreamError::Timeout)?
     }
 }
 

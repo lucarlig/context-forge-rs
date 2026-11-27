@@ -22,6 +22,7 @@ jiff = { version = "1", default-features = false, features = ["std", "tzdb-bundl
 jsonschema = { version = "0.63", default-features = false }
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "fuel", "serde"] }
+percent-encoding = "2"
 redis = { version = "1.8.3", default-features = false, features = ["tokio-rustls-comp"] }
 regex = { version = "1.12", default-features = false, features = ["std", "perf"] }
 ring = "0.17.14"

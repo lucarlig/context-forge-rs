@@ -49,6 +49,15 @@ impl SecretEnvelope {
         }
     }
 
+    pub(crate) fn is_encrypted(value: &str) -> bool {
+        value.starts_with(PREFIX)
+            || (value.starts_with('{')
+                && serde_json::from_str::<Bundle>(value).is_ok_and(|bundle| {
+                    bundle.version.as_deref() == Some("v2")
+                        || bundle.kdf.as_deref() == Some("argon2id")
+                }))
+    }
+
     pub(crate) async fn seal(&self, plaintext: Zeroizing<String>) -> Result<String, EnvelopeError> {
         let permit = self
             .workers

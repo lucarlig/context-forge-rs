@@ -42,6 +42,7 @@ use crate::{
     database::Database,
     forward_identity::IdentityError,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
+    oauth_client::OAuthConfig,
     proxy_catalog_cache::ProxyCatalogCache,
     secret_envelope::SecretEnvelope,
     sessions::Session,
@@ -535,7 +536,7 @@ impl GatewayService {
             .ok_or(ToolError::Unavailable)?;
         let kind = connection.kind.as_str();
         let cipher = self.credential_cipher.as_ref();
-        let mut credentials = if matches!(kind, "" | "none" | "one_time_auth") {
+        let mut credentials = if matches!(kind, "" | "none" | "one_time_auth" | "oauth") {
             Ok(UpstreamCredentials::default())
         } else if kind == "sigv4" {
             SigV4Config::load(
@@ -598,8 +599,26 @@ impl GatewayService {
             tracing::warn!(gateway = %id, "could not load upstream TLS material");
             ToolError::Unavailable
         })?;
+        if kind == "oauth" {
+            let config = OAuthConfig::load(
+                self.vault.as_ref().ok_or(ToolError::Unavailable)?,
+                connection.oauth.as_deref().ok_or(ToolError::Unavailable)?,
+            )
+            .await
+            .map_err(|_| ToolError::Unavailable)?;
+            let authorization = config
+                .authorization(&self.upstream, credentials.tls.as_ref())
+                .await
+                .map_err(|error| {
+                    tracing::warn!(gateway = %id, %error, "could not obtain upstream OAuth token");
+                    ToolError::Unavailable
+                })?;
+            credentials
+                .headers
+                .insert(header::AUTHORIZATION, authorization);
+        }
         if let Some(incoming) = incoming {
-            let managed = matches!(kind, "basic" | "bearer" | "authheaders" | "sigv4");
+            let managed = matches!(kind, "basic" | "bearer" | "authheaders" | "sigv4" | "oauth");
             self.header_forwarding
                 .apply(
                     &self.database,
@@ -962,6 +981,45 @@ async fn register(
     } else {
         None
     };
+    if let Some(config) = input.auth.oauth_config()
+        && let Some(auth) = &mut auth
+    {
+        let encryption_error = || {
+            RegistrationResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway credential encryption unavailable",
+            )
+        };
+        let (encoded, masked) = config
+            .store(service.vault.as_ref().ok_or_else(encryption_error)?)
+            .await
+            .map_err(|_| encryption_error())?;
+        let authorization = config
+            .authorization(&service.upstream, tls.as_ref())
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "upstream gateway OAuth token request failed");
+                if matches!(
+                    error,
+                    UpstreamError::InvalidUrl | UpstreamError::BlockedDestination
+                ) {
+                    RegistrationResponse::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "OAuth token endpoint is invalid or disallowed",
+                    )
+                } else {
+                    RegistrationResponse::new(
+                        StatusCode::BAD_GATEWAY,
+                        "OAuth authentication failed",
+                    )
+                }
+            })?;
+        auth.encoded_oauth = Some(encoded);
+        auth.masked["oauthConfig"] = masked;
+        auth.credentials
+            .headers
+            .insert(header::AUTHORIZATION, authorization);
+    }
     let mut anonymous_credentials = UpstreamCredentials::default();
     let discovery_credentials = auth
         .as_mut()
