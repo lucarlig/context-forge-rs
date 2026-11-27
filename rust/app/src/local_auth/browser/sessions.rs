@@ -146,19 +146,6 @@ fn htmx(headers: &HeaderMap) -> bool {
         .is_some_and(|header| header == "true")
 }
 
-pub(super) fn browser_request(headers: &HeaderMap) -> bool {
-    forms::header_text(headers, header::ACCEPT).is_some_and(|value| value.contains("text/html"))
-        || htmx(headers)
-        || forms::header_text(headers, header::REFERER)
-            .and_then(|value| url::Url::parse(value).ok())
-            .is_some_and(|referer| {
-                let host = referer[url::Position::BeforeHost..url::Position::AfterPort].to_owned();
-                forms::header_text(headers, header::HOST).is_some_and(|value| value == host)
-                    && (referer.path().contains("/admin")
-                        || referer.path().contains("/oauth/callback"))
-            })
-}
-
 pub(super) async fn create_session(
     accounts: &Accounts,
     user: &storage::LocalUser,

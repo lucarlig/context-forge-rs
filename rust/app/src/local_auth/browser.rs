@@ -17,22 +17,19 @@ use minijinja::context;
 use percent_encoding::utf8_percent_encode;
 
 use self::forms::{Form, csrf, render};
-use self::sessions::{
-    Denial, Session, access, browser_request, clear_session_cookies, create_session,
-};
+use self::sessions::{Denial, Session, access, clear_session_cookies, create_session};
 use super::*;
 use crate::{
-    access::{auth_cookie, cookie},
+    access::{auth_cookie, browser_request, cookie},
     auth::TeamVisibility,
     catalog::ManagedCatalog,
     config::{flag, parse, value},
-    http_boundary::allowed_origins,
+    http_boundary::{allowed_origins, csrf::ADMIN_CSRF_COOKIE as CSRF_COOKIE},
     jwt::TokenUse,
 };
 
 const LOGIN: &str = "/admin/login";
 const CHANGE: &str = "/admin/change-password-required";
-const CSRF_COOKIE: &str = "mcpgateway_csrf_token";
 
 pub(crate) struct BrowserSettings {
     root: String,
@@ -169,13 +166,18 @@ pub(super) fn router(
                 );
             }
             if matches!(kind, ManagedCatalog::Gateways) {
-                router = router.route(
-                    &format!("{base}/{{id}}"),
-                    get(catalog::gateway_detail)
-                        .put(catalog::editor::save)
-                        .delete(catalog::delete_gateway)
-                        .layer(Extension(kind)),
-                );
+                router = router
+                    .route(
+                        &format!("{base}/{{id}}"),
+                        get(catalog::gateway_detail)
+                            .put(catalog::editor::save)
+                            .delete(catalog::delete_gateway)
+                            .layer(Extension(kind)),
+                    )
+                    .route(
+                        &format!("{base}/{{id}}/tools/refresh"),
+                        post(catalog::mutate).layer(Extension((kind, catalog::Action::Refresh))),
+                    );
             }
             for action in [catalog::Action::State, catalog::Action::Delete] {
                 router = router.route(

@@ -103,6 +103,7 @@ pub(super) async fn authorize(
 
 pub(super) async fn callback(
     State(service): State<Arc<GatewayService>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
@@ -117,35 +118,73 @@ pub(super) async fn callback(
         Some(state) => callback_inner(&service, &headers, state, &query).await,
         None => Err(CallbackFailure::InvalidState),
     };
-    let (status, payload, message) = match result {
-        Ok(gateway) => (
-            StatusCode::OK,
-            json!({"type":"oauth_callback","status":"success","gatewayId":gateway.id,"gatewayName":gateway.name}),
-            "Authorization successful. This window will close automatically.",
-        ),
-        Err(failure) => (
-            failure.status(),
-            json!({"type":"oauth_callback","status":"error","error":failure.code(),"errorDescription":failure.message()}),
-            failure.message(),
-        ),
-    };
+    let mut proof_cookie = None;
     let nonce = random_secret::<18>().unwrap_or_default();
-    let title = if status.is_success() {
-        "OAuth Authorization Successful"
-    } else {
-        "OAuth Authorization Failed"
+    let settings = &service.gateway_oauth;
+    let root = settings.root_path();
+    let mut controls = String::new();
+    let mut script = String::new();
+    let (status, title, message) = match result {
+        Ok((gateway, email)) => {
+            let payload = json!({"type":"oauth_callback","status":"success","gatewayId":gateway.id,"gatewayName":gateway.name});
+            if popup {
+                script = notify_opener(&nonce, payload, &settings.browser_origin);
+            } else if !nonce.is_empty()
+                && let Some((proof, cookie)) = super::browser::callback_proof(
+                    &service,
+                    &headers,
+                    peer.map(|Extension(ConnectInfo(peer))| peer),
+                    &gateway,
+                    &email,
+                )
+                .await
+            {
+                proof_cookie = Some(cookie);
+                controls = r#"<button id="fetch-tools" type="button">Fetch Tools from MCP Server</button><p id="fetch-status" role="status"></p>"#.to_owned();
+                script = fetch_script(
+                    &nonce,
+                    &format!("{root}/oauth/fetch-tools/{}", gateway.id),
+                    &proof,
+                    payload,
+                    &settings.browser_origin,
+                );
+            }
+            (
+                StatusCode::OK,
+                "OAuth Authorization Successful",
+                if popup {
+                    "Authorization successful. This window will close automatically."
+                } else {
+                    "Authorization completed successfully."
+                },
+            )
+        }
+        Err(failure) => {
+            if popup {
+                let payload = json!({"type":"oauth_callback","status":"error","error":failure.code(),"errorDescription":failure.message()});
+                script = notify_opener(&nonce, payload, &settings.browser_origin);
+            }
+            (
+                failure.status(),
+                "OAuth Authorization Failed",
+                failure.message(),
+            )
+        }
     };
-    let script = if popup && !nonce.is_empty() {
-        let payload = script_json(payload);
-        let target = script_json(json!(service.gateway_oauth.browser_origin));
-        format!(
-            r#"<script nonce="{nonce}">if(window.opener){{window.opener.postMessage({payload},{target});window.close();}}</script>"#
-        )
-    } else {
-        String::new()
-    };
-    let mut response=(status,Html(format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{message}</p>{script}</body></html>"
+    if !popup {
+        let root = root
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        use std::fmt::Write as _;
+        let _ = write!(
+            controls,
+            r#"<p><a href="{root}/admin/?section=gateways#gateways">Return to Admin Panel</a></p>"#
+        );
+    }
+    let mut response = (status, Html(format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{message}</p>{controls}{script}</body></html>"
     ))).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -154,7 +193,7 @@ pub(super) async fn callback(
         HeaderValue::from_static("no-referrer"),
     );
     if let Ok(csp) = HeaderValue::from_str(&format!(
-        "default-src 'none'; script-src 'nonce-{nonce}'; base-uri 'none'; frame-ancestors 'none'"
+        "default-src 'none'; script-src 'nonce-{nonce}'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"
     )) {
         headers.insert(header::CONTENT_SECURITY_POLICY, csp);
     }
@@ -169,6 +208,9 @@ pub(super) async fn callback(
     {
         headers.append(header::SET_COOKIE, cookie);
     }
+    if let Some(cookie) = proof_cookie {
+        headers.append(header::SET_COOKIE, cookie);
+    }
     response
 }
 
@@ -177,7 +219,7 @@ async fn callback_inner(
     headers: &HeaderMap,
     state: &str,
     query: &CallbackQuery,
-) -> Result<OAuthGateway, CallbackFailure> {
+) -> Result<(OAuthGateway, String), CallbackFailure> {
     let transaction = service
         .database
         .consume_oauth_state(state)
@@ -282,7 +324,7 @@ async fn callback_inner(
     if !saved {
         return Err(CallbackFailure::InvalidState);
     }
-    Ok(gateway)
+    Ok((gateway, email))
 }
 
 pub(super) async fn code_config(
@@ -371,6 +413,51 @@ fn transaction_cookie(
         cookie_name(state)
     ))
     .ok()
+}
+
+fn notify_opener(nonce: &str, payload: Value, origin: &str) -> String {
+    if nonce.is_empty() {
+        return String::new();
+    }
+    let payload = script_json(payload);
+    let target = script_json(json!(origin));
+    format!(
+        r#"<script nonce="{nonce}">if(window.opener){{window.opener.postMessage({payload},{target});window.close();}}</script>"#
+    )
+}
+
+fn fetch_script(nonce: &str, path: &str, proof: &str, result: Value, origin: &str) -> String {
+    let path = script_json(json!(path));
+    let proof = script_json(json!(proof));
+    let result = script_json(result);
+    let origin = script_json(json!(origin));
+    format!(
+        r#"<script nonce="{nonce}">
+const button = document.getElementById('fetch-tools');
+const status = document.getElementById('fetch-status');
+button.addEventListener('click', async () => {{
+    button.disabled = true;
+    status.textContent = 'Fetching tools…';
+    try {{
+        const response = await fetch({path}, {{
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {{ 'Accept': 'application/json, text/html', 'X-CSRF-Token': {proof} }}
+        }});
+        const body = await response.json();
+        if (!response.ok || body.success !== true) throw new Error();
+        status.textContent = body.message;
+        if (window.opener && !window.opener.closed) {{
+            window.opener.postMessage({result}, {origin});
+            window.close();
+        }}
+    }} catch {{
+        status.textContent = 'Could not fetch tools. Try again.';
+        button.disabled = false;
+    }}
+}});
+</script>"#
+    )
 }
 
 fn script_json(value: Value) -> String {

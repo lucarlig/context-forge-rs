@@ -11,7 +11,7 @@ pub(super) struct OAuthGateway {
     pub(super) name: String,
     pub(super) url: String,
     visibility: String,
-    team_id: Option<String>,
+    pub(super) team_id: Option<String>,
     owner_email: Option<String>,
     pub(super) oauth_config: Option<String>,
 }
@@ -53,12 +53,16 @@ pub(super) struct TokenStatus {
 }
 
 impl TokenStatus {
-    pub(super) fn metadata(&self, now: Timestamp) -> Value {
-        let status = match self.expires_at.as_deref().and_then(parse_time) {
+    pub(super) fn state(&self, now: Timestamp) -> &'static str {
+        match self.expires_at.as_deref().and_then(parse_time) {
             Some(expiry) if expiry <= now => "expired",
             Some(expiry) if expiry.as_second() - now.as_second() < 300 => "near_expiry",
             _ => "valid",
-        };
+        }
+    }
+
+    pub(super) fn metadata(&self, now: Timestamp) -> Value {
+        let status = self.state(now);
         json!({
             "status":status,"authorized":status!="expired",
             "scopes":self.scopes.as_deref().and_then(|encoded|serde_json::from_str::<Value>(encoded).ok()),

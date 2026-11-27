@@ -573,20 +573,26 @@ impl GatewayService {
         if self.grpc.admin_enabled {
             router = router.merge(grpc_api::router());
         }
-        self.access.protect_api(
-            router
-                .merge(a2a_api::router())
-                .merge(oauth_api::router())
-                .merge(roots::router())
-                .merge(export_api::router())
-                .merge(import_api::router())
-                .merge(tags::router())
-                .merge(prompt_api::router(self.max_prompt_bytes))
-                .merge(tool_api::router())
-                .merge(server_api::router())
-                .merge(resource_api::router(self.resource_limits.max_bytes))
-                .with_state(self.clone()),
-        )
+        let oauth_browser = self.access.protect_oauth_browser(
+            oauth_api::browser_router().with_state(self.clone()),
+            format!("{}/admin/login", self.gateway_oauth.root_path()),
+        );
+        self.access
+            .protect_api(
+                router
+                    .merge(a2a_api::router())
+                    .merge(oauth_api::router())
+                    .merge(roots::router())
+                    .merge(export_api::router())
+                    .merge(import_api::router())
+                    .merge(tags::router())
+                    .merge(prompt_api::router(self.max_prompt_bytes))
+                    .merge(tool_api::router())
+                    .merge(server_api::router())
+                    .merge(resource_api::router(self.resource_limits.max_bytes))
+                    .with_state(self.clone()),
+            )
+            .merge(oauth_browser)
     }
 
     pub fn registration_router_with_probe(

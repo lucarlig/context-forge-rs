@@ -75,6 +75,9 @@ enum ApiTarget {
     PublicRpc,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct OAuthBrowserSession;
+
 enum ServerTarget<'a> {
     Endpoint(Option<&'a str>),
     RpcParameters,
@@ -222,6 +225,13 @@ impl Authorizer {
                 ApiTarget::PublicRpc,
             ),
             authorize_api,
+        ))
+    }
+
+    pub(crate) fn protect_oauth_browser(self: &Arc<Self>, router: Router, login: String) -> Router {
+        router.route_layer(middleware::from_fn_with_state(
+            (self.clone(), login),
+            authorize_oauth_browser,
         ))
     }
 
@@ -821,6 +831,22 @@ pub(crate) fn auth_cookie(headers: &HeaderMap) -> Option<&str> {
     cookie(headers, "jwt_token").or_else(|| cookie(headers, "access_token"))
 }
 
+pub(crate) fn browser_request(headers: &HeaderMap) -> bool {
+    let text = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    text(header::ACCEPT).is_some_and(|value| value.contains("text/html"))
+        || headers
+            .get("hx-request")
+            .is_some_and(|value| value == "true")
+        || text(header::REFERER)
+            .and_then(|value| url::Url::parse(value).ok())
+            .is_some_and(|referer| {
+                let host = &referer[url::Position::BeforeHost..url::Position::AfterPort];
+                text(header::HOST).is_some_and(|value| value == host)
+                    && (referer.path().contains("/admin")
+                        || referer.path().contains("/oauth/callback"))
+            })
+}
+
 pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
@@ -1002,6 +1028,34 @@ async fn authorize_api(
     let principal = access
         .authenticate_for(token, peer(&request), target)
         .await?;
+    request.extensions_mut().insert(principal);
+    dispatch_with_usage(&access, request, next).await
+}
+
+async fn authorize_oauth_browser(
+    State((access, login)): State<(Arc<Authorizer>, String)>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let browser = browser_request(request.headers());
+    let token = bearer(request.headers())?;
+    let session = token.is_none() && browser;
+    let credential = token.or_else(|| session.then(|| auth_cookie(request.headers())).flatten());
+    let Some(credential) = credential else {
+        if session && request.uri().path().starts_with("/oauth/authorize/") {
+            return Ok((StatusCode::FOUND, [(header::LOCATION, login)]).into_response());
+        }
+        return Err(AuthError::ApiRequired("Authorization token required"));
+    };
+    let principal = access
+        .authenticate(credential, peer(&request), None)
+        .await?;
+    if session {
+        if principal.token_use != TokenUse::Session {
+            return Err(AuthError::ApiRequired("Browser session required"));
+        }
+        request.extensions_mut().insert(OAuthBrowserSession);
+    }
     request.extensions_mut().insert(principal);
     dispatch_with_usage(&access, request, next).await
 }

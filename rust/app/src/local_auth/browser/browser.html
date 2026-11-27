@@ -198,8 +198,21 @@
           <tbody>
             {% for item in part.rows %}
             <tr>
-              <th scope="row">{{ item.name }}</th><td>{{ item.description|default('—', true) }}</td><td>{{ "Active" if item.enabled else "Inactive" }}</td><td>{{ item.visibility|default('—', true) }}</td>
+              <th scope="row">{{ item.name }}</th><td>{{ item.description|default('—', true) }}</td>
+              <td>{{ "Active" if item.enabled else "Inactive" }}{% if item.oauth %}<br>{{ item.oauth }}{% endif %}</td>
+              <td>{{ item.visibility|default('—', true) }}</td>
               {% if part.actions %}<td><div class="actions">
+                {% if item.oauth %}
+                <a href="{{ root }}/oauth/authorize/{{ item.id }}">Authorize</a>
+                {% endif %}
+                {% if item.refresh %}
+                <form method="post" action="{{ root }}/admin/gateways/{{ item.id }}/tools/refresh">
+                  <input type="hidden" name="csrf_token" value="{{ proof }}">
+                  {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}
+                  {% if catalog.include_inactive %}<input type="hidden" name="is_inactive_checked" value="true">{% endif %}
+                  <button type="submit">Fetch tools</button>
+                </form>
+                {% endif %}
                 {% if item.update %}
                 <a href="{{ root }}/admin/{{ part.name }}/{{ item.id }}/edit{{ editor_query }}">Edit</a>
                 <form method="post" action="{{ root }}/admin/{{ part.name }}/{{ item.id }}/state">

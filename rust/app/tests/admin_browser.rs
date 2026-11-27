@@ -597,3 +597,91 @@ async fn admin_gateway_json_update_preserves_owner_and_unsubmitted_fields() {
     fixture.process.kill().await.unwrap();
     upstream_task.abort();
 }
+
+#[tokio::test]
+async fn gateway_oauth_browser_session_requires_csrf_for_tool_fetch() {
+    let mut gateway = gateway().await;
+    let client = &gateway.client;
+    let origin = &gateway.origin;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL,"password":gateway.password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let jwt = login["access_token"].as_str().unwrap();
+    let created = client.post(format!("{origin}/gateways"))
+        .bearer_auth(jwt)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({
+            "name":"oauth-browser-fixture", "url":format!("{origin}/upstream"), "visibility":"public",
+            "transport":"STREAMABLEHTTP", "auth_type":"oauth",
+            "oauth_config":{
+                "grant_type":"authorization_code", "issuer":origin, "token_url":format!("{origin}/token"),
+                "authorization_url":format!("{origin}/consent"), "redirect_uri":format!("{origin}/oauth/callback"),
+                "client_id":"fixture-client", "client_secret":"fixture-value"
+            }
+        }).to_string())
+        .send().await.unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: serde_json::Value = serde_json::from_str(&created.text().await.unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap();
+    let session = format!("jwt_token={jwt}");
+    let home = client
+        .get(format!("{origin}/admin/?section=gateways"))
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(home.status(), StatusCode::OK);
+    let proof = cookie(&home, "mcpgateway_csrf_token").to_owned();
+    assert!(
+        home.text()
+            .await
+            .unwrap()
+            .contains("Authorization required")
+    );
+    let authorize = client
+        .get(format!("{origin}/oauth/authorize/{id}"))
+        .header(header::ACCEPT, "text/html")
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = authorize.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with(&format!("{origin}/consent?")));
+    assert!(location.contains("code_challenge_method=S256"));
+
+    for (site, header_value) in [
+        (origin.as_str(), ""),
+        ("https://foreign.example.test", proof.as_str()),
+        (origin.as_str(), "mismatch"),
+    ] {
+        let response = client
+            .post(format!("{origin}/oauth/fetch-tools/{id}"))
+            .header(header::ACCEPT, "text/html")
+            .header(
+                header::COOKIE,
+                format!("{session}; mcpgateway_csrf_token={proof}"),
+            )
+            .header(header::ORIGIN, site)
+            .header("X-CSRF-Token", header_value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let raw_token = client
+        .get(format!("{origin}/oauth/token/{id}"))
+        .header(header::ACCEPT, "text/html")
+        .header(header::COOKIE, &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw_token.status(), StatusCode::UNAUTHORIZED);
+    gateway.process.kill().await.unwrap();
+}

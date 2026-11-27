@@ -34,6 +34,7 @@ pub(crate) struct CatalogListing {
 pub(crate) enum CatalogMutation {
     State(bool),
     Delete { purge_metrics: bool },
+    Refresh,
 }
 
 impl GatewayService {
@@ -43,6 +44,7 @@ impl GatewayService {
         principal: &Principal,
         id: String,
         mutation: CatalogMutation,
+        headers: &HeaderMap,
     ) -> Result<Option<&'static str>, &'static str> {
         match mutation {
             CatalogMutation::State(enabled) => {
@@ -115,6 +117,24 @@ impl GatewayService {
                 result
                     .map(|_| None)
                     .map_err(|error| flash_error(error.0, "delete_failed"))
+            }
+            CatalogMutation::Refresh => {
+                let Json(result) = management::refresh_catalog(
+                    self,
+                    principal,
+                    id,
+                    management::RefreshParameters::default(),
+                    headers,
+                )
+                .await
+                .map_err(|error| {
+                    flash_error(error.into_response().status(), "gateway_refresh_failed")
+                })?;
+                if result["success"] == true {
+                    Ok(Some("gateway_refreshed"))
+                } else {
+                    Err("gateway_refresh_failed")
+                }
             }
         }
     }

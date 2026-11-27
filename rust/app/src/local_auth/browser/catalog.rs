@@ -129,6 +129,7 @@ pub(super) async fn delete_gateway(
 pub(super) enum Action {
     State,
     Delete,
+    Refresh,
 }
 
 impl Action {
@@ -136,12 +137,13 @@ impl Action {
         match self {
             Self::State => "state",
             Self::Delete => "delete",
+            Self::Refresh => "tools/refresh",
         }
     }
 
     fn permission(self) -> &'static str {
         match self {
-            Self::State => "update",
+            Self::State | Self::Refresh => "update",
             Self::Delete => "delete",
         }
     }
@@ -184,9 +186,10 @@ pub(super) async fn mutate(
             Action::Delete => CatalogMutation::Delete {
                 purge_metrics: affirmative("purge_metrics"),
             },
+            Action::Refresh => CatalogMutation::Refresh,
         };
         let result = service
-            .mutate_admin_catalog(kind, &principal, id, mutation)
+            .mutate_admin_catalog(kind, &principal, id, mutation, &parts.headers)
             .await;
         let mut query = url::form_urlencoded::Serializer::new(String::new());
         match result {
@@ -409,10 +412,13 @@ struct Row {
     visibility: Option<String>,
     update: bool,
     delete: bool,
+    refresh: bool,
+    oauth: Option<&'static str>,
 }
 
 async fn rows(
     accounts: &Accounts,
+    service: &GatewayService,
     principal: &Principal,
     kind: ManagedCatalog,
     data: &[Value],
@@ -420,6 +426,16 @@ async fn rows(
     let mut permissions = HashMap::new();
     let mut rows = Vec::with_capacity(data.len());
     let global_admin = principal.is_global_admin();
+    let oauth = if matches!(kind, ManagedCatalog::Gateways) {
+        let ids = data
+            .iter()
+            .filter(|row| row["oauthConfig"]["grant_type"] == "authorization_code")
+            .filter_map(|row| row["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        service.oauth_dashboard_statuses(principal, &ids).await
+    } else {
+        HashMap::new()
+    };
     for value in data {
         let team = value["teamId"].as_str();
         if let Entry::Vacant(entry) = permissions.entry(team) {
@@ -442,14 +458,22 @@ async fn rows(
             || value["ownerEmail"].as_str() == Some(&principal.email)
             || (value["visibility"].as_str() == Some("team") && team_owner);
         let field = |name: &str| value[name].as_str().map(str::to_owned);
+        let id = field("id").unwrap_or_default();
+        let enabled = value["enabled"].as_bool().unwrap_or(false);
         rows.push(Row {
-            id: field("id").unwrap_or_default(),
+            oauth: oauth.get(&id).copied(),
+            id,
             name: field("name").unwrap_or_default(),
             description: field("description").filter(|text| !text.is_empty()),
-            enabled: value["enabled"].as_bool().unwrap_or(false),
+            enabled,
             visibility: field("visibility"),
             update: update && owned,
             delete: delete && owned,
+            refresh: matches!(kind, ManagedCatalog::Gateways)
+                && enabled
+                && value["status"] == "active"
+                && update
+                && owned,
         });
     }
     Ok(rows)
@@ -507,14 +531,16 @@ pub(super) async fn dashboard(
                     } = service.admin_catalog(kind, principal, query, team).await?;
                     let page_link =
                         |page| href(Some(kind.name()), Some((page, pagination.per_page)));
-                    let rows = rows(accounts, principal, kind, &data).await?;
+                    let rows = rows(accounts, service, principal, kind, &data).await?;
                     let create = allows(accounts, principal, kind, "create", team).await?;
 
                     Ok::<_, CatalogApiError>(Section {
                         name: kind.name(),
                         fragment: fragment(kind),
                         label: label(kind),
-                        actions: rows.iter().any(|row| row.update || row.delete),
+                        actions: rows
+                            .iter()
+                            .any(|row| row.update || row.delete || row.oauth.is_some()),
                         rows,
                         create,
                         purge_metrics: !matches!(kind, ManagedCatalog::Gateways),
@@ -540,11 +566,13 @@ pub(super) async fn dashboard(
             Some("name_conflict") => Some("A tool name conflicts with an existing tool."),
             Some("permission_denied") => Some("You don’t have permission to change this entry."),
             Some("state_change_failed") => Some("Could not change the state of the entry."),
+            Some("gateway_refresh_failed") => Some("Could not refresh the MCP server tools."),
             _ => None,
         },
         message: match parameters.get("message").map(String::as_str) {
             Some("gateway_delete_pending") => Some("MCP server deletion is pending."),
             Some("gateway_write_pending") => Some("MCP server initialization is pending."),
+            Some("gateway_refreshed") => Some("MCP server tools refreshed."),
             _ => None,
         },
     })

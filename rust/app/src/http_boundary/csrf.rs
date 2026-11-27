@@ -22,6 +22,7 @@ use crate::{
 };
 
 const INTERNAL_MCP: &str = "/_internal/mcp/";
+pub(crate) const ADMIN_CSRF_COOKIE: &str = "mcpgateway_csrf_token";
 const EXEMPT: &[&str] = &[
     "/health",
     "/auth/login",

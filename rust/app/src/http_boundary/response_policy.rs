@@ -278,16 +278,20 @@ impl SecurityHeaders {
         if self.prevent_download_execution {
             headers.insert("x-download-options", HeaderValue::from_static("noopen"));
         }
-        headers.insert(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("strict-origin-when-cross-origin"),
-        );
-
         let path = path
             .strip_prefix(&self.root)
             .filter(|suffix| suffix.starts_with('/'))
             .unwrap_or(path);
-        if !matches!(path, "/docs" | "/redoc" | "/openapi.json") {
+        let oauth_callback = path == "/oauth/callback";
+        if !oauth_callback || !headers.contains_key(header::REFERRER_POLICY) {
+            headers.insert(
+                header::REFERRER_POLICY,
+                HeaderValue::from_static("strict-origin-when-cross-origin"),
+            );
+        }
+        if !matches!(path, "/docs" | "/redoc" | "/openapi.json")
+            && (!oauth_callback || !headers.contains_key(header::CONTENT_SECURITY_POLICY))
+        {
             headers.insert(
                 header::CONTENT_SECURITY_POLICY,
                 self.content_security_policy(),

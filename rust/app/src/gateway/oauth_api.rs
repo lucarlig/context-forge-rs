@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod browser;
 mod cimd;
 mod clients;
 mod flow;
@@ -13,14 +14,14 @@ pub(crate) use cimd::DOCUMENT_PATH as CIMD_DOCUMENT_PATH;
 pub(super) use handshake::test as test_handshake;
 pub(super) use token_access::{TokenTarget, authorization_header};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use axum::extract::{OriginalUri, Path, Query};
 use jiff::Timestamp;
 use serde_json::Map;
 
 use super::{catalog_api::CatalogApiError, *};
-use crate::oauth_client::IssuerMetadataCache;
+use crate::{http_boundary::csrf::CsrfTokens, oauth_client::IssuerMetadataCache};
 
 const MAX_STATUS_GATEWAYS: usize = 100;
 
@@ -28,6 +29,8 @@ pub struct GatewayOAuthSettings {
     pub(crate) redirect_uri: String,
     pub(crate) callback_path: String,
     pub(crate) browser_origin: String,
+    pub(crate) csrf_origins: HashSet<String>,
+    pub(crate) callback_csrf: Option<CsrfTokens>,
     pub(crate) secure_cookies: bool,
     pub(crate) token_retrieval: bool,
     pub(crate) refresh_threshold: i64,
@@ -86,6 +89,8 @@ impl Default for GatewayOAuthSettings {
             redirect_uri: "http://localhost:4444/oauth/callback".to_owned(),
             callback_path: "/oauth/callback".to_owned(),
             browser_origin: "http://localhost:4444".to_owned(),
+            csrf_origins: HashSet::new(),
+            callback_csrf: None,
             secure_cookies: true,
             token_retrieval: false,
             refresh_threshold: 600,
@@ -102,6 +107,12 @@ impl Default for GatewayOAuthSettings {
 }
 
 impl GatewayOAuthSettings {
+    pub(super) fn root_path(&self) -> &str {
+        self.callback_path
+            .strip_suffix("/oauth/callback")
+            .unwrap_or("")
+    }
+
     pub(in crate::gateway) async fn discover_endpoints(
         &self,
         upstream: &UpstreamClient,
@@ -119,16 +130,20 @@ impl GatewayOAuthSettings {
 
 pub(super) fn router() -> Router<Arc<GatewayService>> {
     Router::new()
-        .route("/oauth/status", get(status_batch))
-        .route("/oauth/status/{id}", get(status))
-        .route("/oauth/authorize/{id}", get(flow::authorize))
         .route("/oauth/token/{id}", get(token_access::token))
-        .route("/oauth/fetch-tools/{id}", post(fetch_tools))
         .route("/oauth/registered-clients", get(clients::list))
         .route(
             "/oauth/registered-clients/{id}",
             get(clients::read).delete(clients::delete),
         )
+}
+
+pub(super) fn browser_router() -> Router<Arc<GatewayService>> {
+    Router::new()
+        .route("/oauth/status", get(status_batch))
+        .route("/oauth/status/{id}", get(status))
+        .route("/oauth/authorize/{id}", get(flow::authorize))
+        .route("/oauth/fetch-tools/{id}", post(browser::fetch_tools))
 }
 
 pub(super) fn callback_router() -> Router<Arc<GatewayService>> {
@@ -139,9 +154,9 @@ pub(super) fn callback_router() -> Router<Arc<GatewayService>> {
 }
 
 async fn fetch_tools(
-    State(service): State<Arc<GatewayService>>,
-    Extension(principal): Extension<Principal>,
-    Path(id): Path<String>,
+    service: Arc<GatewayService>,
+    principal: Principal,
+    id: String,
     headers: HeaderMap,
 ) -> Response {
     let exchange = match visible_gateway(&service, &principal, &id).await {
@@ -163,14 +178,8 @@ async fn fetch_tools(
     } else {
         super::management::RefreshParameters::default()
     };
-    let response = super::management::refresh(
-        State(service.clone()),
-        Extension(principal),
-        Path(id.clone()),
-        Query(query),
-        headers,
-    )
-    .await;
+    let response =
+        super::management::refresh_catalog(&service, &principal, id.clone(), query, &headers).await;
     match response {
         Ok(Json(value)) if value["success"] == true => {
             if exchange {
@@ -289,6 +298,34 @@ async fn attach_status(
             .map_or_else(missing_token, |token| token.metadata(Timestamp::now())),
         Err(_) => unknown_token(),
     };
+}
+
+impl GatewayService {
+    pub(crate) async fn oauth_dashboard_statuses(
+        &self,
+        principal: &Principal,
+        ids: &[String],
+    ) -> HashMap<String, &'static str> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+        let tokens = self.database.oauth_statuses(&principal.email, ids).await;
+        let now = Timestamp::now();
+        ids.iter()
+            .map(|id| {
+                let status = match &tokens {
+                    Ok(tokens) => match tokens.get(id).map(|token| token.state(now)) {
+                        Some("expired") => "Authorization expired",
+                        Some("near_expiry") => "Authorization expires soon",
+                        Some(_) => "Authorized",
+                        None => "Authorization required",
+                    },
+                    Err(_) => "Authorization status unavailable",
+                };
+                (id.clone(), status)
+            })
+            .collect()
+    }
 }
 
 async fn visible_gateway(

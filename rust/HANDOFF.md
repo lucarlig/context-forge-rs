@@ -229,8 +229,20 @@ report queued initialization or cleanup when asynchronous processing is on.
 Eight Rust Anything scenarios match on SQLite and PostgreSQL. They cover
 form and JSON submissions, scoped credentials, validation, masked bearer
 credentials, OAuth forms, and queued lifecycle operations. Chromium verifies
-creation and editing with a bearer credential. OAuth authorization controls
-and the remaining dashboard sections are open.
+creation and editing with a bearer credential.
+
+The MCP server dashboard shows the signed-in user's OAuth authorization state.
+The Authorize link uses the gateway's existing OAuth binding and PKCE. Its
+callback offers Fetch Tools with the existing session and a CSRF proof. The
+dashboard also offers a tool refresh action. Browser POSTs require a trusted
+origin and a matching CSRF cookie and proof.
+
+Five Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+browser consent, popup callbacks, single-use state, signed-out redirects, and
+CSRF enforcement. The replay treats equivalent loopback host spellings as the
+same resource origin. Chromium verifies consent, callback Fetch Tools,
+per-user status, and dashboard refresh with security headers enabled. The
+remaining dashboard sections are open.
 
 ## Gateway and protocol verification
 

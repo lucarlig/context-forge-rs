@@ -240,9 +240,19 @@ pub(super) async fn refresh(
     Query(query): Query<RefreshParameters>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ManagementError> {
+    refresh_catalog(&service, &principal, key, query, &headers).await
+}
+
+pub(super) async fn refresh_catalog(
+    service: &GatewayService,
+    principal: &Principal,
+    key: String,
+    query: RefreshParameters,
+    headers: &HeaderMap,
+) -> Result<Json<Value>, ManagementError> {
     if !service
         .access
-        .allows(&principal, "gateways.update", RoleContext::AnyTeam, true)
+        .allows(principal, "gateways.update", RoleContext::AnyTeam, true)
         .await?
     {
         return Err(ManagementError::Denied);
@@ -250,7 +260,7 @@ pub(super) async fn refresh(
     let started = std::time::Instant::now();
     let include_resources = flag(query.include_resources.as_deref())?;
     let include_prompts = flag(query.include_prompts.as_deref())?;
-    let record = lookup(&service, &principal, key.clone()).await?;
+    let record = lookup(service, principal, key.clone()).await?;
     if record.id != key {
         return Err(ManagementError::NotFound(key));
     }
@@ -260,7 +270,7 @@ pub(super) async fn refresh(
         .map_or(RoleContext::AnyTeam, RoleContext::Team);
     if !service
         .access
-        .allows(&principal, "gateways.update", context, true)
+        .allows(principal, "gateways.update", context, true)
         .await?
     {
         return Err(ManagementError::Denied);
@@ -287,8 +297,8 @@ pub(super) async fn refresh(
             &record.id,
             &record.url,
             true,
-            Some(&headers),
-            Some(&principal),
+            Some(headers),
+            Some(principal),
             UpstreamUse::Discovery,
         )
         .await

@@ -482,6 +482,8 @@ impl Settings {
             redirect_uri: format!("{origin}{callback_path}"),
             callback_path,
             browser_origin: origin,
+            csrf_origins: allowlist("CSRF_TRUSTED_ORIGINS")?,
+            callback_csrf: Some(crate::http_boundary::csrf::CsrfTokens::from_env()?),
             secure_cookies: flag("SECURE_COOKIES")?.unwrap_or(true)
                 || value("ENVIRONMENT", "development")? == "production",
             token_retrieval: flag("OAUTH_TOKEN_RETRIEVAL_ENABLED")?.unwrap_or(false),
