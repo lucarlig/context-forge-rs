@@ -546,6 +546,7 @@ impl Settings {
             csrf_samesite: value("CSRF_COOKIE_SAMESITE", "Strict")?,
             csrf_secure: enabled("CSRF_COOKIE_SECURE", true)?,
             csrf_httponly: enabled("CSRF_COOKIE_HTTPONLY", false)?,
+            browser: crate::local_auth::browser::BrowserSettings::from_env()?,
             a2a_enabled: enabled("MCPGATEWAY_A2A_ENABLED", true)?,
             page_size,
             max_page_size,

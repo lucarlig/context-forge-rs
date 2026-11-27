@@ -35,6 +35,7 @@ mod rate_limit;
 mod response_policy;
 
 pub(crate) use proxy::public_scheme;
+pub(crate) use response_policy::allowed_origins;
 
 // HeaderMap can hold 24,576 distinct names at its largest table capacity.
 const HTTP1_HEADER_CAPACITY: usize = 24_576;

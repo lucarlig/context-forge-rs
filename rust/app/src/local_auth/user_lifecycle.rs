@@ -33,28 +33,35 @@ pub(super) async fn change_password(
         ));
     }
     let client = Client::new(Some(peer), &headers);
-    let user = verify_local_password(
+    change_local_password(
         &accounts,
         &principal.email,
         Zeroizing::new(input.old_password),
+        Zeroizing::new(input.new_password),
         &client,
     )
-    .await?
-    .ok_or_else(|| {
-        AccountError::detail(StatusCode::UNAUTHORIZED, "Current password is incorrect")
-    })?;
-    let hash = prepare_password(
-        &accounts,
-        &user,
-        user.is_admin,
-        Zeroizing::new(input.new_password),
-    )
     .await?;
+    Ok(success("Password changed successfully"))
+}
+
+pub(super) async fn change_local_password(
+    accounts: &Arc<Accounts>,
+    email: &str,
+    old_password: Zeroizing<String>,
+    new_password: Zeroizing<String>,
+    client: &Client,
+) -> Result<storage::LocalUser, AccountError> {
+    let user = verify_local_password(accounts, email, old_password, client)
+        .await?
+        .ok_or_else(|| {
+            AccountError::detail(StatusCode::UNAUTHORIZED, "Current password is incorrect")
+        })?;
+    let hash = prepare_password(accounts, &user, user.is_admin, new_password).await?;
     let patch = UserPatch {
         password_change_required: Some(false),
         ..UserPatch::default()
     };
-    accounts
+    let updated = accounts
         .database
         .edit_local_user(
             &user,
@@ -70,9 +77,9 @@ pub(super) async fn change_password(
         .await?;
     accounts
         .database
-        .local_event(&user.email, "password_change", true, &client, None)
+        .local_event(&user.email, "password_change", true, client, None)
         .await?;
-    Ok(success("Password changed successfully"))
+    Ok(updated)
 }
 
 pub(super) async fn edit_user(

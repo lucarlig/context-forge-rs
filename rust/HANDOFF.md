@@ -152,7 +152,25 @@ Nine CSRF replays match the pinned gateway across 35 live requests. Cookie
 proofs bind to the verified user and JWT session, and the gateway accepts the
 current and previous token windows. The replays cover the login cookie, missing
 or forged proofs, Bearer requests, origin checks, and configured headers and path
-exemptions. Admin route CSRF checks remain open.
+exemptions.
+
+## Admin browser authentication
+
+Enable `MCPGATEWAY_ADMIN_API_ENABLED` for the admin sign-in and password change
+forms and the sign-out endpoint. The dashboard entry checks the caller's admin
+permissions. `MCPGATEWAY_UI_ENABLED` adds the root redirect. The pages use
+server-rendered forms with origin and CSRF checks.
+
+Eight Rust Anything cases compare the reference redirects, form fields,
+cookie attributes, authorization denials, and forced password changes.
+Chromium completes sign-in, password change, dashboard access, and sign-out.
+A Rust integration test covers cross-origin sign-in and missing logout proof.
+
+The pinned SQLite profile writes a revocation row and still accepts the last
+session after logout. The native gateway stores the revoking user's email and
+rejects that session immediately. Live checks verify the native result on SQLite
+and PostgreSQL. Dashboard management sections, recovery views, and Keycloak
+sign-out redirects remain open.
 
 ## Gateway and protocol verification
 

@@ -27,32 +27,9 @@ pub(super) struct ResponsePolicy {
 
 impl ResponsePolicy {
     pub(super) fn from_env(port: u16) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let origins = if std::env::var_os("ALLOWED_ORIGINS").is_some() {
-            allowlist("ALLOWED_ORIGINS")?
-        } else if value("ENVIRONMENT", "development")? == "development" {
-            [
-                "http://localhost".to_owned(),
-                "http://localhost:3000".to_owned(),
-                "http://localhost:8080".to_owned(),
-                "http://127.0.0.1:3000".to_owned(),
-                "http://127.0.0.1:8080".to_owned(),
-                format!("http://localhost:{port}"),
-                format!("http://127.0.0.1:{port}"),
-            ]
-            .into()
-        } else {
-            let domain = reqwest::Url::parse(&value("APP_DOMAIN", "http://localhost:4444")?)?;
-            let host = domain.host_str().ok_or("invalid APP_DOMAIN")?;
-            [
-                format!("https://{host}"),
-                format!("https://app.{host}"),
-                format!("https://admin.{host}"),
-            ]
-            .into()
-        };
         Ok(Self {
             cors: Cors {
-                origins,
+                origins: allowed_origins(port)?,
                 credentials: flag("CORS_ALLOW_CREDENTIALS")?.unwrap_or(true),
             },
             security: flag("SECURITY_HEADERS_ENABLED")?
@@ -66,6 +43,32 @@ impl ResponsePolicy {
     pub(super) fn apply(self, router: Router) -> Router {
         router.layer(middleware::from_fn_with_state(Arc::new(self), respond))
     }
+}
+
+pub(crate) fn allowed_origins(port: u16) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
+    if std::env::var_os("ALLOWED_ORIGINS").is_some() {
+        return allowlist("ALLOWED_ORIGINS");
+    }
+    if value("ENVIRONMENT", "development")? == "development" {
+        return Ok([
+            "http://localhost".to_owned(),
+            "http://localhost:3000".to_owned(),
+            "http://localhost:8080".to_owned(),
+            "http://127.0.0.1:3000".to_owned(),
+            "http://127.0.0.1:8080".to_owned(),
+            format!("http://localhost:{port}"),
+            format!("http://127.0.0.1:{port}"),
+        ]
+        .into());
+    }
+    let domain = reqwest::Url::parse(&value("APP_DOMAIN", "http://localhost:4444")?)?;
+    let host = domain.host_str().ok_or("invalid APP_DOMAIN")?;
+    Ok([
+        format!("https://{host}"),
+        format!("https://app.{host}"),
+        format!("https://admin.{host}"),
+    ]
+    .into())
 }
 
 async fn respond(

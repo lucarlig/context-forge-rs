@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <style>
+    :root { color-scheme: light dark; font: 1rem system-ui, sans-serif; }
+    body { min-height: 100dvh; margin: 0; display: grid; place-items: center; padding: 1rem; box-sizing: border-box; }
+    main { width: min(100%, 26rem); padding: 2rem; border: 1px solid GrayText; border-radius: .6rem; box-sizing: border-box; }
+    h1 { margin: 0 0 1rem; font-size: 1.6rem; }
+    form, label { display: grid; gap: .45rem; }
+    form { gap: 1rem; }
+    input, button { padding: .65rem; font: inherit; }
+    [role=alert] { border-inline-start: .2rem solid; padding-inline-start: .75rem; }
+  </style>
+</head>
+<body>
+  <main>
+    {% if page == "login" %}
+    <h1>Sign in to ContextForge</h1>
+    {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+    <form method="post" action="{{ root }}/admin/login">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Email <input name="email" type="email" autocomplete="username" value="{{ email|default('', true) }}" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+    </form>
+    {% elif page == "password" %}
+    <h1>Password change required</h1>
+    {% if error %}<p role="alert">{{ error }}{% if details %} {{ details }}{% endif %}</p>{% endif %}
+    {% if minimum %}<p>Use at least {{ minimum }} characters.</p>{% endif %}
+    <form method="post" action="{{ root }}/admin/change-password-required">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Current password <input name="current_password" type="password" autocomplete="current-password" required></label>
+      <label>New password <input name="new_password" type="password" autocomplete="new-password" required></label>
+      <label>Confirm new password <input name="confirm_password" type="password" autocomplete="new-password" required></label>
+      <button type="submit">Change password</button>
+    </form>
+    {% else %}
+    <h1>ContextForge</h1>
+    <p>Signed in as {{ email }}.</p>
+    <form method="post" action="{{ root }}/admin/logout">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <button type="submit">Sign out</button>
+    </form>
+    {% endif %}
+  </main>
+</body>
+</html>

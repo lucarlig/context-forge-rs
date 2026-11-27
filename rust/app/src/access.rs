@@ -258,7 +258,7 @@ impl Authorizer {
         Err(AuthError::Forbidden)
     }
 
-    async fn authenticate(
+    pub(crate) async fn authenticate(
         &self,
         token: &str,
         peer: Option<IpAddr>,
@@ -297,13 +297,41 @@ impl Authorizer {
     }
 
     pub(crate) async fn csrf_identity(&self, token: &str) -> Option<(String, String)> {
-        let jwt = self.verifier.as_ref()?.verify(token).ok()?;
+        let jwt = self.verify_gateway_token(token).ok()?;
         let session = jwt.jti().filter(|jti| !jti.is_empty())?.to_owned();
         let email = match self.resolve_identity(&jwt).await {
             Ok(identity) => identity.email,
             Err(_) => claimed_email(&jwt)?.to_owned(),
         };
         Some((email, session))
+    }
+
+    pub(crate) fn verify_gateway_token(&self, token: &str) -> Result<VerifiedJwt, JwtError> {
+        self.verifier
+            .as_ref()
+            .ok_or(JwtError::Invalid)?
+            .verify(token)
+    }
+
+    pub(crate) async fn allows_admin_ui(
+        &self,
+        principal: &Principal,
+        target: RoleContext<'_>,
+    ) -> Result<bool, sqlx::Error> {
+        if principal.visibility == TeamVisibility::Public {
+            return Ok(false);
+        }
+        if principal.is_admin {
+            return Ok(true);
+        }
+        let grants = self.database.grants(&principal.email).await?;
+        Ok(grants.iter().any(|grant| {
+            grant_applies(grant, &principal.visibility, &target)
+                && grant
+                    .permissions
+                    .iter()
+                    .any(|permission| permission == "*" || permission.starts_with("admin."))
+        }))
     }
 
     async fn authenticate_for(

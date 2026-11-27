@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) mod browser;
 pub(crate) mod mail;
 mod password_reset;
 mod passwords;
@@ -74,6 +75,7 @@ pub struct AccountSettings {
     pub(crate) csrf_samesite: String,
     pub(crate) csrf_secure: bool,
     pub(crate) csrf_httponly: bool,
+    pub(crate) browser: Option<browser::BrowserSettings>,
     pub(crate) a2a_enabled: bool,
     pub(crate) page_size: u32,
     pub(crate) max_page_size: u32,
@@ -226,6 +228,9 @@ pub async fn router(
             protected.with_state(state.clone()),
             "Authentication required",
         ));
+    if let Some(settings) = state.settings.browser.as_ref() {
+        router = router.merge(browser::router(state.clone(), settings));
+    }
     if let Some(settings) = state.settings.sso.as_ref() {
         sso::bootstrap(&state.database, settings).await;
         let (sso_public, sso_admin) = sso::routers(settings);
@@ -318,7 +323,6 @@ async fn login(
         ));
     }
     let client = Client::new(Some(peer), &headers);
-    let now = Timestamp::now();
     let using_default = *password == *accounts.settings.default_password;
     let Some(user) = verify_local_password(&accounts, &email, password, &client).await? else {
         return Err(AccountError::detail(
@@ -326,38 +330,46 @@ async fn login(
             "Invalid email or password",
         ));
     };
-    if accounts.settings.enforce_password_change {
+    if requires_password_change(&accounts, &user, using_default).await? {
         let flagged = user.password_change_required;
-        let age = user
-            .password_changed_at
-            .as_deref()
-            .and_then(parse_timestamp)
-            .map(|changed| (now.as_second() - changed.as_second()) / 86_400);
-        let expired = age.is_some_and(|age| age >= accounts.settings.password_max_age_days);
-        let is_default = accounts.settings.detect_default_password
-            && accounts.settings.require_change_for_default
-            && using_default;
-        if flagged || expired || is_default {
-            if is_default && !flagged && !expired {
-                accounts
-                    .database
-                    .require_local_password_change(&email)
-                    .await?;
-            }
-            let mut hint =
-                "Use the Admin UI at /admin/change-password-required to set a new password."
-                    .to_owned();
-            if flagged {
-                hint.push_str(" If this is a headless deployment locked out at bootstrap, set ADMIN_REQUIRE_PASSWORD_CHANGE_ON_BOOTSTRAP=false and restart.");
-            }
-            return Ok((
+        let mut hint =
+            "Use the Admin UI at /admin/change-password-required to set a new password.".to_owned();
+        if flagged {
+            hint.push_str(" If this is a headless deployment locked out at bootstrap, set ADMIN_REQUIRE_PASSWORD_CHANGE_ON_BOOTSTRAP=false and restart.");
+        }
+        return Ok((
                 StatusCode::FORBIDDEN,
                 [("x-password-change-required", "true")],
                 Json(json!({"detail":"Password change required. Please change your password before continuing.", "hint":hint})),
             ).into_response());
-        }
     }
     session_response(&accounts, &user, true).await
+}
+
+async fn requires_password_change(
+    accounts: &Accounts,
+    user: &storage::LocalUser,
+    using_default: bool,
+) -> Result<bool, AccountError> {
+    let settings = &accounts.settings;
+    if !settings.enforce_password_change {
+        return Ok(false);
+    }
+    let expired = user
+        .password_changed_at
+        .as_deref()
+        .and_then(parse_timestamp)
+        .map(|changed| (Timestamp::now().as_second() - changed.as_second()) / 86_400)
+        .is_some_and(|age| age >= settings.password_max_age_days);
+    let is_default =
+        settings.detect_default_password && settings.require_change_for_default && using_default;
+    if is_default && !user.password_change_required && !expired {
+        accounts
+            .database
+            .require_local_password_change(&user.email)
+            .await?;
+    }
+    Ok(user.password_change_required || expired || is_default)
 }
 
 async fn verify_local_password(

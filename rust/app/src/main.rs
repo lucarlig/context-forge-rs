@@ -2,6 +2,7 @@
 
 use std::{error::Error, sync::Arc};
 
+use axum::{Json, http::StatusCode};
 use context_forge_rs::{
     access::Authorizer,
     config::Settings,
@@ -159,7 +160,13 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .merge(management)
         .merge(accounts)
         .merge(service.gateway_oauth_callback())
-        .merge(service.server_oauth_router());
+        .merge(service.server_oauth_router())
+        .fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"detail":"Not Found"})),
+            )
+        });
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     let background = catalog_available.then(|| {
         [
