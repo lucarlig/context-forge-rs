@@ -102,7 +102,10 @@ fn strong_secret(secret: &str) -> bool {
         *frequencies.entry(character).or_default() += 1;
     }
     let length: usize = frequencies.values().sum();
-    if length < 32 || secret.to_ascii_lowercase().starts_with("__replace_me__") {
+    if length < 32
+        || secret.eq_ignore_ascii_case("my-test-key-but-now-longer-than-32-bytes")
+        || secret.to_ascii_lowercase().starts_with("__replace_me__")
+    {
         return false;
     }
     let entropy = frequencies
@@ -176,6 +179,7 @@ const FIELDS: &[(&str, &str, Encoding)] = &[
         Encoding::Envelope,
     ),
     ("tools", "auth_value", Encoding::Aes),
+    ("tools", "sigv4_config", Encoding::SigV4),
     (
         "tools",
         "headers",
@@ -205,6 +209,14 @@ impl RotationKeys {
 
     async fn envelope(&self, encoded: &str) -> Result<Option<String>, ()> {
         if !SecretEnvelope::is_encrypted(encoded) {
+            // Unwrapped Fernet tokens need the historical schema migration.
+            if encoded.starts_with('g')
+                && BASE64_URL_SAFE_NO_PAD
+                    .decode(encoded.trim_end_matches('='))
+                    .is_ok_and(|bytes| bytes.len() >= 57 && bytes[0] == 0x80)
+            {
+                return Err(());
+            }
             return Ok(None);
         }
         match self.old_envelope.open(encoded.to_owned()).await {
@@ -380,7 +392,7 @@ async fn rotate_cell(
         return None;
     };
     let mut targets = Vec::new();
-    collect_targets(&mut value, encoding, &mut targets);
+    collect_targets(&mut value, encoding, false, &mut targets);
     let before = summary.migrated;
     for target in targets {
         let result = if matches!(encoding, Encoding::OAuth) {
@@ -415,6 +427,7 @@ fn outcome(result: Result<Option<String>, ()>, summary: &mut Summary) -> Option<
 fn collect_targets<'a>(
     value: &'a mut Value,
     encoding: Encoding,
+    protected: bool,
     targets: &mut Vec<&'a mut String>,
 ) {
     match value {
@@ -445,15 +458,121 @@ fn collect_targets<'a>(
                         targets.push(encoded);
                     }
                 } else if matches!(encoding, Encoding::OAuth | Encoding::Sentinel(_)) {
-                    collect_targets(value, encoding, targets);
+                    collect_targets(value, encoding, encrypted_field, targets);
                 }
             }
         }
         Value::Array(items) if matches!(encoding, Encoding::OAuth | Encoding::Sentinel(_)) => {
             for item in items {
-                collect_targets(item, encoding, targets);
+                collect_targets(item, encoding, protected, targets);
             }
         }
+        Value::String(value) if protected => targets.push(value),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn rotates_tool_signing_credentials_and_nested_oauth_secret_arrays() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE tools (id TEXT PRIMARY KEY, sigv4_config TEXT);
+             CREATE TABLE gateways (id TEXT PRIMARY KEY, oauth_config TEXT);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let kdf = SecretKdf {
+            time_cost: 1,
+            memory_cost: 1024,
+            parallelism: 1,
+        };
+        let mut keys = RotationKeys::new("fixture previous key", "fixture replacement key", kdf);
+        keys.old_envelope.kdf = kdf;
+        let signing_key = json!({"secret_access_key":"fixture signing value"});
+        let session_token = json!({"session_token":"fixture session value"});
+        let sigv4 = json!({
+            "access_key_id":"fixture-id",
+            "secret_access_key":keys.old_aes.seal(&signing_key).unwrap(),
+            "session_token":keys.old_aes.seal(&session_token).unwrap(),
+            "region":"us-east-1",
+        });
+        let oauth_value = keys
+            .old_envelope
+            .seal(Zeroizing::new("fixture oauth value".into()))
+            .await
+            .unwrap();
+        let oauth = json!({"client_secret":[[oauth_value]],"metadata":[oauth_value]});
+        sqlx::query("INSERT INTO tools VALUES ('tool', $1)")
+            .bind(sigv4.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO gateways VALUES ('gateway', $1)")
+            .bind(oauth.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let database = Database::Sqlite(pool.clone());
+        let summary = rotate(&database, &keys, false).await.unwrap();
+        assert_eq!((summary.migrated, summary.errors), (3, 0));
+        let rotated_sigv4: sqlx::types::Json<Value> =
+            sqlx::query_scalar("SELECT sigv4_config FROM tools")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        for (field, expected) in [
+            ("secret_access_key", signing_key),
+            ("session_token", session_token),
+        ] {
+            let value = rotated_sigv4[field].as_str().unwrap();
+            assert_eq!(keys.new_aes.open::<Value>(value).unwrap(), expected);
+            assert!(keys.old_aes.open::<Value>(value).is_err());
+        }
+        assert_eq!(rotated_sigv4["access_key_id"], sigv4["access_key_id"]);
+        let rotated_oauth: sqlx::types::Json<Value> =
+            sqlx::query_scalar("SELECT oauth_config FROM gateways")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let value = rotated_oauth["client_secret"][0][0].as_str().unwrap();
+        assert_eq!(
+            keys.new_envelope
+                .open(value.to_owned())
+                .await
+                .unwrap()
+                .as_str(),
+            "fixture oauth value"
+        );
+        assert_eq!(rotated_oauth["metadata"], oauth["metadata"]);
+
+        let retry = rotate(&database, &keys, false).await.unwrap();
+        assert_eq!((retry.migrated, retry.skipped, retry.errors), (0, 3, 0));
+    }
+
+    #[test]
+    fn rejects_the_pinned_known_weak_long_key() {
+        assert!(!strong_secret("MY-TEST-KEY-BUT-NOW-LONGER-THAN-32-BYTES"));
+    }
+
+    #[tokio::test]
+    async fn rejects_an_unwrapped_legacy_fernet_token() {
+        let keys = RotationKeys::new("fixture old key", "fixture new key", SecretKdf::default());
+        let mut bytes = [0; 57];
+        bytes[0] = 0x80;
+        let token = BASE64_URL_SAFE_NO_PAD.encode(bytes);
+        assert!(keys.envelope(&token).await.is_err());
     }
 }

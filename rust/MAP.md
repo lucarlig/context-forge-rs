@@ -22,7 +22,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] API token issuance, usage limits, and lifecycle
 - [x] User, team, role, and local login management
 - [x] OAuth, SSO, dynamic registration, and external identities
-- [ ] Encrypted credential storage and rotation
+- [x] Encrypted credential storage and rotation
 - [ ] Remaining database schema, migration history, import, and export
 - [ ] REST tool federation
 - [ ] gRPC tool federation
