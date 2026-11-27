@@ -35,24 +35,12 @@ pub(super) async fn configured_client(
         super::flow::valid_redirect(&redirect).ok_or_else(|| {
             CatalogApiError::detail(StatusCode::BAD_REQUEST, "OAuth callback URL is invalid")
         })?;
-        if config.registration_method() == Some("cimd") {
-            return Err(CatalogApiError::detail(
-                StatusCode::BAD_REQUEST,
-                "CIMD registration is not permitted for this gateway (disabled)",
-            ));
-        }
-        if !service.gateway_oauth.dcr.enabled || !service.gateway_oauth.dcr.auto_register {
-            return Err(CatalogApiError::detail(
-                StatusCode::BAD_REQUEST,
-                "Gateway OAuth configuration is incomplete. Please provide client_id and client_secret, or enable registration: set CIMD_ENABLED=true for Client ID Metadata Documents, or DCR_ENABLED=true and DCR_AUTO_REGISTER_ON_MISSING_CREDENTIALS=true for Dynamic Client Registration.",
-            ));
-        }
         if service
             .database
             .claim_client_registration(&gateway, &claim)
             .await?
         {
-            let result = configure_dynamic_client(
+            let result = configure_missing_client(
                 service,
                 &mut gateway,
                 &mut config,
@@ -81,6 +69,76 @@ pub(super) async fn configured_client(
     }
 }
 
+async fn configure_missing_client(
+    service: &GatewayService,
+    gateway: &mut OAuthGateway,
+    config: &mut OAuthConfig,
+    issuer: &str,
+    redirect: &str,
+    claim: &str,
+) -> Result<(), CatalogApiError> {
+    let settings = &service.gateway_oauth;
+    let upstream = service
+        .upstream
+        .with_timeout_cap(settings.request_timeout.min(Duration::from_secs(30)));
+    let guard = settings.cimd.failed_guard(&settings.dcr, issuer, redirect);
+    let method = config.registration_method();
+    let force_cimd = method == Some("cimd");
+    if force_cimd && let Some(reason) = guard {
+        return Err(CatalogApiError::detail(
+            StatusCode::BAD_REQUEST,
+            format!("CIMD registration is not permitted for this gateway ({reason})"),
+        ));
+    }
+    let metadata = if method != Some("dcr")
+        && guard.is_none()
+        && (!force_cimd || !config.has_code_endpoints())
+    {
+        settings
+            .issuer_metadata
+            .discover(&upstream, issuer, settings.dcr.metadata_ttl)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    if force_cimd
+        || metadata.as_ref().is_some_and(|metadata| {
+            metadata.client_id_metadata_document_supported == Some(Value::Bool(true))
+        })
+    {
+        let failure = || {
+            CatalogApiError::detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to register OAuth client via CIMD",
+            )
+        };
+        config
+            .complete_registration_endpoints(&upstream, metadata.as_ref())
+            .map_err(|_| failure())?;
+        config.use_registered_client(
+            settings.cimd.client_id.clone(),
+            None,
+            settings.cimd.auth_method().to_owned(),
+            redirect.to_owned(),
+            "cimd",
+        );
+        let vault = service
+            .vault
+            .as_ref()
+            .ok_or_else(CatalogApiError::unavailable)?;
+        let (encoded, _) = config.store(vault).await.map_err(|_| failure())?;
+        return persist_config(service, gateway, claim, &encoded, None).await;
+    }
+    if !settings.dcr.enabled || !settings.dcr.auto_register {
+        return Err(CatalogApiError::detail(
+            StatusCode::BAD_REQUEST,
+            "Gateway OAuth configuration is incomplete. Please provide client_id and client_secret, or enable registration: set CIMD_ENABLED=true for Client ID Metadata Documents, or DCR_ENABLED=true and DCR_AUTO_REGISTER_ON_MISSING_CREDENTIALS=true for Dynamic Client Registration.",
+        ));
+    }
+    configure_dynamic_client(service, gateway, config, issuer, redirect, claim).await
+}
+
 async fn configure_dynamic_client(
     service: &GatewayService,
     gateway: &mut OAuthGateway,
@@ -101,14 +159,7 @@ async fn configure_dynamic_client(
         .database
         .registered_credentials(&gateway.id, issuer)
         .await?;
-    if existing.is_none()
-        && !settings.dcr.allowed_issuers.is_empty()
-        && !settings
-            .dcr
-            .allowed_issuers
-            .iter()
-            .any(|allowed| allowed.trim_end_matches('/') == issuer)
-    {
+    if existing.is_none() && !settings.dcr.allows_issuer(issuer) {
         return Err(registration_failed());
     }
     let metadata = settings
@@ -117,7 +168,7 @@ async fn configure_dynamic_client(
         .await
         .map_err(|_| registration_failed())?;
     config
-        .complete_registration_endpoints(&upstream, &metadata)
+        .complete_registration_endpoints(&upstream, Some(&metadata))
         .map_err(|_| registration_failed())?;
     let (credential, registration) = if let Some(credential) = existing {
         (credential, None)
@@ -220,9 +271,28 @@ async fn configure_dynamic_client(
         .store(vault)
         .await
         .map_err(|_| registration_failed())?;
+    persist_config(
+        service,
+        gateway,
+        claim,
+        &encoded,
+        registration
+            .as_ref()
+            .map(|registration| (&credential, registration)),
+    )
+    .await
+}
+
+async fn persist_config(
+    service: &GatewayService,
+    gateway: &mut OAuthGateway,
+    claim: &str,
+    encoded: &str,
+    registration: Option<(&ClientCredential, &RegisteredClientWrite<'_>)>,
+) -> Result<(), CatalogApiError> {
     gateway.version = service
         .database
-        .persist_registered_config(gateway, claim, &encoded, &credential, registration.as_ref())
+        .persist_registered_config(gateway, claim, encoded, registration)
         .await?
         .ok_or_else(|| {
             CatalogApiError::detail(StatusCode::CONFLICT, "Gateway changed during authorization")
@@ -440,8 +510,7 @@ impl Database {
         gateway: &OAuthGateway,
         claim: &str,
         config: &str,
-        credential: &ClientCredential,
-        registration: Option<&RegisteredClientWrite<'_>>,
+        registration: Option<(&ClientCredential, &RegisteredClientWrite<'_>)>,
     ) -> Result<Option<i32>, sqlx::Error> {
         macro_rules! persist {
             ($tx:ident,$json:literal,$timestamp:literal) => {{
@@ -455,7 +524,7 @@ impl Database {
                 if version.is_none() {
                     return Ok(None);
                 }
-                if let Some(registration) = registration {
+                if let Some((credential, registration)) = registration {
                     sqlx::query(concat!("INSERT INTO registered_oauth_clients
                         (id,gateway_id,issuer,client_id,client_secret_encrypted,redirect_uris,grant_types,
                          response_types,scope,token_endpoint_auth_method,registration_client_uri,

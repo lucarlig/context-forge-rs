@@ -204,7 +204,7 @@ async fn callback_inner(
         .pop()
         .filter(|gateway| gateway.version == transaction.gateway_version)
         .ok_or(CallbackFailure::InvalidState)?;
-    let config = code_config(service, &gateway)
+    let mut config = code_config(service, &gateway)
         .await
         .map_err(|_| CallbackFailure::InvalidState)?;
     if !config.verify_response_issuer(query.iss.as_deref()) {
@@ -243,6 +243,11 @@ async fn callback_inner(
     if !gateway.visible_in(&identity.email, &scope) {
         return Err(CallbackFailure::InvalidState);
     }
+    service
+        .gateway_oauth
+        .cimd
+        .configure_assertion(&service.gateway_oauth.dcr, &mut config, &service.upstream)
+        .map_err(|_| CallbackFailure::Exchange)?;
     let redirect = transaction
         .redirect_uri
         .as_deref()

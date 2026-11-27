@@ -8,7 +8,7 @@ use std::{
 
 use url::Url;
 
-use super::{Deserialize, OAuthConfig, UpstreamClient, UpstreamError};
+use super::{Deserialize, OAuthConfig, UpstreamClient, UpstreamError, Value};
 
 const MAX_CACHED_ISSUERS: usize = 256;
 
@@ -20,6 +20,7 @@ pub(crate) struct IssuerMetadata {
     pub(crate) registration_endpoint: Option<String>,
     jwks_uri: Option<String>,
     pub(crate) grant_types_supported: Option<Vec<String>>,
+    pub(crate) client_id_metadata_document_supported: Option<Value>,
 }
 
 #[derive(Default)]
@@ -97,24 +98,32 @@ impl OAuthConfig {
     pub(crate) fn complete_registration_endpoints(
         &mut self,
         upstream: &UpstreamClient,
-        metadata: &IssuerMetadata,
+        metadata: Option<&IssuerMetadata>,
     ) -> Result<(), UpstreamError> {
         let issuer = self.issuer().ok_or(UpstreamError::InvalidUrl)?;
         let token = (!self.token_url.is_empty())
             .then_some(self.token_url.as_str())
-            .or(metadata.token_endpoint.as_deref())
+            .or_else(|| metadata.and_then(|metadata| metadata.token_endpoint.as_deref()))
             .ok_or(UpstreamError::InvalidUrl)?;
         let authorization = self
             .authorization_url
             .as_deref()
             .filter(|url| !url.is_empty())
-            .or(metadata.authorization_endpoint.as_deref())
+            .or_else(|| metadata.and_then(|metadata| metadata.authorization_endpoint.as_deref()))
             .ok_or(UpstreamError::InvalidUrl)?;
         validate_endpoint(upstream, token, Some(issuer))?;
         validate_endpoint(upstream, authorization, Some(issuer))?;
         self.token_url = token.to_owned();
         self.authorization_url = Some(authorization.to_owned());
         Ok(())
+    }
+
+    pub(crate) fn has_code_endpoints(&self) -> bool {
+        !self.token_url.is_empty()
+            && self
+                .authorization_url
+                .as_ref()
+                .is_some_and(|url| !url.is_empty())
     }
 
     pub(crate) fn use_registered_client(
@@ -126,6 +135,7 @@ impl OAuthConfig {
         registration_method: &str,
     ) {
         self.client_id = Some(client_id);
+        zeroize::Zeroize::zeroize(&mut self.client_secret);
         self.client_secret = secret;
         self.token_endpoint_auth_method = Some(auth_method);
         self.redirect_uri = Some(redirect);
@@ -141,12 +151,7 @@ impl OAuthConfig {
         let Some(issuer) = self.issuer() else {
             return;
         };
-        if !self.token_url.is_empty()
-            && self
-                .authorization_url
-                .as_ref()
-                .is_some_and(|url| !url.is_empty())
-        {
+        if self.has_code_endpoints() {
             return;
         }
         let Ok(metadata) = cache.discover(upstream, issuer, ttl).await else {

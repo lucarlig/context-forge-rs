@@ -36,3 +36,11 @@ tenant path, authorization-code exchange, reuse of the registered client,
 and global admin list, detail, and local deletion. Two workers sharing
 either database made one registration request for concurrent authorization
 attempts.
+
+The Client ID Metadata Document flow matched nine normalized requests on
+SQLite and PostgreSQL. The gateway selected its HTTPS metadata document
+when the provider advertised support and rejected an explicit CIMD
+request with a different callback URI. The signed fixture also checked
+the current and previous public keys in the published JWKS. The provider
+verified the dedicated RSA key's client assertions for authorization-code
+exchange and refresh, and the private key stayed out of the database.

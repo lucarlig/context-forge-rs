@@ -187,8 +187,13 @@ async fn refresh_locked(
     let clear = open_token(service, refresh.clone()).await?;
     let origin = resource_origin(target.gateway_url);
     let upstream = service.upstream.with_timeout_cap(Duration::from_secs(30));
-    match target
-        .config
+    let mut config = target.config.clone();
+    service
+        .gateway_oauth
+        .cimd
+        .configure_assertion(&service.gateway_oauth.dcr, &mut config, &upstream)
+        .map_err(|_| CatalogApiError::unavailable())?;
+    match config
         .refresh_user_token(&upstream, target.tls, &clear, origin.as_deref())
         .await
     {

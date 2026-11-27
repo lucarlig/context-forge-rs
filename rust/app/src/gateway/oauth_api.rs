@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod cimd;
 mod clients;
 mod flow;
 mod registration;
 mod storage;
 mod token_access;
 
+pub use cimd::CimdSettings;
+pub(crate) use cimd::DOCUMENT_PATH as CIMD_DOCUMENT_PATH;
 pub(super) use token_access::{TokenTarget, authorization_header};
 
 use std::collections::BTreeSet;
@@ -27,6 +30,7 @@ pub struct GatewayOAuthSettings {
     pub(crate) token_retrieval: bool,
     pub(crate) refresh_threshold: i64,
     pub(crate) dcr: DcrSettings,
+    pub(crate) cimd: CimdSettings,
     pub(crate) request_timeout: Duration,
     pub(crate) issuer_metadata: IssuerMetadataCache,
 }
@@ -59,6 +63,17 @@ impl Default for DcrSettings {
     }
 }
 
+impl DcrSettings {
+    fn allows_issuer(&self, issuer: &str) -> bool {
+        let issuer = issuer.trim_end_matches('/');
+        self.allowed_issuers.is_empty()
+            || self
+                .allowed_issuers
+                .iter()
+                .any(|allowed| allowed.trim_end_matches('/') == issuer)
+    }
+}
+
 impl Default for GatewayOAuthSettings {
     fn default() -> Self {
         Self {
@@ -69,6 +84,7 @@ impl Default for GatewayOAuthSettings {
             token_retrieval: false,
             refresh_threshold: 600,
             dcr: DcrSettings::default(),
+            cimd: CimdSettings::default(),
             request_timeout: Duration::from_secs(30),
             issuer_metadata: IssuerMetadataCache::default(),
         }
@@ -106,7 +122,10 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
 }
 
 pub(super) fn callback_router() -> Router<Arc<GatewayService>> {
-    Router::new().route("/oauth/callback", get(flow::callback))
+    Router::new()
+        .route("/oauth/callback", get(flow::callback))
+        .route(CIMD_DOCUMENT_PATH, get(cimd::document))
+        .route("/oauth/client-metadata/jwks.json", get(cimd::jwks))
 }
 
 async fn fetch_tools(

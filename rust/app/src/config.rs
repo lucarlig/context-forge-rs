@@ -7,8 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     gateway::{
-        CatalogRefresh, DcrSettings, GatewayHealth, GatewayLifecycle, GatewayListeners,
-        GatewayOAuthSettings, ListenerElection, Pagination, ResourceLimits, RootSettings,
+        CIMD_DOCUMENT_PATH, CatalogRefresh, CimdSettings, DcrSettings, GatewayHealth,
+        GatewayLifecycle, GatewayListeners, GatewayOAuthSettings, ListenerElection, Pagination,
+        ResourceLimits, RootSettings,
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     local_auth::{
@@ -329,6 +330,52 @@ impl Settings {
             )?
             .unwrap_or(false),
         };
+        let cimd_base = callback_path
+            .strip_suffix("/oauth/callback")
+            .unwrap_or_default();
+        let client_id = value("CIMD_CLIENT_METADATA_URL", "")?;
+        let client_id = if client_id.is_empty() {
+            format!("{origin}{cimd_base}{CIMD_DOCUMENT_PATH}")
+        } else {
+            client_id
+        };
+        let cimd_url = url::Url::parse(&client_id)?;
+        if !matches!(cimd_url.scheme(), "http" | "https")
+            || !cimd_url.username().is_empty()
+            || cimd_url.password().is_some()
+            || cimd_url.query().is_some()
+            || cimd_url.fragment().is_some()
+            || !cimd_url.path().ends_with(CIMD_DOCUMENT_PATH)
+        {
+            return Err("invalid CIMD_CLIENT_METADATA_URL".into());
+        }
+        let signed = match value("CIMD_TOKEN_ENDPOINT_AUTH_METHOD", "none")?.as_str() {
+            "none" => false,
+            "private_key_jwt" => true,
+            _ => return Err("invalid CIMD_TOKEN_ENDPOINT_AUTH_METHOD".into()),
+        };
+        let cimd = CimdSettings {
+            enabled: flag("CIMD_ENABLED")?.unwrap_or(true),
+            client_id,
+            client_name: value("CIMD_CLIENT_NAME", "ContextForge")?,
+            signed,
+            private_key_path: value("CIMD_PRIVATE_KEY_PATH", "")?,
+            previous_public_key_path: value("CIMD_PREVIOUS_PUBLIC_KEY_PATH", "")?,
+            jwt_private_key_path: value("JWT_PRIVATE_KEY_PATH", "")?,
+            key_id: value("CIMD_KEY_ID", "cimd-1")?,
+            previous_key_id: value("CIMD_PREVIOUS_KEY_ID", "")?,
+            algorithm: serde_json::from_value(serde_json::Value::String(value(
+                "CIMD_SIGNING_ALG",
+                "RS256",
+            )?))?,
+            cache_seconds: parse("CIMD_DOCUMENT_CACHE_SECONDS", 3600)?,
+        };
+        if cimd.enabled && cimd.signed && cimd.private_key_path.is_empty() {
+            return Err(
+                "CIMD_TOKEN_ENDPOINT_AUTH_METHOD=private_key_jwt requires CIMD_PRIVATE_KEY_PATH"
+                    .into(),
+            );
+        }
         Ok(GatewayOAuthSettings {
             redirect_uri: format!("{origin}{callback_path}"),
             callback_path,
@@ -338,6 +385,7 @@ impl Settings {
             token_retrieval: flag("OAUTH_TOKEN_RETRIEVAL_ENABLED")?.unwrap_or(false),
             refresh_threshold,
             dcr,
+            cimd,
             request_timeout: positive_seconds("OAUTH_REQUEST_TIMEOUT", 30.0)?,
             issuer_metadata: Default::default(),
         })

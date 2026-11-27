@@ -188,6 +188,8 @@ impl OAuthConfig {
             && self.client_secret.as_deref() != Some(MASKED)
             && self.private_key.as_deref() != Some(MASKED)
             && (method != ClientAuth::PrivateKeyJwt
+                || (self.is_authorization_code()
+                    && self.registration_method.as_deref() == Some("cimd"))
                 || self
                     .private_key
                     .as_ref()
@@ -225,6 +227,26 @@ impl OAuthConfig {
         }
         let masked = serde_json::to_value(&stored).map_err(|_| EnvelopeError)?;
         Ok((encoded, masked))
+    }
+
+    pub(crate) fn uses_private_key_jwt(&self) -> bool {
+        self.client_auth() == Some(ClientAuth::PrivateKeyJwt)
+    }
+
+    pub(crate) fn token_endpoint(&self) -> &str {
+        &self.token_url
+    }
+
+    pub(crate) fn use_client_assertion(
+        &mut self,
+        key: Zeroizing<String>,
+        algorithm: AssertionAlgorithm,
+        kid: &str,
+    ) {
+        self.private_key.zeroize();
+        self.private_key = Some(key.as_str().to_owned());
+        self.token_endpoint_auth_signing_alg = Some(algorithm);
+        self.private_key_jwt_kid = Some(kid.to_owned());
     }
 
     pub(crate) async fn load(vault: &SecretEnvelope, encoded: &str) -> Result<Self, EnvelopeError> {
