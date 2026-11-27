@@ -415,6 +415,31 @@ impl Authorizer {
                     .any(|value| value == permission || value == "*")
         }))
     }
+
+    pub(crate) async fn allows_global_only(
+        &self,
+        principal: &Principal,
+        permission: &str,
+    ) -> Result<bool, sqlx::Error> {
+        if !principal.token_allows(permission) {
+            return Ok(false);
+        }
+        if principal.is_admin && principal.visibility != TeamVisibility::Public {
+            return Ok(true);
+        }
+        Ok(self
+            .database
+            .grants(&principal.email)
+            .await?
+            .iter()
+            .any(|grant| {
+                grant.scope == "global"
+                    && grant
+                        .permissions
+                        .iter()
+                        .any(|value| value == permission || value == "*")
+            }))
+    }
 }
 
 fn grant_applies(grant: &Grant, visibility: &TeamVisibility, target: &RoleContext<'_>) -> bool {

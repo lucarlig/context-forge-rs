@@ -5,6 +5,7 @@ mod content;
 mod exchanged_tokens;
 mod export_api;
 mod health;
+mod import_api;
 mod lifecycle;
 mod listeners;
 mod management;
@@ -130,6 +131,7 @@ pub struct GatewayService {
     direct_proxy_timeout: Option<Duration>,
     proxy_catalog: ProxyCatalogCache,
     export: ExportSettings,
+    imports: import_api::Imports,
 }
 
 pub struct CatalogRefresh {
@@ -231,6 +233,7 @@ impl GatewayService {
             direct_proxy_timeout: None,
             proxy_catalog: ProxyCatalogCache::new(ProxyCatalogSettings::default()),
             export: ExportSettings::default(),
+            imports: import_api::Imports::default(),
         }
     }
 
@@ -471,6 +474,7 @@ impl GatewayService {
                 .merge(oauth_api::router())
                 .merge(roots::router())
                 .merge(export_api::router())
+                .merge(import_api::router())
                 .merge(tags::router())
                 .merge(prompt_api::router(self.max_prompt_bytes))
                 .merge(tool_api::router())

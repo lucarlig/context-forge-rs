@@ -67,6 +67,11 @@ The pinned 14-case suite matched native SQLite, SQLite initialized by the pinned
 gateway, and PostgreSQL. Live checks covered authorization, scoped server links,
 and credential masking. [Export recordings](replay/export-import/export/README.md)
 
+Configuration import handles dry runs, tool and root writes, job status, and
+cleanup at both API prefixes. Live checks covered scoped ownership on SQLite
+and credential rekeying on PostgreSQL. The remaining entity writers and CLI
+import are pending. [Import recordings](replay/export-import/import/README.md)
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

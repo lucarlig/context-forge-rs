@@ -1,0 +1,19 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "serve-reference",
+  "run": [
+    "context-forge-import-reference",
+    "required-import-replay"
+  ],
+  "timeout_secs": 30,
+  "http": {
+    "ready_secs": 25
+  },
+  "recorded": [
+    "legacy-unauthenticated-import",
+    "legacy-unauthenticated-status",
+    "v1-unauthenticated-cleanup",
+    "v1-unauthenticated-import",
+    "v1-unauthenticated-status-list"
+  ]
+}

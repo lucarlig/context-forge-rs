@@ -12,6 +12,7 @@ const MASK: &str = "*****";
 const SECRET_HEADER: &str = "_mcpgateway_encrypted_header_value_v1";
 
 mod write;
+pub(super) use write::import_tool;
 
 #[derive(Deserialize)]
 struct ToolDetailQuery {

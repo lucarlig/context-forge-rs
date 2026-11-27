@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::catalog::ToolWriteError;
+use crate::gateway::import_api::{ImportScope, Outcome, Strategy};
 
 mod authentication;
 
@@ -80,6 +81,185 @@ pub(super) struct StateQuery {
 #[derive(Deserialize)]
 pub(super) struct DeleteQuery {
     purge_metrics: Option<String>,
+}
+
+pub(in crate::gateway) async fn import_tool(
+    service: &GatewayService,
+    import: &ImportScope<'_>,
+    mut data: serde_json::Map<String, Value>,
+) -> Result<Outcome, CatalogApiError> {
+    let principal = import.principal;
+    let name = validate_name(data["name"].as_str().unwrap_or_default())?;
+    let slug = slugify(&name);
+    let scope = access::catalog_scope(Some(principal));
+    let candidates = service
+        .database
+        .managed_tools(scope, crate::catalog::CatalogEntryFilters::associated(true))
+        .await?;
+    let matching = candidates
+        .iter()
+        .filter(|tool| {
+            tool.gateway_id.is_none() && (tool.original_name == name || tool.name == slug)
+        })
+        .collect::<Vec<_>>();
+    let owned = matching
+        .iter()
+        .copied()
+        .find(|tool| tool.owner_email.as_deref() == Some(principal.email.as_str()));
+    let previous = owned.or_else(|| (matching.len() == 1).then(|| matching[0]));
+    let mut renamed = None;
+    let previous = if matching.is_empty() {
+        None
+    } else {
+        match import.strategy {
+            Strategy::Skip => return Ok(Outcome::Skipped),
+            Strategy::Fail => {
+                return Err(CatalogApiError::detail(
+                    StatusCode::CONFLICT,
+                    format!("Tool name conflict: {name}"),
+                ));
+            }
+            Strategy::Rename => {
+                let suffix = format!("_imported_{}", Timestamp::now().as_second());
+                let base: String = name.chars().take(255 - suffix.len()).collect();
+                let new_name = format!("{base}{suffix}");
+                data.insert("name".into(), new_name.clone().into());
+                renamed = Some(new_name);
+                None
+            }
+            Strategy::Update => {
+                if let Some(previous) = previous
+                    && (principal.is_global_admin()
+                        || previous.owner_email.as_deref() == Some(principal.email.as_str()))
+                {
+                    Some(previous)
+                } else {
+                    return Err(CatalogApiError::detail(
+                        StatusCode::FORBIDDEN,
+                        format!("Permission denied: cannot update tool {name}"),
+                    ));
+                }
+            }
+        }
+    };
+    let original_description = data
+        .remove("original_description")
+        .and_then(|value| value.as_str().map(str::to_owned));
+    data.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "name"
+                | "displayName"
+                | "display_name"
+                | "description"
+                | "url"
+                | "integration_type"
+                | "request_type"
+                | "headers"
+                | "input_schema"
+                | "output_schema"
+                | "annotations"
+                | "jsonpath_filter"
+                | "tool_validation_policy"
+                | "tags"
+                | "auth_type"
+                | "auth_value"
+        )
+    });
+    let auth_type = data.remove("auth_type");
+    if let Some(Value::String(stored)) = data.remove("auth_value") {
+        let auth_type = auth_type
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| invalid("Missing imported tool authentication type"))?;
+        let cipher = service
+            .credential_cipher
+            .as_ref()
+            .ok_or_else(|| invalid("Tool credential encryption unavailable"))?;
+        let encoded = if cipher.open::<serde::de::IgnoredAny>(&stored).is_ok() {
+            stored
+        } else if let Some(source) = import.rekey {
+            let plain = CredentialCipher::new(source)
+                .open::<Value>(&stored)
+                .map_err(|_| invalid("Invalid imported tool credentials"))?;
+            cipher
+                .seal(&plain)
+                .map_err(|_| invalid("Tool credential encryption failed"))?
+        } else {
+            return Err(invalid("Invalid imported tool credentials"));
+        };
+        data.insert(
+            "auth".into(),
+            json!({"auth_type":auth_type,"auth_value":encoded}),
+        );
+    }
+    if let Some(Value::Object(headers)) = data.get_mut("headers") {
+        if previous.is_none() {
+            headers.retain(|_, value| value.as_str() != Some(MASK));
+        }
+        for value in headers.values_mut() {
+            let Some(encoded) = value.get(SECRET_HEADER).and_then(Value::as_str) else {
+                continue;
+            };
+            let decoded = service
+                .credential_cipher
+                .as_ref()
+                .and_then(|cipher| cipher.open::<Value>(encoded).ok())
+                .or_else(|| {
+                    import
+                        .rekey
+                        .and_then(|key| CredentialCipher::new(key).open::<Value>(encoded).ok())
+                })
+                .and_then(|value| value.get("data").and_then(Value::as_str).map(str::to_owned))
+                .ok_or_else(|| invalid("Invalid imported tool headers"))?;
+            *value = Value::String(decoded);
+        }
+    }
+    data.entry("request_type")
+        .or_insert_with(|| Value::String("GET".into()));
+    let fields: ToolFields = serde_json::from_value(Value::Object(data))
+        .map_err(|_| invalid("Invalid imported tool"))?;
+    let mut record = previous.cloned().unwrap_or_else(|| ToolRecord {
+        id: Uuid::new_v4().simple().to_string(),
+        original_name: name.clone(),
+        custom_name: name.clone(),
+        display_name: Some(renamed.clone().unwrap_or_else(|| name.clone())),
+        integration_type: "REST".into(),
+        request_type: "GET".into(),
+        input_schema: json!({"type":"object","properties":{}}).to_string(),
+        tags: "[]".into(),
+        owner_email: Some(principal.email.clone()),
+        team_id: import.team_id.map(str::to_owned),
+        visibility: if import.team_id.is_some() {
+            "team"
+        } else {
+            "private"
+        }
+        .into(),
+        created_by: Some(principal.email.clone()),
+        created_via: Some("import".into()),
+        import_batch_id: Some(import.batch_id.into()),
+        federation_source: Some(format!("imported-by-{}", principal.email)),
+        expose_passthrough: true,
+        ..ToolRecord::default()
+    });
+    apply_fields(service, &mut record, fields, previous.is_none())?;
+    if previous.is_some() {
+        record.modified_by = Some(principal.email.clone());
+        record.modified_via = Some("import".into());
+    } else {
+        record.original_description = original_description.or_else(|| record.description.clone());
+    }
+    let saved = service
+        .database
+        .save_managed_tool(previous, &record)
+        .await
+        .map_err(|error| persistence_error(error, &record))?;
+    publish(service, &saved);
+    Ok(if previous.is_some() {
+        Outcome::Updated
+    } else {
+        Outcome::Created
+    })
 }
 
 pub(super) async fn create(
@@ -174,6 +354,7 @@ pub(super) async fn update(
     set_gateway(&service, &principal, &mut record, &fields).await?;
     apply_fields(&service, &mut record, fields, false)?;
     record.modified_by = Some(principal.email.clone());
+    record.modified_via = Some("api".into());
     record.modified_from_ip = client_address(peer).or(record.modified_from_ip);
     record.modified_user_agent = user_agent(&headers).or(record.modified_user_agent);
     let updated = service

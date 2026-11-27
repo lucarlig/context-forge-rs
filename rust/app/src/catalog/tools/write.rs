@@ -50,12 +50,12 @@ macro_rules! insert_tool {
                 expose_passthrough,tool_validation_policy,auth_type,auth_value,headers,input_schema,output_schema,
                 annotations,extension_metadata,tags,query_mapping,header_mapping,allowlist,plugin_chain_pre,
                 plugin_chain_post,sigv4_config,created_by,created_from_ip,created_user_agent,created_via,
-                created_at,updated_at,version,enabled,reachable)
+                import_batch_id,federation_source,created_at,updated_at,version,enabled,reachable)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,",
                 $open,"$26",$close,",", $open,"$27",$close,",", $open,"$28",$close,",", $open,"$29",$close,",",
                 $open,"$30",$close,",", $open,"$31",$close,",", $open,"$32",$close,",", $open,"$33",$close,",",
                 $open,"$34",$close,",", $open,"$35",$close,",", $open,"$36",$close,",", $open,"$37",$close,",",
-                "$38,$39,$40,'api',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,1,TRUE,TRUE)"
+                "$38,$39,$40,$41,$42,$43,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,1,TRUE,TRUE)"
         )
     };
 }
@@ -71,7 +71,7 @@ macro_rules! update_tool {
                 "annotations=", $open,"$29",$close,", extension_metadata=", $open,"$30",$close,", tags=", $open,"$31",$close,",",
                 "query_mapping=", $open,"$32",$close,", header_mapping=", $open,"$33",$close,", allowlist=", $open,"$34",$close,",",
                 "plugin_chain_pre=", $open,"$35",$close,", plugin_chain_post=", $open,"$36",$close,", sigv4_config=", $open,"$37",$close,",",
-                "modified_by=$38,modified_from_ip=$39,modified_user_agent=$40,modified_via='api',updated_at=CURRENT_TIMESTAMP,
+                "modified_by=$38,modified_from_ip=$39,modified_user_agent=$40,modified_via=$41,updated_at=CURRENT_TIMESTAMP,
                 version=COALESCE(version,0)+1 WHERE id=$1"
         )
     };
@@ -131,7 +131,7 @@ impl Database {
                         &tool.created_user_agent,
                     )
                 };
-                sqlx::query(statement)
+                let query = sqlx::query(statement)
                     .bind(&tool.id)
                     .bind(&tool.name)
                     .bind(&tool.original_name)
@@ -171,9 +171,20 @@ impl Database {
                     .bind(tool.sigv4_config.as_deref())
                     .bind(actor.as_deref())
                     .bind(ip.as_deref())
-                    .bind(agent.as_deref())
-                    .execute(&mut *$tx)
-                    .await?;
+                    .bind(agent.as_deref());
+                if previous.is_some() {
+                    query
+                        .bind(tool.modified_via.as_deref().unwrap_or("api"))
+                        .execute(&mut *$tx)
+                        .await?;
+                } else {
+                    query
+                        .bind(tool.created_via.as_deref().unwrap_or("api"))
+                        .bind(tool.import_batch_id.as_deref())
+                        .bind(tool.federation_source.as_deref())
+                        .execute(&mut *$tx)
+                        .await?;
+                }
                 let updated = sqlx::query_as(TOOL_BY_ID)
                     .bind(&tool.id)
                     .fetch_one(&mut *$tx)

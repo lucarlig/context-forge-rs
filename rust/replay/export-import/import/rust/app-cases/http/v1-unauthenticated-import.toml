@@ -1,0 +1,15 @@
+[request]
+method = "POST"
+path = "/v1/import"
+body = '{"import_data": {"version": "2025-03-26", "exported_at": "2026-01-01T00:00:00Z", "entities": {"tools": []}}}'
+
+[request.headers]
+Accept = "application/json"
+Content-Type = "application/json"
+
+[response]
+status = 401
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin"

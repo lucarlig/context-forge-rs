@@ -13,6 +13,10 @@ use tokio_util::sync::CancellationToken;
 use url::{ParseError, Url};
 
 use super::*;
+use super::{
+    catalog_api::CatalogApiError,
+    import_api::{Outcome, Strategy},
+};
 
 const PATH_ENCODING: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
@@ -119,6 +123,41 @@ impl RootRegistry {
         canonical_uri(&self.settings, uri).map_err(RootError::Policy)
     }
 
+    pub(super) fn valid_import_root(&self, uri: &str, name: &str) -> bool {
+        self.canonical(uri).is_ok() && validate_name(Some(name)).is_ok()
+    }
+
+    pub(super) fn import_root(
+        &self,
+        uri: &str,
+        name: Option<&str>,
+        strategy: Strategy,
+    ) -> Result<Outcome, CatalogApiError> {
+        let uri = self
+            .canonical(uri)
+            .map_err(|_| CatalogApiError::detail(StatusCode::BAD_REQUEST, "Invalid root URI"))?;
+        let mut roots = self.items();
+        if roots.iter().any(|root| root.uri == uri) {
+            if strategy == Strategy::Skip {
+                return Ok(Outcome::Skipped);
+            }
+            return Err(CatalogApiError::detail(
+                StatusCode::CONFLICT,
+                "Root already exists",
+            ));
+        }
+        self.insert(&mut roots, root_from_uri(uri, name.map(str::to_owned)));
+        Ok(Outcome::Created)
+    }
+
+    fn insert(&self, roots: &mut Vec<Root>, root: Root) -> Root {
+        roots.push(root.clone());
+        let _ = self.events.send(json!({
+            "type":"root_added","data":{"uri":root.uri,"name":root.name}
+        }));
+        root
+    }
+
     fn find(&self, uri: &str) -> Result<Root, RootError> {
         let canonical = self.canonical(uri)?;
         self.items()
@@ -190,12 +229,11 @@ async fn add(
             "Root already exists".into(),
         ));
     }
-    let root = root_from_uri(uri, input.name);
-    roots.push(root.clone());
-    let _ = service.roots.events.send(json!({
-        "type":"root_added","data":{"uri":root.uri,"name":root.name}
-    }));
-    Ok(Json(root))
+    Ok(Json(
+        service
+            .roots
+            .insert(&mut roots, root_from_uri(uri, input.name)),
+    ))
 }
 
 async fn detail(

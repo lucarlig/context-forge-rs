@@ -1,0 +1,13 @@
+[request]
+method = "POST"
+path = "/v1/import/cleanup"
+
+[request.headers]
+Accept = "application/json"
+
+[response]
+status = 401
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin"

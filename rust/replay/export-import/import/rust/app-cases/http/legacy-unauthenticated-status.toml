@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/import/status/missing"
+
+[request.headers]
+Accept = "application/json"
+
+[response]
+status = 401
+
+[response.headers]
+content-type = "application/json"
+vary = "Origin"
