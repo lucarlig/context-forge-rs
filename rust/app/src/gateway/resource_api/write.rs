@@ -6,7 +6,10 @@ use percent_encoding::percent_decode_str;
 use regex::Regex;
 
 use super::events::ResourceEvent;
-use super::*;
+use super::{
+    super::catalog_api::{client_address, denied_team, format_bytes, normalized_tags, user_agent},
+    *,
+};
 use crate::catalog::ResourceWriteError;
 
 static UNSAFE_HTML: LazyLock<Regex> = LazyLock::new(|| {
@@ -460,27 +463,6 @@ fn apply_metadata(
     Ok(())
 }
 
-fn normalized_tags(tags: Vec<Value>) -> Result<Value, ResourceError> {
-    let mut normalized = Vec::new();
-    let mut seen = HashSet::new();
-    for tag in tags {
-        let label = tag
-            .as_str()
-            .or_else(|| tag.get("label").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|label| !label.is_empty() && !label.chars().any(char::is_control))
-            .ok_or_else(|| invalid("Invalid resource tag"))?;
-        let id = slugify(tag.get("id").and_then(Value::as_str).unwrap_or(label));
-        if id.is_empty() {
-            return Err(invalid("Invalid resource tag"));
-        }
-        if seen.insert(id.clone()) {
-            normalized.push(json!({"id":id,"label":label}));
-        }
-    }
-    Ok(json!(normalized))
-}
-
 fn validate_uri(input: &str) -> Result<String, ResourceError> {
     let input = input.trim();
     let decoded = percent_decode_str(input)
@@ -566,16 +548,6 @@ fn validate_mime(limits: &ResourceLimits, mime: &str) -> Result<(), ResourceErro
     Ok(())
 }
 
-fn format_bytes(size: usize) -> String {
-    if size < 1024 {
-        format!("{size} B")
-    } else if size < 1024 * 1024 {
-        format!("{:.1} KB", size as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
-    }
-}
-
 fn resolve_gateway_id(
     gateway: Option<String>,
     alias: Option<String>,
@@ -590,17 +562,6 @@ fn resolve_gateway_id(
     Ok(gateway.or(alias))
 }
 
-fn user_agent(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::USER_AGENT)
-        .and_then(|agent| agent.to_str().ok())
-        .map(str::to_owned)
-}
-
-fn client_address(peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<String> {
-    peer.map(|Extension(ConnectInfo(peer))| peer.ip().to_string())
-}
-
 fn publish(service: &GatewayService, record: &ResourceRecord, event: ResourceEvent) {
     service.subscriptions.changed(
         &record.visibility,
@@ -612,15 +573,6 @@ fn publish(service: &GatewayService, record: &ResourceRecord, event: ResourceEve
 
 fn invalid(detail: &'static str) -> ResourceError {
     ResourceError::detail(StatusCode::UNPROCESSABLE_ENTITY, detail)
-}
-
-fn denied_team() -> ResourceError {
-    ResourceError(
-        StatusCode::FORBIDDEN,
-        json!({
-            "message":"Access issue: This API token does not have the required permissions for this team."
-        }),
-    )
 }
 
 fn persistence_error(error: ResourceWriteError, resource: &ResourceRecord) -> ResourceError {

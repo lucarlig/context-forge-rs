@@ -103,3 +103,6 @@ impl Database {
         }
     }
 }
+
+mod write;
+pub(crate) use write::PromptWriteError;

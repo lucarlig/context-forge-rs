@@ -1,21 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use axum::extract::{Path, Query};
+use axum::extract::{DefaultBodyLimit, Path, Query};
 use rmcp::model::{GetPromptRequest, GetPromptRequestParams, GetPromptResult, PromptMessage, Role};
 use tokio_util::sync::CancellationToken;
 
 use super::{catalog_api::*, *};
 use crate::catalog::PromptRecord;
 
-pub(super) fn router() -> Router<Arc<GatewayService>> {
+mod write;
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+struct ArgumentSchema {
+    #[serde(rename = "type")]
+    kind: String,
+    properties: indexmap::IndexMap<String, Value>,
+    required: Vec<String>,
+}
+
+pub(super) fn router(max_bytes: usize) -> Router<Arc<GatewayService>> {
     let mut routes = Router::new();
     for base in ["/prompts", "/v1/prompts"] {
         routes = routes
-            .route(base, get(list))
-            .route(&format!("{base}/"), get(list))
-            .route(&format!("{base}/{{id}}"), get(read).post(execute));
+            .route(base, get(list).post(write::create))
+            .route(&format!("{base}/"), get(list).post(write::create))
+            .route(
+                &format!("{base}/{{id}}"),
+                get(read)
+                    .post(execute)
+                    .put(write::update)
+                    .delete(write::delete),
+            )
+            .route(&format!("{base}/{{id}}/state"), post(write::set_state))
+            .route(&format!("{base}/{{id}}/toggle"), post(write::set_state));
     }
-    routes
+    routes.layer(DefaultBodyLimit::max(
+        max_bytes.saturating_mul(6).saturating_add(65536),
+    ))
 }
 
 async fn list(
@@ -190,17 +211,21 @@ fn metadata(record: &PromptRecord, aliases: bool) -> Value {
             .as_deref()
             .unwrap_or(&record.custom_name)
     );
-    let schema: Value = record
+    let schema: ArgumentSchema = record
         .argument_schema
         .as_deref()
         .and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default();
-    let arguments = schema["properties"].as_object().into_iter().flatten()
-        .map(|(name, property)| json!({
-            "name":name,
-            "description":property["description"].as_str().unwrap_or_default(),
-            "required":schema["required"].as_array().is_some_and(|required| required.iter().any(|value| value == name)),
-        }))
+    let arguments = schema
+        .properties
+        .iter()
+        .map(|(name, property)| {
+            json!({
+                "name":name,
+                "description":property["description"].as_str().unwrap_or_default(),
+                "required":schema.required.contains(name),
+            })
+        })
         .collect::<Vec<_>>();
     response["arguments"] = json!(arguments);
     response["tags"] = serde_json::from_str(&record.tags).unwrap_or_else(|_| json!([]));

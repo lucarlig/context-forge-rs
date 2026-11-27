@@ -19,7 +19,7 @@ mod entry_filters;
 mod prompts;
 mod resources;
 pub(crate) use entry_filters::CatalogEntryFilters;
-pub(crate) use prompts::PromptRecord;
+pub(crate) use prompts::{PromptRecord, PromptWriteError};
 pub(crate) use resources::{ResourceRecord, ResourceWriteError};
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");

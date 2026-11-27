@@ -590,6 +590,7 @@ dependencies = [
  "fernet",
  "futures-util",
  "hmac 0.13.0",
+ "indexmap",
  "ipnet",
  "jiff",
  "jsonschema",

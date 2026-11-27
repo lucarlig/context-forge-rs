@@ -85,6 +85,7 @@ pub struct GatewayService {
     refresh: CatalogRefresh,
     lifecycle: Option<GatewayLifecycle>,
     roots: roots::RootRegistry,
+    max_prompt_bytes: usize,
     resource_limits: ResourceLimits,
     resource_events: resource_api::ResourceEvents,
     active_refreshes: Mutex<HashSet<String>>,
@@ -161,6 +162,7 @@ impl GatewayService {
             refresh,
             lifecycle: None,
             roots: roots::RootRegistry::default(),
+            max_prompt_bytes: 10240,
             resource_limits: ResourceLimits::default(),
             resource_events: resource_api::ResourceEvents::new(
                 tokio_util::sync::CancellationToken::new(),
@@ -211,6 +213,11 @@ impl GatewayService {
 
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resource_limits = limits;
+        self
+    }
+
+    pub fn with_max_prompt_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_prompt_bytes = max_bytes;
         self
     }
 
@@ -344,7 +351,7 @@ impl GatewayService {
             router
                 .merge(roots::router())
                 .merge(tags::router())
-                .merge(prompt_api::router())
+                .merge(prompt_api::router(self.max_prompt_bytes))
                 .merge(resource_api::router(self.resource_limits.max_bytes))
                 .with_state(self.clone()),
         )

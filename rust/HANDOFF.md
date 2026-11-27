@@ -49,3 +49,8 @@ Resource REST writes support creation, update, state changes, and deletion. The 
 Prompt REST reads list the scoped catalog and retrieve or render a prompt by ID
 or name. The pinned recordings cover both API prefixes, inactive entries, and
 public token scope. [Prompt read verification](replay/prompt-management/read/README.md)
+
+Prompt management supports transactional creation, partial updates, state changes,
+and deletion on both databases. The live checks covered template byte limits,
+argument order, revision metadata, and virtual-server scoping.
+[Prompt write verification](replay/prompt-management/write.md)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::catalog::CatalogEntryFilters;
+use crate::catalog::{CatalogEntryFilters, slugify};
 
 #[derive(Default, Deserialize)]
 pub(super) struct CatalogListQuery {
@@ -263,4 +263,60 @@ impl IntoResponse for CatalogApiError {
     fn into_response(self) -> Response {
         (self.0, Json(self.1)).into_response()
     }
+}
+
+pub(super) fn normalized_tags(tags: Vec<Value>) -> Result<Value, CatalogApiError> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in tags {
+        let label = tag
+            .as_str()
+            .or_else(|| tag.get("label").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|label| !label.is_empty() && !label.chars().any(char::is_control))
+            .ok_or_else(|| {
+                CatalogApiError::detail(StatusCode::UNPROCESSABLE_ENTITY, "Invalid catalog tag")
+            })?;
+        let id = slugify(tag.get("id").and_then(Value::as_str).unwrap_or(label));
+        if id.is_empty() {
+            return Err(CatalogApiError::detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid catalog tag",
+            ));
+        }
+        if seen.insert(id.clone()) {
+            normalized.push(json!({"id":id,"label":label}));
+        }
+    }
+    Ok(json!(normalized))
+}
+
+pub(super) fn format_bytes(size: usize) -> String {
+    if size < 1024 {
+        format!("{size} B")
+    } else if size < 1024 * 1024 {
+        format!("{:.1} KB", size as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
+    }
+}
+
+pub(super) fn user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|agent| agent.to_str().ok())
+        .map(str::to_owned)
+}
+
+pub(super) fn client_address(peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<String> {
+    peer.map(|Extension(ConnectInfo(peer))| peer.ip().to_string())
+}
+
+pub(super) fn denied_team() -> CatalogApiError {
+    CatalogApiError(
+        StatusCode::FORBIDDEN,
+        json!({
+            "message":"Access issue: This API token does not have the required permissions for this team."
+        }),
+    )
 }

@@ -631,6 +631,14 @@ impl Settings {
         })
     }
 
+    pub fn max_prompt_bytes() -> Result<usize, Box<dyn Error + Send + Sync>> {
+        let bytes = parse("CONTENT_MAX_PROMPT_SIZE", 10240)?;
+        if !(512..=1048576).contains(&bytes) {
+            return Err("invalid CONTENT_MAX_PROMPT_SIZE".into());
+        }
+        Ok(bytes)
+    }
+
     pub fn resource_limits() -> Result<ResourceLimits, Box<dyn Error + Send + Sync>> {
         let mut limits = ResourceLimits::default();
         limits.max_bytes = parse("CONTENT_MAX_RESOURCE_SIZE", limits.max_bytes)?;
