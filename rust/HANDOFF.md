@@ -228,6 +228,7 @@ unary methods within their catalog scope.
 
 The pinned replay matched registration, method discovery, descriptor reuse,
 protobuf JSON defaults, and invocation errors on SQLite and PostgreSQL.
+The gateway keeps healthy methods when a single descriptor lookup fails.
 Rust returns the scoped record for `GET /admin/grpc/{id}`. The pinned gateway
 returned HTTP 500 in the same fixture.
 Registration stores gRPC metadata. The unary caller follows v1.1.2's behavior
@@ -239,7 +240,18 @@ conflicts, stale-method removal, and retained tool IDs on SQLite and PostgreSQL.
 A failed reflection keeps the last successful descriptors. Rust omits disabled
 services' tools from MCP listings. The pinned gateway listed those tools.
 Native tests cover team-scoped writes, concurrent reflection, and dependent
-record cleanup. TLS parity and CLI translation remain open.
+record cleanup.
+
+The TLS fixture matched trusted-root connections and rejected a hostname
+mismatch. Rust also passed mutual TLS with a certificate chain and private
+key in the gateway's `certs` directory. The v1.1.2 gateway disconnected during
+registration in that fixture. Rust rejects credential files outside approved
+directories.
+
+`context-forge-translate --grpc HOST:PORT` runs the pinned discovery probe.
+Register the service through `/admin/grpc` to expose its methods in MCP. The
+CLI replay checked reflection, shutdown on SIGINT, and the exit code and
+diagnostic for `--connect-grpc`.
 
 ## Gateway management
 

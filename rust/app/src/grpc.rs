@@ -61,7 +61,7 @@ impl Default for GrpcSettings {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum GrpcError {
+pub enum GrpcError {
     #[error("Invalid gRPC target")]
     Target,
     #[error(transparent)]
@@ -78,14 +78,45 @@ pub(crate) enum GrpcError {
     Timeout,
 }
 
-pub(crate) struct GrpcTarget<'a> {
-    pub(crate) address: &'a str,
-    pub(crate) tls: bool,
-    pub(crate) certificate: Option<&'a str>,
-    pub(crate) key: Option<&'a str>,
+pub struct GrpcTarget<'a> {
+    pub address: &'a str,
+    pub tls: bool,
+    pub certificate: Option<&'a str>,
+    pub key: Option<&'a str>,
+}
+
+pub struct GrpcProbe {
+    pub service_count: usize,
+    _channel: Channel,
 }
 
 impl GrpcTarget<'_> {
+    pub async fn probe(
+        &self,
+        upstream: &UpstreamClient,
+        deadline: Duration,
+    ) -> Result<GrpcProbe, GrpcError> {
+        let (channel, discovery) = self.open_reflection(upstream, deadline).await?;
+        Ok(GrpcProbe {
+            service_count: discovery.services.len(),
+            _channel: channel,
+        })
+    }
+
+    async fn open_reflection(
+        &self,
+        upstream: &UpstreamClient,
+        deadline: Duration,
+    ) -> Result<(Channel, Discovery), GrpcError> {
+        timeout(deadline, async {
+            let channel = self.channel(upstream).await?;
+            let discovery = reflect(channel.clone(), deadline).await?;
+            Ok((channel, discovery))
+        })
+        .await
+        .map_err(|_| GrpcError::Timeout)?
+    }
+
     pub(crate) fn url(&self) -> Result<String, GrpcError> {
         let lower = self.address.to_ascii_lowercase();
         if ["unix:", "unix-abstract:", "vsock:", "fd:"]
@@ -202,7 +233,8 @@ pub(crate) struct ReflectedMethod {
 #[derive(Serialize)]
 pub(crate) struct ReflectedService {
     pub(crate) name: String,
-    pub(crate) package: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) package: Option<String>,
     pub(crate) methods: Vec<ReflectedMethod>,
 }
 
@@ -230,11 +262,8 @@ pub(crate) async fn discover(
     target: &GrpcTarget<'_>,
     deadline: Duration,
 ) -> Result<Discovery, GrpcError> {
-    timeout(deadline, async {
-        reflect(target.channel(upstream).await?, deadline).await
-    })
-    .await
-    .map_err(|_| GrpcError::Timeout)?
+    let (_, discovery) = target.open_reflection(upstream, deadline).await?;
+    Ok(discovery)
 }
 
 async fn reflect(channel: Channel, deadline: Duration) -> Result<Discovery, GrpcError> {
@@ -260,15 +289,30 @@ async fn reflect(channel: Channel, deadline: Duration) -> Result<Discovery, Grpc
         .collect::<BTreeSet<_>>();
     let mut blobs = IndexSet::new();
     let mut size = 0;
+    let mut services = BTreeMap::new();
     for name in &names {
-        let MessageResponse::FileDescriptorResponse(files) = reflection_request(
+        let files = match reflection_request(
             &mut client,
             MessageRequest::FileContainingSymbol(name.clone()),
             deadline,
         )
-        .await?
-        else {
-            return Err(GrpcError::Reflection);
+        .await
+        {
+            Ok(MessageResponse::FileDescriptorResponse(files)) => files,
+            Ok(_) => continue,
+            Err(GrpcError::Timeout) => return Err(GrpcError::Timeout),
+            Err(error) => {
+                tracing::debug!(reason = %error, "gRPC descriptor request failed");
+                services.insert(
+                    name.clone(),
+                    ReflectedService {
+                        name: name.clone(),
+                        package: None,
+                        methods: Vec::new(),
+                    },
+                );
+                continue;
+            }
         };
         for blob in files.file_descriptor_proto {
             let length = blob.len();
@@ -285,28 +329,28 @@ async fn reflect(channel: Channel, deadline: Duration) -> Result<Discovery, Grpc
     }
     let blobs = blobs.into_iter().collect::<Vec<_>>();
     let pool = descriptor_pool(&blobs)?;
-    let services = pool
-        .services()
-        .filter(|service| names.contains(service.full_name()))
-        .map(|service| {
-            let name = service.full_name().to_owned();
-            let result = ReflectedService {
-                name: name.clone(),
-                package: service.package_name().to_owned(),
-                methods: service
-                    .methods()
-                    .map(|method| ReflectedMethod {
-                        name: method.name().to_owned(),
-                        input_type: format!(".{}", method.input().full_name()),
-                        output_type: format!(".{}", method.output().full_name()),
-                        client_streaming: method.is_client_streaming(),
-                        server_streaming: method.is_server_streaming(),
-                    })
-                    .collect(),
-            };
-            (name, result)
-        })
-        .collect();
+    services.extend(
+        pool.services()
+            .filter(|service| names.contains(service.full_name()))
+            .map(|service| {
+                let name = service.full_name().to_owned();
+                let result = ReflectedService {
+                    name: name.clone(),
+                    package: Some(service.package_name().to_owned()),
+                    methods: service
+                        .methods()
+                        .map(|method| ReflectedMethod {
+                            name: method.name().to_owned(),
+                            input_type: format!(".{}", method.input().full_name()),
+                            output_type: format!(".{}", method.output().full_name()),
+                            client_streaming: method.is_client_streaming(),
+                            server_streaming: method.is_server_streaming(),
+                        })
+                        .collect(),
+                };
+                (name, result)
+            }),
+    );
     Ok(Discovery { services, blobs })
 }
 

@@ -8,15 +8,15 @@ mod stdio;
 use std::{error::Error, sync::Arc, time::Duration};
 
 use clap::{ArgGroup, Parser};
-use context_forge_rs::config::Settings;
+use context_forge_rs::{config::Settings, grpc::GrpcTarget};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::filter::LevelFilter;
 
 #[derive(Parser)]
 #[command(
-    about = "Translate MCP between stdio, SSE, and Streamable HTTP",
-    group(ArgGroup::new("source").required(true).args(["stdio", "connect_sse", "connect_streamable_http"]))
+    about = "Translate MCP transports or discover a gRPC service",
+    group(ArgGroup::new("source").required(true).args(["stdio", "connect_sse", "connect_streamable_http", "grpc", "connect_grpc"]))
 )]
 struct Arguments {
     #[arg(long, value_name = "COMMAND")]
@@ -25,6 +25,22 @@ struct Arguments {
     connect_sse: Option<String>,
     #[arg(long, value_name = "URL")]
     connect_streamable_http: Option<String>,
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        help = "Discover methods on a gRPC service"
+    )]
+    grpc: Option<String>,
+    #[arg(long, value_name = "HOST:PORT")]
+    connect_grpc: Option<String>,
+    #[arg(long, requires = "grpc")]
+    grpc_tls: bool,
+    #[arg(long, requires = "grpc", value_name = "PATH")]
+    grpc_cert: Option<String>,
+    #[arg(long, requires = "grpc", value_name = "PATH")]
+    grpc_key: Option<String>,
+    #[arg(long = "grpc-metadata", requires = "grpc", value_name = "KEY=VALUE")]
+    _grpc_metadata: Vec<String>,
     #[arg(long = "stdioCommand", value_name = "COMMAND")]
     stdio_command: Option<String>,
     #[arg(long = "oauth2Bearer", value_name = "TOKEN")]
@@ -70,6 +86,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_writer(std::io::stderr)
         .with_max_level(level)
         .init();
+
+    if args.connect_grpc.is_some() {
+        eprintln!(
+            "Error: --connect-grpc mode not yet implemented. Use --grpc to expose a gRPC server."
+        );
+        std::process::exit(1);
+    }
+    if let Some(address) = args.grpc.as_deref() {
+        let target = GrpcTarget {
+            address,
+            tls: args.grpc_tls,
+            certificate: args.grpc_cert.as_deref(),
+            key: args.grpc_key.as_deref(),
+        };
+        let upstream = Settings::upstream_client()?;
+        let deadline = Settings::grpc_federation()?.timeout;
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+        let probe = tokio::select! {
+            () = &mut shutdown => return Ok(()),
+            result = target.probe(&upstream, deadline) => result?,
+        };
+        tracing::info!("Discovered: {} services", probe.service_count);
+        tracing::info!("Register the service through /admin/grpc to expose its methods in MCP");
+        shutdown.await;
+        return Ok(());
+    }
 
     let remote = args
         .connect_sse

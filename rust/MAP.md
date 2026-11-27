@@ -25,7 +25,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Encrypted credential storage and rotation
 - [ ] Remaining database schema, migration history, import, and export
 - [x] REST tool federation
-- [ ] gRPC tool federation
+- [x] gRPC tool federation
 - [ ] A2A federation and task lifecycle
 - [ ] Native plugins, policy evaluation, and external extensions
 - [ ] Admin backend and UI integration
