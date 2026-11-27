@@ -415,7 +415,7 @@ pub(super) fn local_resource(record: ResourceContentRecord, uri: String) -> Reso
     }
 }
 
-fn render_prompt(
+pub(super) fn render_prompt(
     record: PromptContentRecord,
     arguments: JsonObject,
     modern: bool,

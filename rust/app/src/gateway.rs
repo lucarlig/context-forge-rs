@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod catalog_api;
 mod content;
 mod health;
 mod lifecycle;
 mod management;
+mod prompt_api;
 mod proxy;
 mod resource_api;
 mod roots;
@@ -342,6 +344,7 @@ impl GatewayService {
             router
                 .merge(roots::router())
                 .merge(tags::router())
+                .merge(prompt_api::router())
                 .merge(resource_api::router(self.resource_limits.max_bytes))
                 .with_state(self.clone()),
         )

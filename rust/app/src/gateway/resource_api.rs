@@ -4,8 +4,14 @@ use axum::extract::{DefaultBodyLimit, Path, Query};
 use rmcp::model::{ReadResourceRequest, ReadResourceRequestParams};
 use tokio_util::sync::CancellationToken;
 
-use super::*;
-use crate::catalog::{ResourceContentRecord, ResourceFilters, ResourceRecord};
+use super::{
+    catalog_api::{
+        CatalogApiError as ResourceError, CatalogListQuery, CatalogPage, alias_metadata, flag,
+        http_server_id, require_catalog_permission,
+    },
+    *,
+};
+use crate::catalog::{CatalogEntryFilters, ResourceContentRecord, ResourceRecord};
 
 mod events;
 mod write;
@@ -34,161 +40,42 @@ pub(super) fn router(max_resource_bytes: usize) -> Router<Arc<GatewayService>> {
     ))
 }
 
-#[derive(Default, Deserialize)]
-struct ResourceQuery {
-    include_inactive: Option<String>,
-    include_pagination: Option<String>,
-    limit: Option<i64>,
-    cursor: Option<String>,
-    tags: Option<String>,
-    visibility: Option<String>,
-    team_id: Option<String>,
-    gateway_id: Option<String>,
-    mcp_server_id: Option<String>,
-}
-
-impl ResourceQuery {
-    fn gateway_filter(&self) -> Result<Option<&str>, ResourceError> {
-        let gateway = self.gateway_id.as_deref();
-        let alias = self.mcp_server_id.as_deref();
-        if gateway
-            .zip(alias)
-            .is_some_and(|(gateway, alias)| gateway != alias)
-        {
-            return Err(ResourceError::detail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "gateway_id and mcp_server_id conflict",
-            ));
-        }
-        Ok(gateway.or(alias))
-    }
-
-    fn tags(&self) -> Vec<String> {
-        let mut tags = self
-            .tags
-            .as_deref()
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        tags.sort_unstable();
-        tags.dedup();
-        tags
-    }
-}
-
 async fn list(
     State(service): State<Arc<GatewayService>>,
     Extension(principal): Extension<Principal>,
-    Query(query): Query<ResourceQuery>,
+    Query(query): Query<CatalogListQuery>,
 ) -> Result<Json<Value>, ResourceError> {
-    require_resources(&service, &principal, "resources.read", true).await?;
-    let include_inactive = flag(query.include_inactive.as_deref())?;
-    let include_pagination = flag(query.include_pagination.as_deref())?;
-    let gateway = query.gateway_filter()?;
-    let team = query.team_id.as_deref();
-    if let (TeamVisibility::Teams(allowed), Some(team)) = (&principal.visibility, team)
-        && !allowed.iter().any(|id| id == team)
-    {
-        return Err(ResourceError(
-            StatusCode::FORBIDDEN,
-            json!({
-                "message":"Access issue: This API token does not have the required permissions for this team."
-            }),
-        ));
-    }
-    let tags = query.tags();
-    let limit = match query.limit {
-        Some(0) => None,
-        Some(limit) if limit > 0 => Some(limit.min(i64::from(service.management_max_page_size))),
-        Some(_) => {
-            return Err(ResourceError::detail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "Invalid limit",
-            ));
-        }
-        None => Some(i64::from(service.management_page_size)),
-    };
-    let fingerprint = Sha256::digest(
-        json!([
-            list_fingerprint("rest/resources", Some(&principal), None),
-            include_inactive,
-            &tags,
-            team,
-            gateway,
-            &query.visibility,
-        ])
-        .to_string()
-        .as_bytes(),
-    )
-    .into();
-    let cursor = query
-        .cursor
-        .as_deref()
-        .and_then(|value| service.pagination.decode(value, &fingerprint).ok())
-        .and_then(|cursor| serde_json::from_str::<(String, String)>(&cursor.after_id).ok());
-    let mut rows = service
+    require_catalog_permission(&service, &principal, "resources.read", true).await?;
+    let page = CatalogPage::prepare(&service, &principal, &query, "rest/resources")?;
+    let rows = service
         .database
         .managed_resources(
             access::catalog_scope(Some(&principal)),
-            ResourceFilters {
-                templates: false,
-                include_inactive,
-                visibility: query.visibility.as_deref(),
-                team,
-                gateway,
-                after: cursor
-                    .as_ref()
-                    .map(|(created, id)| (created.as_str(), id.as_str())),
-                limit: limit.map_or(i64::MAX, |limit| limit + 1),
-                tags: &tags,
-            },
+            page.filters(),
+            false,
         )
         .await?;
-    let mut next_cursor = None;
-    if let Some(limit) = limit
-        && rows.len() as i64 > limit
-    {
-        rows.truncate(limit as usize);
-        if include_pagination && let Some(last) = rows.last() {
-            let position = json!([last.created_at, last.id]).to_string();
-            let expires = Timestamp::now()
-                .as_second()
-                .saturating_add(service.pagination.ttl);
-            next_cursor = Some(
-                service
-                    .pagination
-                    .encode(position, fingerprint, expires)
-                    .map_err(|_| ResourceError::unavailable())?,
-            );
-        }
-    }
-    let resources = rows
-        .iter()
-        .map(|resource| metadata(resource, true))
-        .collect::<Vec<_>>();
-    Ok(Json(if include_pagination {
-        json!({"resources":resources,"nextCursor":next_cursor})
-    } else {
-        json!(resources)
-    }))
+    Ok(Json(page.envelope(
+        &service,
+        rows,
+        "resources",
+        |row| (&row.created_at, &row.id),
+        |row| metadata(row, true),
+    )?))
 }
 
 async fn templates(
     State(service): State<Arc<GatewayService>>,
     Extension(principal): Extension<Principal>,
-    Query(query): Query<ResourceQuery>,
+    Query(query): Query<CatalogListQuery>,
 ) -> Result<Json<Value>, ResourceError> {
-    require_resources(&service, &principal, "resources.read", true).await?;
+    require_catalog_permission(&service, &principal, "resources.read", true).await?;
     let tags = query.tags();
     let records = service
         .database
         .managed_resources(
             access::catalog_scope(Some(&principal)),
-            ResourceFilters {
-                templates: true,
+            CatalogEntryFilters {
                 include_inactive: flag(query.include_inactive.as_deref())?,
                 visibility: query.visibility.as_deref(),
                 team: None,
@@ -197,6 +84,7 @@ async fn templates(
                 limit: i64::MAX,
                 tags: &tags,
             },
+            true,
         )
         .await?;
     let templates = records.into_iter().map(|resource| json!({
@@ -212,9 +100,9 @@ async fn info(
     State(service): State<Arc<GatewayService>>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
-    Query(query): Query<ResourceQuery>,
+    Query(query): Query<CatalogListQuery>,
 ) -> Result<Json<Value>, ResourceError> {
-    require_resources(&service, &principal, "resources.read", true).await?;
+    require_catalog_permission(&service, &principal, "resources.read", true).await?;
     let resource = find_visible(
         &service,
         &principal,
@@ -231,7 +119,7 @@ async fn read(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ResourceError> {
-    require_resources(&service, &principal, "resources.read", true).await?;
+    require_catalog_permission(&service, &principal, "resources.read", true).await?;
     let server = headers
         .get("x-server-id")
         .map(http_server_id)
@@ -241,17 +129,11 @@ async fn read(
         .database
         .resource_content_by_id(access::catalog_scope(Some(&principal)), server, &id)
         .await?
-        .ok_or_else(|| ResourceError::missing(&id))?;
+        .ok_or_else(|| missing_resource(&id))?;
     let uri = record.uri.clone();
     Ok(Json(
         resource_content(&service, &principal, record, uri, &headers, false).await?,
     ))
-}
-
-fn http_server_id(value: &axum::http::HeaderValue) -> Result<&str, ResourceError> {
-    value
-        .to_str()
-        .map_err(|_| ResourceError::detail(StatusCode::BAD_REQUEST, "Invalid server ID"))
 }
 
 async fn test_uri(
@@ -260,12 +142,12 @@ async fn test_uri(
     Path(uri): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ResourceError> {
-    require_resources(&service, &principal, "resources.read", false).await?;
+    require_catalog_permission(&service, &principal, "resources.read", false).await?;
     let record = service
         .database
         .resource_content(access::catalog_scope(Some(&principal)), None, &uri)
         .await?
-        .ok_or_else(|| ResourceError::missing(&uri))?;
+        .ok_or_else(|| missing_resource(&uri))?;
     let content = resource_content(&service, &principal, record, uri, &headers, true).await?;
     Ok(Json(json!({"content":content})))
 }
@@ -330,25 +212,6 @@ async fn resource_content(
     Ok(envelope)
 }
 
-async fn require_resources(
-    service: &GatewayService,
-    principal: &Principal,
-    permission: &str,
-    bypass: bool,
-) -> Result<(), ResourceError> {
-    if !service
-        .access
-        .allows(principal, permission, RoleContext::AnyTeam, bypass)
-        .await?
-    {
-        return Err(ResourceError::detail(
-            StatusCode::FORBIDDEN,
-            "Access denied",
-        ));
-    }
-    Ok(())
-}
-
 async fn find_visible(
     service: &GatewayService,
     principal: &Principal,
@@ -366,7 +229,7 @@ async fn find_visible(
                 record.owner_email.as_deref(),
             )
         })
-        .ok_or_else(|| ResourceError::missing(id))?;
+        .ok_or_else(|| missing_resource(id))?;
     if !record.enabled && !inactive {
         return Err(ResourceError::detail(
             StatusCode::NOT_FOUND,
@@ -374,17 +237,6 @@ async fn find_visible(
         ));
     }
     Ok(record)
-}
-
-fn flag(input: Option<&str>) -> Result<bool, ResourceError> {
-    match input.map(str::to_ascii_lowercase).as_deref() {
-        None | Some("0" | "false" | "f" | "off" | "n" | "no") => Ok(false),
-        Some("1" | "true" | "t" | "on" | "y" | "yes") => Ok(true),
-        _ => Err(ResourceError::detail(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Invalid boolean query parameter",
-        )),
-    }
 }
 
 fn metadata(record: &ResourceRecord, aliases: bool) -> Value {
@@ -412,56 +264,9 @@ fn metadata(record: &ResourceRecord, aliases: bool) -> Value {
         response["meta"] = Value::Null;
         return response;
     }
-    let Value::Object(response) = response else {
-        unreachable!()
-    };
-    let mut aliased: serde_json::Map<_, _> = response
-        .into_iter()
-        .map(|(key, value)| {
-            let mut pieces = key.split('_');
-            let mut camel = pieces.next().unwrap_or_default().to_owned();
-            for piece in pieces {
-                let mut characters = piece.chars();
-                if let Some(first) = characters.next() {
-                    camel.extend(first.to_uppercase());
-                    camel.push_str(characters.as_str());
-                }
-            }
-            (camel, value)
-        })
-        .collect();
-    aliased.insert("_meta".to_owned(), Value::Null);
-    Value::Object(aliased)
+    alias_metadata(response)
 }
 
-struct ResourceError(StatusCode, Value);
-
-impl ResourceError {
-    fn detail(status: StatusCode, detail: impl Into<String>) -> Self {
-        Self(status, json!({"detail":detail.into()}))
-    }
-
-    fn missing(id: &str) -> Self {
-        Self::detail(StatusCode::NOT_FOUND, format!("Resource not found: {id}"))
-    }
-
-    fn unavailable() -> Self {
-        Self::detail(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Resource service unavailable",
-        )
-    }
-}
-
-impl From<sqlx::Error> for ResourceError {
-    fn from(error: sqlx::Error) -> Self {
-        tracing::error!(%error, "resource registry query failed");
-        Self::unavailable()
-    }
-}
-
-impl IntoResponse for ResourceError {
-    fn into_response(self) -> Response {
-        (self.0, Json(self.1)).into_response()
-    }
+fn missing_resource(id: &str) -> ResourceError {
+    ResourceError::detail(StatusCode::NOT_FOUND, format!("Resource not found: {id}"))
 }

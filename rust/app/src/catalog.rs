@@ -15,8 +15,12 @@ use crate::{
     upstream::{DiscoveredMetadata, UpstreamTransport},
 };
 
+mod entry_filters;
+mod prompts;
 mod resources;
-pub(crate) use resources::{ResourceFilters, ResourceRecord, ResourceWriteError};
+pub(crate) use entry_filters::CatalogEntryFilters;
+pub(crate) use prompts::PromptRecord;
+pub(crate) use resources::{ResourceRecord, ResourceWriteError};
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
 pub(crate) const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
@@ -770,7 +774,7 @@ pub(crate) const SQLITE_TOOL_INSERT: &str = insert_tool!("json($8)", "json($9)",
 pub(crate) const POSTGRES_TOOL_INSERT: &str =
     insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)");
 
-macro_rules! resource_management_columns {
+macro_rules! catalog_audit_columns {
     ($prefix:literal) => {
         [
             ("created_by", concat!($prefix, "created_by VARCHAR(255)")),
@@ -814,38 +818,58 @@ macro_rules! resource_management_columns {
 
 impl Database {
     pub async fn migrate_catalog(&self) -> Result<(), sqlx::Error> {
-        macro_rules! migrate {
-            ($tx:ident, $columns:literal) => {{
-                sqlx::raw_sql(MIGRATION).execute(&mut *$tx).await?;
+        macro_rules! add_columns {
+            ($tx:ident, $columns:literal, $definitions:expr) => {{
                 let existing = sqlx::query_scalar::<_, String>($columns)
                     .fetch_all(&mut *$tx)
                     .await?;
-                for (name, statement) in
-                    resource_management_columns!("ALTER TABLE resources ADD COLUMN ")
-                {
+                for (name, statement) in $definitions {
                     if !existing.iter().any(|column| column == name) {
                         sqlx::query(statement).execute(&mut *$tx).await?;
                     }
                 }
-                $tx.commit().await
             }};
         }
+        let resource_columns = catalog_audit_columns!("ALTER TABLE resources ADD COLUMN ");
+        let prompt_columns = catalog_audit_columns!("ALTER TABLE prompts ADD COLUMN ")
+            .into_iter()
+            .chain([(
+                "display_name",
+                "ALTER TABLE prompts ADD COLUMN display_name VARCHAR(255)",
+            )]);
         match self {
             Self::Sqlite(pool) => {
                 let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-                migrate!(
+                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
+                add_columns!(
                     transaction,
-                    "SELECT name FROM pragma_table_info('resources')"
-                )
+                    "SELECT name FROM pragma_table_info('resources')",
+                    resource_columns
+                );
+                add_columns!(
+                    transaction,
+                    "SELECT name FROM pragma_table_info('prompts')",
+                    prompt_columns
+                );
+                transaction.commit().await
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
                 sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
-                migrate!(
+                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
+                add_columns!(
                     transaction,
                     "SELECT CAST(column_name AS TEXT) FROM information_schema.columns
-                    WHERE table_schema = current_schema() AND table_name = 'resources'"
-                )
+                    WHERE table_schema = current_schema() AND table_name = 'resources'",
+                    resource_columns
+                );
+                add_columns!(
+                    transaction,
+                    "SELECT CAST(column_name AS TEXT) FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = 'prompts'",
+                    prompt_columns
+                );
+                transaction.commit().await
             }
         }
     }

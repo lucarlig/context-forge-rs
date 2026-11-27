@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/prompts"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc2NzIyNTYwMCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJwcm9tcHQtYWRtaW4tZml4dHVyZS1zdGF0aWMiLCJpc19hZG1pbiI6dHJ1ZSwidGVhbXMiOm51bGwsInRva2VuX3VzZSI6ImFwaSIsInVzZXIiOnsiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzX2FkbWluIjp0cnVlfX0.GV4cSyiz3TFiPJ2S7cXFbPBXufIl8UXRIiVXb6f1bjg"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

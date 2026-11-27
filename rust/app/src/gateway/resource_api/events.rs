@@ -63,7 +63,7 @@ pub(super) async fn subscribe(
     State(service): State<Arc<GatewayService>>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Response, ResourceError> {
-    require_resources(&service, &principal, "resources.read", true).await?;
+    require_catalog_permission(&service, &principal, "resources.read", true).await?;
     let event_stream = &service.resource_events;
     let subscription = (
         event_stream.events.subscribe(),

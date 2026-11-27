@@ -360,7 +360,7 @@ async fn editable(
     permission: &str,
     action: &str,
 ) -> Result<ResourceRecord, ResourceError> {
-    require_resources(service, principal, permission, true).await?;
+    require_catalog_permission(service, principal, permission, true).await?;
     let resource = find_visible(service, principal, id, true).await?;
     let team = resource.team_id.as_deref();
     let role = team.map_or(RoleContext::AnyTeam, RoleContext::Team);

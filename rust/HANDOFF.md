@@ -45,3 +45,7 @@ The tag APIs aggregate counts and list tagged entities within the caller's catal
 Resource REST reads cover metadata, templates, and content by ID and URI. The recordings verify filtering and scoped access, including against SQLite created by the pinned gateway. [Resource read verification](replay/resource-management/read/README.md)
 
 Resource REST writes support creation, update, state changes, and deletion. The live checks covered ownership, content limits, and metric retention and purge behavior. [Resource write verification](replay/resource-management/write.md)
+
+Prompt REST reads list the scoped catalog and retrieve or render a prompt by ID
+or name. The pinned recordings cover both API prefixes, inactive entries, and
+public token scope. [Prompt read verification](replay/prompt-management/read/README.md)

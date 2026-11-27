@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+use crate::catalog::CatalogEntryFilters;
+
+#[derive(Default, Deserialize)]
+pub(super) struct CatalogListQuery {
+    pub(super) include_inactive: Option<String>,
+    pub(super) include_pagination: Option<String>,
+    pub(super) limit: Option<i64>,
+    pub(super) cursor: Option<String>,
+    pub(super) tags: Option<String>,
+    pub(super) visibility: Option<String>,
+    pub(super) team_id: Option<String>,
+    pub(super) gateway_id: Option<String>,
+    pub(super) mcp_server_id: Option<String>,
+}
+
+impl CatalogListQuery {
+    pub(super) fn gateway_filter(&self) -> Result<Option<&str>, CatalogApiError> {
+        let gateway = self.gateway_id.as_deref();
+        let alias = self.mcp_server_id.as_deref();
+        if gateway
+            .zip(alias)
+            .is_some_and(|(gateway, alias)| gateway != alias)
+        {
+            return Err(CatalogApiError::detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "gateway_id and mcp_server_id conflict",
+            ));
+        }
+        Ok(gateway.or(alias))
+    }
+
+    pub(super) fn tags(&self) -> Vec<String> {
+        let mut tags = self
+            .tags
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+}
+
+pub(super) struct CatalogPage<'a> {
+    include_inactive: bool,
+    include_pagination: bool,
+    visibility: Option<&'a str>,
+    team: Option<&'a str>,
+    gateway: Option<&'a str>,
+    tags: Vec<String>,
+    limit: Option<i64>,
+    cursor: Option<(String, String)>,
+    fingerprint: [u8; 32],
+}
+
+impl<'a> CatalogPage<'a> {
+    pub(super) fn prepare(
+        service: &GatewayService,
+        principal: &Principal,
+        query: &'a CatalogListQuery,
+        endpoint: &str,
+    ) -> Result<Self, CatalogApiError> {
+        let include_inactive = flag(query.include_inactive.as_deref())?;
+        let include_pagination = flag(query.include_pagination.as_deref())?;
+        let gateway = query.gateway_filter()?;
+        let team = query.team_id.as_deref();
+        if let (TeamVisibility::Teams(allowed), Some(team)) = (&principal.visibility, team)
+            && !allowed.iter().any(|id| id == team)
+        {
+            return Err(CatalogApiError(
+                StatusCode::FORBIDDEN,
+                json!({
+                    "message":"Access issue: This API token does not have the required permissions for this team."
+                }),
+            ));
+        }
+        let tags = query.tags();
+        let limit = match query.limit {
+            Some(0) => None,
+            Some(limit) if limit > 0 => {
+                Some(limit.min(i64::from(service.management_max_page_size)))
+            }
+            Some(_) => {
+                return Err(CatalogApiError::detail(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Invalid limit",
+                ));
+            }
+            None => Some(i64::from(service.management_page_size)),
+        };
+        let fingerprint = Sha256::digest(
+            json!([
+                list_fingerprint(endpoint, Some(principal), None),
+                include_inactive,
+                &tags,
+                team,
+                gateway,
+                &query.visibility,
+            ])
+            .to_string()
+            .as_bytes(),
+        )
+        .into();
+        let cursor = query
+            .cursor
+            .as_deref()
+            .and_then(|value| service.pagination.decode(value, &fingerprint).ok())
+            .and_then(|cursor| serde_json::from_str::<(String, String)>(&cursor.after_id).ok());
+        Ok(Self {
+            include_inactive,
+            include_pagination,
+            visibility: query.visibility.as_deref(),
+            team,
+            gateway,
+            tags,
+            limit,
+            cursor,
+            fingerprint,
+        })
+    }
+
+    pub(super) fn filters(&self) -> CatalogEntryFilters<'_> {
+        CatalogEntryFilters {
+            include_inactive: self.include_inactive,
+            visibility: self.visibility,
+            team: self.team,
+            gateway: self.gateway,
+            after: self
+                .cursor
+                .as_ref()
+                .map(|(created, id)| (created.as_str(), id.as_str())),
+            limit: self.limit.map_or(i64::MAX, |limit| limit + 1),
+            tags: &self.tags,
+        }
+    }
+
+    pub(super) fn envelope<T>(
+        &self,
+        service: &GatewayService,
+        mut rows: Vec<T>,
+        key: &str,
+        position: impl Fn(&T) -> (&str, &str),
+        metadata: impl Fn(&T) -> Value,
+    ) -> Result<Value, CatalogApiError> {
+        let mut next_cursor = None;
+        if let Some(limit) = self.limit
+            && rows.len() as i64 > limit
+        {
+            rows.truncate(limit as usize);
+            if self.include_pagination
+                && let Some(last) = rows.last()
+            {
+                let position = json!(position(last)).to_string();
+                let expires = Timestamp::now()
+                    .as_second()
+                    .saturating_add(service.pagination.ttl);
+                next_cursor = Some(
+                    service
+                        .pagination
+                        .encode(position, self.fingerprint, expires)
+                        .map_err(|_| CatalogApiError::unavailable())?,
+                );
+            }
+        }
+        let entries = rows.iter().map(metadata).collect::<Vec<_>>();
+        Ok(if self.include_pagination {
+            json!({(key): entries, "nextCursor": next_cursor})
+        } else {
+            json!(entries)
+        })
+    }
+}
+
+pub(super) fn flag(input: Option<&str>) -> Result<bool, CatalogApiError> {
+    match input.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("0" | "false" | "f" | "off" | "n" | "no") => Ok(false),
+        Some("1" | "true" | "t" | "on" | "y" | "yes") => Ok(true),
+        _ => Err(CatalogApiError::detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid boolean query parameter",
+        )),
+    }
+}
+
+pub(super) async fn require_catalog_permission(
+    service: &GatewayService,
+    principal: &Principal,
+    permission: &str,
+    bypass: bool,
+) -> Result<(), CatalogApiError> {
+    if !service
+        .access
+        .allows(principal, permission, RoleContext::AnyTeam, bypass)
+        .await?
+    {
+        return Err(CatalogApiError::detail(
+            StatusCode::FORBIDDEN,
+            "Access denied",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn http_server_id(value: &axum::http::HeaderValue) -> Result<&str, CatalogApiError> {
+    value
+        .to_str()
+        .map_err(|_| CatalogApiError::detail(StatusCode::BAD_REQUEST, "Invalid server ID"))
+}
+
+pub(super) fn alias_metadata(response: Value) -> Value {
+    let Value::Object(response) = response else {
+        unreachable!()
+    };
+    let mut aliased: serde_json::Map<_, _> = response
+        .into_iter()
+        .map(|(key, value)| {
+            let mut pieces = key.split('_');
+            let mut camel = pieces.next().unwrap_or_default().to_owned();
+            for piece in pieces {
+                let mut characters = piece.chars();
+                if let Some(first) = characters.next() {
+                    camel.extend(first.to_uppercase());
+                    camel.push_str(characters.as_str());
+                }
+            }
+            (camel, value)
+        })
+        .collect();
+    aliased.insert("_meta".to_owned(), Value::Null);
+    Value::Object(aliased)
+}
+
+pub(super) struct CatalogApiError(pub(super) StatusCode, pub(super) Value);
+
+impl CatalogApiError {
+    pub(super) fn detail(status: StatusCode, detail: impl Into<String>) -> Self {
+        Self(status, json!({"detail":detail.into()}))
+    }
+
+    pub(super) fn unavailable() -> Self {
+        Self::detail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Catalog service unavailable",
+        )
+    }
+}
+
+impl From<sqlx::Error> for CatalogApiError {
+    fn from(error: sqlx::Error) -> Self {
+        tracing::error!(%error, "catalog registry query failed");
+        Self::unavailable()
+    }
+}
+
+impl IntoResponse for CatalogApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(self.1)).into_response()
+    }
+}
