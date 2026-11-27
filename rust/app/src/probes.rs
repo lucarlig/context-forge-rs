@@ -5,12 +5,16 @@ use std::{error::Error, sync::Arc};
 use axum::{
     Json, Router,
     extract::State,
-    http::{StatusCode, header::VARY},
+    http::{
+        StatusCode,
+        header::{ALLOW, VARY},
+    },
     response::IntoResponse,
     routing::get,
 };
 use redis::AsyncConnectionConfig;
 use serde::Serialize;
+use serde_json::json;
 
 use crate::{config::RedisSettings, database::Database};
 
@@ -51,9 +55,17 @@ struct ProbeState {
 
 pub fn router(database: Database, redis: Option<RedisProbe>) -> Router {
     Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
+        .route("/health", get(health).head(probe_head))
+        .route("/ready", get(ready).head(probe_head))
         .with_state(Arc::new(ProbeState { database, redis }))
+}
+
+async fn probe_head() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(ALLOW, "GET")],
+        Json(json!({"detail": "Method Not Allowed"})),
+    )
 }
 
 #[derive(Serialize)]

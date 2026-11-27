@@ -130,13 +130,19 @@ headers. They cover unique CSP nonces, cache exemptions, frame and HSTS flags,
 CORS defaults by environment, and preflight denials. The profiles disable
 response compression and compare the fields in `Vary` without regard to order.
 
+Nineteen live compression replays match zstd, Brotli, and gzip negotiation,
+body sizes, and response headers. They cover the MCP SSE bypass and verify
+that clients receive the initial event on compressed legacy SSE streams.
+Native tests cover response trailers and the range and pre-encoding exclusions.
+HEAD requests to the health and readiness probes return 405, as upstream.
+
 Seventeen live rate-limit replays match the reference for endpoint tiers,
 anonymous and authenticated requests, IP and team scopes, tier-specific
 lockouts, and the 429 body and headers. They verify dedicated and shared Redis
 across two gateway instances, database-cache isolation, and in-memory fallback
 when Redis is unavailable. The Redis checks use plain TCP. Redis hostname
 verification stays enabled. Rate-limit security event persistence and
-response compression remain open.
+Redis TLS replay remain open.
 
 ## Gateway and protocol verification
 

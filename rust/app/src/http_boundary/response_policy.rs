@@ -12,6 +12,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 
+use super::compression::{Coding, Compression};
 use crate::config::{allowlist, flag, parse, value};
 
 const EXPOSE_HEADERS: &str = "Content-Length, X-Request-ID, X-Password-Change-Required";
@@ -21,6 +22,7 @@ const PREFLIGHT_VARY: &str = "Origin, Access-Control-Request-Method, Access-Cont
 pub(super) struct ResponsePolicy {
     cors: Cors,
     security: Option<SecurityHeaders>,
+    compression: Option<Compression>,
 }
 
 impl ResponsePolicy {
@@ -57,6 +59,7 @@ impl ResponsePolicy {
                 .unwrap_or(true)
                 .then(SecurityHeaders::from_env)
                 .transpose()?,
+            compression: Compression::from_env()?,
         })
     }
 
@@ -77,6 +80,11 @@ async fn respond(
             .get("x-forwarded-proto")
             .is_some_and(|value| value == "https");
     let path = request.uri().path().to_owned();
+    let compressor = policy
+        .compression
+        .as_ref()
+        .filter(|compression| compression.supports_path(&path));
+    let coding = compressor.and_then(|_| Coding::select(request.headers()));
     let mut response = match policy.cors.preflight(&request, origin.as_ref()) {
         Some(preflight) => preflight,
         None => {
@@ -88,6 +96,9 @@ async fn respond(
             response
         }
     };
+    if let Some(compressor) = compressor {
+        response = compressor.apply(response, coding).await;
+    }
     if let Some(security) = &policy.security {
         security.apply(
             response.headers_mut(),
@@ -351,7 +362,7 @@ fn cacheable(path: &str) -> bool {
             })
 }
 
-fn add_vary(headers: &mut HeaderMap, field: &str) {
+pub(super) fn add_vary(headers: &mut HeaderMap, field: &str) {
     let mut values = headers
         .get_all(header::VARY)
         .iter()

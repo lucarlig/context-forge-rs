@@ -27,6 +27,7 @@ use crate::{
     config::{flag, parse, value},
 };
 
+mod compression;
 mod proxy;
 mod rate_limit;
 mod response_policy;

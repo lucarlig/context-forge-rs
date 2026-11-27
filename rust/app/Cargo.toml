@@ -20,6 +20,8 @@ encoding_rs = "0.8.44"
 fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"] }
 futures-util = "0.3"
 hmac = "0.13"
+http-body = "1"
+http-body-util = "0.1"
 hyper = { version = "1.13", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
 indexmap = { version = "2", features = ["serde"] }
