@@ -129,6 +129,26 @@ pub(super) async fn list(
     }))
 }
 
+pub(super) async fn rpc_list(
+    service: Arc<GatewayService>,
+    principal: Principal,
+) -> Result<Value, ManagementError> {
+    let Json(paged) = list(
+        State(service),
+        Extension(principal),
+        Query(ListParameters {
+            include_inactive: None,
+            include_pagination: Some("true".into()),
+            visibility: None,
+            team_id: None,
+            cursor: None,
+            limit: None,
+        }),
+    )
+    .await?;
+    Ok(paged)
+}
+
 pub(super) async fn detail(
     State(service): State<Arc<GatewayService>>,
     Extension(principal): Extension<Principal>,

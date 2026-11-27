@@ -13,6 +13,7 @@ mod oauth_api;
 mod openapi;
 mod prompt_api;
 mod proxy;
+pub(crate) mod public_rpc;
 mod resource_api;
 mod rest_tool;
 mod roots;
@@ -1135,7 +1136,7 @@ impl GatewayService {
     }
 }
 
-fn tool_result_error(message: impl Into<String>) -> Result<Value, ToolError> {
+pub(crate) fn tool_result_error(message: impl Into<String>) -> Result<Value, ToolError> {
     let mut result = CallToolResult::error(vec![ContentBlock::text(message.into())]);
     result.result_type = None;
     serde_json::to_value(result).map_err(|_| ToolError::Unavailable)
@@ -1174,6 +1175,8 @@ pub(crate) enum ToolError {
     Denied,
     #[error("Unknown tool")]
     NotFound,
+    #[error("{0}")]
+    InvalidArguments(String),
     #[error("Tool service unavailable")]
     Unavailable,
     #[error("OAuth authorization required. Visit /oauth/authorize/{0} to complete the flow.")]

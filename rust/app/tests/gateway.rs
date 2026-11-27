@@ -92,6 +92,14 @@ async fn rest_tool_calls_require_visibility_and_execute_scope_before_dispatch() 
     .execute(pool)
     .await
     .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO servers (id, name, visibility) VALUES
+             ('rest-server', 'REST server', 'public'), ('other-server', 'Other server', 'public');
+         INSERT INTO server_tool_association (server_id, tool_id) VALUES ('rest-server', 'rest');",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
     let service = Arc::new(GatewayService::new(
         database.clone(),
         authorizer(database),
@@ -179,6 +187,97 @@ async fn rest_tool_calls_require_visibility_and_execute_scope_before_dispatch() 
         }),
     );
     assert_eq!(hits.load(Ordering::Relaxed), 2);
+
+    let rpc_gateway = Running::start(
+        service
+            .mcp_router_with_sessions(true, ProtocolMode::Auto, Some(SessionSettings::default()))
+            .merge(service.registration_router()),
+    )
+    .await;
+    let mut server_arguments = json!({"item":"blue","value":42});
+    let scoped = token(
+        "member",
+        json!(["alpha"]),
+        json!({"server_id":"rest-server"}),
+    );
+    let rpc = async |authorization: Option<&str>,
+                     server: Option<&str>,
+                     session: Option<&str>,
+                     arguments: &Value| {
+        let mut payload = json!({"jsonrpc":"2.0","id":99,"method":"tools/call",
+            "params":{"name":"team-rest","arguments":arguments}});
+        if let Some(server) = server {
+            payload["params"]["server_id"] = json!(server);
+        }
+        let mut request = client
+            .post(rpc_gateway.url("/rpc/"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(payload.to_string());
+        if let Some(authorization) = authorization {
+            request = request.bearer_auth(authorization);
+        }
+        if let Some(session) = session {
+            request = request.header("Mcp-Session-Id", session);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        (
+            status,
+            serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap(),
+        )
+    };
+    assert_eq!(
+        rpc(None, None, None, &server_arguments).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        rpc(Some(&scoped), Some("other-server"), None, &server_arguments)
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+    );
+    let (_, denied) = rpc(
+        Some(&read_only),
+        Some("rest-server"),
+        None,
+        &server_arguments,
+    )
+    .await;
+    assert_eq!(denied["error"]["code"], -32003, "{denied}");
+    let (_, wrong_team) = rpc(
+        Some(&outsider),
+        Some("rest-server"),
+        None,
+        &server_arguments,
+    )
+    .await;
+    assert!(wrong_team["error"].is_object(), "{wrong_team}");
+    let (_, missing_session) = rpc(Some(&scoped), None, Some("aabbcc"), &server_arguments).await;
+    assert_eq!(
+        missing_session["error"]["code"], -32002,
+        "{missing_session}"
+    );
+    assert_eq!(missing_session["error"]["message"], "Session not found");
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    let response = client
+        .get(rpc_gateway.url("/tools"))
+        .bearer_auth(&scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    server_arguments["value"] = json!(false);
+    let (_, invalid) = rpc(Some(&scoped), None, None, &server_arguments).await;
+    assert_eq!(invalid["error"]["code"], -32603, "{invalid}");
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    server_arguments["value"] = json!(42);
+    let (_, result) = rpc(Some(&scoped), None, None, &server_arguments).await;
+    assert_eq!(
+        result["result"]["structuredContent"],
+        json!({"name":"blue","body":{"value":42}})
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
 }
 
 type SseFixtureSessions = Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;

@@ -57,6 +57,7 @@ pub struct Principal {
     pub(crate) token_use: TokenUse,
     catalog_token: Option<TokenIdentity>,
     catalog_scopes: Option<Vec<String>>,
+    pub(crate) server_limit: Option<String>,
     is_admin: bool,
     scopes: Vec<String>,
     credential_hash: [u8; 32],
@@ -66,6 +67,17 @@ pub enum RoleContext<'a> {
     Global,
     Team(&'a str),
     AnyTeam,
+}
+
+#[derive(Clone, Copy)]
+enum ApiTarget {
+    Management,
+    PublicRpc,
+}
+
+enum ServerTarget<'a> {
+    Endpoint(Option<&'a str>),
+    RpcParameters,
 }
 
 #[derive(Clone)]
@@ -197,7 +209,18 @@ impl Authorizer {
         missing: &'static str,
     ) -> Router {
         router.route_layer(middleware::from_fn_with_state(
-            (self.clone(), missing),
+            (self.clone(), missing, ApiTarget::Management),
+            authorize_api,
+        ))
+    }
+
+    pub(crate) fn protect_rpc(self: &Arc<Self>, router: Router) -> Router {
+        router.route_layer(middleware::from_fn_with_state(
+            (
+                self.clone(),
+                "Authorization token required",
+                ApiTarget::PublicRpc,
+            ),
             authorize_api,
         ))
     }
@@ -241,6 +264,16 @@ impl Authorizer {
         peer: Option<IpAddr>,
         server_id: Option<&str>,
     ) -> Result<Principal, AuthError> {
+        self.authenticate_for(token, peer, ServerTarget::Endpoint(server_id))
+            .await
+    }
+
+    async fn authenticate_for(
+        &self,
+        token: &str,
+        peer: Option<IpAddr>,
+        target: ServerTarget<'_>,
+    ) -> Result<Principal, AuthError> {
         let jwt = match self
             .verifier
             .as_ref()
@@ -270,13 +303,37 @@ impl Authorizer {
                 return Err(AuthError::Inactive);
             }
         }
-        let scopes = verify_restrictions(jwt.payload(), peer, server_id, tracked.is_some())?;
+        let claim_server = jwt.payload()["scopes"]
+            .get("server_id")
+            .filter(|id| !id.is_null())
+            .map(|id| {
+                id.as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or(AuthError::Invalid)
+            })
+            .transpose()?;
+        let recorded_server = tracked.as_ref().and_then(|row| row.server_id.as_deref());
+        if recorded_server == Some("") {
+            return Err(AuthError::Invalid);
+        }
+        if claim_server.is_some() && recorded_server.is_some() && claim_server != recorded_server {
+            return Err(AuthError::Forbidden);
+        }
+        let server_limit = claim_server.or(recorded_server);
+        if let ServerTarget::Endpoint(server_id) = target
+            && server_limit.is_some()
+            && server_limit != server_id
+        {
+            return Err(AuthError::Forbidden);
+        }
+        let server_limit = server_limit.map(str::to_owned);
+        let scopes = verify_restrictions(jwt.payload(), peer, tracked.is_some())?;
         let identity = self.resolve_identity(&jwt).await?;
         let (catalog_scopes, catalog_token) = if let Some(row) = tracked {
             if row.user_email != identity.email {
                 return Err(AuthError::Invalid);
             }
-            let scopes = managed_token_scopes(&row, peer, server_id)?;
+            let scopes = managed_token_scopes(&row, peer)?;
             (
                 Some(scopes),
                 Some(TokenIdentity {
@@ -321,6 +378,7 @@ impl Authorizer {
             token_use: jwt.token_use(),
             catalog_token,
             catalog_scopes,
+            server_limit,
             is_admin: identity.is_admin,
             scopes,
             credential_hash: Sha256::digest(token.as_bytes()).into(),
@@ -347,6 +405,7 @@ impl Authorizer {
             token_use: TokenUse::Session,
             catalog_token: None,
             catalog_scopes: None,
+            server_limit: None,
             is_admin: identity.is_admin,
             scopes: Vec::new(),
             credential_hash: Sha256::digest(token.as_bytes()).into(),
@@ -473,22 +532,12 @@ fn eligible_team(grant: &Grant, target: &RoleContext<'_>) -> bool {
 fn verify_restrictions(
     payload: &Value,
     peer: Option<IpAddr>,
-    server_id: Option<&str>,
     allow_limits: bool,
 ) -> Result<Vec<String>, AuthError> {
     let scopes = payload.get("scopes").filter(|scope| !scope.is_null());
     let Some(scopes) = scopes else {
         return Ok(Vec::new());
     };
-    if let Some(required) = scopes.get("server_id").filter(|value| !value.is_null()) {
-        let required = required
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .ok_or(AuthError::Invalid)?;
-        if server_id != Some(required) {
-            return Err(AuthError::Forbidden);
-        }
-    }
     if let Some(allowlist) = scopes
         .get("ip_restrictions")
         .filter(|value| !value.is_null())
@@ -528,7 +577,6 @@ fn verify_restrictions(
 fn managed_token_scopes(
     row: &ApiTokenRecord,
     peer: Option<IpAddr>,
-    server_id: Option<&str>,
 ) -> Result<Vec<String>, AuthError> {
     let decode = |value: Option<&str>| -> Result<Value, AuthError> {
         value
@@ -558,9 +606,9 @@ fn managed_token_scopes(
     {
         stored.push("servers.use".to_owned());
     }
-    let persisted = json!({"scopes":{"server_id":row.server_id,"permissions":stored,
+    let persisted = json!({"scopes":{"permissions":stored,
         "ip_restrictions":decode(row.ip_restrictions.as_deref())?}});
-    verify_restrictions(&persisted, peer, server_id, false)
+    verify_restrictions(&persisted, peer, false)
 }
 
 #[derive(Debug)]
@@ -842,12 +890,32 @@ struct ServerPath {
 }
 
 async fn authorize_api(
-    State((access, missing)): State<(Arc<Authorizer>, &'static str)>,
+    State((access, missing, target)): State<(Arc<Authorizer>, &'static str, ApiTarget)>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
+    if matches!(target, ApiTarget::PublicRpc)
+        && request
+            .headers()
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .count()
+            == 1
+        && request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .is_some_and(|value| value.is_empty())
+    {
+        return Err(AuthError::ApiRequired(missing));
+    }
     let token = bearer(request.headers())?.ok_or(AuthError::ApiRequired(missing))?;
-    let principal = access.authenticate(token, peer(&request), None).await?;
+    let target = match target {
+        ApiTarget::Management => ServerTarget::Endpoint(None),
+        ApiTarget::PublicRpc => ServerTarget::RpcParameters,
+    };
+    let principal = access
+        .authenticate_for(token, peer(&request), target)
+        .await?;
     request.extensions_mut().insert(principal);
     dispatch_with_usage(&access, request, next).await
 }

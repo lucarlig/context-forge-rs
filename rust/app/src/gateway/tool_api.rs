@@ -58,13 +58,46 @@ async fn list(
     Query(query): Query<CatalogListQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
     require_catalog_permission(&service, &principal, "tools.read", true).await?;
+    list_payload(&service, &principal, &query, None)
+        .await
+        .map(Json)
+}
+
+pub(super) async fn rpc_list(
+    service: &GatewayService,
+    principal: &Principal,
+    server: Option<&CatalogServer>,
+    cursor: Option<String>,
+) -> Result<Value, CatalogApiError> {
+    let query = CatalogListQuery {
+        include_pagination: Some("true".into()),
+        limit: Some(0),
+        cursor,
+        ..Default::default()
+    };
+    list_payload(service, principal, &query, server).await
+}
+
+async fn list_payload(
+    service: &GatewayService,
+    principal: &Principal,
+    query: &CatalogListQuery,
+    server: Option<&CatalogServer>,
+) -> Result<Value, CatalogApiError> {
     let projection = JsonProjection::parse(query.apijsonpath.as_deref())?;
-    let page = CatalogPage::prepare(&service, &principal, &query, "rest/tools")?;
-    let scope = access::catalog_scope(Some(&principal));
-    let tools = service
-        .database
-        .managed_tools(scope, page.filters())
-        .await?;
+    let page = CatalogPage::prepare(service, principal, query, "rest/tools")?;
+    let scope = access::catalog_scope(Some(principal));
+    let tools = if let Some(server) = server {
+        service
+            .database
+            .managed_server_tools(scope, &server.id, false)
+            .await?
+    } else {
+        service
+            .database
+            .managed_tools(scope, page.filters())
+            .await?
+    };
     let mut teams = HashMap::new();
     if scope.can_own() && !principal.is_global_admin() {
         for tool in &tools {
@@ -81,7 +114,7 @@ async fn list(
         }
     }
     let mut response = page.envelope(
-        &service,
+        service,
         tools.iter().collect(),
         "tools",
         |tool| (&tool.created_at, &tool.id),
@@ -93,11 +126,11 @@ async fn list(
                 .copied()
                 .unwrap_or(false);
             metadata(
-                &service,
+                service,
                 tool,
                 true,
                 false,
-                can_view_headers(&principal, tool, team_owner),
+                can_view_headers(principal, tool, team_owner),
             )
         },
     )?;
@@ -108,7 +141,7 @@ async fn list(
             response["tools"] = projection.apply(&response["tools"]);
         }
     }
-    Ok(Json(response))
+    Ok(response)
 }
 
 async fn detail(

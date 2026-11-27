@@ -177,7 +177,15 @@ older schema drafts, regex subject limits, and malformed HTTP responses. They
 also compare catalog schemas and result shaping for 2025 and 2026 clients.
 Rust validates offline with native regex limits. The reference sandbox's
 wall-clock timeout and unusual parser diagnostics still need parity checks.
-The public `/rpc` tool invocation path remains open.
+
+Authenticated `POST /rpc` and `POST /rpc/` serve tool calls, legacy tool
+names, catalog reads, resource reads, prompt retrieval, and initialization.
+The gateway applies virtual-server token restrictions before catalog access
+or outbound dispatch. Rust Anything compared 45 cases on SQLite and
+PostgreSQL. The comparison checks each implementation's release version and
+resource subscription advertisement separately. Rust reports its own
+release version and leaves resource subscriptions disabled on this route.
+The RPC subscription, sampling, and elicitation paths remain open.
 
 `POST /v1/tools/generate-schemas-from-openapi` generates schemas for a selected
 operation. It requires `tools.create` and accepts an explicit document URL or

@@ -17,7 +17,7 @@ use axum::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::any,
+    routing::{any, post},
 };
 use futures_util::{Stream, StreamExt, stream};
 use rmcp::model::{
@@ -124,10 +124,10 @@ impl Default for HttpOptions {
     }
 }
 
-struct McpState {
-    service: Arc<GatewayService>,
+pub(crate) struct McpState {
+    pub(crate) service: Arc<GatewayService>,
     modern: Option<Modern>,
-    sessions: Option<Sessions>,
+    pub(crate) sessions: Option<Sessions>,
     json_response: bool,
 }
 
@@ -147,7 +147,13 @@ pub(crate) fn router(
             sessions.shutdown.clone(),
         ))
     });
-    let gateway = service.clone();
+    let state = Arc::new(McpState {
+        modern: (mode == ProtocolMode::Auto)
+            .then(|| Modern::new(service.clone(), options.json_response)),
+        sessions: options.sessions.map(Sessions::new),
+        json_response: options.json_response,
+        service: service.clone(),
+    });
     let router = Router::new()
         .route("/mcp", any(handle_request))
         .route("/mcp/", any(handle_request))
@@ -156,14 +162,16 @@ pub(crate) fn router(
         .route("/v1/virtual-servers/{server_id}/mcp", any(handle_request))
         .route("/v1/virtual-servers/{server_id}/mcp/", any(handle_request))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .with_state(Arc::new(McpState {
-            modern: (mode == ProtocolMode::Auto)
-                .then(|| Modern::new(service.clone(), options.json_response)),
-            sessions: options.sessions.map(Sessions::new),
-            json_response: options.json_response,
-            service,
-        }));
-    let router = gateway.protect_server_mcp(router, require_auth);
+        .with_state(state.clone());
+    let public_rpc = crate::gateway::public_rpc::handle;
+    let rpc = Router::new()
+        .route("/rpc", post(public_rpc))
+        .route("/rpc/", post(public_rpc))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(state);
+    let router = service
+        .protect_server_mcp(router, require_auth)
+        .merge(service.access.protect_rpc(rpc));
     if let Some((redis, timeout, concurrency, lock_timeout, shutdown)) = relay {
         affinity::spawn(
             redis,
@@ -315,7 +323,10 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
     response
 }
 
-async fn forward_remote(state: &McpState, request: Request) -> Result<Request, Box<Response>> {
+pub(crate) async fn forward_remote(
+    state: &McpState,
+    request: Request,
+) -> Result<Request, Box<Response>> {
     if !matches!(
         *request.method(),
         Method::GET | Method::POST | Method::DELETE
@@ -1538,6 +1549,11 @@ fn tool_error(id: &Value, error: ToolError) -> Response {
     let (code, message) = match error {
         ToolError::Denied => (0, "Access denied"),
         ToolError::NotFound => (0, "Unknown tool"),
+        ToolError::InvalidArguments(message) => {
+            let result =
+                crate::gateway::tool_result_error(message).expect("tool error content serializes");
+            return rpc_success(id, result);
+        }
         ToolError::Cursor => (INVALID_PARAMS, "Invalid cursor"),
         ToolError::Unavailable => (0, "Tool service unavailable"),
         error @ (ToolError::OAuthRequired(_) | ToolError::OAuthExchangeFailed) => {
@@ -1680,7 +1696,7 @@ fn with_session(mut response: Response, id: Option<&HeaderValue>) -> Response {
     response
 }
 
-fn session_header(headers: &HeaderMap) -> Result<Option<&HeaderValue>, SessionError> {
+pub(crate) fn session_header(headers: &HeaderMap) -> Result<Option<&HeaderValue>, SessionError> {
     let mut values = headers.get_all(SESSION_HEADER).iter();
     let id = values.next();
     if values.next().is_some() {
@@ -1757,7 +1773,7 @@ struct RpcSuccess<'a, T> {
     result: T,
 }
 
-fn rpc_success(id: &Value, result: impl Serialize) -> Response {
+pub(crate) fn rpc_success(id: &Value, result: impl Serialize) -> Response {
     Json(RpcSuccess {
         jsonrpc: "2.0",
         id,

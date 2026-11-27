@@ -49,10 +49,10 @@ pub(super) async fn execute(
         match validation {
             Ok(None) => {}
             Ok(Some(error)) => {
-                return tool_result_error(format!(
+                return Err(ToolError::InvalidArguments(format!(
                     "Invalid arguments for tool '{}': {error}",
                     params.name
-                ));
+                )));
             }
             Err(_) => {
                 return tool_result_error(

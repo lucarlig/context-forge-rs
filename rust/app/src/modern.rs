@@ -536,6 +536,9 @@ impl ServerHandler for GatewayHandler {
             Err(ToolError::NotFound) => {
                 CallToolResult::error(vec![ContentBlock::text(format!("Unknown tool: {name}"))])
             }
+            Err(ToolError::InvalidArguments(message)) => {
+                CallToolResult::error(vec![ContentBlock::text(message)])
+            }
             Err(error) => return Err(tool_error(error)),
         };
         result.result_type = Some(ResultType::COMPLETE);
@@ -838,6 +841,7 @@ fn tool_error(error: ToolError) -> ErrorData {
     match error {
         ToolError::Denied => ErrorData::new(ErrorCode(0), "Access denied", None),
         ToolError::NotFound => ErrorData::new(ErrorCode(0), "Unknown tool", None),
+        ToolError::InvalidArguments(message) => ErrorData::invalid_params(message, None),
         ToolError::Cursor => ErrorData::invalid_params("Invalid cursor", None),
         ToolError::Unavailable => ErrorData::internal_error("Tool service unavailable", None),
         error @ (ToolError::OAuthRequired(_) | ToolError::OAuthExchangeFailed) => {
