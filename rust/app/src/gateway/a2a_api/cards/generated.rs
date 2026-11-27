@@ -63,7 +63,7 @@ fn standalone(agent: &AgentRecord) -> Value {
         extensions: document::truthy(&caps["extensions"]).then(|| caps["extensions"].clone()),
         input_modes: modes(caps, "defaultInputModes"),
         output_modes: modes(caps, "defaultOutputModes"),
-        skills: skills(agent).cloned().collect(),
+        skills: agent.published_skills().cloned().collect(),
     };
     let mut card = Card {
         name: &agent.name,
@@ -145,7 +145,7 @@ fn aggregate(agents: &[AgentRecord]) -> CardCapabilities {
         let caps = &agent.capabilities.0;
         result.streaming |= document::truthy(&caps["streaming"]);
         result.push |= document::truthy(&caps["pushNotifications"]);
-        for skill in skills(agent) {
+        for skill in agent.published_skills() {
             let include = skill
                 .get("id")
                 .is_none_or(|id| id.as_str().is_some_and(|id| seen.insert(id)));
@@ -165,17 +165,6 @@ fn aggregate(agents: &[AgentRecord]) -> CardCapabilities {
         }
     }
     result
-}
-
-fn skills(agent: &AgentRecord) -> impl Iterator<Item = &Value> {
-    agent
-        .skills
-        .as_ref()
-        .and_then(|skills| skills.0.as_array())
-        .or_else(|| agent.capabilities.0["skills"].as_array())
-        .into_iter()
-        .flatten()
-        .filter(|skill| skill.is_object())
 }
 
 fn modes(caps: &Value, key: &str) -> Vec<String> {

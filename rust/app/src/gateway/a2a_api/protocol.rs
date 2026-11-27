@@ -28,6 +28,18 @@ const METHODS: [(&str, &str); 11] = [
     ("agent/getAuthenticatedExtendedCard", "GetExtendedAgentCard"),
 ];
 
+pub(super) fn has_rpc_error(value: &Value) -> bool {
+    value["jsonrpc"] == "2.0"
+        && match &value["error"] {
+            Value::Null => false,
+            Value::Bool(value) => *value,
+            Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+            Value::String(value) => !value.is_empty(),
+            Value::Array(value) => !value.is_empty(),
+            Value::Object(value) => !value.is_empty(),
+        }
+}
+
 pub(super) fn version_header(version: &str) -> String {
     let version = version.trim().trim_start_matches(['v', 'V']);
     let mut parts = version.split('.').filter(|part| !part.is_empty());

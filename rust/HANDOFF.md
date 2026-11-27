@@ -337,7 +337,18 @@ an A2A event stream. The referenced internal webhook dispatcher path
 returned 404. Rust matched both responses. The pinned release exposes
 webhook settings through the task push configuration routes.
 
-The A2A test route and scoped metrics remain open.
+The A2A test route supports a default or custom query. Its 502 response
+contains a fixed message for upstream failures. The scoped metrics endpoint
+counts interactions for visible agents and treats JSON-RPC errors over
+HTTP 200 as failed interactions. Age-based aggregation uses hourly rollups
+and retains raw observations until their hour has a rollup.
+
+Rust Anything matched the A2A test route, metrics, and both metrics flags on
+SQLite. The diagnostics scenarios matched on PostgreSQL, including metrics
+from an adopted database. A Rust regression covers team and owner visibility,
+permission checks, and weighted aggregation across raw and hourly records.
+
+The public A2A federation and task lifecycle milestone is verified.
 
 ## Gateway management
 

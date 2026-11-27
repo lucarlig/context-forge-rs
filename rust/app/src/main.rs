@@ -118,6 +118,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_grpc_settings(Settings::grpc_federation()?)
         .with_a2a_settings(a2a_enabled, a2a_timeout)
         .with_a2a_card_timeout(Settings::a2a_card_timeout()?)
+        .with_a2a_metrics(Settings::a2a_metrics()?)
         .with_uaid_settings(Settings::uaid_settings(a2a_enabled)?)
         .with_schema_validation(Settings::schema_validation()?)
         .with_token_issuer(email_auth_enabled, issuer)

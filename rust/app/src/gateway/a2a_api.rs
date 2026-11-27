@@ -8,11 +8,12 @@ use serde_json::Map;
 use sqlx::types::Json as DbJson;
 
 use super::{catalog_api::*, *};
-use crate::catalog::{AgentLookup, AgentRecord, AgentWriteError};
+use crate::catalog::{AgentInteraction, AgentLookup, AgentRecord, AgentWriteError};
 use crate::schema_validation::Target;
 use crate::uaid::{self, UaidInput};
 
 mod cards;
+mod diagnostics;
 mod federation;
 mod lifecycle;
 mod oauth;
@@ -35,6 +36,8 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
             .route(&format!("{base}/{{id}}/state"), post(lifecycle::set_state))
             .route(&format!("{base}/{{id}}/toggle"), post(lifecycle::set_state))
             .route(&format!("{base}/invoke"), post(invoke_by_id))
+            .route(&format!("{base}/metrics"), get(diagnostics::metrics))
+            .route(&format!("{base}/{{id}}/test"), post(diagnostics::test))
             .route(&format!("{base}/fetch-card"), post(cards::discover))
             .route(&format!("{base}/{{id}}/card"), get(cards::generated))
             .route(&format!("{base}/{{id}}/stored-card"), get(cards::stored))
@@ -356,6 +359,7 @@ async fn detail(
 
 fn read_agent(agent: &AgentRecord) -> Value {
     let mut data = serde_json::to_value(agent).expect("agent record serializes");
+    data["skills"] = json!(agent.published_skills().collect::<Vec<_>>());
     data["createdAt"] = json!(agent.created_at.replace(' ', "T"));
     data["updatedAt"] = json!(agent.updated_at.replace(' ', "T"));
     data["lastInteraction"] = json!(
@@ -484,7 +488,7 @@ async fn invoke_recorded(
     input: Invocation,
     headers: &HeaderMap,
 ) -> Result<Value, CatalogApiError> {
-    let result = invoke(app, agent, input, Some(headers)).await?;
+    let result = invoke(app, agent, input, Some(headers), InvocationSource::Api).await?;
     tasks::record(app, &agent.id, &result, None).await;
     Ok(result)
 }
@@ -573,11 +577,17 @@ fn rpc_error(status: StatusCode, code: i32, message: &str, id: Option<Value>) ->
     (status, Json(body)).into_response()
 }
 
+enum InvocationSource {
+    Api,
+    Tool,
+}
+
 async fn invoke(
     app: &GatewayService,
     agent: &AgentRecord,
     input: Invocation,
     incoming: Option<&HeaderMap>,
+    source: InvocationSource,
 ) -> Result<Value, CatalogApiError> {
     let fail = || CatalogApiError::detail(StatusCode::BAD_REQUEST, FAILURE);
     let hops = incoming.map_or(0, uaid::hop_count);
@@ -690,6 +700,37 @@ async fn invoke(
     let mut request = reqwest::Request::new(reqwest::Method::POST, url);
     *request.headers_mut() = headers;
     *request.body_mut() = Some(payload.to_string().into());
+    let started = std::time::Instant::now();
+    let result = dispatch_upstream(app, request).await;
+    if matches!(source, InvocationSource::Tool) {
+        return result;
+    }
+    let metric = app.a2a_metrics.record.then(|| AgentInteraction {
+        response_time: started.elapsed(),
+        kind: &input.interaction_type,
+        failure: match &result {
+            Ok(body) if protocol::has_rpc_error(body) => {
+                Some("A2A agent returned a JSON-RPC error")
+            }
+            Err(_) => Some(FAILURE),
+            Ok(_) => None,
+        },
+    });
+    if let Err(error) = app
+        .database
+        .record_agent_interaction(&agent.id, metric)
+        .await
+    {
+        tracing::warn!(%error, "failed to record A2A interaction");
+    }
+    result
+}
+
+async fn dispatch_upstream(
+    app: &GatewayService,
+    request: reqwest::Request,
+) -> Result<Value, CatalogApiError> {
+    let fail = || CatalogApiError::detail(StatusCode::BAD_REQUEST, FAILURE);
     let response = app
         .upstream
         .with_timeout_cap(app.a2a_timeout)
@@ -710,11 +751,7 @@ async fn invoke(
             format!("A2A agent returned HTTP {}", response.status.as_u16()),
         ));
     }
-    let data: Value = serde_json::from_slice(&response.body).map_err(|_| fail())?;
-    if let Err(error) = app.database.record_agent_interaction(&agent.id).await {
-        tracing::warn!(%error, "failed to record A2A interaction");
-    }
-    Ok(data)
+    serde_json::from_slice(&response.body).map_err(|_| fail())
 }
 
 pub(super) async fn call_tool(
@@ -766,6 +803,7 @@ pub(super) async fn call_tool(
             interaction_type,
         },
         headers,
+        InvocationSource::Tool,
     )
     .await
     {

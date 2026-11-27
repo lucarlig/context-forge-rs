@@ -41,6 +41,8 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "gateway/a2a_cards.rs"]
 mod a2a_cards;
+#[path = "gateway/a2a_diagnostics.rs"]
+mod a2a_diagnostics;
 #[path = "gateway/a2a_federation.rs"]
 mod a2a_federation;
 #[path = "gateway/a2a_oauth.rs"]

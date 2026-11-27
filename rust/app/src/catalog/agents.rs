@@ -6,7 +6,9 @@ use crate::uaid::GeneratedUaid;
 use sqlx::types::Json as DbJson;
 
 mod lifecycle;
+mod metrics;
 pub(crate) use cards::NewAgentCard;
+pub(crate) use metrics::AgentInteraction;
 
 #[derive(Clone, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +64,16 @@ pub(crate) struct AgentRecord {
 }
 
 impl AgentRecord {
+    pub(crate) fn published_skills(&self) -> impl Iterator<Item = &Value> {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.0.as_array())
+            .or_else(|| self.capabilities.0["skills"].as_array())
+            .into_iter()
+            .flatten()
+            .filter(|skill| skill.is_object())
+    }
+
     pub(crate) fn set_uaid(&mut self, generated: GeneratedUaid) {
         self.uaid = Some(generated.identifier);
         self.uaid_registry = Some(generated.registry);
@@ -360,19 +372,6 @@ impl Database {
                 insert!(tx)
             }
         }
-    }
-
-    pub(crate) async fn record_agent_interaction(&self, id: &str) -> Result<(), sqlx::Error> {
-        let update = "UPDATE a2a_agents SET last_interaction = CURRENT_TIMESTAMP WHERE id = $1";
-        match self {
-            Self::Sqlite(pool) => {
-                sqlx::query(update).bind(id).execute(pool).await?;
-            }
-            Self::Postgres(pool) => {
-                sqlx::query(update).bind(id).execute(pool).await?;
-            }
-        };
-        Ok(())
     }
 }
 

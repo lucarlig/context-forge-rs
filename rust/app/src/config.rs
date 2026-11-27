@@ -147,6 +147,24 @@ impl Settings {
         positive_seconds("FEDERATION_TIMEOUT", 120.0)
     }
 
+    pub fn a2a_metrics() -> Result<crate::gateway::A2aMetricsSettings, Box<dyn Error + Send + Sync>>
+    {
+        let retention_days: u64 = parse("METRICS_RETENTION_DAYS", 7)?;
+        let delete_raw_hours: u64 = parse("METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS", 1)?;
+        if !(1..=365).contains(&retention_days) || !(1..=8760).contains(&delete_raw_hours) {
+            return Err("Invalid execution metric retention window".into());
+        }
+        let mut raw_hours = retention_days * 24;
+        if flag("METRICS_DELETE_RAW_AFTER_ROLLUP")?.unwrap_or(true) {
+            raw_hours = raw_hours.min(delete_raw_hours);
+        }
+        Ok(crate::gateway::A2aMetricsSettings {
+            enabled: flag("MCPGATEWAY_A2A_METRICS_ENABLED")?.unwrap_or(true),
+            record: flag("DB_METRICS_RECORDING_ENABLED")?.unwrap_or(true),
+            raw_window: Duration::from_secs(raw_hours * 3600),
+        })
+    }
+
     pub fn uaid_settings(
         enabled: bool,
     ) -> Result<crate::uaid::UaidSettings, Box<dyn Error + Send + Sync>> {

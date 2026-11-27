@@ -19,7 +19,8 @@ const A2A_TASKS: &str = include_str!("../migrations/006_a2a_tasks.sql");
 const A2A_PUSH_CONFIGS: &str = include_str!("../migrations/007_a2a_push_configs.sql");
 const A2A_CARDS: &str = include_str!("../migrations/008_a2a_cards.sql");
 const A2A_UAID: &str = include_str!("../migrations/009_a2a_uaid.sql");
-const MIGRATIONS: [&str; 11] = [
+const A2A_METRICS: &str = include_str!("../migrations/010_a2a_metrics.sql");
+const MIGRATIONS: [&str; 12] = [
     "identity",
     "catalog",
     "legacy_sse",
@@ -31,6 +32,7 @@ const MIGRATIONS: [&str; 11] = [
     "a2a_push_configs",
     "a2a_cards",
     "a2a_uaid",
+    "a2a_metrics",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -244,7 +246,7 @@ impl Database {
             return Ok(());
         }
         macro_rules! upgrade {
-            ($transaction:ident, $usage:expr, $accounts:expr, $columns:expr) => {{
+            ($transaction:ident, $usage:expr, $accounts:expr, $columns:expr, $metrics:expr) => {{
                 sqlx::query(CREATE_HISTORY)
                     .execute(&mut *$transaction)
                     .await?;
@@ -321,6 +323,9 @@ impl Database {
                         10 => {
                             sqlx::raw_sql(A2A_UAID).execute(&mut *$transaction).await?;
                         }
+                        11 => {
+                            sqlx::raw_sql($metrics).execute(&mut *$transaction).await?;
+                        }
                         _ => unreachable!("unknown migration implementation"),
                     }
                     sqlx::query(RECORD)
@@ -340,7 +345,8 @@ impl Database {
                     transaction,
                     crate::tokens::SQLITE_USAGE_MIGRATION,
                     crate::local_auth::SQLITE_MIGRATION,
-                    "SELECT name FROM pragma_table_info($1)"
+                    "SELECT name FROM pragma_table_info($1)",
+                    sqlx::AssertSqlSafe(A2A_METRICS.replace("BIGSERIAL", "INTEGER"))
                 );
             }
             Self::Postgres(pool) => {
@@ -357,7 +363,8 @@ impl Database {
                     crate::tokens::POSTGRES_USAGE_MIGRATION,
                     crate::local_auth::POSTGRES_MIGRATION,
                     "SELECT CAST(column_name AS TEXT) FROM information_schema.columns
-                     WHERE table_schema = current_schema() AND table_name = $1"
+                     WHERE table_schema = current_schema() AND table_name = $1",
+                    A2A_METRICS
                 );
             }
         }

@@ -120,6 +120,7 @@ pub struct GatewayService {
     a2a_enabled: bool,
     a2a_timeout: Duration,
     a2a_card_timeout: Duration,
+    a2a_metrics: A2aMetricsSettings,
     uaid: crate::uaid::UaidSettings,
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
@@ -153,6 +154,22 @@ pub struct GatewayService {
 pub struct CatalogRefresh {
     pub default_seconds: i32,
     pub minimum_seconds: i32,
+}
+
+pub struct A2aMetricsSettings {
+    pub(crate) enabled: bool,
+    pub(crate) record: bool,
+    pub(crate) raw_window: Duration,
+}
+
+impl Default for A2aMetricsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            record: true,
+            raw_window: Duration::from_secs(3600),
+        }
+    }
 }
 
 impl Default for CatalogRefresh {
@@ -230,6 +247,7 @@ impl GatewayService {
             a2a_enabled: true,
             a2a_timeout: Duration::from_secs(30),
             a2a_card_timeout: Duration::from_secs(120),
+            a2a_metrics: A2aMetricsSettings::default(),
             uaid: crate::uaid::UaidSettings::default(),
             email_auth_enabled: true,
             token_issuer: None,
@@ -295,6 +313,11 @@ impl GatewayService {
 
     pub fn with_a2a_card_timeout(mut self, timeout: Duration) -> Self {
         self.a2a_card_timeout = timeout;
+        self
+    }
+
+    pub fn with_a2a_metrics(mut self, settings: A2aMetricsSettings) -> Self {
+        self.a2a_metrics = settings;
         self
     }
 

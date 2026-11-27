@@ -26,7 +26,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [ ] Remaining database schema, migration history, import, and export
 - [x] REST tool federation
 - [x] gRPC tool federation
-- [ ] A2A federation and task lifecycle
+- [x] A2A federation and task lifecycle
 - [ ] Native plugins, policy evaluation, and external extensions
 - [ ] Admin backend and UI integration
 - [ ] HTTP security middleware, trusted proxies, correlation IDs, and rate limits
