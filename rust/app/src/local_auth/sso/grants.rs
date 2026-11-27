@@ -5,9 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Map;
 
 use super::{providers::Provider, *};
+use crate::local_auth::storage::revoke_credentials;
 
 pub(crate) struct SsoIdentityPolicy {
     pub(crate) approval_required: bool,
+    pub(crate) allow_provider_linking: bool,
     pub(crate) teams: TeamSettings,
     pub(crate) admin_domains: HashSet<String>,
     pub(crate) github_admin_orgs: HashSet<String>,
@@ -134,11 +136,13 @@ impl Database {
     pub(super) async fn sync_sso_roles_and_profile(
         &self,
         user: &storage::LocalUser,
+        provider: &str,
         mapping: &MappedAccess<'_>,
         defaults: &UserProvisioning,
         name: Option<&str>,
         existing: bool,
     ) -> Result<bool, sqlx::Error> {
+        let relinking = user.auth_provider != provider;
         macro_rules! sync {
             ($tx:ident,$lock:literal) => {{
                 let Some((current_admin, origin)) = sqlx::query_as::<_,(bool,Option<String>)>(concat!(
@@ -169,15 +173,19 @@ impl Database {
                     .bind(&defaults.admin_role).fetch_optional(&mut *$tx).await?;
                 let role_promotes = admin_role.as_ref().is_some_and(|role|
                     desired.iter().any(|(id,scope,_)| id==role && scope=="global"));
-                let manual_admin = current_admin && origin.as_deref()!=Some("sso");
+                let manual_admin = current_admin && !relinking && origin.as_deref()!=Some("sso");
                 let admin = manual_admin || mapping.admin || role_promotes;
                 let demoted = current_admin && !admin;
                 let admin_origin = if manual_admin { origin.as_deref() } else { admin.then_some("sso") };
                 sqlx::query("UPDATE email_users SET is_admin=$2,admin_origin=$3,full_name=COALESCE($4,full_name),
                     email_verified_at=CASE WHEN $5 THEN COALESCE(email_verified_at,CURRENT_TIMESTAMP) ELSE email_verified_at END,
-                    last_login=CASE WHEN $5 THEN CURRENT_TIMESTAMP ELSE last_login END,updated_at=CURRENT_TIMESTAMP WHERE id=$1")
-                    .bind(&user.id).bind(admin).bind(admin_origin).bind(name).bind(existing)
+                    last_login=CASE WHEN $5 THEN CURRENT_TIMESTAMP ELSE last_login END,
+                    auth_provider=$6,updated_at=CURRENT_TIMESTAMP WHERE id=$1")
+                    .bind(&user.id).bind(admin).bind(admin_origin).bind(name).bind(existing).bind(provider)
                     .execute(&mut *$tx).await?;
+                if relinking {
+                    revoke_credentials!($tx,&user.email,&user.email,"sso_provider_relinked");
+                }
                 if let Some(role) = admin_role {
                     if admin && !manual_admin {
                         desired.push((role,"global".to_owned(),None));
@@ -187,7 +195,7 @@ impl Database {
                             .bind(&user.email).bind(role).execute(&mut *$tx).await?;
                     }
                 }
-                if mapping.sync_roles {
+                if mapping.sync_roles || relinking {
                     let existing_roles = sqlx::query_as::<_, (String,String,String,Option<String>)>(
                         "SELECT id,role_id,scope,scope_id FROM user_roles
                          WHERE user_email=$1 AND is_active AND grant_source='sso'")

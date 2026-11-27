@@ -453,17 +453,38 @@ impl Database {
             .to_string();
         macro_rules! insert {
             ($tx:ident,$date:literal,$expired:literal,$lock:literal) => {{
-                let account=sqlx::query_scalar::<_,String>(concat!("SELECT id FROM email_users
-                    WHERE id=$1 AND is_active=TRUE AND password_hash IS NOT DISTINCT FROM $2",$lock))
-                    .bind(&user.id).bind(user.password_hash.as_deref()).fetch_optional(&mut *$tx).await?;
+                let account = sqlx::query_scalar::<_, String>(concat!(
+                    "SELECT id FROM email_users
+                    WHERE id=$1 AND is_active=TRUE AND password_hash IS NOT DISTINCT FROM $2
+                    AND auth_provider=$3",
+                    $lock
+                ))
+                .bind(&user.id)
+                .bind(user.password_hash.as_deref())
+                .bind(&user.auth_provider)
+                .fetch_optional(&mut *$tx)
+                .await?;
                 if account.is_none() {
                     return Ok(false);
                 }
-                sqlx::query(concat!("DELETE FROM cf_local_sessions WHERE user_email=$1 AND ",$expired))
-                    .bind(&user.email).execute(&mut *$tx).await?;
-                sqlx::query(concat!("INSERT INTO cf_local_sessions(jti,user_email,issued_at,expires_at)
-                    VALUES($1,$2,CURRENT_TIMESTAMP,",$date,")"))
-                    .bind(jti).bind(&user.email).bind(expiry).execute(&mut *$tx).await?;
+                sqlx::query(concat!(
+                    "DELETE FROM cf_local_sessions WHERE user_email=$1 AND ",
+                    $expired
+                ))
+                .bind(&user.email)
+                .execute(&mut *$tx)
+                .await?;
+                sqlx::query(concat!(
+                    "INSERT INTO cf_local_sessions(jti,user_email,issued_at,expires_at)
+                    VALUES($1,$2,CURRENT_TIMESTAMP,",
+                    $date,
+                    ")"
+                ))
+                .bind(jti)
+                .bind(&user.email)
+                .bind(expiry)
+                .execute(&mut *$tx)
+                .await?;
                 $tx.commit().await?;
                 Ok(true)
             }};
@@ -518,3 +539,4 @@ mod reset;
 mod user_writes;
 pub(super) use reset::{ResetRequest, ResetToken};
 pub(super) use user_writes::CredentialChange;
+pub(super) use user_writes::{REVOKE_LOCAL_API_TOKENS, REVOKE_LOCAL_SESSIONS, revoke_credentials};

@@ -101,20 +101,30 @@ pub(super) async fn authenticate_identity(
         created = database.create_local_user(&new_user, provisioning).await?;
         user = database.local_user(&email).await?;
     }
-    let Some(user) = user.filter(|user| {
-        user.auth_provider == provider.id && user.is_active && !user.locked(Timestamp::now())
-    }) else {
+    let Some(user) = user.filter(|user| user.is_active && !user.locked(Timestamp::now())) else {
         return Ok(None);
     };
+    let relinking = user.auth_provider != provider.id;
+    if relinking && (!policy.allow_provider_linking || verified != Some(true)) {
+        return Ok(None);
+    }
     if !database
-        .sync_sso_roles_and_profile(&user, &mapped, provisioning, name.as_deref(), !created)
+        .sync_sso_roles_and_profile(
+            &user,
+            &provider.id,
+            &mapped,
+            provisioning,
+            name.as_deref(),
+            !created,
+        )
         .await?
     {
         return Ok(None);
     }
-    if let Some(teams) = &mapped.teams {
+    let empty_teams = Default::default();
+    if let Some(teams) = mapped.teams.as_ref().or(relinking.then_some(&empty_teams)) {
         database
-            .sync_sso_memberships(&email, teams, &policy.teams, provisioning)
+            .sync_sso_memberships(&email, &provider.id, teams, &policy.teams, provisioning)
             .await?;
     }
     Ok(database.local_user(&email).await?.filter(|user| {
@@ -162,7 +172,7 @@ pub(super) fn email_verified(claim: &Value) -> bool {
             || claim.as_str().is_some_and(|value| {
                 matches!(
                     value.trim().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes"
+                    "true" | "1" | "yes" | "on"
                 )
             })
     })

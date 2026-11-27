@@ -7,7 +7,7 @@ use super::*;
 struct MemberSettings<'a> {
     teams: &'a TeamSettings,
     provisioning: &'a UserProvisioning,
-    sso: bool,
+    sso_provider: Option<&'a str>,
 }
 
 pub(in crate::local_auth::teams) enum MemberMutation<'a> {
@@ -184,7 +184,7 @@ impl Database {
             &MemberSettings {
                 teams: &settings.teams,
                 provisioning: &settings.provisioning,
-                sso: false,
+                sso_provider: None,
             },
         )
         .await
@@ -193,6 +193,7 @@ impl Database {
     pub(in crate::local_auth) async fn sync_sso_memberships(
         &self,
         email: &str,
+        provider: &str,
         desired: &BTreeMap<String, String>,
         teams: &TeamSettings,
         provisioning: &UserProvisioning,
@@ -216,7 +217,7 @@ impl Database {
         let options = MemberSettings {
             teams,
             provisioning,
-            sso: true,
+            sso_provider: Some(provider),
         };
         for team in existing.iter().filter(|team| !desired.contains_key(*team)) {
             if let Err(error) = self
@@ -252,7 +253,17 @@ impl Database {
         macro_rules! write {
             ($tx:ident,$postgres:tt) => {{
                 let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_team)?;
-                if !settings.sso {
+                if let Some(provider) = settings.sso_provider {
+                    let sql = if $postgres {
+                        "SELECT id FROM email_users WHERE email=$1 AND auth_provider=$2 AND is_active FOR UPDATE"
+                    } else {
+                        "SELECT id FROM email_users WHERE email=$1 AND auth_provider=$2 AND is_active"
+                    };
+                    if sqlx::query_scalar::<_,String>(sql).bind(email).bind(provider)
+                        .fetch_optional(&mut *$tx).await?.is_none() {
+                        return Err(denied("SSO provider binding changed"));
+                    }
+                } else {
                     team_permission!($tx,id,actor, matches!(operation,MemberMutation::Remove) && actor==email);
                 }
                 if team.is_personal {
@@ -269,7 +280,7 @@ impl Database {
                             return Err(AccountError::detail(StatusCode::NOT_FOUND,"User not found or inactive"));
                         }
                         let mut member = insert_member!($tx,team,email,role,Some(actor),actor,settings,false);
-                        if settings.sso {
+                        if settings.sso_provider.is_some() {
                             sqlx::query("UPDATE email_team_members SET grant_source='sso' WHERE id=$1")
                                 .bind(&member.id).execute(&mut *$tx).await?;
                             member.grant_source = Some("sso".to_owned());
@@ -279,7 +290,7 @@ impl Database {
                     MemberMutation::Role(_) | MemberMutation::Remove=>{
                         let mut member:Member=sqlx::query_as(MEMBER_ANY_STATE).bind(id).bind(email)
                             .fetch_optional(&mut *$tx).await?.filter(|member:&Member|member.is_active).ok_or_else(missing_member)?;
-                        if settings.sso && member.grant_source.as_deref()!=Some("sso") {
+                        if settings.sso_provider.is_some() && member.grant_source.as_deref()!=Some("sso") {
                             return Err(missing_member());
                         }
                         let role=match operation {MemberMutation::Role(role)=>Some(role),_=>None};

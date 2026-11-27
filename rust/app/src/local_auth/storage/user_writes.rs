@@ -9,19 +9,22 @@ pub(in crate::local_auth) struct CredentialChange<'a> {
     pub(in crate::local_auth) reset_token: Option<&'a str>,
 }
 
-const REVOKE_LOCAL_SESSIONS: &str = "INSERT INTO token_revocations
+pub(in crate::local_auth) const REVOKE_LOCAL_SESSIONS: &str = "INSERT INTO token_revocations
     (jti,revoked_at,revoked_by,reason,token_expiry)
     SELECT jti,CURRENT_TIMESTAMP,$2,$3,expires_at FROM cf_local_sessions WHERE user_email=$1
     ON CONFLICT(jti) DO NOTHING";
 
-const REVOKE_LOCAL_API_TOKENS: &str = "INSERT INTO token_revocations
+pub(in crate::local_auth) const REVOKE_LOCAL_API_TOKENS: &str = "INSERT INTO token_revocations
     (jti,revoked_at,revoked_by,reason,token_expiry)
     SELECT jti,CURRENT_TIMESTAMP,$2,$3,expires_at FROM email_api_tokens WHERE user_email=$1
     ON CONFLICT(jti) DO NOTHING";
 
 macro_rules! revoke_credentials {
     ($tx:ident,$email:expr,$actor:expr,$reason:expr) => {{
-        for statement in [REVOKE_LOCAL_SESSIONS, REVOKE_LOCAL_API_TOKENS] {
+        for statement in [
+            $crate::local_auth::storage::REVOKE_LOCAL_SESSIONS,
+            $crate::local_auth::storage::REVOKE_LOCAL_API_TOKENS,
+        ] {
             sqlx::query(statement)
                 .bind($email)
                 .bind($actor)
@@ -41,6 +44,7 @@ macro_rules! revoke_credentials {
             .await?;
     }};
 }
+pub(in crate::local_auth) use revoke_credentials;
 
 impl Database {
     pub(in crate::local_auth) async fn local_password_history(

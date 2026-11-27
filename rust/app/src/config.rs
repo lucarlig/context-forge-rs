@@ -518,6 +518,7 @@ impl Settings {
     fn sso_identity_policy() -> Result<SsoIdentityPolicy, Box<dyn Error + Send + Sync>> {
         Ok(SsoIdentityPolicy {
             approval_required: flag("SSO_REQUIRE_ADMIN_APPROVAL")?.unwrap_or(false),
+            allow_provider_linking: flag("SSO_ALLOW_PROVIDER_LINKING")?.unwrap_or(false),
             teams: Self::account_teams()?,
             admin_domains: allowlist("SSO_AUTO_ADMIN_DOMAINS")?,
             github_admin_orgs: allowlist("SSO_GITHUB_ADMIN_ORGS")?,

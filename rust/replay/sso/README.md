@@ -37,3 +37,14 @@ The group mapping fixture used a custom OIDC groups claim on both
 databases. It granted the configured team membership and RBAC role,
 promoted the user when an administrator group appeared, and removed
 those grants when the groups disappeared.
+
+## Provider linking
+
+The pinned gateway and Rust both refused a link when the new provider
+omitted email verification or reported an unverified email. With
+`SSO_ALLOW_PROVIDER_LINKING=true`, an explicitly verified email linked
+the existing user to the new provider and demoted the former
+administrator. The browser callback and authenticated profile matched on
+SQLite and PostgreSQL. Rust also revoked the previous native session
+when it changed the provider binding. The pinned release still
+accepted that session after the change.
