@@ -21,6 +21,7 @@ async fn a2a_routes_and_mcp_tools_enforce_parent_scope_before_dispatch() {
                         );
                         assert!(!headers.contains_key("x-vault-tokens"));
                         assert!(!headers.contains_key("x-unlisted"));
+                        assert_eq!(headers["x-contextforge-uaid-hop"], "1");
                         Json(json!({"query":body["parameters"]["query"]}))
                     },
                 ),
@@ -220,8 +221,10 @@ async fn a2a_routes_and_mcp_tools_enforce_parent_scope_before_dispatch() {
     assert_eq!(result["result"]["isError"], false, "{result}");
     assert_eq!(calls.load(Ordering::Relaxed), 3);
 
-    sqlx::query("UPDATE a2a_agents SET uaid = 'uaid:fixture' WHERE id = $1")
+    let uaid = "uaid:did:did:key:fixture;uid=0;proto=a2a;nativeId=agent.example.test";
+    sqlx::query("UPDATE a2a_agents SET uaid=$2 WHERE id=$1")
         .bind(id)
+        .bind(uaid)
         .execute(pool)
         .await
         .unwrap();
@@ -233,6 +236,32 @@ async fn a2a_routes_and_mcp_tools_enforce_parent_scope_before_dispatch() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(
+        &client,
+        gateway.url("/v1/a2a/invoke"),
+        json!({"agent_id":uaid}),
+        Some(&outsider),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = send_with_headers(
+        &client,
+        gateway.url("/a2a/invoke"),
+        json!({"agent_id":id}),
+        Some(&member),
+        &[
+            ("x-contextforge-uaid-hop", "1, 5"),
+            ("x-contextforge-uaid-hop", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("federation hop limit reached")
+    );
     sqlx::raw_sql(
         "UPDATE a2a_agents SET uaid = NULL;
          CREATE TABLE a2a_agent_plugin_bindings

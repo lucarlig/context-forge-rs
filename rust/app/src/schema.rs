@@ -18,7 +18,8 @@ const A2A: &str = include_str!("../migrations/005_a2a.sql");
 const A2A_TASKS: &str = include_str!("../migrations/006_a2a_tasks.sql");
 const A2A_PUSH_CONFIGS: &str = include_str!("../migrations/007_a2a_push_configs.sql");
 const A2A_CARDS: &str = include_str!("../migrations/008_a2a_cards.sql");
-const MIGRATIONS: [&str; 10] = [
+const A2A_UAID: &str = include_str!("../migrations/009_a2a_uaid.sql");
+const MIGRATIONS: [&str; 11] = [
     "identity",
     "catalog",
     "legacy_sse",
@@ -29,6 +30,7 @@ const MIGRATIONS: [&str; 10] = [
     "a2a_tasks",
     "a2a_push_configs",
     "a2a_cards",
+    "a2a_uaid",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -315,6 +317,9 @@ impl Database {
                         }
                         9 => {
                             sqlx::raw_sql(A2A_CARDS).execute(&mut *$transaction).await?;
+                        }
+                        10 => {
+                            sqlx::raw_sql(A2A_UAID).execute(&mut *$transaction).await?;
                         }
                         _ => unreachable!("unknown migration implementation"),
                     }

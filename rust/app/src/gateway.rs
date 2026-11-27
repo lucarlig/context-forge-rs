@@ -120,6 +120,7 @@ pub struct GatewayService {
     a2a_enabled: bool,
     a2a_timeout: Duration,
     a2a_card_timeout: Duration,
+    uaid: crate::uaid::UaidSettings,
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
     gateway_oauth: GatewayOAuthSettings,
@@ -229,6 +230,7 @@ impl GatewayService {
             a2a_enabled: true,
             a2a_timeout: Duration::from_secs(30),
             a2a_card_timeout: Duration::from_secs(120),
+            uaid: crate::uaid::UaidSettings::default(),
             email_auth_enabled: true,
             token_issuer: None,
             gateway_oauth: GatewayOAuthSettings::default(),
@@ -293,6 +295,11 @@ impl GatewayService {
 
     pub fn with_a2a_card_timeout(mut self, timeout: Duration) -> Self {
         self.a2a_card_timeout = timeout;
+        self
+    }
+
+    pub fn with_uaid_settings(mut self, settings: crate::uaid::UaidSettings) -> Self {
+        self.uaid = settings;
         self
     }
 

@@ -51,7 +51,8 @@ const UPDATE_AGENT: &str = "
         config=$11, passthrough_headers=$12, tags=$13, auth_type=$14, auth_value=$15,
         auth_query_params=$16, team_id=$17, visibility=$18,
         modified_by=$19, modified_from_ip=$20, modified_via='api', modified_user_agent=$21,
-        oauth_config=$22, version=version+1, updated_at=CURRENT_TIMESTAMP WHERE id=$1";
+        oauth_config=$22, uaid=$23, uaid_registry=$24, uaid_proto=$25, uaid_native_id=$26,
+        version=version+1, updated_at=CURRENT_TIMESTAMP WHERE id=$1";
 
 const UPDATE_TOOL: &str = "
     UPDATE tools SET name=$2, custom_name_slug=$2, custom_name=$3, url=$4,
@@ -156,6 +157,10 @@ impl Database {
                     .bind(&agent.modified_from_ip)
                     .bind(&agent.modified_user_agent)
                     .bind(&agent.oauth_config)
+                    .bind(&agent.uaid)
+                    .bind(&agent.uaid_registry)
+                    .bind(&agent.uaid_proto)
+                    .bind(&agent.uaid_native_id)
                     .execute(&mut *$tx)
                     .await?;
                 let row = sqlx::query_as(BY_ID)

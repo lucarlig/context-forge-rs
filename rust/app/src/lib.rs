@@ -40,6 +40,7 @@ mod sessions;
 mod sigv4;
 mod subscriptions;
 mod tokens;
+pub mod uaid;
 pub mod upstream;
 mod upstream_tls;
 mod websocket;

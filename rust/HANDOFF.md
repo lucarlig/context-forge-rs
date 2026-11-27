@@ -267,7 +267,8 @@ credentials, and invocation through the generated MCP tool. Native tests check
 team scope, masked credentials, the feature flag, and outbound header filtering.
 Agents registered by the pinned release and their existing bearer credentials
 also work through both routes after Rust adopts the SQLite database.
-UAID routing and enforced plugin bindings reject invocation before dispatch.
+Agents with enforced plugin bindings reject invocation before dispatch until
+the native plugin engine can apply those bindings.
 
 The A2A invocation routes persist task state, history, and artifacts. Agent
 owners, team owners, and scoped platform administrators can page through
@@ -322,7 +323,21 @@ PostgreSQL. An adopted SQLite database reused existing encrypted credentials.
 A concurrent Rust test checked token reuse and scoped access. Two live workers
 shared an encrypted Redis token and acquired a fresh token after reactivation.
 
-Streaming, webhook delivery, and UAID routing remain open.
+UAID generation and lookup preserve existing agent IDs. Cross-gateway
+invocation checks the domain allowlist and pinned URL policy. It forwards
+the caller's verified JWT when configured. The hop counter advances on
+local and remote calls. The highest valid inbound value sets the hop count.
+Rust Anything matched generation, local lookup, remote calls, and deny paths
+on SQLite. The UAID replay also matched on PostgreSQL. Two native gateways
+verified cross-gateway JWT forwarding. An adopted SQLite database resolved
+its existing UAIDs.
+
+The v1.1.2 replay received HTTP 400 from JSON-RPC when the upstream returned
+an A2A event stream. The referenced internal webhook dispatcher path
+returned 404. Rust matched both responses. The pinned release exposes
+webhook settings through the task push configuration routes.
+
+The A2A test route and scoped metrics remain open.
 
 ## Gateway management
 

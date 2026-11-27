@@ -10,8 +10,10 @@ use sqlx::types::Json as DbJson;
 use super::{catalog_api::*, *};
 use crate::catalog::{AgentLookup, AgentRecord, AgentWriteError};
 use crate::schema_validation::Target;
+use crate::uaid::{self, UaidInput};
 
 mod cards;
+mod federation;
 mod lifecycle;
 mod oauth;
 mod protocol;
@@ -107,8 +109,8 @@ struct AgentInput {
     passthrough_headers: Option<Vec<String>>,
     #[serde(default)]
     tags: Vec<Value>,
-    #[serde(default)]
-    generate_uaid: bool,
+    #[serde(flatten)]
+    uaid: UaidInput,
     #[serde(alias = "cardUrl")]
     card_url: Option<String>,
     #[serde(flatten)]
@@ -156,12 +158,6 @@ async fn register(
             "Invalid A2A agent configuration",
         ));
     }
-    if input.generate_uaid {
-        return Err(CatalogApiError::detail(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "A2A UAID registration is unavailable",
-        ));
-    }
     let team = registration_team(
         &app,
         &principal,
@@ -189,6 +185,10 @@ async fn register(
             "Outbound A2A URL blocked by URL policy",
         )
     })?;
+    let uaid = input
+        .uaid
+        .generate(&app.uaid, endpoint, name, true)
+        .map_err(|message| CatalogApiError::detail(StatusCode::UNPROCESSABLE_ENTITY, message))?;
     let auth = input
         .auth
         .prepare(
@@ -227,7 +227,7 @@ async fn register(
         auth.as_ref().map(|auth| &auth.credentials.headers),
     )
     .await?;
-    let record = AgentRecord {
+    let mut record = AgentRecord {
         id: Uuid::new_v4().simple().to_string(),
         name: name.to_owned(),
         slug,
@@ -272,6 +272,9 @@ async fn register(
         icon_url: None,
         oauth_config,
     };
+    if let Some(uaid) = uaid {
+        record.set_uaid(uaid);
+    }
     let agent = app
         .database
         .insert_agent(
@@ -451,8 +454,14 @@ async fn invoke_by_id(
     Json(input): Json<InvocationById>,
 ) -> Result<Json<Value>, CatalogApiError> {
     require(&app, &principal, "a2a.invoke").await?;
-    let agent = find(&app, Some(&principal), AgentLookup::Id(&input.agent_id)).await?;
-    let result = invoke_recorded(&app, &agent, input.invocation, &headers).await?;
+    let result = federation::dispatch(
+        &app,
+        &principal,
+        AgentLookup::Id(&input.agent_id),
+        input.invocation,
+        &headers,
+    )
+    .await?;
     Ok(Json(result))
 }
 
@@ -464,8 +473,8 @@ async fn invoke_by_name(
     Json(input): Json<Invocation>,
 ) -> Result<Json<Value>, CatalogApiError> {
     require(&app, &principal, "a2a.invoke").await?;
-    let agent = find(&app, Some(&principal), AgentLookup::Name(&name)).await?;
-    let result = invoke_recorded(&app, &agent, input, &headers).await?;
+    let result =
+        federation::dispatch(&app, &principal, AgentLookup::Name(&name), input, &headers).await?;
     Ok(Json(result))
 }
 
@@ -520,19 +529,16 @@ async fn raw_rpc(
         return Ok(rpc_error(StatusCode::BAD_REQUEST, -32600, &error, id));
     }
 
-    let response = async {
-        let agent = find(&app, Some(&principal), AgentLookup::Name(&name)).await?;
-        invoke_recorded(
-            &app,
-            &agent,
-            Invocation {
-                parameters: body,
-                interaction_type: query_interaction(),
-            },
-            &headers,
-        )
-        .await
-    }
+    let response = federation::dispatch(
+        &app,
+        &principal,
+        AgentLookup::Name(&name),
+        Invocation {
+            parameters: body,
+            interaction_type: query_interaction(),
+        },
+        &headers,
+    )
     .await;
     match response {
         Ok(result) if result.get("jsonrpc").is_some() => Ok(Json(result).into_response()),
@@ -574,16 +580,24 @@ async fn invoke(
     incoming: Option<&HeaderMap>,
 ) -> Result<Value, CatalogApiError> {
     let fail = || CatalogApiError::detail(StatusCode::BAD_REQUEST, FAILURE);
+    let hops = incoming.map_or(0, uaid::hop_count);
+    federation::check_hops(app, &agent.id, hops)?;
     if !agent.enabled {
         return Err(CatalogApiError::detail(
             StatusCode::BAD_REQUEST,
             format!("A2A Agent '{}' is disabled", agent.name),
         ));
     }
-    if agent.uaid.as_deref().is_some_and(|value| !value.is_empty()) {
+    if agent.uaid.as_deref().is_some_and(|value| !value.is_empty())
+        && (!app.uaid.permits_endpoint(&agent.endpoint_url)
+            || agent
+                .uaid_native_id
+                .as_deref()
+                .is_some_and(|endpoint| !app.uaid.permits_endpoint(endpoint)))
+    {
         return Err(CatalogApiError::detail(
             StatusCode::BAD_REQUEST,
-            "A2A UAID routing is unavailable",
+            "A2A UAID agent endpoint is blocked by the domain allowlist",
         ));
     }
     if app.database.agent_has_enforced_binding(agent).await? {
@@ -657,6 +671,7 @@ async fn invoke(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    uaid::stamp(&mut headers, hops);
     let payload = if jsonrpc {
         headers.insert(
             "a2a-version",

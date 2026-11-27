@@ -23,7 +23,8 @@ pub(super) struct AgentPatch {
     #[serde(default, deserialize_with = "nullable")]
     team_id: Option<Option<String>>,
     visibility: Option<String>,
-    generate_uaid: Option<bool>,
+    #[serde(flatten)]
+    uaid: UaidInput,
     #[serde(flatten)]
     auth: AuthInput,
 }
@@ -58,11 +59,6 @@ pub(super) async fn update(
         ));
     }
     let endpoint_changed = agent.endpoint_url != previous.endpoint_url;
-    if patch.generate_uaid == Some(true) && agent.uaid.is_none()
-        || endpoint_changed && previous.uaid.is_some()
-    {
-        return Err(invalid("A2A UAID registration is unavailable"));
-    }
     if endpoint_changed {
         app.upstream
             .check_endpoint(&agent.endpoint_url)
@@ -72,6 +68,19 @@ pub(super) async fn update(
                     "Outbound A2A URL blocked by URL policy",
                 )
             })?;
+        if previous.uaid.is_some() && !app.uaid.permits_endpoint(&agent.endpoint_url) {
+            return Err(invalid(
+                "A2A UAID agent endpoint is blocked by the domain allowlist",
+            ));
+        }
+    }
+    if previous.uaid.is_none()
+        && let Some(uaid) = patch
+            .uaid
+            .generate(&app.uaid, &agent.endpoint_url, &agent.name, false)
+            .map_err(invalid)?
+    {
+        agent.set_uaid(uaid);
     }
     if let Some(config) = patch.auth.oauth_config() {
         oauth::validate_config(&app, config, previous.oauth_config.as_ref())?;

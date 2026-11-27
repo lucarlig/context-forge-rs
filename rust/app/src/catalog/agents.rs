@@ -2,6 +2,7 @@
 
 use super::entry_filters::fetch_catalog_entries;
 use super::*;
+use crate::uaid::GeneratedUaid;
 use sqlx::types::Json as DbJson;
 
 mod lifecycle;
@@ -61,6 +62,13 @@ pub(crate) struct AgentRecord {
 }
 
 impl AgentRecord {
+    pub(crate) fn set_uaid(&mut self, generated: GeneratedUaid) {
+        self.uaid = Some(generated.identifier);
+        self.uaid_registry = Some(generated.registry);
+        self.uaid_proto = Some(generated.protocol);
+        self.uaid_native_id = Some(generated.source);
+    }
+
     pub(crate) fn stored_headers(&self) -> Option<std::borrow::Cow<'_, str>> {
         self.auth_value.as_deref().map(|stored| {
             if stored.starts_with(['"', '{']) {
@@ -118,6 +126,7 @@ macro_rules! projection {
     };
 }
 const BY_ID: &str = concat!(projection!(), " WHERE r.id = $1");
+const BY_UAID: &str = concat!(projection!(), " WHERE r.id = $1 OR r.uaid = $1 LIMIT 2");
 const BY_NAME: &str = concat!(
     projection!(),
     " WHERE r.name = $1 ORDER BY r.created_at DESC, r.id DESC"
@@ -138,9 +147,10 @@ const INSERT_AGENT: &str = "
         protocol_version, capabilities, skills, config, passthrough_headers, tags, auth_type,
         auth_value, auth_query_params, team_id, owner_email, visibility, enabled, reachable,
         created_at, updated_at, created_by, created_from_ip, created_via, created_user_agent, version,
-        tool_id, oauth_config)
+        tool_id, oauth_config, uaid, uaid_registry, uaid_proto, uaid_native_id)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $18, $20, 'api', $21, 1, $22, $23)";
+            $19, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $18, $20, 'api', $21, 1, $22, $23,
+            $24, $25, $26, $27)";
 
 const INSERT_TOOL: &str = "
     INSERT INTO tools (id, name, original_name, custom_name_slug, custom_name, url,
@@ -151,6 +161,26 @@ const INSERT_TOOL: &str = "
         CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,$9,'api',1,$10,$9,$11)";
 
 impl Database {
+    pub(crate) async fn local_uaid_agents(
+        &self,
+        identifier: &str,
+    ) -> Result<Vec<AgentRecord>, sqlx::Error> {
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as(BY_UAID)
+                    .bind(identifier)
+                    .fetch_all(pool)
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(BY_UAID)
+                    .bind(identifier)
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+    }
+
     pub(crate) async fn agent_has_enforced_binding(
         &self,
         agent: &AgentRecord,
@@ -304,6 +334,10 @@ impl Database {
                     .bind(&agent.created_user_agent)
                     .bind(&tool_id)
                     .bind(&agent.oauth_config)
+                    .bind(&agent.uaid)
+                    .bind(&agent.uaid_registry)
+                    .bind(&agent.uaid_proto)
+                    .bind(&agent.uaid_native_id)
                     .execute(&mut *$tx)
                     .await?;
                 cards::insert_cards!($tx, &agent.id, cards);

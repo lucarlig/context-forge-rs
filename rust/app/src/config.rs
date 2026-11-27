@@ -147,6 +147,25 @@ impl Settings {
         positive_seconds("FEDERATION_TIMEOUT", 120.0)
     }
 
+    pub fn uaid_settings(
+        enabled: bool,
+    ) -> Result<crate::uaid::UaidSettings, Box<dyn Error + Send + Sync>> {
+        let domains = allowlist("UAID_ALLOWED_DOMAINS")?;
+        let allow_all_domains = flag("UAID_ALLOW_ALL_DOMAINS")?.unwrap_or(false);
+        let mut settings = crate::uaid::UaidSettings::default();
+        settings.allow_all_domains = allow_all_domains;
+        settings.forward_auth = flag("UAID_FORWARD_AUTH")?.unwrap_or(true);
+        settings.max_length = parse("UAID_MAX_LENGTH", 2048)?;
+        settings.max_hops = parse("UAID_MAX_FEDERATION_HOPS", 5)?;
+        if enabled && domains.is_empty() && !allow_all_domains {
+            tracing::error!("UAID routing requires an explicitly authorized destination");
+        }
+        let require_domains =
+            enabled && flag("UAID_REQUIRE_ALLOWLIST_ON_STARTUP")?.unwrap_or(false);
+        settings.configure(domains, require_domains)?;
+        Ok(settings)
+    }
+
     pub fn grpc_federation() -> Result<crate::grpc::GrpcSettings, Box<dyn Error + Send + Sync>> {
         let max_message_bytes = parse("MCPGATEWAY_GRPC_MAX_MESSAGE_SIZE", 4 * 1024 * 1024)?;
         let min_page_size = parse("PAGINATION_MIN_PAGE_SIZE", 1)?;
