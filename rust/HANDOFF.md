@@ -151,6 +151,15 @@ deprecation, and deletion. The comparison verified credential masking and
 encrypted persistence on both databases.
 [Tool write verification](replay/tool-management/write.md)
 
+MCP clients can discover and invoke registered REST tools through the scoped
+catalog. Requests support URL templates, query and header mappings, JSON,
+form data, and multipart bodies. The Rust client pins the upstream destination.
+Fourteen scenarios matched the pinned gateway's results and outbound requests
+on SQLite and PostgreSQL. A Rust integration test verifies that wrong-team
+tokens, read-only tokens, and invalid URL arguments stop before outbound dispatch.
+OpenAPI import, direct passthrough, gateway credential inheritance, and response
+filter evaluation remain open.
+
 The gateway management and catalog milestone is verified. Standing upstream
 listeners reconcile the catalog after acknowledgment and apply subsequent
 tool, resource, and prompt changes. A two-worker Redis test verified that only

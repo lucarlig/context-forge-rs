@@ -1116,6 +1116,29 @@ impl UpstreamClient {
         self.policy.validate_url(endpoint).map(|_| ())
     }
 
+    pub(crate) async fn rest_response(
+        &self,
+        mut request: reqwest::Request,
+        signer: Option<&crate::sigv4::SigV4>,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), UpstreamError> {
+        timeout_at(self.deadline()?, async {
+            let (client, url) = self
+                .pinned_client(request.url().as_str(), None, None)
+                .await?;
+            *request.url_mut() = url;
+            if let Some(signer) = signer {
+                signer
+                    .sign(&mut request)
+                    .map_err(|_| UpstreamError::Transport)?;
+            }
+            let response = client.execute(request).await?;
+            let status = response.status();
+            Ok((status, read_json_body(response).await?))
+        })
+        .await
+        .map_err(|_| UpstreamError::Timeout)?
+    }
+
     pub(crate) async fn oauth_document<T: DeserializeOwned>(
         &self,
         endpoint: &str,

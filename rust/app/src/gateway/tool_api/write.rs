@@ -7,6 +7,7 @@ use crate::catalog::ToolWriteError;
 use crate::gateway::import_api::{ImportScope, Outcome, Strategy};
 
 mod authentication;
+pub(in crate::gateway) use authentication::protected_header;
 
 #[derive(Deserialize)]
 pub(super) struct CreateTool {
@@ -678,11 +679,10 @@ fn apply_passthrough(
         tool.query_mapping = Some(json!(query).to_string());
     }
     if let Some(headers) = fields.header_mapping.take() {
-        if headers.keys().any(|name| {
-            HeaderName::from_bytes(name.as_bytes()).is_err()
-                || authentication::protected_header(name)
-                || name.to_ascii_lowercase().starts_with("mcp-")
-        }) {
+        if headers
+            .values()
+            .any(|name| mapped_header_name(name).is_none())
+        {
             return Err(invalid("Invalid tool header mapping"));
         }
         tool.header_mapping = Some(json!(headers).to_string());
@@ -703,6 +703,9 @@ fn checked_endpoint(service: &GatewayService, value: &str) -> Result<String, Cat
     let value = value.trim();
     if value.len() > 767 || service.upstream.check_endpoint(value).is_err() {
         return Err(invalid("Tool URL is invalid or disallowed"));
+    }
+    if value.contains('{') {
+        return Ok(value.to_owned());
     }
     reqwest::Url::parse(value)
         .map(|url| url.to_string())

@@ -237,7 +237,7 @@ pub(super) fn prepare_headers(
     Ok(Value::Object(updated).to_string())
 }
 
-pub(super) fn protected_header(name: &str) -> bool {
+pub(in crate::gateway) fn protected_header(name: &str) -> bool {
     static SENSITIVE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"(?i)^(?:x-)?(?:auth|api|access|refresh|client|bearer|session|security)[-_]?(?:token|secret|key)$")
             .expect("valid credential header pattern")

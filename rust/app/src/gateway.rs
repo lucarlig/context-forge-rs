@@ -13,6 +13,7 @@ mod oauth_api;
 mod prompt_api;
 mod proxy;
 mod resource_api;
+mod rest_tool;
 mod roots;
 mod server_api;
 mod tags;
@@ -687,6 +688,13 @@ impl GatewayService {
                 }
                 if tool.deprecated {
                     return tool_result_error(tool_api::deprecated_message(&request.name));
+                }
+                if let Some(rest) = &tool.rest {
+                    return tokio::select! {
+                        biased;
+                        () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
+                        result = rest_tool::execute(self, &tool, rest, &request, principal, context.request_headers) => result,
+                    };
                 }
                 let transport = UpstreamTransport::from_name(&tool.gateway_transport);
                 let available = matches!(tool.gateway_mode.as_str(), "cache" | "direct_proxy")

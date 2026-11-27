@@ -9,10 +9,23 @@ use super::{catalog_api::*, *};
 use crate::{catalog::ToolRecord, credentials::decode_header_values};
 
 const MASK: &str = "*****";
-const SECRET_HEADER: &str = "_mcpgateway_encrypted_header_value_v1";
+pub(super) const SECRET_HEADER: &str = "_mcpgateway_encrypted_header_value_v1";
 
 mod write;
 pub(super) use write::import_tool;
+pub(super) use write::protected_header;
+
+pub(super) fn mapped_header_name(name: &str) -> Option<HeaderName> {
+    let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+    let normalized = name.as_str();
+    (!protected_header(normalized)
+        && !crate::forward_headers::hop_header_name(normalized)
+        && !normalized.starts_with("mcp-")
+        && !normalized.starts_with("x-mcp-")
+        && !normalized.starts_with("x-forwarded-user")
+        && normalized != "x-upstream-authorization")
+        .then_some(name)
+}
 
 #[derive(Deserialize)]
 struct ToolDetailQuery {
@@ -433,7 +446,7 @@ pub(super) fn deprecated_message(name: &str) -> String {
     )
 }
 
-fn decode_stored_auth(
+pub(super) fn decode_stored_auth(
     cipher: &CredentialCipher,
     stored: &str,
 ) -> Result<std::collections::BTreeMap<String, String>, CredentialError> {

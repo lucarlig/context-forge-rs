@@ -112,7 +112,7 @@ fn default_annotations() -> Option<Value> {
     Some(Value::Object(Default::default()))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CatalogTool {
     pub id: String,
     pub original_name: String,
@@ -126,7 +126,21 @@ pub struct CatalogTool {
     pub(crate) deprecated: bool,
     pub(crate) reachable: bool,
     pub(crate) needs_upstream_config: bool,
+    pub(crate) rest: Option<RestTool>,
     pub definition: ToolDefinition,
+}
+
+#[derive(Clone, sqlx::FromRow)]
+pub(crate) struct RestTool {
+    pub(crate) http_url: Option<String>,
+    pub(crate) headers: Option<String>,
+    pub(crate) auth_type: Option<String>,
+    pub(crate) auth_value: Option<String>,
+    pub(crate) sigv4_config: Option<String>,
+    pub(crate) timeout_ms: Option<i32>,
+    pub(crate) query_mapping: Option<String>,
+    pub(crate) header_mapping: Option<String>,
+    pub(crate) pending_policy: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -365,6 +379,9 @@ struct ToolRow {
     input_schema: String,
     output_schema: Option<String>,
     annotations: Option<String>,
+    integration_type: String,
+    #[sqlx(flatten)]
+    rest: RestTool,
 }
 
 macro_rules! visible {
@@ -447,8 +464,10 @@ macro_rules! tool_query {
     ($team_ids:literal) => {
         concat!(
             "WITH visible_team_ids(id) AS (", $team_ids, ")
-             SELECT t.id, t.original_name, g.id AS gateway_id, g.name AS gateway_name,
-                g.url AS gateway_url, g.gateway_mode, g.transport AS gateway_transport, t.request_type,
+             SELECT t.id, t.original_name, COALESCE(g.id, '') AS gateway_id,
+                COALESCE(g.name, '') AS gateway_name, COALESCE(g.url, '') AS gateway_url,
+                COALESCE(g.gateway_mode, '') AS gateway_mode, COALESCE(g.transport, '') AS gateway_transport,
+                t.request_type, t.integration_type,
                 (
                     ", gateway_policy!(), "
                     OR ((LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth')
@@ -465,17 +484,32 @@ macro_rules! tool_query {
                     OR ", non_empty_json!("t.plugin_chain_post"), "
                 ) AS requires_gateway_policy,
                 ", connection_configured!(), " AS needs_upstream_config,
-                (t.reachable AND g.reachable) AS reachable, t.deprecated, t.name, t.title,
+                (t.reachable AND COALESCE(g.reachable, TRUE)) AS reachable, t.deprecated, t.name, t.title,
                 COALESCE(t.description, '') AS description, CAST(t.input_schema AS TEXT) AS input_schema,
-                CAST(t.output_schema AS TEXT) AS output_schema, CAST(t.annotations AS TEXT) AS annotations
+                CAST(t.output_schema AS TEXT) AS output_schema, CAST(t.annotations AS TEXT) AS annotations,
+                t.url AS http_url, t.timeout_ms,
+                CASE WHEN CAST($2 AS TEXT) IS NOT NULL AND t.integration_type = 'REST'
+                    THEN CAST(t.headers AS TEXT) END AS headers,
+                t.auth_type,
+                CASE WHEN CAST($2 AS TEXT) IS NOT NULL AND t.integration_type = 'REST'
+                    THEN t.auth_value END AS auth_value,
+                CASE WHEN CAST($2 AS TEXT) IS NOT NULL AND t.integration_type = 'REST'
+                    THEN CAST(t.sigv4_config AS TEXT) END AS sigv4_config,
+                CAST(t.query_mapping AS TEXT) AS query_mapping,
+                CAST(t.header_mapping AS TEXT) AS header_mapping,
+                (TRIM(COALESCE(t.jsonpath_filter, '')) <> '' OR t.validation_refusal IS NOT NULL
+                    OR COALESCE(t.tool_validation_policy, '') <> ''
+                    OR COALESCE(g.tool_validation_policy, '') <> ''
+                    OR ", non_empty_json!("t.plugin_chain_pre"), "
+                    OR ", non_empty_json!("t.plugin_chain_post"), ") AS pending_policy
              FROM tools t
-             JOIN gateways g ON g.id = t.gateway_id
-             WHERE t.enabled = TRUE AND t.integration_type = 'MCP' AND t.name IS NOT NULL
-                AND g.enabled = TRUE AND g.status = 'active'
+             LEFT JOIN gateways g ON g.id = t.gateway_id
+             WHERE t.enabled = TRUE AND t.integration_type IN ('MCP', 'REST') AND t.name IS NOT NULL
+                AND ((t.integration_type = 'REST' AND t.gateway_id IS NULL)
+                    OR (g.enabled = TRUE AND g.status = 'active' AND ", visible!("g"), "))
                 AND (CAST($2 AS TEXT) IS NULL OR t.name = $2)
                 AND (CAST($3 AS TEXT) IS NULL OR t.id > $3)
                 AND ", visible!("t"), "
-                AND ", visible!("g"), "
                 AND (CAST($1 AS TEXT) IS NULL OR EXISTS (
                     SELECT 1 FROM server_tool_association a
                     JOIN servers s ON s.id = a.server_id
@@ -1767,6 +1801,8 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         input_schema,
         output_schema,
         annotations,
+        integration_type,
+        rest,
     } = row;
     Ok(CatalogTool {
         id,
@@ -1780,6 +1816,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         requires_gateway_policy,
         reachable,
         deprecated,
+        rest: (integration_type == "REST").then_some(rest),
         needs_upstream_config,
         definition: ToolDefinition {
             name,

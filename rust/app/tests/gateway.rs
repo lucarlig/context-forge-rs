@@ -50,6 +50,97 @@ const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
 
+#[tokio::test]
+async fn rest_tool_calls_require_visibility_and_execute_scope_before_dispatch() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = Running::start(
+        Router::new()
+            .route(
+                "/items/{name}",
+                post(
+                    |State(hits): State<Arc<AtomicUsize>>,
+                     Path(name): Path<String>,
+                     Json(body): Json<Value>| async move {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        Json(json!({"name": name, "body": body}))
+                    },
+                ),
+            )
+            .with_state(hits.clone()),
+    )
+    .await;
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    sqlx::query(
+        "INSERT INTO tools (id, name, original_name, custom_name, custom_name_slug, url,
+                integration_type, request_type, input_schema, visibility, team_id)
+         VALUES ('rest', 'team-rest', 'team-rest', 'team-rest', 'team-rest', $1,
+                'REST', 'POST', '{\"type\":\"object\"}', 'team', 'alpha')",
+    )
+    .bind(upstream.url("/items/{item}?signed=a%2Bb"))
+    .execute(pool)
+    .await
+    .unwrap();
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        ),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.mcp_router(true, ProtocolMode::Auto)).await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let member = token("member", json!(["alpha"]), json!({}));
+    let outsider = token("outsider", json!(["beta"]), json!({}));
+    let read_only = token(
+        "member",
+        json!(["alpha"]),
+        json!({"permissions":["tools.read"]}),
+    );
+    let call = async |credential: &str, item: &str| {
+        send(
+            &client,
+            gateway.url("/mcp/"),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"team-rest","arguments":{"item":item,"value":42}}}),
+            Some(credential),
+        )
+        .await
+        .1
+    };
+    for (credential, item) in [
+        (&outsider, "demo"),
+        (&read_only, "demo"),
+        (&member, "a/../b"),
+    ] {
+        let response = call(credential, item).await;
+        assert!(
+            response["error"].is_object() || response["result"]["isError"] == true,
+            "{response}"
+        );
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+    }
+    let response = call(&member, "blue").await;
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("REST invocation failed: {response}"));
+    let body: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(body, json!({"name":"blue","body":{"value":42}}));
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+}
+
 type SseFixtureSessions = Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Value>>>>;
 
 async fn open_upstream_sse(State(sessions): State<SseFixtureSessions>) -> Response {
