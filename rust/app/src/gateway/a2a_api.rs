@@ -12,6 +12,7 @@ use crate::catalog::{AgentLookup, AgentRecord, AgentWriteError};
 use crate::schema_validation::Target;
 
 mod protocol;
+mod tasks;
 
 const FAILURE: &str = "A2A agent invocation failed";
 
@@ -24,7 +25,20 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
             .route(&format!("{base}/{{id}}"), get(detail))
             .route(&format!("{base}/invoke"), post(invoke_by_id))
             .route(&format!("{base}/{{name}}/invoke"), post(invoke_by_name))
-            .route(&format!("{base}/{{name}}/jsonrpc"), post(raw_rpc));
+            .route(&format!("{base}/{{name}}/jsonrpc"), post(raw_rpc))
+            .route(&format!("{base}/{{agent}}/tasks"), get(tasks::list))
+            .route(
+                &format!("{base}/{{agent}}/tasks/{{task}}"),
+                get(tasks::detail),
+            )
+            .route(
+                &format!("{base}/{{agent}}/tasks/{{task}}/cancel"),
+                post(tasks::cancel),
+            )
+            .route(
+                &format!("{base}/{{agent}}/tasks/{{task}}/messages"),
+                post(tasks::continue_task),
+            );
     }
     router
 }
@@ -358,9 +372,8 @@ async fn invoke_by_id(
 ) -> Result<Json<Value>, CatalogApiError> {
     require(&app, &principal, "a2a.invoke").await?;
     let agent = find(&app, Some(&principal), AgentLookup::Id(&input.agent_id)).await?;
-    invoke(&app, &agent, input.invocation, Some(&headers))
-        .await
-        .map(Json)
+    let result = invoke_recorded(&app, &agent, input.invocation, &headers).await?;
+    Ok(Json(result))
 }
 
 async fn invoke_by_name(
@@ -372,7 +385,19 @@ async fn invoke_by_name(
 ) -> Result<Json<Value>, CatalogApiError> {
     require(&app, &principal, "a2a.invoke").await?;
     let agent = find(&app, Some(&principal), AgentLookup::Name(&name)).await?;
-    invoke(&app, &agent, input, Some(&headers)).await.map(Json)
+    let result = invoke_recorded(&app, &agent, input, &headers).await?;
+    Ok(Json(result))
+}
+
+async fn invoke_recorded(
+    app: &GatewayService,
+    agent: &AgentRecord,
+    input: Invocation,
+    headers: &HeaderMap,
+) -> Result<Value, CatalogApiError> {
+    let result = invoke(app, agent, input, Some(headers)).await?;
+    tasks::record(app, &agent.id, &result, None).await;
+    Ok(result)
 }
 
 async fn raw_rpc(
@@ -417,14 +442,14 @@ async fn raw_rpc(
 
     let response = async {
         let agent = find(&app, Some(&principal), AgentLookup::Name(&name)).await?;
-        invoke(
+        invoke_recorded(
             &app,
             &agent,
             Invocation {
                 parameters: body,
                 interaction_type: query_interaction(),
             },
-            Some(&headers),
+            &headers,
         )
         .await
     }

@@ -269,8 +269,17 @@ Agents registered by the pinned release and their existing bearer credentials
 also work through both routes after Rust adopts the SQLite database.
 UAID routing and enforced plugin bindings reject invocation before dispatch.
 
-Agent updates, deletion, cards, OAuth, streaming, UAID routing, and task
-lifecycle remain open.
+The A2A invocation routes persist task state, history, and artifacts. Agent
+owners, team owners, and scoped platform administrators can page through
+task summaries, read details, send follow-up messages, and cancel tasks.
+Follow-up events store message IDs, part kinds and lengths, and state changes.
+The v0.3 and v1 replays matched on SQLite and PostgreSQL. A Rust regression
+test verifies that a response arriving after cancellation preserves the
+canceled state. The pinned gateway can overwrite that state.
+Rust also reads task history and page tokens created by v1.1.2 on SQLite.
+
+Agent updates, deletion, cards, OAuth, streaming, UAID routing, and push
+notification configuration remain open.
 
 ## Gateway management
 

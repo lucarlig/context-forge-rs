@@ -15,6 +15,7 @@ use crate::{
     upstream::{DiscoveredMetadata, UpstreamTransport},
 };
 
+mod agent_tasks;
 mod agents;
 mod entry_filters;
 mod metrics;
@@ -22,6 +23,7 @@ mod prompts;
 mod resources;
 mod servers;
 mod tools;
+pub(crate) use agent_tasks::{AgentTask, AgentTaskCursor, TaskContinuation, terminal_task_state};
 pub(crate) use agents::{AgentLookup, AgentRecord, AgentWriteError};
 pub(crate) use entry_filters::CatalogEntryFilters;
 pub(crate) use metrics::{ExecutionMetrics, MetricEntity};
