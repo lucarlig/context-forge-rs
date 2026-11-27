@@ -555,6 +555,9 @@ impl GatewayService {
                 if !tool.reachable {
                     return tool_result_error(format!("Unknown tool: {}", request.name));
                 }
+                if tool.deprecated {
+                    return tool_result_error(tool_api::deprecated_message(&request.name));
+                }
                 let transport = UpstreamTransport::from_name(&tool.gateway_transport);
                 let available = matches!(tool.gateway_mode.as_str(), "cache" | "direct_proxy")
                     && UpstreamTransport::from_name(&tool.request_type) == transport

@@ -11,6 +11,8 @@ use crate::{catalog::ToolRecord, credentials::decode_header_values};
 const MASK: &str = "*****";
 const SECRET_HEADER: &str = "_mcpgateway_encrypted_header_value_v1";
 
+mod write;
+
 #[derive(Deserialize)]
 struct ToolDetailQuery {
     apijsonpath: Option<String>,
@@ -20,9 +22,14 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
     let mut routes = Router::new();
     for base in ["/tools", "/v1/tools"] {
         routes = routes
-            .route(base, get(list))
-            .route(&format!("{base}/"), get(list))
-            .route(&format!("{base}/{{id}}"), get(detail))
+            .route(base, get(list).post(write::create))
+            .route(&format!("{base}/"), get(list).post(write::create))
+            .route(
+                &format!("{base}/{{id}}"),
+                get(detail).put(write::update).delete(write::delete),
+            )
+            .route(&format!("{base}/{{id}}/state"), post(write::set_state))
+            .route(&format!("{base}/{{id}}/toggle"), post(write::set_state))
             .route(&format!("{base}/preview/{{*name}}"), post(preview));
     }
     routes
@@ -180,7 +187,7 @@ async fn preview(
     if tool.deprecated {
         return Err(CatalogApiError::detail(
             StatusCode::BAD_REQUEST,
-            format!("Tool '{name}' is deprecated"),
+            deprecated_message(&name),
         ));
     }
     let schema = json_value(Some(&tool.input_schema));
@@ -304,7 +311,18 @@ fn json_value(text: Option<&str>) -> Value {
 
 fn parse_tags(text: &str) -> Value {
     let values = serde_json::from_str::<Vec<Value>>(text).unwrap_or_default();
-    normalized_tags(values).unwrap_or_else(|_| json!([]))
+    Value::Array(
+        values
+            .into_iter()
+            .filter_map(|value| {
+                if let Some(label) = value.as_str() {
+                    let id = slugify(label);
+                    return (!id.is_empty()).then(|| json!({"id":id,"label":label}));
+                }
+                (value["id"].is_string() && value["label"].is_string()).then_some(value)
+            })
+            .collect(),
+    )
 }
 
 fn read_headers(cipher: Option<&CredentialCipher>, tool: &ToolRecord, reveal: bool) -> Value {
@@ -354,7 +372,7 @@ fn masked_auth(
     });
     if full
         && let (Some(cipher), Some(stored)) = (cipher, tool.auth_value.as_deref())
-        && let Ok(values) = decode_header_values(Some(cipher), stored)
+        && let Ok(values) = decode_stored_auth(cipher, stored)
     {
         let authorization = values
             .iter()
@@ -406,6 +424,19 @@ fn masked_auth(
 
 fn tool_missing(id: &str) -> CatalogApiError {
     CatalogApiError::detail(StatusCode::NOT_FOUND, format!("Tool not found: {id}"))
+}
+
+pub(super) fn deprecated_message(name: &str) -> String {
+    format!(
+        "Tool '{name}' is deprecated and cannot be executed. Please update your agent to use an alternative tool."
+    )
+}
+
+fn decode_stored_auth(
+    cipher: &CredentialCipher,
+    stored: &str,
+) -> Result<std::collections::BTreeMap<String, String>, CredentialError> {
+    decode_header_values(Some(cipher), stored).or_else(|_| cipher.open(stored))
 }
 
 struct JsonProjection {

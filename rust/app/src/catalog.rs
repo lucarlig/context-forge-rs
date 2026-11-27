@@ -22,7 +22,7 @@ mod tools;
 pub(crate) use entry_filters::CatalogEntryFilters;
 pub(crate) use prompts::{PromptRecord, PromptWriteError};
 pub(crate) use resources::{ResourceRecord, ResourceWriteError};
-pub(crate) use tools::ToolRecord;
+pub(crate) use tools::{ToolRecord, ToolWriteError};
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
 pub(crate) const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
@@ -118,6 +118,7 @@ pub struct CatalogTool {
     pub gateway_transport: String,
     pub request_type: String,
     pub requires_gateway_policy: bool,
+    pub(crate) deprecated: bool,
     pub(crate) reachable: bool,
     pub(crate) needs_upstream_config: bool,
     pub definition: ToolDefinition,
@@ -349,6 +350,7 @@ struct ToolRow {
     request_type: String,
     requires_gateway_policy: bool,
     reachable: bool,
+    deprecated: bool,
     needs_upstream_config: bool,
     name: String,
     title: Option<String>,
@@ -447,6 +449,7 @@ macro_rules! tool_query {
                         AND NOT (", configured_auth!(), "
                             AND LOWER(COALESCE(t.auth_type, '')) = LOWER(COALESCE(g.auth_type, ''))))
                     OR COALESCE(t.jsonpath_filter, '') <> ''
+                    OR COALESCE(t.tool_validation_policy, '') <> ''
                     OR COALESCE(t.timeout_ms, 0) <> 0
                     OR t.validation_refusal IS NOT NULL
                     OR ", non_empty_json!("t.headers"), "
@@ -455,7 +458,7 @@ macro_rules! tool_query {
                     OR ", non_empty_json!("t.plugin_chain_post"), "
                 ) AS requires_gateway_policy,
                 ", connection_configured!(), " AS needs_upstream_config,
-                (t.reachable AND g.reachable) AS reachable, t.name, t.title,
+                (t.reachable AND g.reachable) AS reachable, t.deprecated, t.name, t.title,
                 COALESCE(t.description, '') AS description, CAST(t.input_schema AS TEXT) AS input_schema,
                 CAST(t.output_schema AS TEXT) AS output_schema, CAST(t.annotations AS TEXT) AS annotations
              FROM tools t
@@ -1749,20 +1752,39 @@ pub(crate) fn prompt_argument_schema(prompt: &rmcp::model::Prompt) -> Value {
 }
 
 pub(crate) fn slugify(value: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    let lower = value.to_lowercase();
+    let mut letters = lower.chars().peekable();
     let mut result = String::new();
     let mut separator = false;
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'_' {
+    let mut previous = None;
+    while let Some(character) = letters.next() {
+        if character == '\''
+            && previous.is_some_and(char::is_alphanumeric)
+            && letters
+                .peek()
+                .is_some_and(|character| character.is_alphanumeric())
+        {
+            continue;
+        }
+        if character.is_alphanumeric() {
             if separator && !result.is_empty() {
                 result.push('-');
             }
-            result.push(char::from(byte.to_ascii_lowercase()));
+            match character {
+                'æ' => result.push_str("ae"),
+                'ß' => result.push_str("ss"),
+                'ø' => result.push('o'),
+                character => result.push(character),
+            }
             separator = false;
-        } else if byte == b'-' || byte.is_ascii_whitespace() {
+        } else {
             separator = true;
         }
+        previous = Some(character);
     }
-    result.trim_matches('_').to_owned()
+    result.nfkd().filter(char::is_ascii).collect()
 }
 
 fn metadata_item(list: CatalogList, row: MetadataRow) -> Result<(String, Value), sqlx::Error> {
@@ -1821,6 +1843,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         request_type,
         requires_gateway_policy,
         reachable,
+        deprecated,
         needs_upstream_config,
         name,
         title,
@@ -1840,6 +1863,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         request_type,
         requires_gateway_policy,
         reachable,
+        deprecated,
         needs_upstream_config,
         definition: ToolDefinition {
             name,

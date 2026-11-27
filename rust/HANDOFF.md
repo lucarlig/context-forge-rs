@@ -58,3 +58,8 @@ argument order, revision metadata, and virtual-server scoping.
 Tool REST reads expose scoped metadata, mask headers for callers without edit
 access, and support JSONPath projection. Dry-run preview validates arguments and
 checks virtual-server membership. [Tool read verification](replay/tool-management/read/README.md)
+
+Tool management supports transactional creation, edits, state changes,
+deprecation, and deletion. The comparison verified credential masking and
+encrypted persistence on both databases.
+[Tool write verification](replay/tool-management/write.md)
