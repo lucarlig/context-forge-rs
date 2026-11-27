@@ -31,6 +31,7 @@ mod secret_envelope;
 mod sessions;
 mod sigv4;
 mod subscriptions;
+mod tokens;
 pub mod upstream;
 mod upstream_tls;
 mod websocket;

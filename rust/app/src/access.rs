@@ -22,7 +22,8 @@ use crate::{
     catalog::{CatalogScope, CatalogServer},
     database::Database,
     identity::{Grant, Identity},
-    jwt::{JwtError, JwtVerifier, TokenUse, VerifiedJwt},
+    jwt::{JwtError, JwtVerifier, TokenUse, VerifiedJwt, validate_time_restrictions},
+    tokens::{ApiTokenRecord, TokenIdentity, TokenRequest, TokenReservation},
 };
 
 const GLOBAL_ONLY_PERMISSIONS: &[&str] = &[
@@ -38,6 +39,7 @@ pub struct Authorizer {
     database: Database,
     verifier: Option<JwtVerifier>,
     invalidate_sessions_on_password_change: bool,
+    log_token_usage: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +48,9 @@ pub struct Principal {
     pub visibility: TeamVisibility,
     pub(crate) full_name: Option<String>,
     pub(crate) expires_at: Option<i64>,
+    pub(crate) token_use: TokenUse,
+    catalog_token: Option<TokenIdentity>,
+    catalog_scopes: Option<Vec<String>>,
     is_admin: bool,
     scopes: Vec<String>,
 }
@@ -74,7 +79,13 @@ impl Authorizer {
             database,
             verifier,
             invalidate_sessions_on_password_change,
+            log_token_usage: true,
         }
+    }
+
+    pub fn with_token_usage_logging(mut self, enabled: bool) -> Self {
+        self.log_token_usage = enabled;
+        self
     }
 
     pub fn protect_mcp(self: &Arc<Self>, router: Router, require_auth: bool) -> Router {
@@ -162,8 +173,42 @@ impl Authorizer {
             JwtError::TimeRestricted | JwtError::InvalidTimeRestrictions => AuthError::Forbidden,
             _ => AuthError::Invalid,
         })?;
-        let scopes = verify_restrictions(jwt.payload(), peer, server_id)?;
+        let tracked = if jwt.token_use() == TokenUse::Api
+            && let Some(jti) = jwt.jti()
+        {
+            self.database.token_from_jti(jti).await?
+        } else {
+            None
+        };
+        if let Some(token_row) = tracked.as_ref() {
+            if token_row.token_hash != crate::tokens::hash_api_token(token) {
+                return Err(AuthError::Invalid);
+            }
+            if token_row.is_revoked {
+                return Err(AuthError::Revoked);
+            }
+            if !token_row.is_active {
+                return Err(AuthError::Inactive);
+            }
+        }
+        let scopes = verify_restrictions(jwt.payload(), peer, server_id, tracked.is_some())?;
         let identity = self.resolve_identity(&jwt).await?;
+        let (catalog_scopes, catalog_token) = if let Some(row) = tracked {
+            if row.user_email != identity.email {
+                return Err(AuthError::Invalid);
+            }
+            let scopes = managed_token_scopes(&row, peer, server_id)?;
+            (
+                Some(scopes),
+                Some(TokenIdentity {
+                    id: row.id,
+                    jti: row.jti,
+                    user_email: row.user_email,
+                }),
+            )
+        } else {
+            (None, None)
+        };
         let visibility = match jwt.token_use() {
             TokenUse::Api => auth::normalize_api_teams(jwt.payload()),
             TokenUse::Session => {
@@ -194,6 +239,9 @@ impl Authorizer {
             visibility,
             full_name: identity.full_name,
             expires_at: jwt.payload().get("exp").and_then(Value::as_i64),
+            token_use: jwt.token_use(),
+            catalog_token,
+            catalog_scopes,
             is_admin: identity.is_admin,
             scopes,
         })
@@ -237,7 +285,7 @@ impl Authorizer {
         target: RoleContext<'_>,
         allow_admin_bypass: bool,
     ) -> Result<bool, sqlx::Error> {
-        if !auth::token_scope_grants(Some(&principal.scopes), permission) {
+        if !principal.token_allows(permission) {
             return Ok(false);
         }
         if allow_admin_bypass
@@ -295,6 +343,7 @@ fn verify_restrictions(
     payload: &Value,
     peer: Option<IpAddr>,
     server_id: Option<&str>,
+    allow_limits: bool,
 ) -> Result<Vec<String>, AuthError> {
     let scopes = payload.get("scopes").filter(|scope| !scope.is_null());
     let Some(scopes) = scopes else {
@@ -332,7 +381,7 @@ fn verify_restrictions(
     }
     if let Some(limits) = scopes.get("usage_limits").filter(|value| !value.is_null()) {
         let limits = limits.as_object().ok_or(AuthError::Invalid)?;
-        if !limits.is_empty() {
+        if !limits.is_empty() && !allow_limits {
             return Err(AuthError::Forbidden);
         }
     }
@@ -345,11 +394,52 @@ fn verify_restrictions(
     }
 }
 
+fn managed_token_scopes(
+    row: &ApiTokenRecord,
+    peer: Option<IpAddr>,
+    server_id: Option<&str>,
+) -> Result<Vec<String>, AuthError> {
+    let decode = |value: Option<&str>| -> Result<Value, AuthError> {
+        value
+            .map(|value| serde_json::from_str(value).map_err(|_| AuthError::Invalid))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    };
+    let time = decode(row.time_restrictions.as_deref())?;
+    if !time.is_null() {
+        validate_time_restrictions(&time, jiff::Timestamp::now())
+            .map_err(|_| AuthError::Forbidden)?;
+    }
+    let stored = decode(row.resource_scopes.as_deref())?;
+    let mut stored: Vec<String> = if stored.is_null() {
+        Vec::new()
+    } else {
+        serde_json::from_value(stored).map_err(|_| AuthError::Invalid)?
+    };
+    if !stored
+        .iter()
+        .any(|name| matches!(name.as_str(), "*" | "servers.use"))
+        && stored.iter().any(|name| {
+            ["tools.", "resources.", "prompts.", "logging."]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+    {
+        stored.push("servers.use".to_owned());
+    }
+    let persisted = json!({"scopes":{"server_id":row.server_id,"permissions":stored,
+        "ip_restrictions":decode(row.ip_restrictions.as_deref())?}});
+    verify_restrictions(&persisted, peer, server_id, false)
+}
+
 #[derive(Debug)]
 pub(crate) enum AuthError {
     Required,
     ApiRequired,
     Invalid,
+    Revoked,
+    Inactive,
+    UsageLimit(&'static str),
     Forbidden,
     ServerMissing(Option<String>),
     TeamRevoked,
@@ -374,6 +464,9 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid authentication credentials",
             ),
+            Self::Revoked => (StatusCode::UNAUTHORIZED, "Token has been revoked"),
+            Self::Inactive => (StatusCode::UNAUTHORIZED, "Token is inactive or expired"),
+            Self::UsageLimit(reason) => (StatusCode::TOO_MANY_REQUESTS, reason),
             Self::Forbidden => (StatusCode::FORBIDDEN, "Access denied"),
             Self::ServerMissing(None) => (StatusCode::NOT_FOUND, "Server not found"),
             Self::ServerMissing(Some(id)) => {
@@ -413,6 +506,7 @@ impl Principal {
 
     pub(crate) fn token_allows(&self, permission: &str) -> bool {
         auth::token_scope_grants(Some(&self.scopes), permission)
+            && auth::token_scope_grants(self.catalog_scopes.as_deref(), permission)
     }
 
     pub(crate) fn authorization_fingerprint(&self) -> [u8; 32] {
@@ -429,7 +523,16 @@ impl Principal {
         let mut scopes: Vec<_> = self.scopes.iter().collect();
         scopes.sort_unstable();
         scopes.dedup();
-        let data = json!([self.email, self.is_admin, scope, scopes]).to_string();
+        let mut data = json!([self.email, self.is_admin, scope, scopes]);
+        if let Some(catalog_scopes) = self.catalog_scopes.as_ref() {
+            let mut catalog_scopes = catalog_scopes.iter().collect::<Vec<_>>();
+            catalog_scopes.sort_unstable();
+            catalog_scopes.dedup();
+            data.as_array_mut()
+                .expect("authorization fingerprint")
+                .push(json!(catalog_scopes));
+        }
+        let data = data.to_string();
         Sha256::digest(data.as_bytes()).into()
     }
 }
@@ -545,7 +648,7 @@ async fn authorize_mcp(
     if let Some(server) = server {
         request.extensions_mut().insert(server);
     }
-    Ok(next.run(request).await)
+    dispatch_with_usage(&access.auth, request, next).await
 }
 
 #[derive(Deserialize)]
@@ -561,7 +664,59 @@ async fn authorize_api(
     let token = bearer(request.headers())?.ok_or(AuthError::ApiRequired)?;
     let principal = access.authenticate(token, peer(&request), None).await?;
     request.extensions_mut().insert(principal);
-    Ok(next.run(request).await)
+    dispatch_with_usage(&access, request, next).await
+}
+
+async fn dispatch_with_usage(
+    auth: &Authorizer,
+    request: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let started = std::time::Instant::now();
+    let reservation = if let Some(token) = request
+        .extensions()
+        .get::<Principal>()
+        .and_then(|principal| principal.catalog_token.as_ref())
+    {
+        let address = peer(&request).map(|address| address.to_string());
+        let reservation = auth
+            .database
+            .reserve_token_request(
+                token,
+                TokenRequest {
+                    endpoint: request.uri().path(),
+                    method: request.method().as_str(),
+                    peer: address.as_deref(),
+                    agent: request
+                        .headers()
+                        .get(header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok()),
+                },
+                auth.log_token_usage,
+            )
+            .await?;
+        match reservation {
+            TokenReservation::Allowed(record) => record,
+            TokenReservation::Limited(reason) => return Err(AuthError::UsageLimit(reason)),
+            TokenReservation::Inactive => return Err(AuthError::Inactive),
+        }
+    } else {
+        None
+    };
+    let response = next.run(request).await;
+    if let Some(id) = reservation
+        && let Err(error) = auth
+            .database
+            .finish_token_request(
+                id,
+                response.status().as_u16(),
+                started.elapsed().as_millis().min(i32::MAX as u128) as i32,
+            )
+            .await
+    {
+        tracing::warn!(%error,"could not finish API token usage record");
+    }
+    Ok(response)
 }
 
 fn peer(request: &Request) -> Option<IpAddr> {

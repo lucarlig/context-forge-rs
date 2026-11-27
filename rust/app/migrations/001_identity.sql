@@ -96,3 +96,31 @@ CREATE TABLE IF NOT EXISTS token_revocations (
     token_expiry TIMESTAMP WITH TIME ZONE,
     last_activity TIMESTAMP WITH TIME ZONE
 );
+
+CREATE TABLE IF NOT EXISTS email_api_tokens (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    user_email VARCHAR(255) NOT NULL REFERENCES email_users(email) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    jti VARCHAR(36) NOT NULL UNIQUE,
+    token_hash VARCHAR(255) NOT NULL,
+    server_id VARCHAR(36),
+    resource_scopes JSON,
+    ip_restrictions JSON,
+    time_restrictions JSON,
+    usage_limits JSON,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    last_used TIMESTAMP WITH TIME ZONE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    description TEXT,
+    tags JSON,
+    team_id VARCHAR(36) REFERENCES email_teams(id) ON DELETE CASCADE,
+    UNIQUE (user_email,name,team_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_email_api_tokens_user_name_global
+    ON email_api_tokens (user_email,name) WHERE team_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_email_api_tokens_user_active_created
+    ON email_api_tokens (user_email,is_active,created_at);
+CREATE INDEX IF NOT EXISTS idx_email_api_tokens_team_active_created
+    ON email_api_tokens (team_id,is_active,created_at);

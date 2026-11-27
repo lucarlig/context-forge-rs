@@ -59,6 +59,9 @@ impl Database {
             Self::Sqlite(pool) => {
                 let mut transaction = pool.begin().await?;
                 sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
+                sqlx::raw_sql(crate::tokens::SQLITE_USAGE_MIGRATION)
+                    .execute(&mut *transaction)
+                    .await?;
                 transaction.commit().await
             }
             Self::Postgres(pool) => {
@@ -67,6 +70,9 @@ impl Database {
                     .execute(&mut *transaction)
                     .await?;
                 sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
+                sqlx::raw_sql(crate::tokens::POSTGRES_USAGE_MIGRATION)
+                    .execute(&mut *transaction)
+                    .await?;
                 transaction.commit().await
             }
         }

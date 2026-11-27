@@ -7,7 +7,8 @@ use jiff::{
     civil::{Time, Weekday},
 };
 use jsonwebtoken::{
-    Algorithm, AlgorithmFamily, DecodingKey, Validation, decode, errors::ErrorKind,
+    Algorithm, AlgorithmFamily, DecodingKey, EncodingKey, Header, Validation, decode, encode,
+    errors::ErrorKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -110,6 +111,55 @@ pub struct JwtVerifier {
     validation: Validation,
     require_jti: bool,
     environment: Option<String>,
+}
+
+pub struct JwtIssuer {
+    key: EncodingKey,
+    header: Header,
+    issuer: String,
+    audience: String,
+    environment: String,
+}
+
+impl JwtIssuer {
+    pub fn new(
+        algorithm: &str,
+        key: &[u8],
+        issuer: String,
+        audience: String,
+        environment: String,
+        derive_key: bool,
+    ) -> Result<Self, JwtConfigError> {
+        if issuer.is_empty() || audience.is_empty() || environment.is_empty() {
+            return Err(JwtConfigError::EmptySetting);
+        }
+        let algorithm: Algorithm = algorithm.parse().map_err(|_| JwtConfigError::Algorithm)?;
+        let key = match algorithm.family() {
+            AlgorithmFamily::Hmac if key.len() < 32 => return Err(JwtConfigError::WeakKey),
+            AlgorithmFamily::Hmac if derive_key => {
+                EncodingKey::from_secret(&environment_key(key, &environment)?)
+            }
+            AlgorithmFamily::Hmac => EncodingKey::from_secret(key),
+            AlgorithmFamily::Rsa => EncodingKey::from_rsa_pem(key),
+            AlgorithmFamily::Ec => EncodingKey::from_ec_pem(key),
+            AlgorithmFamily::Ed => EncodingKey::from_ed_pem(key),
+        }
+        .map_err(|_| JwtConfigError::Key)?;
+        Ok(Self {
+            key,
+            header: Header::new(algorithm),
+            issuer,
+            audience,
+            environment,
+        })
+    }
+
+    pub(crate) fn sign(&self, mut claims: Value) -> Result<String, jsonwebtoken::errors::Error> {
+        claims["iss"] = self.issuer.as_str().into();
+        claims["aud"] = self.audience.as_str().into();
+        claims["env"] = self.environment.as_str().into();
+        encode(&self.header, &claims, &self.key)
+    }
 }
 
 impl JwtVerifier {
@@ -269,7 +319,10 @@ fn utc() -> &'static str {
     "UTC"
 }
 
-fn validate_time_restrictions(restrictions: &Value, now: Timestamp) -> Result<(), JwtError> {
+pub(crate) fn validate_time_restrictions(
+    restrictions: &Value,
+    now: Timestamp,
+) -> Result<(), JwtError> {
     let restrictions = TimeRestrictions::deserialize(restrictions)
         .map_err(|_| JwtError::InvalidTimeRestrictions)?;
     let start = restrictions.start_time.filter(|time| !time.is_empty());

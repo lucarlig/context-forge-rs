@@ -10,7 +10,7 @@ use crate::{
         CatalogRefresh, GatewayHealth, GatewayLifecycle, GatewayListeners, ListenerElection,
         Pagination, ResourceLimits, RootSettings,
     },
-    jwt::{JwtConfig, JwtVerifier},
+    jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
         SessionSettings, SseBackend, SseSettings, WebSocketSettings,
@@ -236,6 +236,39 @@ impl Settings {
     pub fn auth_encryption_secret() -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
         let secret = value("AUTH_ENCRYPTION_SECRET", "")?;
         Ok((!secret.is_empty()).then_some(secret))
+    }
+
+    pub fn jwt_issuer() -> Result<Option<JwtIssuer>, Box<dyn Error + Send + Sync>> {
+        let algorithm = value("JWT_ALGORITHM", "HS256")?;
+        let key = if matches!(algorithm.as_str(), "HS256" | "HS384" | "HS512") {
+            value("JWT_SECRET_KEY", "")?.into_bytes()
+        } else {
+            let path = value("JWT_PRIVATE_KEY_PATH", "")?;
+            if path.is_empty() {
+                return Ok(None);
+            }
+            std::fs::read(path).map_err(|_| "could not read JWT_PRIVATE_KEY_PATH")?
+        };
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let key = zeroize::Zeroizing::new(key);
+        Ok(Some(JwtIssuer::new(
+            &algorithm,
+            &key,
+            value("JWT_ISSUER", "mcpgateway")?,
+            value("JWT_AUDIENCE", "mcpgateway-api")?,
+            value("ENVIRONMENT", "development")?,
+            flag("DERIVE_KEY_PER_ENVIRONMENT")?.unwrap_or(false),
+        )?))
+    }
+
+    pub fn email_auth_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
+        Ok(flag("EMAIL_AUTH_ENABLED")?.unwrap_or(true))
+    }
+
+    pub fn token_usage_logging() -> Result<bool, Box<dyn Error + Send + Sync>> {
+        Ok(flag("TOKEN_USAGE_LOGGING_ENABLED")?.unwrap_or(true))
     }
 
     pub fn query_auth_hosts() -> Result<Option<HashSet<String>>, Box<dyn Error + Send + Sync>> {

@@ -40,11 +40,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             database.migrate_legacy_sse().await?;
         }
     }
-    let access = Arc::new(Authorizer::new(
-        database.clone(),
-        verifier,
-        Settings::invalidate_sessions_on_password_change()?,
-    ));
+    let access = Arc::new(
+        Authorizer::new(
+            database.clone(),
+            verifier,
+            Settings::invalidate_sessions_on_password_change()?,
+        )
+        .with_token_usage_logging(Settings::token_usage_logging()?),
+    );
     let (management_page_size, management_max_page_size) = Settings::management_page_sizes()?;
     let catalog_refresh = Settings::catalog_refresh()?;
     let health_settings = Settings::gateway_health(&catalog_refresh)?;
@@ -63,6 +66,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_resource_limits(Settings::resource_limits()?)
         .with_max_prompt_bytes(Settings::max_prompt_bytes()?)
         .with_tool_preview(Settings::tool_preview_enabled()?)
+        .with_token_issuer(Settings::email_auth_enabled()?, Settings::jwt_issuer()?)
         .with_virtual_server_base(Settings::virtual_server_base()?)
         .with_server_oauth_metadata(well_known, cache_max_age, allow_oauth_loopback)
         .with_logging_filter(handle)

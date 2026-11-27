@@ -12,6 +12,7 @@ mod resource_api;
 mod roots;
 mod server_api;
 mod tags;
+mod token_api;
 mod tool_api;
 
 use std::{
@@ -92,6 +93,8 @@ pub struct GatewayService {
     roots: roots::RootRegistry,
     max_prompt_bytes: usize,
     tool_preview_enabled: bool,
+    email_auth_enabled: bool,
+    token_issuer: Option<crate::jwt::JwtIssuer>,
     pub(crate) virtual_server_base: String,
     well_known_enabled: bool,
     well_known_max_age: u32,
@@ -174,6 +177,8 @@ impl GatewayService {
             roots: roots::RootRegistry::default(),
             max_prompt_bytes: 10240,
             tool_preview_enabled: true,
+            email_auth_enabled: true,
+            token_issuer: None,
             virtual_server_base: "http://localhost:4444".to_owned(),
             well_known_enabled: true,
             well_known_max_age: 3600,
@@ -238,6 +243,16 @@ impl GatewayService {
 
     pub fn with_tool_preview(mut self, enabled: bool) -> Self {
         self.tool_preview_enabled = enabled;
+        self
+    }
+
+    pub fn with_token_issuer(
+        mut self,
+        enabled: bool,
+        issuer: Option<crate::jwt::JwtIssuer>,
+    ) -> Self {
+        self.email_auth_enabled = enabled;
+        self.token_issuer = issuer;
         self
     }
 
@@ -387,6 +402,9 @@ impl GatewayService {
                     &format!("{route}/{{key}}/toggle"),
                     post(management::set_state),
                 );
+        }
+        if self.email_auth_enabled {
+            router = router.merge(token_api::router());
         }
         self.access.protect_api(
             router
