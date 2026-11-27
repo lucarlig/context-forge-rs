@@ -1063,6 +1063,35 @@ impl UpstreamClient {
         form: &str,
         basic: Option<&HeaderValue>,
     ) -> Result<Zeroizing<String>, UpstreamError> {
+        let (bytes, is_form) = self
+            .oauth_token_response(endpoint, tls, form, basic)
+            .await?;
+        let token = if is_form {
+            url::form_urlencoded::parse(&bytes)
+                .find(|(name, _)| name == "access_token")
+                .map(|(_, value)| value.into_owned())
+        } else {
+            #[derive(Deserialize)]
+            struct TokenResponse {
+                access_token: String,
+            }
+            serde_json::from_slice::<TokenResponse>(&bytes)
+                .ok()
+                .map(|response| response.access_token)
+        };
+        token
+            .filter(|value| !value.is_empty())
+            .map(Zeroizing::new)
+            .ok_or(UpstreamError::InvalidResponse)
+    }
+
+    pub(crate) async fn oauth_token_response(
+        &self,
+        endpoint: &str,
+        tls: Option<&TlsMaterial>,
+        form: &str,
+        basic: Option<&HeaderValue>,
+    ) -> Result<(Zeroizing<Vec<u8>>, bool), UpstreamError> {
         timeout_at(self.deadline()?, async {
             let (client, url) = self.pinned_client(endpoint, tls, None).await?;
             let mut request = client
@@ -1080,24 +1109,8 @@ impl UpstreamClient {
             let is_form = response_media_type(&response).is_some_and(|media| {
                 media.eq_ignore_ascii_case("application/x-www-form-urlencoded")
             });
-            let bytes = read_json_body(response).await?;
-            let token = if is_form {
-                url::form_urlencoded::parse(&bytes)
-                    .find(|(name, _)| name == "access_token")
-                    .map(|(_, value)| value.into_owned())
-            } else {
-                #[derive(Deserialize)]
-                struct TokenResponse {
-                    access_token: String,
-                }
-                serde_json::from_slice::<TokenResponse>(&bytes)
-                    .ok()
-                    .map(|response| response.access_token)
-            };
-            token
-                .filter(|value| !value.is_empty())
-                .map(Zeroizing::new)
-                .ok_or(UpstreamError::InvalidResponse)
+            let bytes = Zeroizing::new(read_json_body(response).await?);
+            Ok((bytes, is_form))
         })
         .await
         .map_err(|_| UpstreamError::Timeout)?

@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_max_prompt_bytes(Settings::max_prompt_bytes()?)
         .with_tool_preview(Settings::tool_preview_enabled()?)
         .with_token_issuer(email_auth_enabled, issuer)
+        .with_gateway_oauth(Settings::gateway_oauth()?)
         .with_virtual_server_base(Settings::virtual_server_base()?)
         .with_server_oauth_metadata(well_known, cache_max_age, allow_oauth_loopback)
         .with_logging_filter(handle)
@@ -116,6 +117,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .merge(transport)
         .merge(management)
         .merge(accounts)
+        .merge(service.gateway_oauth_callback())
         .merge(service.server_oauth_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     let background = catalog_available.then(|| {

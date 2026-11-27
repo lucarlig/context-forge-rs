@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     gateway::{
-        CatalogRefresh, GatewayHealth, GatewayLifecycle, GatewayListeners, ListenerElection,
-        Pagination, ResourceLimits, RootSettings,
+        CatalogRefresh, GatewayHealth, GatewayLifecycle, GatewayListeners, GatewayOAuthSettings,
+        ListenerElection, Pagination, ResourceLimits, RootSettings,
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     local_auth::{
@@ -273,6 +273,41 @@ impl Settings {
 
     pub fn token_usage_logging() -> Result<bool, Box<dyn Error + Send + Sync>> {
         Ok(flag("TOKEN_USAGE_LOGGING_ENABLED")?.unwrap_or(true))
+    }
+
+    pub fn gateway_oauth() -> Result<GatewayOAuthSettings, Box<dyn Error + Send + Sync>> {
+        let base = url::Url::parse(&value("APP_DOMAIN", "http://localhost:4444")?)?;
+        if !matches!(base.scheme(), "http" | "https")
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.query().is_some()
+            || base.fragment().is_some()
+        {
+            return Err("invalid OAuth callback domain".into());
+        }
+        let root = value("APP_ROOT_PATH", "")?;
+        let root = root.trim_matches('/');
+        let app_path = base.path().trim_matches('/');
+        let path = [app_path, root, "oauth/callback"]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        let callback_path = format!("/{path}");
+        let origin = base.origin().ascii_serialization();
+        let refresh_threshold = parse("OAUTH_TOKEN_REFRESH_THRESHOLD_SECONDS", 600)?;
+        if !(0..=3600).contains(&refresh_threshold) {
+            return Err("invalid OAUTH_TOKEN_REFRESH_THRESHOLD_SECONDS".into());
+        }
+        Ok(GatewayOAuthSettings {
+            redirect_uri: format!("{origin}{callback_path}"),
+            callback_path,
+            browser_origin: origin,
+            secure_cookies: flag("SECURE_COOKIES")?.unwrap_or(true)
+                || value("ENVIRONMENT", "development")? == "production",
+            token_retrieval: flag("OAUTH_TOKEN_RETRIEVAL_ENABLED")?.unwrap_or(false),
+            refresh_threshold,
+        })
     }
 
     pub fn local_accounts() -> Result<AccountSettings, Box<dyn Error + Send + Sync>> {

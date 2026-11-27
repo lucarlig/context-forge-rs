@@ -77,6 +77,7 @@ use proxy::DirectTarget;
 pub use health::GatewayHealth;
 pub use lifecycle::GatewayLifecycle;
 pub use listeners::{GatewayListeners, ListenerElection};
+pub use oauth_api::GatewayOAuthSettings;
 pub(crate) use proxy::GATEWAY_ID_HEADER;
 pub use resource_api::ResourceLimits;
 pub use roots::{RootSettings, RootSetupError};
@@ -96,6 +97,7 @@ pub struct GatewayService {
     tool_preview_enabled: bool,
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
+    gateway_oauth: GatewayOAuthSettings,
     pub(crate) virtual_server_base: String,
     well_known_enabled: bool,
     well_known_max_age: u32,
@@ -180,6 +182,7 @@ impl GatewayService {
             tool_preview_enabled: true,
             email_auth_enabled: true,
             token_issuer: None,
+            gateway_oauth: GatewayOAuthSettings::default(),
             virtual_server_base: "http://localhost:4444".to_owned(),
             well_known_enabled: true,
             well_known_max_age: 3600,
@@ -255,6 +258,15 @@ impl GatewayService {
         self.email_auth_enabled = enabled;
         self.token_issuer = issuer;
         self
+    }
+
+    pub fn with_gateway_oauth(mut self, settings: GatewayOAuthSettings) -> Self {
+        self.gateway_oauth = settings;
+        self
+    }
+
+    pub fn gateway_oauth_callback(self: &Arc<Self>) -> Router {
+        oauth_api::callback_router().with_state(self.clone())
     }
 
     pub fn with_virtual_server_base(mut self, base: String) -> Self {
@@ -1201,6 +1213,10 @@ async fn register(
     } else {
         None
     };
+    let oauth_for_user = input
+        .auth
+        .oauth_config()
+        .is_some_and(OAuthConfig::is_authorization_code);
     if let Some(config) = input.auth.oauth_config()
         && let Some(auth) = &mut auth
     {
@@ -1216,7 +1232,7 @@ async fn register(
             .map_err(|_| encryption_error())?;
         auth.encoded_oauth = Some(encoded);
         auth.masked["oauthConfig"] = masked;
-        if lifecycle.is_none() {
+        if lifecycle.is_none() && !oauth_for_user {
             let authorization = config
                 .authorization(&service.upstream, tls.as_ref())
                 .await
@@ -1249,7 +1265,7 @@ async fn register(
         .as_mut()
         .map_or(&mut anonymous_credentials, |auth| &mut auth.credentials);
     discovery_credentials.tls = tls;
-    let (discovery, metadata) = if lifecycle.is_some() {
+    let (discovery, metadata) = if lifecycle.is_some() || oauth_for_user {
         (
             DiscoveredCatalog {
                 capabilities: json!({}),

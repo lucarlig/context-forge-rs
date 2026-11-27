@@ -615,6 +615,7 @@ dependencies = [
  "sha2 0.11.2",
  "shell-words",
  "sqlx",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-tungstenite",

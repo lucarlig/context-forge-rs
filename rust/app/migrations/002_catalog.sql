@@ -275,3 +275,20 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_app_user_email ON oauth_tokens(app_user_email);
+
+CREATE TABLE IF NOT EXISTS oauth_states (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    gateway_id VARCHAR(36) NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
+    state VARCHAR(500) NOT NULL UNIQUE,
+    code_verifier VARCHAR(128),
+    app_user_email VARCHAR(255),
+    redirect_uri VARCHAR(2048),
+    team_id VARCHAR(255),
+    browser_binding_hash VARCHAR(64),
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    used BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_state_lookup ON oauth_states(gateway_id,state);
+CREATE INDEX IF NOT EXISTS idx_oauth_states_expiry ON oauth_states(expires_at);

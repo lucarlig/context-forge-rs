@@ -53,6 +53,7 @@ unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1.9"
 lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
+subtle = { version = "2.6", default-features = false }
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod flow;
 mod storage;
 
 use std::collections::BTreeSet;
@@ -12,10 +13,38 @@ use super::{catalog_api::CatalogApiError, *};
 
 const MAX_STATUS_GATEWAYS: usize = 100;
 
+pub struct GatewayOAuthSettings {
+    pub(crate) redirect_uri: String,
+    pub(crate) callback_path: String,
+    pub(crate) browser_origin: String,
+    pub(crate) secure_cookies: bool,
+    pub(crate) token_retrieval: bool,
+    pub(crate) refresh_threshold: i64,
+}
+
+impl Default for GatewayOAuthSettings {
+    fn default() -> Self {
+        Self {
+            redirect_uri: "http://localhost:4444/oauth/callback".to_owned(),
+            callback_path: "/oauth/callback".to_owned(),
+            browser_origin: "http://localhost:4444".to_owned(),
+            secure_cookies: true,
+            token_retrieval: false,
+            refresh_threshold: 600,
+        }
+    }
+}
+
 pub(super) fn router() -> Router<Arc<GatewayService>> {
     Router::new()
         .route("/oauth/status", get(status_batch))
         .route("/oauth/status/{id}", get(status))
+        .route("/oauth/authorize/{id}", get(flow::authorize))
+        .route("/oauth/token/{id}", get(flow::token))
+}
+
+pub(super) fn callback_router() -> Router<Arc<GatewayService>> {
+    Router::new().route("/oauth/callback", get(flow::callback))
 }
 
 async fn status(

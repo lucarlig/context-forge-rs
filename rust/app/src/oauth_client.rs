@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod authorization_code;
+
 use std::time::Duration;
 
 use axum::http::HeaderValue;
@@ -16,6 +18,7 @@ use crate::{
     upstream::{UpstreamClient, UpstreamError},
     upstream_tls::TlsMaterial,
 };
+pub(crate) use authorization_code::UserOAuthTokens;
 
 const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -28,6 +31,7 @@ const ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-be
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OAuthConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     token_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     grant_type: Option<String>,
@@ -49,6 +53,16 @@ pub(crate) struct OAuthConfig {
     audience: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resource: Option<OAuthValues>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redirect_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registration_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_response_iss_parameter_supported: Option<bool>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -74,6 +88,10 @@ impl Drop for OAuthConfig {
 }
 
 impl OAuthConfig {
+    pub(crate) fn is_authorization_code(&self) -> bool {
+        self.grant_type.as_deref() == Some("authorization_code")
+    }
+
     pub(crate) fn resolve_masks(&mut self, stored: Option<&Self>) -> Result<(), EnvelopeError> {
         let keep_secret = self.client_secret.as_deref() == Some(MASKED);
         let keep_key = self.private_key.as_deref() == Some(MASKED);
@@ -82,7 +100,11 @@ impl OAuthConfig {
         }
         let stored = stored.ok_or(EnvelopeError)?;
         let origin = |url| url::Url::parse(url).ok().map(|url| url.origin());
-        if origin(&self.token_url) != origin(&stored.token_url) {
+        if origin(&self.token_url) != origin(&stored.token_url)
+            || self.is_authorization_code()
+                && self.issuer.as_deref().and_then(origin)
+                    != stored.issuer.as_deref().and_then(origin)
+        {
             return Err(EnvelopeError);
         }
         if keep_secret {
@@ -134,11 +156,27 @@ impl OAuthConfig {
         let Some(method) = self.client_auth() else {
             return false;
         };
-        self.grant_type
-            .as_deref()
-            .is_none_or(|grant| grant == "client_credentials")
-            && (method == ClientAuth::None
-                || self.client_id.as_ref().is_some_and(|id| !id.is_empty()))
+        let client = self.client_id.as_ref().is_some_and(|id| !id.is_empty());
+        let issuer = self
+            .issuer
+            .as_ref()
+            .is_some_and(|issuer| !issuer.is_empty());
+        let endpoints = if self.is_authorization_code() {
+            (client || issuer)
+                && (issuer
+                    || (!self.token_url.is_empty()
+                        && self
+                            .authorization_url
+                            .as_ref()
+                            .is_some_and(|url| !url.is_empty())))
+        } else {
+            self.grant_type
+                .as_deref()
+                .is_none_or(|grant| grant == "client_credentials")
+                && (method == ClientAuth::None || client)
+                && !self.token_url.is_empty()
+        };
+        endpoints
             && self.client_secret.as_deref() != Some(MASKED)
             && self.private_key.as_deref() != Some(MASKED)
             && (method != ClientAuth::PrivateKeyJwt
@@ -150,7 +188,6 @@ impl OAuthConfig {
                 .private_key_jwt_kid
                 .as_ref()
                 .is_none_or(|kid| !kid.trim().is_empty())
-            && !self.token_url.is_empty()
             && self.audience.as_ref().is_none_or(|audience| {
                 let audience = audience.trim();
                 audience.is_empty()
@@ -201,6 +238,9 @@ impl OAuthConfig {
         upstream: &UpstreamClient,
         tls: Option<&TlsMaterial>,
     ) -> Result<HeaderValue, UpstreamError> {
+        if self.is_authorization_code() {
+            return Err(UpstreamError::InvalidCredentials);
+        }
         let method = self
             .client_auth()
             .ok_or(UpstreamError::InvalidCredentials)?;
@@ -247,8 +287,19 @@ impl OAuthConfig {
         method: ClientAuth,
         assertion: Option<&ClientAssertionSigner>,
     ) -> Result<(Zeroizing<String>, Option<HeaderValue>), UpstreamError> {
+        self.token_form("client_credentials", &[], method, assertion)
+    }
+
+    fn token_form(
+        &self,
+        grant: &str,
+        fields: &[(&str, &str)],
+        method: ClientAuth,
+        assertion: Option<&ClientAssertionSigner>,
+    ) -> Result<(Zeroizing<String>, Option<HeaderValue>), UpstreamError> {
         let mut form = Serializer::new(String::new());
-        form.append_pair("grant_type", "client_credentials");
+        form.append_pair("grant_type", grant);
+        form.extend_pairs(fields.iter().copied());
         let mut basic = None;
         let id = self.client_id.as_deref().filter(|id| !id.is_empty());
         let secret = self
@@ -293,7 +344,9 @@ impl OAuthConfig {
                 }
             }
         }
-        if let Some(scopes) = &self.scopes {
+        if grant == "client_credentials"
+            && let Some(scopes) = &self.scopes
+        {
             let scope = match scopes {
                 OAuthValues::One(value) => value.clone(),
                 OAuthValues::Many(values) => values.join(" "),
