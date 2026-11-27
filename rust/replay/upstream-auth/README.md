@@ -16,6 +16,8 @@ One-time registration credentials apply during discovery. Later calls can supply
 
 Gateway registration accepts a private CA and an optional client certificate and key for HTTPS upstreams. The private key is encrypted in the database and masked in API responses. [TLS and mutual TLS recordings](tls/README.md)
 
+AWS SigV4 gateway registration encrypts the secret access key and temporary session token. The gateway signs the bytes it sends during discovery and invocation. [SigV4 recordings](sigv4/README.md)
+
 For replay, register four public Streamable HTTP servers named `basic`, `bearer`, `headers`, and `query` in the fixture database. Each exposes an `echo` tool and prefixes its result with the gateway name. Use synthetic credentials that the upstream fixture requires and that the gateway stores using the configured encryption secret.
 
 ```sh

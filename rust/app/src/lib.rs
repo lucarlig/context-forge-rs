@@ -26,6 +26,7 @@ mod redis_sessions;
 mod resource_relay;
 mod secret_envelope;
 mod sessions;
+mod sigv4;
 mod subscriptions;
 pub mod upstream;
 mod upstream_tls;

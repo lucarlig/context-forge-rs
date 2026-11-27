@@ -16,7 +16,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::upstream_tls::TlsMaterial;
+use crate::{
+    sigv4::{SigV4, SigV4Config},
+    upstream_tls::TlsMaterial,
+};
 
 pub(crate) struct CredentialCipher {
     key: LessSafeKey,
@@ -83,6 +86,7 @@ pub(crate) struct UpstreamCredentials {
     pub(crate) identity_meta: Option<Value>,
     pub(crate) request_bound_header: Option<HeaderName>,
     pub(crate) tls: Option<TlsMaterial>,
+    pub(crate) sigv4: Option<std::sync::Arc<SigV4>>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +109,8 @@ pub(crate) struct AuthInput {
     auth_query_param_key: Option<String>,
     #[serde(alias = "authQueryParamValue")]
     auth_query_param_value: Option<String>,
+    #[serde(alias = "sigv4Config")]
+    sigv4_config: Option<SigV4Config>,
 }
 
 #[derive(Deserialize)]
@@ -117,6 +123,7 @@ pub(crate) struct PreparedAuth<'a> {
     pub(crate) kind: &'static str,
     pub(crate) encoded_headers: Option<String>,
     pub(crate) encoded_query: Option<String>,
+    pub(crate) encoded_sigv4: Option<String>,
     pub(crate) credentials: UpstreamCredentials,
     pub(crate) masked: Value,
     cipher: &'a CredentialCipher,
@@ -155,9 +162,32 @@ impl AuthInput {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
+        if self.sigv4_config.is_some() && kind != "sigv4" {
+            return Err(AuthError::Invalid);
+        }
         let mut masked = json!({"authType": kind, "authValue": "*****"});
         let (kind, values) = match kind.as_str() {
             "" | "none" | "one_time_auth" => return Ok(None),
+            "sigv4" => {
+                let config = self.sigv4_config.as_ref().ok_or(AuthError::Invalid)?;
+                if !config.valid() {
+                    return Err(AuthError::Invalid);
+                }
+                let cipher = cipher.ok_or(CredentialError)?;
+                let (signer, encoded, masked) = config.prepare(cipher)?;
+                return Ok(Some(PreparedAuth {
+                    kind: "sigv4",
+                    encoded_headers: None,
+                    encoded_query: None,
+                    encoded_sigv4: Some(encoded),
+                    credentials: UpstreamCredentials {
+                        sigv4: Some(signer),
+                        ..UpstreamCredentials::default()
+                    },
+                    masked: json!({"authType": "sigv4", "sigv4Config": masked}),
+                    cipher,
+                }));
+            }
             "query_param" => {
                 validate_query_host(query_hosts, url)?;
                 let key = required(self.auth_query_param_key.as_deref())?;
@@ -174,6 +204,7 @@ impl AuthInput {
                     encoded_query: Some(
                         serde_json::to_string(&encoded).map_err(|_| CredentialError)?,
                     ),
+                    encoded_sigv4: None,
                     credentials: UpstreamCredentials {
                         query,
                         ..UpstreamCredentials::default()
@@ -244,6 +275,7 @@ impl AuthInput {
             kind,
             encoded_headers: Some(json!(encoded).to_string()),
             encoded_query: None,
+            encoded_sigv4: None,
             credentials: UpstreamCredentials {
                 headers,
                 ..UpstreamCredentials::default()
@@ -255,7 +287,15 @@ impl AuthInput {
 }
 
 impl PreparedAuth<'_> {
-    pub(crate) fn matches_stored(&self, headers: Option<&str>, query: Option<&str>) -> bool {
+    pub(crate) fn matches_stored(
+        &self,
+        headers: Option<&str>,
+        query: Option<&str>,
+        sigv4: Option<&str>,
+    ) -> bool {
+        if let Some(signer) = &self.credentials.sigv4 {
+            return sigv4.is_some_and(|stored| signer.matches_stored(stored));
+        }
         if self.kind == "query_param" {
             return query.is_some_and(|stored| {
                 decode_query(Some(self.cipher), stored)
@@ -432,7 +472,7 @@ mod tests {
         assert!(auth.encoded_headers.is_none());
         let stored = auth.encoded_query.as_deref().unwrap();
         assert!(!stored.contains("synthetic value"));
-        assert!(auth.matches_stored(None, Some(stored)));
+        assert!(auth.matches_stored(None, Some(stored), None));
         assert_eq!(
             decode_query(Some(&cipher), stored).unwrap(),
             auth.credentials.query

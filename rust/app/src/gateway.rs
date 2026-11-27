@@ -45,6 +45,7 @@ use crate::{
     proxy_catalog_cache::ProxyCatalogCache,
     secret_envelope::SecretEnvelope,
     sessions::Session,
+    sigv4::SigV4Config,
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
     upstream::{ToolContext, UpstreamClient, UpstreamEndpoint, UpstreamError, UpstreamTransport},
     upstream_tls::TlsMaterial,
@@ -520,29 +521,30 @@ impl GatewayService {
         if !needs_upstream_config && incoming.is_none() && !self.identity_forwarding.enabled {
             return Ok(None);
         }
-        let (
-            kind,
-            stored_headers,
-            stored_query,
-            passthrough,
-            identity,
-            ca,
-            client_cert,
-            client_key,
-        ) = self
+        let connection = self
             .database
             .gateway_connection(id, url)
             .await?
             .ok_or(ToolError::Unavailable)?;
+        let kind = connection.kind.as_str();
         let cipher = self.credential_cipher.as_ref();
-        let mut credentials = if matches!(kind.as_str(), "" | "none" | "one_time_auth") {
+        let mut credentials = if matches!(kind, "" | "none" | "one_time_auth") {
             Ok(UpstreamCredentials::default())
+        } else if kind == "sigv4" {
+            SigV4Config::load(
+                cipher.ok_or(ToolError::Unavailable)?,
+                connection.sigv4.as_deref().ok_or(ToolError::Unavailable)?,
+            )
+            .map(|sigv4| UpstreamCredentials {
+                sigv4: Some(sigv4),
+                ..UpstreamCredentials::default()
+            })
         } else if kind == "query_param" {
             validate_query_host(self.query_auth_hosts.as_ref(), url)
                 .map_err(|_| ToolError::Unavailable)?;
             decode_query(
                 cipher,
-                stored_query.as_deref().ok_or(ToolError::Unavailable)?,
+                connection.query.as_deref().ok_or(ToolError::Unavailable)?,
             )
             .map(|query| UpstreamCredentials {
                 query,
@@ -551,7 +553,10 @@ impl GatewayService {
         } else {
             decode_headers(
                 cipher,
-                stored_headers.as_deref().ok_or(ToolError::Unavailable)?,
+                connection
+                    .headers
+                    .as_deref()
+                    .ok_or(ToolError::Unavailable)?,
             )
             .map(|headers| UpstreamCredentials {
                 headers,
@@ -562,7 +567,7 @@ impl GatewayService {
             tracing::warn!(gateway = %id, "could not load upstream authentication");
             ToolError::Unavailable
         })?;
-        let client_key = match client_key.filter(|key| !key.trim().is_empty()) {
+        let client_key = match connection.client_key.filter(|key| !key.trim().is_empty()) {
             Some(key) if key.trim_start().starts_with("-----BEGIN ") => Some(Zeroizing::new(key)),
             Some(key) => Some(
                 self.vault
@@ -575,8 +580,9 @@ impl GatewayService {
             None => None,
         };
         credentials.tls = TlsMaterial::from_pem(
-            ca.as_deref(),
-            client_cert
+            connection.ca_certificate.as_deref(),
+            connection
+                .client_cert
                 .as_deref()
                 .filter(|cert| !cert.trim().is_empty()),
             client_key.as_ref().map(|key| key.as_str()),
@@ -586,25 +592,31 @@ impl GatewayService {
             ToolError::Unavailable
         })?;
         if let Some(incoming) = incoming {
-            let managed = matches!(kind.as_str(), "basic" | "bearer" | "authheaders");
+            let managed = matches!(kind, "basic" | "bearer" | "authheaders" | "sigv4");
             self.header_forwarding
                 .apply(
                     &self.database,
                     &mut credentials.headers,
                     incoming,
-                    passthrough.as_deref(),
+                    connection.passthrough.as_deref(),
                     managed,
                 )
                 .await?;
         }
         self.identity_forwarding
-            .apply(&mut credentials, principal, id, identity.as_deref())
+            .apply(
+                &mut credentials,
+                principal,
+                id,
+                connection.identity.as_deref(),
+            )
             .map_err(|error| {
                 tracing::warn!(gateway = %id, %error, "could not propagate upstream identity");
                 ToolError::Unavailable
             })?;
         Ok((!credentials.headers.is_empty()
             || !credentials.query.is_empty()
+            || credentials.sigv4.is_some()
             || credentials.tls.is_some()
             || credentials.identity_meta.is_some())
         .then_some(credentials))
@@ -959,6 +971,12 @@ async fn register(
         .map_err(|error| {
             tracing::warn!(%error, "upstream gateway discovery failed");
             match error {
+                UpstreamError::Status(401 | 403) if discovery_credentials.sigv4.is_some() => {
+                    RegistrationResponse::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "Upstream rejected the SigV4 credentials",
+                    )
+                }
                 UpstreamError::InvalidUrl | UpstreamError::BlockedDestination => {
                     RegistrationResponse::new(
                         StatusCode::BAD_REQUEST,

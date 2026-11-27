@@ -47,6 +47,7 @@ use crate::{
     credentials::{QueryValues, UpstreamCredentials},
     events::PassiveEvents,
     sessions::SessionLifetime,
+    sigv4::SigV4,
     upstream_tls,
 };
 
@@ -357,6 +358,7 @@ impl<'a> UpstreamEndpoint<'a> {
         let credentials = self.credentials.filter(|credentials| {
             !credentials.headers.is_empty()
                 || !credentials.query.is_empty()
+                || credentials.sigv4.is_some()
                 || credentials.tls.is_some()
         })?;
         let mut entries: Vec<_> = credentials.headers.iter().collect();
@@ -391,7 +393,12 @@ impl<'a> UpstreamEndpoint<'a> {
             hash_field(&mut hash, value.as_bytes());
         }
         if let Some(tls) = &credentials.tls {
+            hash_field(&mut hash, b"tls");
             hash_field(&mut hash, &tls.fingerprint());
+        }
+        if let Some(signer) = &credentials.sigv4 {
+            hash_field(&mut hash, b"sigv4");
+            hash_field(&mut hash, &signer.fingerprint());
         }
         Some(hash.finalize().into())
     }
@@ -894,7 +901,15 @@ impl UpstreamClient {
             .tls_backend_preconfigured(
                 upstream_tls::client_config(tls).map_err(|_| UpstreamError::Transport)?,
             );
-        if let Some(credentials) = endpoint.credentials {
+        let sigv4 = endpoint.credentials.and_then(|credentials| {
+            credentials.sigv4.as_ref().map(|signer| RequestSigning {
+                signer: signer.clone(),
+                headers: credentials.headers.clone(),
+            })
+        });
+        if let Some(credentials) = endpoint.credentials
+            && sigv4.is_none()
+        {
             builder = builder.default_headers(credentials.headers.clone());
         }
         if let Some(domain) = url.domain() {
@@ -917,6 +932,7 @@ impl UpstreamClient {
             query: endpoint
                 .credentials
                 .map_or_else(QueryValues::new, |credentials| credentials.query.clone()),
+            sigv4,
             next_id: AtomicI64::new(1),
         })
     }
@@ -958,12 +974,18 @@ struct Session {
     session_id: Option<HeaderValue>,
     sse: Option<Mutex<Option<SseStream>>>,
     query: QueryValues,
+    sigv4: Option<RequestSigning>,
     next_id: AtomicI64,
+}
+
+struct RequestSigning {
+    signer: Arc<SigV4>,
+    headers: HeaderMap,
 }
 
 impl Session {
     async fn open_sse(&mut self) -> Result<(), UpstreamError> {
-        let response = self.request_builder(Method::GET, None).send().await?;
+        let response = self.send(self.request_builder(Method::GET, None)).await?;
         if !response.status().is_success() {
             return Err(http_error(response).await);
         }
@@ -1336,10 +1358,8 @@ impl Session {
                 request = request.header(NAME_HEADER, scoped_name_header(name)?);
             }
         }
-        let response = request
-            .header(CONTENT_TYPE, "application/json")
-            .body(bytes)
-            .send()
+        let response = self
+            .send(request.header(CONTENT_TYPE, "application/json").body(bytes))
             .await?;
         if response.status().is_success() {
             Ok(response)
@@ -1351,6 +1371,29 @@ impl Session {
         } else {
             Err(http_error(response).await)
         }
+    }
+
+    async fn send(&self, builder: reqwest::RequestBuilder) -> Result<Response, UpstreamError> {
+        let Some(signing) = &self.sigv4 else {
+            return Ok(builder.send().await?);
+        };
+        let mut request = builder.build()?;
+        for name in signing.headers.keys() {
+            if !request.headers().contains_key(name) {
+                for value in signing.headers.get_all(name) {
+                    request.headers_mut().append(name, value.clone());
+                }
+            }
+        }
+        signing
+            .signer
+            .sign(&mut request)
+            .map_err(|_| UpstreamError::Transport)?;
+        let response = self.client.execute(request).await?;
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err(UpstreamError::Status(response.status().as_u16()));
+        }
+        Ok(response)
     }
 
     async fn cancel(&self, id: i64) {
@@ -1376,7 +1419,7 @@ impl Session {
         }
         if self.session_id.is_some() {
             let request = self.request_builder(Method::DELETE, self.protocol_version.as_ref());
-            let _ = timeout(TERMINATION_TIMEOUT, request.send()).await;
+            let _ = timeout(TERMINATION_TIMEOUT, self.send(request)).await;
         }
     }
 
@@ -1442,7 +1485,7 @@ impl Session {
         if let Some(id) = cursor {
             request = request.header("last-event-id", id.clone());
         }
-        let mut response = timeout(CONNECT_TIMEOUT, request.send())
+        let mut response = timeout(CONNECT_TIMEOUT, self.send(request))
             .await
             .map_err(|_| UpstreamError::Timeout)??;
         if !response.status().is_success() {
