@@ -69,6 +69,9 @@ async fn forward(
     );
     headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
     uaid::stamp(headers, hops);
+    if let Some(id) = crate::http_boundary::CorrelationId::current() {
+        id.write_header(headers);
+    }
     if app.uaid.forward_auth
         && let Some(token) = principal
             .verified_bearer(incoming)

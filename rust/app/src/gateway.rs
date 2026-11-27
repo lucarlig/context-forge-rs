@@ -830,7 +830,7 @@ impl GatewayService {
             .transport
             .filter(|_| gateway.available)
             .ok_or(ToolError::Unavailable)?;
-        let credentials = match self
+        let mut credentials = match self
             .configured_upstream(
                 &gateway.id,
                 &gateway.url,
@@ -862,16 +862,30 @@ impl GatewayService {
             }
             Err(error) => return Err(error),
         };
+        let association = downstream.and_then(|session| {
+            let authorization = principal.map(Principal::authorization_fingerprint);
+            context.notifications = session.passive_journal(authorization);
+            session.upstream(
+                &gateway.id,
+                UpstreamEndpoint {
+                    url: &gateway.url,
+                    transport,
+                    credentials: credentials.as_ref(),
+                },
+                authorization,
+            )
+        });
+        if association.is_none()
+            && direct_timeout.is_none()
+            && let Some(id) = crate::http_boundary::CorrelationId::current()
+        {
+            id.write_header(&mut credentials.get_or_insert_default().headers);
+        }
         let endpoint = UpstreamEndpoint {
             url: &gateway.url,
             transport,
             credentials: credentials.as_ref(),
         };
-        let association = downstream.and_then(|session| {
-            let authorization = principal.map(Principal::authorization_fingerprint);
-            context.notifications = session.passive_journal(authorization);
-            session.upstream(&gateway.id, endpoint, authorization)
-        });
         let legacy_caller = context.client_capabilities.is_none();
         let cancellation = context.cancellation;
         let client = direct_timeout.map(|timeout| self.upstream.with_timeout_cap(timeout));

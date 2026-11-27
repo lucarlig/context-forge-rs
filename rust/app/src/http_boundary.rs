@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{error::Error, pin::pin};
+use std::{error::Error, future::Future, pin::pin};
 
 use axum::{
     Extension, Json, Router,
@@ -206,7 +206,35 @@ struct Correlation {
     respond: bool,
 }
 
-async fn correlate(State(settings): State<Correlation>, request: Request, next: Next) -> Response {
+#[derive(Clone)]
+pub(crate) struct CorrelationId(HeaderValue);
+
+tokio::task_local! {
+    static REQUEST_ID: Option<CorrelationId>;
+}
+
+impl CorrelationId {
+    pub(crate) fn current() -> Option<Self> {
+        REQUEST_ID.try_with(Clone::clone).ok().flatten()
+    }
+
+    pub(crate) fn write_header(self, headers: &mut HeaderMap) {
+        headers.insert("x-correlation-id", self.0);
+    }
+}
+
+pub(crate) fn with_correlation<T>(
+    id: Option<CorrelationId>,
+    operation: impl Future<Output = T>,
+) -> impl Future<Output = T> {
+    REQUEST_ID.scope(id, operation)
+}
+
+async fn correlate(
+    State(settings): State<Correlation>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let incoming = request
         .headers()
         .get(&settings.name)
@@ -217,8 +245,11 @@ async fn correlate(State(settings): State<Correlation>, request: Request, next: 
     let id = incoming.unwrap_or_else(|| {
         HeaderValue::from_str(&Uuid::new_v4().simple().to_string()).expect("UUID is ASCII")
     });
+    let correlation = CorrelationId(id.clone());
+    request.extensions_mut().insert(correlation.clone());
     let span = tracing::info_span!("request", request_id = ?id, method = %request.method());
-    let mut response = next.run(request).instrument(span).await;
+    let mut response =
+        with_correlation(Some(correlation), next.run(request).instrument(span)).await;
     if settings.respond {
         response.headers_mut().insert(settings.name, id);
     }

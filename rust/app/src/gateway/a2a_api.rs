@@ -681,6 +681,9 @@ async fn invoke(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    if let Some(id) = crate::http_boundary::CorrelationId::current() {
+        id.write_header(&mut headers);
+    }
     uaid::stamp(&mut headers, hops);
     let payload = if jsonrpc {
         headers.insert(

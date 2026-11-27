@@ -107,7 +107,13 @@ The HTTP/1 listener uses the configured count to size the parser. At
 `MAX_HEADER_COUNT=120`, the live replay accepts 120 fields and returns a JSON
 431 at 121. The transport retains its own bounds for larger requests.
 An authenticated WebSocket upgrade and ping pass on both gateways.
-Outbound correlation ID propagation remains open.
+
+Eleven outbound Rust Anything cases match the pinned gateway for legacy and
+modern Streamable HTTP tool calls, A2A invocations, MCP-generated A2A tools,
+and UAID peers. The active ID uses the standard `X-Correlation-ID` outbound
+header even when the client-facing header name changes. Pooled MCP sessions
+keep per-request IDs out of connection headers. Correlation for calls relayed
+over the legacy SSE and WebSocket entry points remains open.
 
 ## Gateway and protocol verification
 

@@ -44,6 +44,7 @@ use crate::{
     access::Principal,
     catalog::{CatalogList, CatalogServer, ToolDefinition},
     gateway::{GatewayService, ToolError},
+    http_boundary::{CorrelationId, with_correlation},
     mcp::{
         JSON_MEDIA_TYPE, MAX_REQUEST_BODY_BYTES, ROOT_INSTRUCTIONS, accepts_event_stream,
         accepts_json, accepts_post_stream, catalog_event_capabilities, rpc_error,
@@ -523,7 +524,9 @@ impl ServerHandler for GatewayHandler {
             },
             None,
         );
-        let mut result = match with_progress(invocation, updates, &context).await {
+        let correlation = parts.extensions.get::<CorrelationId>().cloned();
+        let invocation = Box::pin(with_progress(invocation, updates, &context));
+        let mut result = match with_correlation(correlation, invocation).await {
             Ok(value) if value["resultType"] == "input_required" => {
                 let mut result: InputRequiredResult = serde_json::from_value(value)
                     .map_err(|_| ErrorData::internal_error("Invalid upstream tool result", None))?;
