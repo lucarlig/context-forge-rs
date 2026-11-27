@@ -23,7 +23,7 @@ use crate::{
     database::Database,
     identity::{Grant, Identity},
     jwt::{JwtError, JwtVerifier, TokenUse, VerifiedJwt, validate_time_restrictions},
-    tokens::{ApiTokenRecord, TokenIdentity, TokenRequest, TokenReservation},
+    tokens::{ApiTokenRecord, TokenIdentity, TokenRequest, TokenReservation, TokenUsageRecord},
 };
 
 const GLOBAL_ONLY_PERMISSIONS: &[&str] = &[
@@ -86,6 +86,45 @@ impl Authorizer {
     pub fn with_token_usage_logging(mut self, enabled: bool) -> Self {
         self.log_token_usage = enabled;
         self
+    }
+
+    pub(crate) async fn reserve_usage(
+        &self,
+        principal: Option<&Principal>,
+        request: TokenRequest<'_>,
+    ) -> Result<Option<TokenUsageRecord>, AuthError> {
+        let Some(token) = principal.and_then(|principal| principal.catalog_token.as_ref()) else {
+            return Ok(None);
+        };
+        match self
+            .database
+            .reserve_token_request(token, request, self.log_token_usage)
+            .await?
+        {
+            TokenReservation::Allowed(record) => Ok(record),
+            TokenReservation::Limited(reason) => Err(AuthError::UsageLimit(reason)),
+            TokenReservation::Inactive => Err(AuthError::Inactive),
+        }
+    }
+
+    pub(crate) async fn finish_usage(
+        &self,
+        record: Option<TokenUsageRecord>,
+        status: StatusCode,
+        started: std::time::Instant,
+    ) {
+        if let Some(record) = record
+            && let Err(error) = self
+                .database
+                .finish_token_request(
+                    record,
+                    status.as_u16(),
+                    started.elapsed().as_millis().min(i32::MAX as u128) as i32,
+                )
+                .await
+        {
+            tracing::warn!(%error,"could not finish API token usage record");
+        }
     }
 
     pub fn protect_mcp(self: &Arc<Self>, router: Router, require_auth: bool) -> Router {
@@ -673,49 +712,24 @@ async fn dispatch_with_usage(
     next: Next,
 ) -> Result<Response, AuthError> {
     let started = std::time::Instant::now();
-    let reservation = if let Some(token) = request
-        .extensions()
-        .get::<Principal>()
-        .and_then(|principal| principal.catalog_token.as_ref())
-    {
-        let address = peer(&request).map(|address| address.to_string());
-        let reservation = auth
-            .database
-            .reserve_token_request(
-                token,
-                TokenRequest {
-                    endpoint: request.uri().path(),
-                    method: request.method().as_str(),
-                    peer: address.as_deref(),
-                    agent: request
-                        .headers()
-                        .get(header::USER_AGENT)
-                        .and_then(|value| value.to_str().ok()),
-                },
-                auth.log_token_usage,
-            )
-            .await?;
-        match reservation {
-            TokenReservation::Allowed(record) => record,
-            TokenReservation::Limited(reason) => return Err(AuthError::UsageLimit(reason)),
-            TokenReservation::Inactive => return Err(AuthError::Inactive),
-        }
-    } else {
-        None
-    };
+    let address = peer(&request).map(|address| address.to_string());
+    let reservation = auth
+        .reserve_usage(
+            request.extensions().get::<Principal>(),
+            TokenRequest {
+                endpoint: request.uri().path(),
+                method: request.method().as_str(),
+                peer: address.as_deref(),
+                agent: request
+                    .headers()
+                    .get(header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok()),
+            },
+        )
+        .await?;
     let response = next.run(request).await;
-    if let Some(id) = reservation
-        && let Err(error) = auth
-            .database
-            .finish_token_request(
-                id,
-                response.status().as_u16(),
-                started.elapsed().as_millis().min(i32::MAX as u128) as i32,
-            )
-            .await
-    {
-        tracing::warn!(%error,"could not finish API token usage record");
-    }
+    auth.finish_usage(reservation, response.status(), started)
+        .await;
     Ok(response)
 }
 

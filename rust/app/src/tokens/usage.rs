@@ -132,8 +132,8 @@ impl Database {
                     let endpoint:String=request.endpoint.chars().take(255).collect();
                     let method:String=request.method.chars().take(10).collect();
                     let id=sqlx::query_scalar::<_,i64>("INSERT INTO token_usage_logs
-                        (token_jti,user_email,endpoint,method,ip_address,user_agent,blocked,block_reason,status_code)
-                        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING CAST(id AS BIGINT)")
+                        (token_jti,user_email,endpoint,method,ip_address,user_agent,blocked,block_reason,status_code,timestamp)
+                        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_TIMESTAMP) RETURNING CAST(id AS BIGINT)")
                         .bind(&token.jti).bind(&token.user_email).bind(endpoint).bind(method)
                         .bind(request.peer).bind(request.agent).bind(limited.is_some()).bind(limited)
                         .bind(limited.map(|_|429_i32)).fetch_one(&mut *$tx).await?;

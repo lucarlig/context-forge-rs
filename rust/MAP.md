@@ -19,7 +19,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Authenticated MCP upstreams, identity forwarding, and direct proxy mode
 - [x] Gateway update, delete, refresh, health lifecycle, and full catalog APIs
 - [x] Virtual-server management and OAuth resource metadata
-- [ ] API token issuance, usage limits, and lifecycle
+- [x] API token issuance, usage limits, and lifecycle
 - [ ] User, team, role, and local login management
 - [ ] OAuth, SSO, dynamic registration, and external identities
 - [ ] Encrypted credential storage and rotation

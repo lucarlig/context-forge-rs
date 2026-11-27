@@ -24,6 +24,7 @@ use crate::{
     access,
     gateway::GatewayService,
     mcp::{MAX_REQUEST_BODY_BYTES, legacy_transport_reply},
+    tokens::TokenRequest,
 };
 
 pub struct WebSocketSettings {
@@ -154,13 +155,11 @@ async fn respond(
         .entry("id")
         .or_insert_with(|| json!(Uuid::new_v4().to_string()))
         .clone();
-    if method.starts_with("notifications/") {
-        return Some(json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string());
-    }
+    let notification = method.starts_with("notifications/");
     let permission = rpc_permission(&method);
     let server_id = request["params"]["server_id"]
         .as_str()
-        .filter(|id| !id.is_empty());
+        .filter(|id| !notification && !id.is_empty());
     let server = match server_id {
         Some(server_id) => match state
             .gateway
@@ -193,20 +192,62 @@ async fn respond(
             Err(error) => return Some(database_error(error, &id)),
         }
     }
-    let mut reply =
+    let started = std::time::Instant::now();
+    let peer = peer.map(|address| address.to_string());
+    let reservation = match state
+        .gateway
+        .access
+        .reserve_usage(
+            principal.as_ref(),
+            TokenRequest {
+                endpoint: "/ws",
+                method: "WS",
+                peer: peer.as_deref(),
+                agent: headers
+                    .get(header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok()),
+            },
+        )
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(access::AuthError::UsageLimit(message)) => {
+            return Some(
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32029,"message":message}})
+                    .to_string(),
+            );
+        }
+        Err(access::AuthError::Storage(error)) => return Some(database_error(error, &id)),
+        Err(_) => return Some(rpc_denied(&id, &method)),
+    };
+    let mut reply = if notification {
+        json!({"jsonrpc":"2.0","id":id,"result":{}})
+    } else {
         legacy_transport_reply(&state.gateway, principal.as_ref(), server.as_ref(), request)
             .await
-            .unwrap_or_else(|| invalid_request(id));
+            .unwrap_or_else(|| invalid_request(id))
+    };
     if reply["error"]["code"] == -32601 {
         reply["error"] =
             json!({"code":-32601,"message":format!("Method not found: {method}"),"data":{}});
     }
+    let status = if reply.get("error").is_some() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    state
+        .gateway
+        .access
+        .finish_usage(reservation, status, started)
+        .await;
     Some(reply.to_string())
 }
 
 fn rpc_permission(method: &str) -> Option<&'static str> {
     match method {
         "initialize" | "ping" | "subscriptions/listen" => None,
+        name if name.starts_with("notifications/") => None,
         "tools/list" | "list_tools" | "completion/complete" => Some("tools.read"),
         "resources/list"
         | "resources/templates/list"

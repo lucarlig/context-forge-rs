@@ -243,4 +243,4 @@ impl Database {
 }
 
 mod usage;
-pub(crate) use usage::{TokenIdentity, TokenRequest, TokenReservation};
+pub(crate) use usage::{TokenIdentity, TokenRequest, TokenReservation, TokenUsageRecord};

@@ -25,3 +25,17 @@ it from the signed scope and its request middleware reads only that scope.
 Setting `TOKEN_USAGE_LOGGING_ENABLED=false` leaves the usage report empty and
 keeps the quota active. The quota stores timestamps and token IDs without
 request metadata.
+
+The interoperability fixture used the pinned gateway to create each database
+and issue a credential. After switching to Rust, the same credential worked
+and reached its stored limit on SQLite and PostgreSQL. The runtime also
+enforced team membership, permission delegation, client IP, stored expiry,
+and virtual-server scope through the actual MCP endpoint. The hash stored in
+the database matched the SHA-256 digest of the one-time credential.
+
+Two Rust workers shared each database. Twelve simultaneous tool catalog
+requests with one daily quota slot returned one success and eleven HTTP 429
+responses. A WebSocket connection used its hourly slot on the first RPC.
+The next RPC and an HTTP call on the peer worker both returned the quota
+error. Revocation through one worker took effect on the other worker before
+its next request.
