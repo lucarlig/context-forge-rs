@@ -295,7 +295,7 @@ impl OAuthConfig {
         }
     }
 
-    fn resources<'a>(&'a self, default: Option<&'a str>) -> Vec<&'a str> {
+    pub(super) fn resources<'a>(&'a self, default: Option<&'a str>) -> Vec<&'a str> {
         match &self.resource {
             Some(OAuthValues::One(value)) if !value.is_empty() => vec![value.as_str()],
             Some(OAuthValues::Many(values)) if !values.is_empty() => {
@@ -306,7 +306,7 @@ impl OAuthConfig {
     }
 }
 
-fn token_claims(token: &str) -> Option<Value> {
+pub(super) fn token_claims(token: &str) -> Option<Value> {
     let payload = token
         .split('.')
         .nth(1)

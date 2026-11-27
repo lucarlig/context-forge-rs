@@ -310,7 +310,19 @@ public and extended card documents, versions, timestamps, and cache metadata.
 A Rust regression verifies the credential origin boundary, extended-card
 permissions, and virtual-server skill visibility.
 
-OAuth, streaming, webhook delivery, and UAID routing remain open.
+Outbound A2A OAuth uses the client credentials grant for direct A2A calls,
+JSON-RPC, and the generated MCP tool. The token request supports configured
+and derived resources. Tokens with mismatched configured audiences, scopes,
+or issuers are rejected before dispatch. Agent edits and activation changes
+select a fresh cache entry. Masked edits preserve stored secrets when the
+token URL stays the same.
+
+Rust Anything matched the OAuth replay on SQLite. The replay also matched on
+PostgreSQL. An adopted SQLite database reused existing encrypted credentials.
+A concurrent Rust test checked token reuse and scoped access. Two live workers
+shared an encrypted Redis token and acquired a fresh token after reactivation.
+
+Streaming, webhook delivery, and UAID routing remain open.
 
 ## Gateway management
 

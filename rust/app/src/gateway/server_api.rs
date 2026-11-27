@@ -258,7 +258,7 @@ fn metadata(service: &GatewayService, server: &ServerRecord, links: &ServerLinks
     camelcase_fields(response)
 }
 
-fn mask_oauth_fields(value: &mut Value) {
+pub(super) fn mask_oauth_fields(value: &mut Value) {
     match value {
         Value::Object(fields) => {
             for (name, value) in fields {
@@ -282,6 +282,8 @@ fn is_oauth_secret(name: &str) -> bool {
         "access_token",
         "password",
         "token",
+        "id_token",
+        "secret",
     ]
     .into_iter()
     .any(|key| name.eq_ignore_ascii_case(key))

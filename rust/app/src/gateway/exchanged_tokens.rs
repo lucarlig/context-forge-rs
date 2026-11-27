@@ -6,6 +6,7 @@ use axum::http::HeaderValue;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 
 use super::*;
+use crate::oauth_client::A2aOAuthError;
 use crate::{config::RedisSettings, redis_sessions::RedisSessionDirectory};
 
 const MAX_ENTRIES: usize = 1024;
@@ -30,13 +31,14 @@ pub(super) struct ExchangedTokens {
 enum CachedExchange {
     Bearer(HeaderValue),
     Failed,
+    A2aFailed(A2aOAuthError),
 }
 
 impl CachedExchange {
     fn into_authorization(self) -> Result<HeaderValue, UpstreamError> {
         match self {
             Self::Bearer(authorization) => Ok(authorization),
-            Self::Failed => Err(UpstreamError::InvalidCredentials),
+            Self::Failed | Self::A2aFailed(_) => Err(UpstreamError::InvalidCredentials),
         }
     }
 }
@@ -72,23 +74,7 @@ impl ExchangedTokens {
                 .ok_or(UpstreamError::InvalidCredentials)
         };
         let key = cache_key(connection.gateway_id, connection.version, principal);
-        let entry = {
-            let mut entries = self.local.lock().map_err(|_| UpstreamError::Transport)?;
-            if entries.len() >= MAX_ENTRIES
-                && !entries.contains_key(&key)
-                && let Some(removable) = entries
-                    .iter()
-                    .find(|(_, entry)| Arc::strong_count(entry) == 1)
-                    .map(|(key, _)| key.clone())
-            {
-                entries.remove(&removable);
-            }
-            if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
-                Arc::new(tokio::sync::Mutex::new(None))
-            } else {
-                entries.entry(key.clone()).or_default().clone()
-            }
-        };
+        let entry = self.entry(&key)?;
         let mut entry = entry.lock().await;
         subject_lifetime()?;
         let shared = self.redis.as_ref().zip(connection.cipher);
@@ -139,6 +125,72 @@ impl ExchangedTokens {
         subject_lifetime()?;
         exchange.map(|token| token.authorization)
     }
+
+    fn entry(&self, key: &str) -> Result<Entry, UpstreamError> {
+        let mut entries = self.local.lock().map_err(|_| UpstreamError::Transport)?;
+        if let Some(entry) = entries.get(key) {
+            return Ok(entry.clone());
+        }
+        if entries.len() >= MAX_ENTRIES
+            && let Some(removable) = entries
+                .iter()
+                .find(|(_, entry)| Arc::strong_count(entry) == 1)
+                .map(|(key, _)| key.clone())
+        {
+            entries.remove(&removable);
+        }
+        let entry = Entry::default();
+        if entries.len() < MAX_ENTRIES {
+            entries.insert(key.to_owned(), entry.clone());
+        }
+        Ok(entry)
+    }
+
+    pub(super) async fn a2a_authorization(
+        &self,
+        key: &str,
+        cipher: Option<&CredentialCipher>,
+        request: impl Future<Output = Result<(HeaderValue, u64), A2aOAuthError>>,
+    ) -> Result<HeaderValue, A2aOAuthError> {
+        let entry = self.entry(key).map_err(|_| A2aOAuthError::Request)?;
+        let mut entry = entry.lock().await;
+        let shared = self.redis.as_ref().zip(cipher);
+        let read = match shared {
+            Some((redis, cipher)) => redis.read(key, cipher).await,
+            None => Err(()),
+        };
+        let cached = match read {
+            Ok(cached) => cached,
+            Err(()) => entry
+                .as_ref()
+                .filter(|(until, _)| *until > Instant::now())
+                .map(|(_, cached)| cached.clone()),
+        };
+        if let Some(cached) = cached {
+            return match cached {
+                CachedExchange::Bearer(header) => Ok(header),
+                CachedExchange::A2aFailed(error) => Err(error),
+                CachedExchange::Failed => Err(A2aOAuthError::Request),
+            };
+        }
+        let result = request.await;
+        let (cached, ttl) = match &result {
+            Ok((header, expires)) => (
+                CachedExchange::Bearer(header.clone()),
+                expires - REFRESH_MARGIN.min(expires / 2),
+            ),
+            Err(error) => (CachedExchange::A2aFailed(*error), FAILURE_TTL),
+        };
+        if ttl > 0
+            && let Some(until) = Instant::now().checked_add(Duration::from_secs(ttl))
+        {
+            if let Some((redis, cipher)) = shared {
+                redis.write(key, &cached, ttl, cipher).await;
+            }
+            *entry = Some((until, cached));
+        }
+        result.map(|(authorization, _)| authorization)
+    }
 }
 
 fn cache_key(id: &str, version: i32, principal: &Principal) -> String {
@@ -158,6 +210,8 @@ struct SharedExchanges {
 struct StoredExchange<T> {
     until: i64,
     authorization: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    a2a_failure: Option<A2aOAuthError>,
 }
 
 impl SharedExchanges {
@@ -209,6 +263,8 @@ impl SharedExchanges {
                     let mut header = HeaderValue::from_str(&authorization).ok()?;
                     header.set_sensitive(true);
                     Some(CachedExchange::Bearer(header))
+                } else if let Some(error) = exchange.a2a_failure {
+                    Some(CachedExchange::A2aFailed(error))
                 } else {
                     Some(CachedExchange::Failed)
                 }
@@ -221,12 +277,16 @@ impl SharedExchanges {
                 Ok(header) => Some(header),
                 Err(_) => return,
             },
-            CachedExchange::Failed => None,
+            CachedExchange::Failed | CachedExchange::A2aFailed(_) => None,
         };
         let until = Timestamp::now().as_second().saturating_add(ttl as i64);
         let exchange = StoredExchange {
             until,
             authorization,
+            a2a_failure: match cached {
+                CachedExchange::A2aFailed(error) => Some(*error),
+                _ => None,
+            },
         };
         if let Ok(sealed) = cipher.seal_scoped(&exchange, key.as_bytes()) {
             let _ = self

@@ -72,14 +72,18 @@ pub(super) async fn update(
                     "Outbound A2A URL blocked by URL policy",
                 )
             })?;
-        if previous.auth_type.as_deref() == Some("oauth") {
-            return Err(invalid("A2A OAuth endpoint updates are unavailable"));
-        }
+    }
+    if let Some(config) = patch.auth.oauth_config() {
+        oauth::validate_config(&app, config, previous.oauth_config.as_ref())?;
     }
     let mut auth = GatewayConnectionRow {
         kind: agent.auth_type.clone().unwrap_or_default(),
         headers: agent.stored_headers().map(std::borrow::Cow::into_owned),
         query: agent.auth_query_params.clone(),
+        oauth: agent
+            .oauth_config
+            .as_ref()
+            .map(|config| config.0.to_string()),
         ..GatewayConnectionRow::default()
     };
     if patch
@@ -87,6 +91,7 @@ pub(super) async fn update(
         .apply_agent_update(
             &mut auth,
             app.credential_cipher.as_ref(),
+            app.vault.as_ref(),
             app.query_auth_hosts.as_ref(),
             &agent.endpoint_url,
             endpoint_changed,
@@ -97,6 +102,13 @@ pub(super) async fn update(
         agent.auth_type = (!auth.kind.is_empty()).then_some(auth.kind);
         agent.auth_value = auth.headers;
         agent.auth_query_params = auth.query;
+        agent.oauth_config = auth
+            .oauth
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| CatalogApiError::unavailable())?
+            .map(DbJson);
     }
     agent.modified_by = Some(principal.email.clone());
     agent.modified_from_ip = client_address(peer).or(agent.modified_from_ip);

@@ -452,6 +452,10 @@ impl Settings {
             dcr,
             cimd,
             request_timeout: positive_seconds("OAUTH_REQUEST_TIMEOUT", 30.0)?,
+            a2a_token_policy: crate::oauth_client::A2aTokenPolicy {
+                attempts: parse("OAUTH_MAX_RETRIES", 3)?,
+                strict_resource: flag("OAUTH_REQUIRE_CONFIGURED_RESOURCE")?.unwrap_or(false),
+            },
             issuer_metadata: Default::default(),
             handshake_registered_only: flag("GATEWAY_TEST_ALLOW_REGISTERED_ONLY")?.unwrap_or(true),
             handshake_public_only: flag("SSRF_PROTECTION_ENABLED")?.unwrap_or(true),

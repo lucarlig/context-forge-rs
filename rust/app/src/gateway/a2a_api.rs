@@ -13,6 +13,7 @@ use crate::schema_validation::Target;
 
 mod cards;
 mod lifecycle;
+mod oauth;
 mod protocol;
 mod push_configs;
 mod tasks;
@@ -201,7 +202,7 @@ async fn register(
     if auth.as_ref().is_some_and(|auth| {
         !matches!(
             auth.kind,
-            "basic" | "bearer" | "authheaders" | "query_param"
+            "basic" | "bearer" | "authheaders" | "query_param" | "oauth"
         )
     }) {
         return Err(CatalogApiError::detail(
@@ -215,6 +216,10 @@ async fn register(
         .map(serde_json::from_str)
         .transpose()
         .map_err(|_| CatalogApiError::unavailable())?;
+    let oauth_config = match input.auth.oauth_config() {
+        Some(config) => Some(oauth::store(&app, config).await?),
+        None => None,
+    };
     let cards = cards::registration(
         &app,
         input.card_url.as_deref(),
@@ -265,7 +270,7 @@ async fn register(
         uaid_native_id: None,
         tenant: None,
         icon_url: None,
-        oauth_config: None,
+        oauth_config,
     };
     let agent = app
         .database
@@ -370,6 +375,11 @@ fn read_agent(agent: &AgentRecord) -> Value {
         "authQueryParamValueMasked",
     ] {
         data[key] = Value::Null;
+    }
+    if let Some(config) = agent.oauth_config.as_ref() {
+        let mut masked = config.0.clone();
+        server_api::mask_oauth_fields(&mut masked);
+        data["oauthConfig"] = masked;
     }
     if agent.auth_type.as_deref() == Some("query_param")
         && let Some(query) = agent.auth_query_params.as_deref()
@@ -607,6 +617,20 @@ async fn invoke(
     let mut url = url::Url::parse(&agent.endpoint_url).map_err(|_| fail())?;
     match agent.auth_type.as_deref() {
         None | Some("none" | "") => {}
+        Some("oauth") => {
+            app.upstream
+                .check_endpoint(&agent.endpoint_url)
+                .map_err(|_| {
+                    CatalogApiError::detail(
+                        StatusCode::BAD_REQUEST,
+                        "Outbound A2A URL blocked by URL policy",
+                    )
+                })?;
+            headers.insert(
+                header::AUTHORIZATION,
+                oauth::authorization(app, agent).await?,
+            );
+        }
         Some("bearer" | "basic" | "authheaders") => {
             let stored = agent.stored_headers().ok_or_else(fail)?;
             headers.extend(

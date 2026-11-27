@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod a2a;
 mod authorization_code;
 mod discovery;
 mod token_exchange;
@@ -20,6 +21,7 @@ use crate::{
     upstream::{UpstreamClient, UpstreamError},
     upstream_tls::TlsMaterial,
 };
+pub(crate) use a2a::{A2aOAuthError, A2aTokenPolicy};
 pub(crate) use authorization_code::UserOAuthTokens;
 pub(crate) use discovery::{IssuerMetadata, IssuerMetadataCache, validate_endpoint};
 
@@ -62,6 +64,10 @@ pub(crate) struct OAuthConfig {
     redirect_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_issuer: Option<OAuthValues>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omit_resource: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     registration_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,16 +300,7 @@ impl OAuthConfig {
         let method = self
             .client_auth()
             .ok_or(UpstreamError::InvalidCredentials)?;
-        let assertion = if method == ClientAuth::PrivateKeyJwt {
-            Some(ClientAssertionSigner::new(
-                self.token_endpoint_auth_signing_alg.unwrap_or_default(),
-                self.private_key
-                    .as_deref()
-                    .ok_or(UpstreamError::InvalidCredentials)?,
-            )?)
-        } else {
-            None
-        };
+        let assertion = self.client_assertion(method)?;
         let mut retries = [1, 2].into_iter();
         loop {
             let (form, basic) = self.token_request(method, assertion.as_ref())?;
@@ -330,6 +327,22 @@ impl OAuthConfig {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn client_assertion(
+        &self,
+        method: ClientAuth,
+    ) -> Result<Option<ClientAssertionSigner>, UpstreamError> {
+        if method != ClientAuth::PrivateKeyJwt {
+            return Ok(None);
+        }
+        ClientAssertionSigner::new(
+            self.token_endpoint_auth_signing_alg.unwrap_or_default(),
+            self.private_key
+                .as_deref()
+                .ok_or(UpstreamError::InvalidCredentials)?,
+        )
+        .map(Some)
     }
 
     fn token_request(

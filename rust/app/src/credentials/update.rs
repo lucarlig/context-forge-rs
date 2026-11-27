@@ -18,6 +18,7 @@ impl AuthInput {
         &mut self,
         current: &mut GatewayConnectionRow,
         cipher: Option<&CredentialCipher>,
+        vault: Option<&SecretEnvelope>,
         query_hosts: Option<&HashSet<String>>,
         url: &str,
         url_changed: bool,
@@ -26,12 +27,11 @@ impl AuthInput {
             .auth_type
             .as_deref()
             .map(|kind| kind.trim().to_ascii_lowercase());
-        if self.oauth_config.is_some()
-            || self.sigv4_config.is_some()
+        if self.sigv4_config.is_some()
             || kind.as_deref().is_some_and(|kind| {
                 !matches!(
                     kind,
-                    "" | "none" | "basic" | "bearer" | "authheaders" | "query_param"
+                    "" | "none" | "basic" | "bearer" | "authheaders" | "query_param" | "oauth"
                 )
             })
         {
@@ -60,7 +60,7 @@ impl AuthInput {
                 _ => {}
             }
         }
-        self.apply_update(current, cipher, None, query_hosts, url)
+        self.apply_update(current, cipher, vault, query_hosts, url)
             .await
     }
 

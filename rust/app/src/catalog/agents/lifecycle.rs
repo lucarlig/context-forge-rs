@@ -51,7 +51,7 @@ const UPDATE_AGENT: &str = "
         config=$11, passthrough_headers=$12, tags=$13, auth_type=$14, auth_value=$15,
         auth_query_params=$16, team_id=$17, visibility=$18,
         modified_by=$19, modified_from_ip=$20, modified_via='api', modified_user_agent=$21,
-        version=version+1, updated_at=CURRENT_TIMESTAMP WHERE id=$1";
+        oauth_config=$22, version=version+1, updated_at=CURRENT_TIMESTAMP WHERE id=$1";
 
 const UPDATE_TOOL: &str = "
     UPDATE tools SET name=$2, custom_name_slug=$2, custom_name=$3, url=$4,
@@ -155,6 +155,7 @@ impl Database {
                     .bind(&agent.modified_by)
                     .bind(&agent.modified_from_ip)
                     .bind(&agent.modified_user_agent)
+                    .bind(&agent.oauth_config)
                     .execute(&mut *$tx)
                     .await?;
                 let row = sqlx::query_as(BY_ID)
@@ -176,14 +177,19 @@ impl Database {
         macro_rules! set_state {
             ($tx:ident, $lock:literal, $exists:literal) => {{
                 let tool = locked_tool!($tx, agent, $lock);
-                sqlx::query(
-                    "UPDATE a2a_agents SET enabled=$2, updated_at=CURRENT_TIMESTAMP
-                    WHERE id=$1 AND enabled <> $2",
-                )
-                .bind(&agent.id)
-                .bind(enabled)
-                .execute(&mut *$tx)
-                .await?;
+                let stamp = jiff::Timestamp::now().strftime("%F %T%.6f").to_string();
+                let state_sql = if $lock.is_empty() {
+                    "UPDATE a2a_agents SET enabled=$2, updated_at=$3 WHERE id=$1 AND enabled <> $2"
+                } else {
+                    "UPDATE a2a_agents SET enabled=$2, updated_at=CAST((CAST($3 AS TEXT) || '+00:00') AS TIMESTAMPTZ)
+                        WHERE id=$1 AND enabled <> $2"
+                };
+                sqlx::query(state_sql)
+                    .bind(&agent.id)
+                    .bind(enabled)
+                    .bind(&stamp)
+                    .execute(&mut *$tx)
+                    .await?;
                 if let Some(tool) = tool {
                     sqlx::query(
                         "UPDATE tools SET enabled=($2 AND validation_refusal IS NULL),

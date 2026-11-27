@@ -138,9 +138,9 @@ const INSERT_AGENT: &str = "
         protocol_version, capabilities, skills, config, passthrough_headers, tags, auth_type,
         auth_value, auth_query_params, team_id, owner_email, visibility, enabled, reachable,
         created_at, updated_at, created_by, created_from_ip, created_via, created_user_agent, version,
-        tool_id)
+        tool_id, oauth_config)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $18, $20, 'api', $21, 1, $22)";
+            $19, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $18, $20, 'api', $21, 1, $22, $23)";
 
 const INSERT_TOOL: &str = "
     INSERT INTO tools (id, name, original_name, custom_name_slug, custom_name, url,
@@ -303,6 +303,7 @@ impl Database {
                     .bind(&agent.created_from_ip)
                     .bind(&agent.created_user_agent)
                     .bind(&tool_id)
+                    .bind(&agent.oauth_config)
                     .execute(&mut *$tx)
                     .await?;
                 cards::insert_cards!($tx, &agent.id, cards);
