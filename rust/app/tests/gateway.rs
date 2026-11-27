@@ -781,6 +781,106 @@ async fn manual_refresh_keeps_retained_tool_ids_and_reconciles_requested_metadat
     assert_eq!(names, ["added", "echo"]);
 }
 
+#[tokio::test]
+async fn gateway_update_preserves_catalog_ids_and_rolls_back_a_failed_destination() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let upstream = Running::start(
+        Router::new()
+            .route("/mcp", post(refresh_fixture))
+            .route("/moved", post(refresh_fixture))
+            .route(
+                "/unavailable",
+                post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .with_state(Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database.clone()),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.registration_router()).await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registered) = send(
+        &client,
+        gateway.url("/gateways"),
+        json!({"name":"original","url":upstream.url("/mcp"),"transport":"STREAMABLEHTTP"}),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let id = registered["id"].as_str().unwrap();
+    let endpoint = gateway.url(&format!("/v1/mcp-servers/{id}"));
+    let retained: String =
+        sqlx::query_scalar("SELECT id FROM tools WHERE gateway_id = $1 AND original_name = 'echo'")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+    let moved = upstream.url("/moved");
+    let updated = client
+        .put(&endpoint)
+        .bearer_auth(&admin)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"name":"New Name","url":moved,"refreshIntervalSeconds":60}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value = serde_json::from_slice(&updated.bytes().await.unwrap()).unwrap();
+    assert_eq!(updated["url"], moved);
+    assert_eq!(updated["version"], 2);
+    assert_eq!(updated["refreshIntervalSeconds"], 60);
+    let (name, url): (String, String) = sqlx::query_as("SELECT name,url FROM tools WHERE id = $1")
+        .bind(retained)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "new-name-echo");
+    assert_eq!(url, moved);
+
+    let failed = client
+        .put(&endpoint)
+        .bearer_auth(&admin)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"name":"Abandoned","url":upstream.url("/unavailable")}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+    let current = client
+        .get(&endpoint)
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let current: Value = serde_json::from_slice(&current).unwrap();
+    assert_eq!(current["name"], "New Name");
+    assert_eq!(current["url"], moved);
+    assert_eq!(current["version"], 2);
+}
+
 async fn refresh_fixture(
     State(phase): State<Arc<AtomicUsize>>,
     Json(request): Json<Value>,

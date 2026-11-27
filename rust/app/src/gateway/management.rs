@@ -18,6 +18,9 @@ use crate::{
 
 use super::*;
 
+mod update;
+pub(super) use update::update;
+
 const MASKED: &str = "*****";
 
 #[derive(Deserialize)]

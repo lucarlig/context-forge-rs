@@ -12,6 +12,8 @@ use crate::{
         INSERT_RESOURCE, POSTGRES_TOOL_INSERT, RegistrationError, SQLITE_TOOL_INSERT,
         ToolDefinition, prompt_argument_schema, resource_registrations, slugify,
     },
+    credentials::{CredentialCipher, decode_headers, decode_query},
+    oauth_client::OAuthConfig,
     upstream::DiscoveredMetadata,
 };
 
@@ -139,9 +141,101 @@ const PROMPT_REMOVAL: &[&str] = &[
     "DELETE FROM prompts WHERE id = $1",
 ];
 
+const GATEWAY_NAME_CONFLICT: &str = "
+    SELECT EXISTS (
+        SELECT 1 FROM gateways WHERE id <> $1 AND slug = $2 AND visibility = $3
+        AND ($3 = 'public' OR ($3 = 'team' AND team_id = $4)
+             OR ($3 = 'private' AND owner_email = $5))
+    )";
+const GATEWAY_URL_CANDIDATES: &str = "
+    SELECT auth_type, CAST(auth_value AS TEXT), CAST(auth_query_params AS TEXT),
+        CAST(sigv4_config AS TEXT), CAST(oauth_config AS TEXT)
+    FROM gateways WHERE id <> $1 AND url = $2 AND visibility = $3
+    AND ($3 = 'public' OR ($3 = 'team' AND team_id = $4)
+         OR ($3 = 'private' AND owner_email = $5))";
+type AuthCandidate = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+const GATEWAY_TOOL_NAME_CONFLICT: &str = "
+    SELECT EXISTS (
+        SELECT 1 FROM tools changed JOIN tools existing ON
+            changed.id <> existing.id AND changed.name = existing.name AND changed.visibility = existing.visibility
+        WHERE changed.gateway_id = $1 AND
+            (changed.visibility = 'public' OR
+             (changed.visibility = 'team' AND changed.team_id = existing.team_id) OR
+             (changed.visibility = 'private' AND changed.owner_email = existing.owner_email))
+    )";
+const RENAMED_CATALOG_ITEMS: &[&str] = &[
+    "UPDATE tools SET name = $2 || '-' || custom_name_slug WHERE gateway_id = $1 AND name = $3 || '-' || custom_name_slug",
+    "UPDATE resources SET name = $2 || '-' || custom_name_slug WHERE gateway_id = $1 AND name = $3 || '-' || custom_name_slug",
+    "UPDATE prompts SET name = $2 || '-' || custom_name_slug WHERE gateway_id = $1 AND name = $3 || '-' || custom_name_slug",
+];
+const SCOPED_CATALOG_ITEMS: &[&str] = &[
+    "UPDATE tools SET visibility = CASE WHEN visibility = $2 THEN $3 ELSE visibility END,
+        team_id = CASE WHEN team_id IS NOT DISTINCT FROM $4 THEN $5 ELSE team_id END WHERE gateway_id = $1",
+    "UPDATE resources SET visibility = CASE WHEN visibility = $2 THEN $3 ELSE visibility END,
+        team_id = CASE WHEN team_id IS NOT DISTINCT FROM $4 THEN $5 ELSE team_id END WHERE gateway_id = $1",
+    "UPDATE prompts SET visibility = CASE WHEN visibility = $2 THEN $3 ELSE visibility END,
+        team_id = CASE WHEN team_id IS NOT DISTINCT FROM $4 THEN $5 ELSE team_id END WHERE gateway_id = $1",
+];
+
 fn stored_json(raw: Option<&str>) -> Option<Value> {
     raw.and_then(|raw| serde_json::from_str(raw).ok())
         .filter(|value: &Value| !value.is_null())
+}
+
+fn nonempty_stored_headers(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !matches!(value.trim(), "" | "null" | "{}" | "\"\""))
+}
+
+fn same_gateway_auth(
+    gateway: &GatewayRecord,
+    candidate: &AuthCandidate,
+    cipher: Option<&CredentialCipher>,
+) -> bool {
+    let (kind, headers, query, sigv4, oauth) = candidate;
+    match (gateway.auth_type.as_deref(), kind.as_deref()) {
+        (Some("oauth"), Some("oauth")) => gateway
+            .oauth_config
+            .as_deref()
+            .zip(oauth.as_deref())
+            .is_some_and(|(left, right)| OAuthConfig::matches_stored(left, right)),
+        (Some("sigv4"), Some("sigv4")) => {
+            let config =
+                stored_json(gateway.sigv4_config.as_deref()).zip(stored_json(sigv4.as_deref()));
+            config.is_some_and(|(left, right)| {
+                ["access_key_id", "region", "service"]
+                    .into_iter()
+                    .all(|key| left[key].is_string() && left[key] == right[key])
+            })
+        }
+        (Some("query_param"), Some("query_param")) => gateway
+            .auth_query_params
+            .as_deref()
+            .zip(query.as_deref())
+            .is_some_and(|(left, right)| {
+                decode_query(cipher, left)
+                    .is_ok_and(|left| decode_query(cipher, right).is_ok_and(|right| left == right))
+            }),
+        (Some("oauth" | "sigv4" | "query_param"), _)
+        | (_, Some("oauth" | "sigv4" | "query_param")) => false,
+        _ => {
+            match (
+                nonempty_stored_headers(gateway.auth_value.as_deref()),
+                nonempty_stored_headers(headers.as_deref()),
+            ) {
+                (None, None) => true,
+                (Some(left), Some(right)) => decode_headers(cipher, left).is_ok_and(|left| {
+                    decode_headers(cipher, right).is_ok_and(|right| left == right)
+                }),
+                _ => false,
+            }
+        }
+    }
 }
 
 macro_rules! json_parameter {
@@ -151,6 +245,69 @@ macro_rules! json_parameter {
     (postgres, $parameter:literal) => {
         concat!("CAST(", $parameter, " AS JSON)")
     };
+}
+
+macro_rules! apply_gateway_metadata {
+    ($tx:ident, $dialect:ident, $before:ident, $after:ident, $cipher:ident) => {{
+        let renamed = $before.slug != $after.slug;
+        let scope_changed = $before.visibility != $after.visibility || $before.team_id != $after.team_id;
+        if (renamed || scope_changed)
+            && sqlx::query_scalar::<_, bool>(GATEWAY_NAME_CONFLICT)
+                .bind(&$after.id).bind(&$after.slug).bind(&$after.visibility)
+                .bind($after.team_id.as_deref()).bind($after.owner_email.as_deref())
+                .fetch_one(&mut *$tx).await?
+        {
+            return Err(RegistrationError::NameConflict);
+        }
+        if scope_changed || $after.url != $before.url {
+            let candidates = sqlx::query_as::<_, AuthCandidate>(GATEWAY_URL_CANDIDATES)
+                .bind(&$after.id).bind(&$after.url).bind(&$after.visibility)
+                .bind($after.team_id.as_deref()).bind($after.owner_email.as_deref())
+                .fetch_all(&mut *$tx).await?;
+            if candidates.iter().any(|candidate| same_gateway_auth($after, candidate, $cipher)) {
+                return Err(RegistrationError::UrlConflict);
+            }
+        }
+        sqlx::query(concat!("UPDATE gateways SET name = $2, slug = $3, description = $4,
+            visibility = $5, team_id = $6, tags = ", json_parameter!($dialect, "$7"),
+            ", passthrough_headers = ", json_parameter!($dialect, "$8"),
+            ", identity_propagation = ", json_parameter!($dialect, "$9"),
+            ", refresh_interval_seconds = $10, gateway_mode = $11,
+            modified_by = $12, modified_from_ip = $13, modified_via = 'api', modified_user_agent = $14,
+            url = $15, transport = $16, reachable = $17,
+            updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE id = $1"))
+            .bind(&$after.id).bind(&$after.name).bind(&$after.slug).bind($after.description.as_deref())
+            .bind(&$after.visibility).bind($after.team_id.as_deref()).bind(&$after.tags)
+            .bind($after.passthrough_headers.as_deref()).bind($after.identity_propagation.as_deref())
+            .bind($after.refresh_interval_seconds).bind(&$after.gateway_mode).bind($after.modified_by.as_deref())
+            .bind($after.modified_from_ip.as_deref()).bind($after.modified_user_agent.as_deref())
+            .bind(&$after.url).bind(&$after.transport).bind($after.reachable)
+            .execute(&mut *$tx).await?;
+        if renamed {
+            for statement in RENAMED_CATALOG_ITEMS {
+                sqlx::query(*statement).bind(&$after.id).bind(&$after.slug).bind(&$before.slug)
+                    .execute(&mut *$tx).await?;
+            }
+        }
+        if scope_changed {
+            for statement in SCOPED_CATALOG_ITEMS {
+                sqlx::query(*statement).bind(&$after.id).bind(&$before.visibility).bind(&$after.visibility)
+                    .bind($before.team_id.as_deref()).bind($after.team_id.as_deref())
+                    .execute(&mut *$tx).await?;
+            }
+        }
+        if $after.url != $before.url || $after.transport != $before.transport {
+            sqlx::query("UPDATE tools SET url = $2, request_type = $3
+                WHERE gateway_id = $1 AND integration_type = 'MCP'")
+                .bind(&$after.id).bind(&$after.url).bind(&$after.transport)
+                .execute(&mut *$tx).await?;
+        }
+        if (renamed || scope_changed) && sqlx::query_scalar::<_, bool>(GATEWAY_TOOL_NAME_CONFLICT)
+            .bind(&$after.id).fetch_one(&mut *$tx).await?
+        {
+            return Err(RegistrationError::ToolNameConflict);
+        }
+    }};
 }
 
 macro_rules! refresh_metadata {
@@ -253,8 +410,31 @@ impl Database {
         gateway: &GatewayRecord,
         input: CatalogRefreshInput<'_>,
     ) -> Result<Option<CatalogChanges>, RegistrationError> {
+        self.write_gateway_catalog(gateway, gateway, Some(input), false, None)
+            .await
+    }
+
+    pub(crate) async fn update_gateway_metadata(
+        &self,
+        expected: &GatewayRecord,
+        gateway: &GatewayRecord,
+        input: Option<CatalogRefreshInput<'_>>,
+        cipher: Option<&CredentialCipher>,
+    ) -> Result<Option<CatalogChanges>, RegistrationError> {
+        self.write_gateway_catalog(expected, gateway, input, true, cipher)
+            .await
+    }
+
+    async fn write_gateway_catalog(
+        &self,
+        expected: &GatewayRecord,
+        gateway: &GatewayRecord,
+        input: Option<CatalogRefreshInput<'_>>,
+        updating: bool,
+        cipher: Option<&CredentialCipher>,
+    ) -> Result<Option<CatalogChanges>, RegistrationError> {
         let mut names = HashSet::new();
-        for tool in input.tools {
+        for tool in input.as_ref().into_iter().flat_map(|input| input.tools) {
             let slug = slugify(&tool.name);
             if slug.is_empty() || slug.len() + gateway.slug.len() >= 255 || tool.name.len() > 255 {
                 return Err(RegistrationError::Invalid("Invalid upstream tool name"));
@@ -267,10 +447,17 @@ impl Database {
         macro_rules! sync {
             ($transaction:ident, $lock:literal, $exists:literal, $insert_tool:expr,
              $dialect:ident, $now:literal) => {{
-                let id = lock_gateway!($transaction, gateway, $lock);
+                let id = lock_gateway!($transaction, expected, $lock);
                 if id.is_none() {
                     return Ok(None);
                 }
+                if updating {
+                    apply_gateway_metadata!($transaction, $dialect, expected, gateway, cipher);
+                }
+                let Some(input) = input else {
+                    $transaction.commit().await?;
+                    return Ok(Some(changes));
+                };
                 let mut stored_tools: HashMap<_, _> = sqlx::query_as::<_, StoredTool>(STORED_TOOLS)
                     .bind(&gateway.id).fetch_all(&mut *$transaction).await?
                     .into_iter().map(|tool| (tool.original_name.clone(), tool)).collect();
@@ -324,7 +511,7 @@ impl Database {
                     ", last_refresh_at = CASE WHEN $4 THEN last_refresh_at ELSE ", $now, " END,
                     last_seen = CASE WHEN $4 THEN ", $now, " ELSE last_seen END,
                     updated_at = ", $now, " WHERE id = $1"))
-                    .bind(&gateway.id).bind(input.capabilities.to_string()).bind(&now).bind(input.activating)
+                    .bind(&gateway.id).bind(input.capabilities.to_string()).bind(&now).bind(input.activating || updating)
                     .execute(&mut *$transaction).await?;
                 if input.activating {
                     set_gateway_state!($transaction, &gateway.id, true, &now, $now);

@@ -275,7 +275,9 @@ impl GatewayService {
                 .route(&format!("{route}/"), get(management::list).post(register))
                 .route(
                     &format!("{route}/{{key}}"),
-                    get(management::detail).delete(management::delete),
+                    get(management::detail)
+                        .put(management::update)
+                        .delete(management::delete),
                 )
                 .route(
                     &format!("{route}/{{key}}/impact-preview"),

@@ -8,7 +8,7 @@ use crate::{
     database::Database,
 };
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Clone, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GatewayRecord {
     pub(crate) id: String,

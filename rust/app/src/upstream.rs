@@ -960,6 +960,10 @@ impl UpstreamClient {
         Ok((builder.build()?, url))
     }
 
+    pub(crate) fn check_endpoint(&self, endpoint: &str) -> Result<(), UpstreamError> {
+        self.policy.validate_url(endpoint).map(|_| ())
+    }
+
     pub(crate) async fn exchange_oauth_token(
         &self,
         endpoint: &str,
