@@ -6,7 +6,9 @@ use jsonwebtoken::EncodingKey;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    gateway::{CatalogRefresh, GatewayHealth, GatewayLifecycle, Pagination, RootSettings},
+    gateway::{
+        CatalogRefresh, GatewayHealth, GatewayLifecycle, Pagination, ResourceLimits, RootSettings,
+    },
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
@@ -627,6 +629,21 @@ impl Settings {
             file_prefixes: allowlist("ROOT_ALLOWED_FILE_PREFIXES")?,
             defaults: serde_json::from_str(&defaults).map_err(|_| "invalid DEFAULT_ROOTS")?,
         })
+    }
+
+    pub fn resource_limits() -> Result<ResourceLimits, Box<dyn Error + Send + Sync>> {
+        let mut limits = ResourceLimits::default();
+        limits.max_bytes = parse("CONTENT_MAX_RESOURCE_SIZE", limits.max_bytes)?;
+        if !(1024..=10485760).contains(&limits.max_bytes) {
+            return Err("invalid CONTENT_MAX_RESOURCE_SIZE".into());
+        }
+        limits.strict_mime = flag("CONTENT_STRICT_MIME_VALIDATION")?.unwrap_or(false);
+        if env::var_os("CONTENT_ALLOWED_RESOURCE_MIMETYPES").is_some() {
+            let configured = value("CONTENT_ALLOWED_RESOURCE_MIMETYPES", "[]")?;
+            limits.allowed_mime = serde_json::from_str(&configured)
+                .map_err(|_| "invalid CONTENT_ALLOWED_RESOURCE_MIMETYPES")?;
+        }
+        Ok(limits)
     }
 
     pub fn invalidate_sessions_on_password_change() -> Result<bool, Box<dyn Error + Send + Sync>> {

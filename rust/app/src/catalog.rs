@@ -16,7 +16,7 @@ use crate::{
 };
 
 mod resources;
-pub(crate) use resources::{ResourceFilters, ResourceRecord};
+pub(crate) use resources::{ResourceFilters, ResourceRecord, ResourceWriteError};
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
 pub(crate) const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";

@@ -21,6 +21,7 @@ ipnet = "2.12"
 jiff = { version = "1", default-features = false, features = ["std", "tzdb-bundle-always"] }
 jsonschema = { version = "0.63", default-features = false }
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
+mime_guess = "2"
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "fuel", "serde"] }
 p256 = "0.14"
 p384 = "0.14"

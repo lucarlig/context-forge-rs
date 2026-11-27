@@ -1,24 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use axum::extract::{Path, Query};
+use axum::extract::{DefaultBodyLimit, Path, Query};
 use rmcp::model::{ReadResourceRequest, ReadResourceRequestParams};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::catalog::{ResourceContentRecord, ResourceFilters, ResourceRecord};
 
-pub(super) fn router() -> Router<Arc<GatewayService>> {
+mod write;
+pub use write::ResourceLimits;
+
+pub(super) fn router(max_resource_bytes: usize) -> Router<Arc<GatewayService>> {
     let mut routes = Router::new();
     for base in ["/resources", "/v1/resources"] {
         routes = routes
-            .route(base, get(list))
-            .route(&format!("{base}/"), get(list))
+            .route(base, get(list).post(write::create))
+            .route(&format!("{base}/"), get(list).post(write::create))
             .route(&format!("{base}/templates/list"), get(templates))
             .route(&format!("{base}/test/{{*uri}}"), get(test_uri))
             .route(&format!("{base}/{{id}}/info"), get(info))
-            .route(&format!("{base}/{{id}}"), get(read));
+            .route(
+                &format!("{base}/{{id}}"),
+                get(read).put(write::update).delete(write::delete),
+            )
+            .route(&format!("{base}/{{id}}/state"), post(write::set_state))
+            .route(&format!("{base}/{{id}}/toggle"), post(write::set_state));
     }
-    routes
+    routes.layer(DefaultBodyLimit::max(
+        max_resource_bytes.saturating_mul(6).saturating_add(65536),
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -368,7 +378,15 @@ fn metadata(record: &ResourceRecord, aliases: bool) -> Value {
     response["created_at"] = record.created_at.replacen(' ', "T", 1).into();
     response["updated_at"] = record.updated_at.replacen(' ', "T", 1).into();
     response["mcp_server_id"] = json!(record.gateway_id);
-    response["tags"] = serde_json::from_str(&record.tags).unwrap_or_else(|_| json!([]));
+    let tags = serde_json::from_str::<Vec<Value>>(&record.tags).unwrap_or_default();
+    response["tags"] = json!(
+        tags.iter()
+            .filter_map(|tag| tag
+                .as_str()
+                .or_else(|| tag["label"].as_str())
+                .or_else(|| tag["name"].as_str()))
+            .collect::<Vec<_>>()
+    );
     response["extension_metadata"] = record
         .extension_metadata
         .as_deref()

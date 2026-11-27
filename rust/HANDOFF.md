@@ -43,3 +43,5 @@ The root management APIs support canonically identified network and file roots, 
 The tag APIs aggregate counts and list tagged entities within the caller's catalog scope. SQLite and PostgreSQL matched all ten pinned replays. [Tag management verification](replay/tag-management/README.md)
 
 Resource REST reads cover metadata, templates, and content by ID and URI. The recordings verify filtering and scoped access, including against SQLite created by the pinned gateway. [Resource read verification](replay/resource-management/read/README.md)
+
+Resource REST writes support creation, update, state changes, and deletion. The live checks covered ownership, content limits, and metric retention and purge behavior. [Resource write verification](replay/resource-management/write.md)

@@ -403,15 +403,15 @@ fn prompt_completions(
 }
 
 pub(super) fn local_resource(record: ResourceContentRecord, uri: String) -> ResourceContents {
-    if let Some(blob) = record.blob {
-        ResourceContents::blob(BASE64_STANDARD.encode(blob), uri).with_mime_type(
-            record
-                .mime
-                .unwrap_or_else(|| "application/octet-stream".into()),
-        )
-    } else {
-        ResourceContents::text(record.text.unwrap_or_default(), uri)
-            .with_mime_type(record.mime.unwrap_or_else(|| "text/plain".into()))
+    match (record.text, record.blob) {
+        (None, Some(blob)) => ResourceContents::blob(BASE64_STANDARD.encode(blob), uri)
+            .with_mime_type(
+                record
+                    .mime
+                    .unwrap_or_else(|| "application/octet-stream".into()),
+            ),
+        (text, _) => ResourceContents::text(text.unwrap_or_default(), uri)
+            .with_mime_type(record.mime.unwrap_or_else(|| "text/plain".into())),
     }
 }
 

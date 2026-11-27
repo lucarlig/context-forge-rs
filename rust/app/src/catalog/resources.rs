@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[derive(Clone, Serialize, sqlx::FromRow)]
+#[derive(Clone, Default, Serialize, sqlx::FromRow)]
 pub(crate) struct ResourceRecord {
     pub(crate) id: String,
     pub(crate) uri: String,
@@ -90,6 +90,9 @@ macro_rules! list_resources {
 }
 
 const RESOURCE_BY_ID: &str = concat!(resource_select!(), " WHERE r.id = $1");
+
+mod write;
+pub(crate) use write::ResourceWriteError;
 
 impl Database {
     pub(crate) async fn managed_resource(

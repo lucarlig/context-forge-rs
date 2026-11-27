@@ -70,6 +70,7 @@ use proxy::DirectTarget;
 pub use health::GatewayHealth;
 pub use lifecycle::GatewayLifecycle;
 pub(crate) use proxy::GATEWAY_ID_HEADER;
+pub use resource_api::ResourceLimits;
 pub use roots::{RootSettings, RootSetupError};
 
 pub struct GatewayService {
@@ -82,6 +83,7 @@ pub struct GatewayService {
     refresh: CatalogRefresh,
     lifecycle: Option<GatewayLifecycle>,
     roots: roots::RootRegistry,
+    resource_limits: ResourceLimits,
     active_refreshes: Mutex<HashSet<String>>,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
@@ -156,6 +158,7 @@ impl GatewayService {
             refresh,
             lifecycle: None,
             roots: roots::RootRegistry::default(),
+            resource_limits: ResourceLimits::default(),
             active_refreshes: Mutex::default(),
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
@@ -197,6 +200,11 @@ impl GatewayService {
     ) -> Result<Self, RootSetupError> {
         self.roots = roots::RootRegistry::new(settings, shutdown)?;
         Ok(self)
+    }
+
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self
     }
 
     pub fn with_credential_secret(mut self, secret: Option<&str>) -> Self {
@@ -329,7 +337,7 @@ impl GatewayService {
             router
                 .merge(roots::router())
                 .merge(tags::router())
-                .merge(resource_api::router())
+                .merge(resource_api::router(self.resource_limits.max_bytes))
                 .with_state(self.clone()),
         )
     }
