@@ -13,12 +13,14 @@ use crate::{
 const IDENTITY: &str = include_str!("../migrations/001_identity.sql");
 const CATALOG: &str = include_str!("../migrations/002_catalog.sql");
 const LEGACY_SSE: &str = include_str!("../migrations/003_legacy_sse.sql");
-const MIGRATIONS: [&str; 5] = [
+const GRPC: &str = include_str!("../migrations/004_grpc.sql");
+const MIGRATIONS: [&str; 6] = [
     "identity",
     "catalog",
     "legacy_sse",
     "historical_catalog",
     "cel_response_filters",
+    "grpc_services",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -289,6 +291,9 @@ impl Database {
                             }
                         }
                         4 => response_filters::translate_filters!($transaction),
+                        5 => {
+                            sqlx::raw_sql(GRPC).execute(&mut *$transaction).await?;
+                        }
                         _ => unreachable!("unknown migration implementation"),
                     }
                     sqlx::query(RECORD)

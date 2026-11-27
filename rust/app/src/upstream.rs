@@ -1128,6 +1128,26 @@ impl UpstreamClient {
         self.policy.validate_url(endpoint).map(|_| ())
     }
 
+    pub(crate) async fn pinned_addresses(
+        &self,
+        endpoint: &str,
+    ) -> Result<Vec<SocketAddr>, UpstreamError> {
+        let url = self.policy.validate_url(endpoint)?;
+        let port = url
+            .port_or_known_default()
+            .ok_or(UpstreamError::InvalidUrl)?;
+        match url.host().ok_or(UpstreamError::InvalidUrl)? {
+            Host::Ipv4(ip) => Ok(vec![SocketAddr::new(ip.into(), port)]),
+            Host::Ipv6(ip) => Ok(vec![SocketAddr::new(ip.into(), port)]),
+            Host::Domain(host) => {
+                let addresses = lookup_host((host, port))
+                    .await
+                    .map_err(|_| UpstreamError::Resolve)?;
+                check_addresses(&self.policy, addresses)
+            }
+        }
+    }
+
     pub(crate) async fn rest_response(
         &self,
         mut request: reqwest::Request,

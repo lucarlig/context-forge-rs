@@ -136,6 +136,21 @@ impl Default for HeaderForwarding {
 }
 
 impl Settings {
+    pub fn grpc_federation() -> Result<crate::grpc::GrpcSettings, Box<dyn Error + Send + Sync>> {
+        let max_message_bytes = parse("MCPGATEWAY_GRPC_MAX_MESSAGE_SIZE", 4 * 1024 * 1024)?;
+        if max_message_bytes == 0 {
+            return Err("invalid MCPGATEWAY_GRPC_MAX_MESSAGE_SIZE".into());
+        }
+        Ok(crate::grpc::GrpcSettings {
+            enabled: flag("MCPGATEWAY_GRPC_ENABLED")?.unwrap_or(false),
+            admin_enabled: flag("MCPGATEWAY_ADMIN_API_ENABLED")?.unwrap_or(false)
+                || flag("MCPGATEWAY_UI_ENABLED")?.unwrap_or(false),
+            allow_public_visibility: flag("ALLOW_PUBLIC_VISIBILITY")?.unwrap_or(true),
+            timeout: positive_seconds("MCPGATEWAY_GRPC_TIMEOUT", 30.0)?,
+            max_message_bytes,
+        })
+    }
+
     pub fn rest_tool_limits() -> Result<(Duration, usize), Box<dyn Error + Send + Sync>> {
         let timeout = positive_seconds("TOOL_TIMEOUT", 60.0)?;
         let chars = parse("REST_RESPONSE_TEXT_MAX_LENGTH", 5000)?;

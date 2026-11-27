@@ -128,6 +128,7 @@ pub struct CatalogTool {
     pub(crate) reachable: bool,
     pub(crate) needs_upstream_config: bool,
     pub(crate) rest: Option<RestTool>,
+    pub(crate) grpc_service_id: Option<String>,
     pub(crate) response_filter: String,
     pub definition: ToolDefinition,
 }
@@ -382,6 +383,7 @@ struct ToolRow {
     output_schema: Option<String>,
     annotations: Option<String>,
     integration_type: String,
+    grpc_service_id: Option<String>,
     response_filter: String,
     #[sqlx(flatten)]
     rest: RestTool,
@@ -472,6 +474,7 @@ macro_rules! tool_query {
                 g.version AS gateway_version,
                 COALESCE(g.gateway_mode, '') AS gateway_mode, COALESCE(g.transport, '') AS gateway_transport,
                 t.request_type, t.integration_type,
+                CASE WHEN t.integration_type = 'gRPC' THEN t.grpc_service_id END AS grpc_service_id,
                 COALESCE(t.jsonpath_filter, '') AS response_filter,
                 (
                     ", gateway_policy!(), "
@@ -508,9 +511,13 @@ macro_rules! tool_query {
                     OR ", non_empty_json!("t.plugin_chain_post"), ") AS pending_policy
              FROM tools t
              LEFT JOIN gateways g ON g.id = t.gateway_id
-             WHERE t.enabled = TRUE AND t.integration_type IN ('MCP', 'REST') AND t.name IS NOT NULL
-                AND ((t.integration_type = 'REST' AND t.gateway_id IS NULL)
-                    OR (g.enabled = TRUE AND g.status = 'active' AND ", visible!("g"), "))
+             LEFT JOIN grpc_services gs ON gs.id = t.grpc_service_id
+             WHERE t.enabled = TRUE AND t.name IS NOT NULL
+                AND ((t.integration_type IN ('MCP', 'REST')
+                    AND ((t.integration_type = 'REST' AND t.gateway_id IS NULL)
+                        OR (g.enabled = TRUE AND g.status = 'active' AND ", visible!("g"), ")))
+                    OR ($9 AND t.integration_type = 'gRPC' AND t.gateway_id IS NULL
+                        AND gs.enabled = TRUE AND ", visible!("gs"), "))
                 AND (CAST($2 AS TEXT) IS NULL OR t.name = $2)
                 AND (CAST($3 AS TEXT) IS NULL OR t.id > $3)
                 AND ", visible!("t"), "
@@ -901,8 +908,9 @@ impl Database {
         server_id: Option<&str>,
         after_id: Option<&str>,
         limit: u32,
+        grpc_enabled: bool,
     ) -> Result<Vec<CatalogTool>, sqlx::Error> {
-        self.mcp_tools(scope, server_id, None, after_id, limit)
+        self.mcp_tools(scope, server_id, None, after_id, limit, grpc_enabled)
             .await
     }
 
@@ -1251,9 +1259,10 @@ impl Database {
         scope: CatalogScope<'_>,
         server_id: Option<&str>,
         name: &str,
+        grpc_enabled: bool,
     ) -> Result<Option<CatalogTool>, sqlx::Error> {
         let mut matches = self
-            .mcp_tools(scope, server_id, Some(name), None, 2)
+            .mcp_tools(scope, server_id, Some(name), None, 2, grpc_enabled)
             .await?;
         if matches.len() > 1 {
             return Err(sqlx::Error::Protocol(
@@ -1270,6 +1279,7 @@ impl Database {
         name: Option<&str>,
         after_id: Option<&str>,
         limit: u32,
+        grpc_enabled: bool,
     ) -> Result<Vec<CatalogTool>, sqlx::Error> {
         let teams = match scope.visibility {
             TeamVisibility::Teams(teams) => teams.as_slice(),
@@ -1288,6 +1298,7 @@ impl Database {
                     .bind(scope.can_own())
                     .bind(team_ids)
                     .bind(i64::from(limit))
+                    .bind(grpc_enabled)
                     .fetch_all($pool)
                     .await?
             };
@@ -1807,6 +1818,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         output_schema,
         annotations,
         integration_type,
+        grpc_service_id,
         response_filter,
         rest,
     } = row;
@@ -1824,6 +1836,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         reachable,
         deprecated,
         rest: (integration_type == "REST").then_some(rest),
+        grpc_service_id,
         response_filter,
         needs_upstream_config,
         definition: ToolDefinition {
@@ -2020,14 +2033,14 @@ mod tests {
 
         assert_eq!(
             ids(database
-                .list_mcp_tools(public, None, None, 10)
+                .list_mcp_tools(public, None, None, 10, false)
                 .await
                 .unwrap()),
             ["01"]
         );
         assert_eq!(
             ids(database
-                .list_mcp_tools(owner, None, Some("01"), 10)
+                .list_mcp_tools(owner, None, Some("01"), 10, false)
                 .await
                 .unwrap()),
             ["02", "03"]
@@ -2043,35 +2056,35 @@ mod tests {
         assert!(!database.active_team("missing").await.unwrap());
         assert!(
             database
-                .list_mcp_tools(outsider, Some("fort-server"), None, 10)
+                .list_mcp_tools(outsider, Some("fort-server"), None, 10, false)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             database
-                .find_mcp_tool(outsider, Some("fort-server"), "public-echo")
+                .find_mcp_tool(outsider, Some("fort-server"), "public-echo", false)
                 .await
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             ids(database
-                .list_mcp_tools(member, Some("fort-server"), Some("01"), 1)
+                .list_mcp_tools(member, Some("fort-server"), Some("01"), 1, false)
                 .await
                 .unwrap()),
             ["02"]
         );
         assert!(
             database
-                .find_mcp_tool(member, Some("fort-server"), "own-echo")
+                .find_mcp_tool(member, Some("fort-server"), "own-echo", false)
                 .await
                 .unwrap()
                 .is_none()
         );
 
         let tool = database
-            .find_mcp_tool(member, Some("fort-server"), "fort-echo")
+            .find_mcp_tool(member, Some("fort-server"), "fort-echo", false)
             .await
             .unwrap()
             .unwrap();
@@ -2096,7 +2109,7 @@ mod tests {
             .unwrap();
         assert!(
             database
-                .find_mcp_tool(member, Some("fort-server"), "fort-echo")
+                .find_mcp_tool(member, Some("fort-server"), "fort-echo", false)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2108,7 +2121,7 @@ mod tests {
             .unwrap();
         assert!(
             database
-                .find_mcp_tool(member, Some("fort-server"), "fort-echo")
+                .find_mcp_tool(member, Some("fort-server"), "fort-echo", false)
                 .await
                 .unwrap()
                 .is_none()
@@ -2164,7 +2177,7 @@ mod tests {
         };
         assert!(
             database
-                .find_mcp_tool(public, None, "fixture-echo")
+                .find_mcp_tool(public, None, "fixture-echo", false)
                 .await
                 .unwrap()
                 .is_some()

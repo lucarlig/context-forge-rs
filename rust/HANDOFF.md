@@ -219,6 +219,23 @@ match the pinned gateway's evaluation and validation on SQLite and PostgreSQL.
 A live test verifies that migrated filters run after startup and that the
 configured deadline returns a tool error.
 
+## gRPC federation
+
+With `MCPGATEWAY_GRPC_ENABLED=true` and the admin API enabled, POST
+`/admin/grpc` to register a service. The gateway saves reflected descriptors
+and methods in the database. Authenticated MCP callers can find and invoke
+unary methods within their catalog scope.
+
+The pinned replay matched registration, method discovery, descriptor reuse,
+protobuf JSON defaults, and invocation errors on SQLite and PostgreSQL.
+Rust returns the scoped record for `GET /admin/grpc/{id}`. The pinned gateway
+returned HTTP 500 in the same fixture.
+Registration stores gRPC metadata. The unary caller follows v1.1.2's behavior
+for that metadata, which stays in the registry. Service listing, updates, state
+changes, deletion, re-reflection, TLS parity, and CLI translation remain open.
+
+## Gateway management
+
 The gateway management and catalog milestone is verified. Standing upstream
 listeners reconcile the catalog after acknowledgment and apply subsequent
 tool, resource, and prompt changes. A two-worker Redis test verified that only

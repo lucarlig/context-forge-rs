@@ -20,6 +20,7 @@ encoding_rs = "0.8.44"
 fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"] }
 futures-util = "0.3"
 hmac = "0.13"
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 indexmap = { version = "2", features = ["serde"] }
 ipnet = "2.12"
 jiff = { version = "1", default-features = false, features = ["std", "tzdb-bundle-always"] }
@@ -31,6 +32,8 @@ p256 = "0.14"
 p384 = "0.14"
 p521 = "0.14"
 percent-encoding = "2"
+prost = "0.14.4"
+prost-reflect = { version = "0.16.5", features = ["serde"] }
 redis = { version = "1.8.3", default-features = false, features = ["tokio-rustls-comp"] }
 regex = { version = "1.12", default-features = false, features = ["std", "perf"] }
 ring = "0.17.14"
@@ -48,8 +51,10 @@ sqlx = { version = "0.9.1", default-features = false, features = ["derive", "pos
 sqlx-postgres = { version = "0.9.1", default-features = false, features = ["json"] }
 sqlx-sqlite = { version = "0.9.1", default-features = false, features = ["json"] }
 thiserror = "2"
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tokio-util = "0.7"
+tonic = { version = "0.14.9", default-features = false, features = ["channel", "codegen", "tls-ring", "tls-native-roots"] }
+tonic-reflection = { version = "0.14.9", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"

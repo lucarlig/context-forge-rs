@@ -23,6 +23,7 @@ use context_forge_rs::{
     config::{RedisSettings, Settings},
     database::Database,
     gateway::{CatalogRefresh, GatewayHealth, GatewayService, Pagination},
+    grpc::GrpcSettings,
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, ListenSettings, ProtocolMode, RedisSessionDirectory, SessionSettings,
@@ -53,6 +54,114 @@ const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";
 const LIST: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/03-tools-list.body");
 const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-tools-call.body");
+
+#[tokio::test]
+async fn grpc_feature_gate_and_parent_scope_prevent_dispatch() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let target = upstream.local_addr().unwrap().to_string();
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    sqlx::query(
+        "INSERT INTO grpc_services (id, name, slug, target, team_id, visibility)
+         VALUES ('grpc', 'gRPC', 'grpc', $1, 'alpha', 'team')",
+    )
+    .bind(&target)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tools (id, name, original_name, custom_name, custom_name_slug, integration_type,
+                grpc_service_id, input_schema, visibility)
+         VALUES ('tool', 'grpc-echo', 'fixture.Echo.Call', 'grpc-echo', 'grpc-echo',
+                'gRPC', 'grpc', '{}', 'public')",
+    )
+    .execute(pool).await.unwrap();
+    let member = token("member", json!(["alpha"]), json!({}));
+    let outsider = token("outsider", json!(["beta"]), json!({}));
+    let no_execute = token(
+        "member",
+        json!(["alpha"]),
+        json!({"permissions":["tools.read"]}),
+    );
+    let admin_without_grant = token("admin", Value::Null, json!({}));
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    for enabled in [true, false] {
+        let service = Arc::new(
+            GatewayService::new(
+                database.clone(),
+                authorizer(database.clone()),
+                UpstreamClient::new(
+                    EgressPolicy {
+                        allow_localhost: true,
+                        ..EgressPolicy::default()
+                    },
+                    Duration::from_secs(2),
+                ),
+                Pagination::new(100, 900, None),
+                CatalogRefresh::default(),
+            )
+            .with_grpc_settings(GrpcSettings {
+                enabled,
+                admin_enabled: true,
+                ..GrpcSettings::default()
+            }),
+        );
+        let gateway = Running::start(
+            service
+                .mcp_router(true, ProtocolMode::Auto)
+                .merge(service.registration_router()),
+        )
+        .await;
+        for (credential, expected) in [(&member, usize::from(enabled)), (&outsider, 0)] {
+            let (_, response) = send(
+                &client,
+                gateway.url("/mcp/"),
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+                Some(credential),
+            )
+            .await;
+            let tools = response["result"]["tools"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{response}"));
+            assert_eq!(tools.len(), expected, "{response}");
+        }
+        for credential in [&outsider, if enabled { &no_execute } else { &member }] {
+            let (_, response) = send(
+                &client, gateway.url("/mcp/"),
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grpc-echo","arguments":{}}}),
+                Some(credential),
+            ).await;
+            assert!(
+                response["error"].is_object() || response["result"]["isError"] == true,
+                "{response}"
+            );
+        }
+        for (credential, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(&admin_without_grant), StatusCode::FORBIDDEN),
+        ] {
+            let mut request = client
+                .post(gateway.url("/admin/grpc"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(json!({"name":"Unauthorized","target":target}).to_string());
+            if let Some(credential) = credential {
+                request = request.bearer_auth(credential);
+            }
+            assert_eq!(request.send().await.unwrap().status(), expected);
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), upstream.accept())
+            .await
+            .is_err()
+    );
+}
 
 #[tokio::test]
 async fn rest_tool_calls_require_visibility_and_execute_scope_before_dispatch() {

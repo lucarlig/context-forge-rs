@@ -4,6 +4,7 @@ mod catalog_api;
 mod content;
 mod exchanged_tokens;
 mod export_api;
+mod grpc_api;
 mod health;
 mod import_api;
 mod lifecycle;
@@ -65,6 +66,7 @@ use crate::{
     },
     database::Database,
     forward_identity::IdentityError,
+    grpc::GrpcSettings,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     oauth_client::OAuthConfig,
     proxy_catalog_cache::ProxyCatalogCache,
@@ -113,6 +115,7 @@ pub struct GatewayService {
     roots: roots::RootRegistry,
     max_prompt_bytes: usize,
     tool_preview_enabled: bool,
+    grpc: GrpcSettings,
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
     gateway_oauth: GatewayOAuthSettings,
@@ -218,6 +221,7 @@ impl GatewayService {
             roots: roots::RootRegistry::default(),
             max_prompt_bytes: 10240,
             tool_preview_enabled: true,
+            grpc: GrpcSettings::default(),
             email_auth_enabled: true,
             token_issuer: None,
             gateway_oauth: GatewayOAuthSettings::default(),
@@ -266,6 +270,11 @@ impl GatewayService {
     pub fn with_rest_tool_limits(mut self, timeout: Duration, response_text_limit: usize) -> Self {
         self.rest_timeout = timeout;
         self.rest_response_text_limit = response_text_limit;
+        self
+    }
+
+    pub fn with_grpc_settings(mut self, settings: GrpcSettings) -> Self {
+        self.grpc = settings;
         self
     }
 
@@ -504,6 +513,9 @@ impl GatewayService {
         if self.email_auth_enabled {
             router = router.merge(token_api::router());
         }
+        if self.grpc.admin_enabled {
+            router = router.merge(grpc_api::router());
+        }
         self.access.protect_api(
             router
                 .merge(oauth_api::router())
@@ -615,6 +627,7 @@ impl GatewayService {
                 server_id,
                 continuation.as_ref().map(|cursor| cursor.after_id.as_str()),
                 size + 1,
+                self.grpc.enabled,
             )
             .await?;
 
@@ -730,6 +743,13 @@ impl GatewayService {
                         result = rest_tool::execute(self, &tool, rest, &request, principal, context.request_headers) => {
                             result.map(|value| rest_tool::for_caller(value, context.client_capabilities.is_some()))
                         }
+                    };
+                }
+                if let Some(service_id) = &tool.grpc_service_id {
+                    return tokio::select! {
+                        biased;
+                        () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
+                        result = grpc_api::invoke(self, &tool, service_id, &request, principal) => result,
                     };
                 }
                 let transport = UpstreamTransport::from_name(&tool.gateway_transport);
@@ -1134,6 +1154,7 @@ impl GatewayService {
                 access::catalog_scope(principal),
                 server.map(|server| server.id.as_str()),
                 name,
+                self.grpc.enabled,
             )
             .await?)
     }

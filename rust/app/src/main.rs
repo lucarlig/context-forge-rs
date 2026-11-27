@@ -114,6 +114,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_tool_preview(Settings::tool_preview_enabled()?)
         .with_response_filters(Settings::response_filters()?)
         .with_rest_tool_limits(rest_timeout, rest_response_text_limit)
+        .with_grpc_settings(Settings::grpc_federation()?)
         .with_schema_validation(Settings::schema_validation()?)
         .with_token_issuer(email_auth_enabled, issuer)
         .with_gateway_oauth(Settings::gateway_oauth()?)
