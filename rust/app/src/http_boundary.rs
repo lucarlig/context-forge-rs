@@ -24,12 +24,17 @@ use uuid::Uuid;
 
 use crate::config::{flag, parse, value};
 
+mod proxy;
+
+pub(crate) use proxy::public_scheme;
+
 // HeaderMap can hold 24,576 distinct names at its largest table capacity.
 const HTTP1_HEADER_CAPACITY: usize = 24_576;
 
 pub struct HttpBoundary {
     header_limits: Option<HeaderLimits>,
     correlation: Option<Correlation>,
+    proxies: proxy::ProxyHeaders,
 }
 
 impl HttpBoundary {
@@ -56,6 +61,7 @@ impl HttpBoundary {
         Ok(Self {
             header_limits,
             correlation,
+            proxies: proxy::ProxyHeaders::from_env()?,
         })
     }
 
@@ -113,6 +119,7 @@ impl HttpBoundary {
         if let Some(limits) = self.header_limits {
             router = router.layer(middleware::from_fn_with_state(limits, limit_headers));
         }
+        router = self.proxies.apply(router);
         if let Some(correlation) = self.correlation {
             router = router.layer(middleware::from_fn_with_state(correlation, correlate));
         }
@@ -286,6 +293,7 @@ mod tests {
                 count: 120,
             }),
             correlation: None,
+            proxies: proxy::ProxyHeaders::parse("").unwrap(),
         };
         let router = Router::new().route(
             "/",
@@ -330,6 +338,7 @@ mod tests {
                 preserve: true,
                 respond: true,
             }),
+            proxies: proxy::ProxyHeaders::parse("").unwrap(),
         }
         .apply(Router::new().route("/", get(|| async { StatusCode::UNAUTHORIZED })));
         let request = || {

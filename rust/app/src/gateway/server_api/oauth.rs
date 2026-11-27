@@ -157,25 +157,7 @@ fn request_base(configured_base: &str, headers: &HeaderMap, uri: &Uri) -> String
     else {
         return configured_base.to_owned();
     };
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|header| header.to_str().ok())
-        .and_then(|header| header.split(',').next())
-        .map(str::trim)
-        .and_then(|value| {
-            if value.eq_ignore_ascii_case("https") {
-                Some("https")
-            } else if value.eq_ignore_ascii_case("http") {
-                Some("http")
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            uri.scheme_str()
-                .filter(|scheme| matches!(*scheme, "http" | "https"))
-        })
-        .unwrap_or("http");
+    let scheme = crate::http_boundary::public_scheme(headers, uri);
     let configured = reqwest::Url::parse(configured_base).ok();
     let prefix = configured
         .as_ref()

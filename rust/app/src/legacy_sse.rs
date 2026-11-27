@@ -139,19 +139,16 @@ pub(crate) fn router(
 async fn open(State(state): State<Arc<SseState>>, request: Request) -> Response {
     let principal = request.extensions().get::<Principal>().cloned();
     let server = request.extensions().get::<CatalogServer>().cloned();
-    let authority = request.uri().authority().cloned().or_else(|| {
-        request
-            .headers()
-            .get(header::HOST)?
-            .to_str()
-            .ok()?
-            .parse::<Authority>()
-            .ok()
-    });
+    let authority = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .and_then(|host| host.parse::<Authority>().ok())
+        .or_else(|| request.uri().authority().cloned());
     let Some(authority) = authority else {
         return detail(StatusCode::BAD_REQUEST, "Missing or invalid Host");
     };
-    let scheme = request.uri().scheme_str().unwrap_or("http");
+    let scheme = crate::http_boundary::public_scheme(request.headers(), request.uri());
     let path = match server.as_ref() {
         Some(server) => format!("/servers/{}/message", server.id),
         None => "/message".to_owned(),

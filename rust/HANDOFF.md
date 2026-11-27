@@ -119,6 +119,12 @@ Each command receives its own ID unless preservation is enabled and a
 passthrough rule admits the opening request's ID. Both relays capture allowed
 headers at connection setup and exclude gateway identity and routing headers.
 
+Twelve live proxy cases match the pinned client IP, token IP restrictions,
+SSE message URLs, and OAuth metadata URLs. `FORWARDED_ALLOW_IPS` limits
+which peers can set the client address and request scheme. Public URL
+construction uses valid forwarded host and protocol values even when the
+peer falls outside that list, as in the reference gateway.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.
