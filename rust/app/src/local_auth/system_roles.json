@@ -141,22 +141,22 @@
     "scope": "global",
     "permissions": [
       "admin.dashboard",
-      "admin.overview",
       "gateways.read",
       "servers.read",
-      "servers.use",
-      "teams.read",
       "teams.join",
       "tools.read",
       "resources.read",
       "prompts.read",
-      "llm.read",
       "a2a.read",
-      "metrics:read",
+      "llm.read",
+      "teams.read",
       "tokens.create",
       "tokens.read",
       "tokens.update",
-      "tokens.revoke"
+      "tokens.revoke",
+      "admin.overview",
+      "servers.use",
+      "metrics:read"
     ],
     "is_system_role": true
   }

@@ -3,6 +3,7 @@
 pub(crate) mod mail;
 mod password_reset;
 mod passwords;
+mod rbac;
 mod storage;
 mod user_lifecycle;
 
@@ -202,6 +203,7 @@ pub async fn router(
                 post(user_lifecycle::unlock_user),
             );
     }
+    let protected = protected.merge(rbac::router());
     Ok(public
         .with_state(state.clone())
         .merge(state.access.protect_api_with_message(

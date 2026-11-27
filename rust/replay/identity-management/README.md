@@ -45,3 +45,9 @@ confirmation email, and login with the new password. The database stored the
 SHA-256 digest of the link token. On SQLite and PostgreSQL, two simultaneous
 submissions of the same Rust reset link produced one success and one rejection.
 The password and session revocations committed together.
+
+All 24 normalized role-management responses matched on SQLite and
+PostgreSQL. The fixture covered the permissions catalog, built-in roles,
+inherited role creation, assignment, permission checks, revocation, and
+soft deletion. It also checked that a regular account cannot list roles for
+administration and that built-in roles cannot be edited.
