@@ -118,7 +118,14 @@ impl GatewayService {
         let upstream = self.upstream.with_timeout_cap(settings.timeout);
         let probe = timeout(settings.timeout, async {
             let credentials = self
-                .connection_credentials(&record.id, &record.url, connection, None, None)
+                .connection_credentials(
+                    &record.id,
+                    &record.url,
+                    connection,
+                    None,
+                    None,
+                    UpstreamUse::Discovery,
+                )
                 .await
                 .map_err(|_| "Could not load upstream authentication or TLS material".to_owned())?;
             let endpoint = UpstreamEndpoint {
@@ -163,7 +170,7 @@ impl GatewayService {
         let user_oauth = record
             .oauth_config
             .as_deref()
-            .is_some_and(oauth_api::requires_user);
+            .is_some_and(oauth_api::defers_discovery);
         let should_refresh = record.enabled
             && authenticated
             && !user_oauth

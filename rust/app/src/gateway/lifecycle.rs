@@ -133,7 +133,7 @@ impl GatewayService {
         if record
             .oauth_config
             .as_deref()
-            .is_some_and(oauth_api::requires_user)
+            .is_some_and(oauth_api::defers_discovery)
         {
             return Ok(self.database.finish_deferred_gateway(record).await?);
         }
@@ -151,7 +151,14 @@ impl GatewayService {
             .await?
             .ok_or(RegistrationError::Invalid("Gateway connection unavailable"))?;
         let credentials = self
-            .connection_credentials(&record.id, &record.url, connection, None, None)
+            .connection_credentials(
+                &record.id,
+                &record.url,
+                connection,
+                None,
+                None,
+                UpstreamUse::Discovery,
+            )
             .await
             .map_err(|_| {
                 RegistrationError::Invalid("Could not load upstream authentication or TLS material")

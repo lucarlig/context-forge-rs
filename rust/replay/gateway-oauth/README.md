@@ -44,3 +44,16 @@ request with a different callback URI. The signed fixture also checked
 the current and previous public keys in the published JWKS. The provider
 verified the dedicated RSA key's client assertions for authorization-code
 exchange and refresh, and the private key stayed out of the database.
+
+Three RFC 8693 fixtures matched 10 normalized checks each on SQLite and
+PostgreSQL. They covered impersonation, delegation with an actor access
+token, and delegation with a signed actor assertion. The provider verified
+the exact authenticated subject and expected grant fields. Repeated calls
+with the same valid credential reused the exchange. The discovery
+credential handled catalog refresh when configured, and a deferred
+gateway could refresh under the calling user's credentials.
+
+A separate check matched the pinned tool error when the provider returned
+a non-bearer token. That response did not reach the MCP upstream. Gateway
+configuration and connection changes for token exchange require a
+platform administrator.

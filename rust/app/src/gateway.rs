@@ -2,6 +2,7 @@
 
 mod catalog_api;
 mod content;
+mod exchanged_tokens;
 mod health;
 mod lifecycle;
 mod listeners;
@@ -72,7 +73,17 @@ use crate::{
     },
     upstream_tls::TlsMaterial,
 };
+use exchanged_tokens::{ExchangeConnection, ExchangedTokens};
 use proxy::DirectTarget;
+
+const TOKEN_EXCHANGE_ADMIN_REQUIRED: &str =
+    "Configuring a token-exchange gateway requires platform administrator privileges.";
+
+#[derive(Clone, Copy)]
+enum UpstreamUse {
+    Invocation,
+    Discovery,
+}
 
 pub use health::GatewayHealth;
 pub use lifecycle::GatewayLifecycle;
@@ -99,6 +110,7 @@ pub struct GatewayService {
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
     gateway_oauth: GatewayOAuthSettings,
+    exchanged_tokens: ExchangedTokens,
     pub(crate) virtual_server_base: String,
     well_known_enabled: bool,
     well_known_max_age: u32,
@@ -184,6 +196,7 @@ impl GatewayService {
             email_auth_enabled: true,
             token_issuer: None,
             gateway_oauth: GatewayOAuthSettings::default(),
+            exchanged_tokens: ExchangedTokens::default(),
             virtual_server_base: "http://localhost:4444".to_owned(),
             well_known_enabled: true,
             well_known_max_age: 3600,
@@ -665,11 +678,12 @@ impl GatewayService {
                 gateway.needs_upstream_config,
                 context.request_headers,
                 principal,
+                UpstreamUse::Invocation,
             )
             .await
         {
             Ok(credentials) => credentials,
-            Err(ToolError::OAuthRequired(_)) => {
+            Err(error @ (ToolError::OAuthRequired(_) | ToolError::OAuthExchangeFailed)) => {
                 let name = self
                     .database
                     .gateway_records(&gateway.id)
@@ -677,6 +691,11 @@ impl GatewayService {
                     .into_iter()
                     .find(|record| record.id == gateway.id)
                     .map_or_else(|| gateway.id.clone(), |record| record.name);
+                if matches!(error, ToolError::OAuthExchangeFailed) {
+                    return tool_result_error(format!(
+                        "Tool invocation failed: Token exchange failed for gateway '{name}'. Contact your administrator."
+                    ));
+                }
                 return tool_result_error(format!(
                     "Tool invocation failed: Please authorize {name} first. Visit /oauth/authorize/{} to complete OAuth flow.",
                     gateway.id
@@ -730,6 +749,7 @@ impl GatewayService {
         needs_upstream_config: bool,
         request_headers: Option<&HeaderMap>,
         principal: Option<&Principal>,
+        usage: UpstreamUse,
     ) -> Result<Option<UpstreamCredentials>, ToolError> {
         let incoming =
             request_headers.filter(|headers| self.header_forwarding.needs_config(headers));
@@ -746,11 +766,11 @@ impl GatewayService {
             && connection
                 .oauth
                 .as_deref()
-                .is_some_and(oauth_api::requires_user)
+                .is_some_and(oauth_api::is_authorization_code)
         {
             return Err(ToolError::OAuthRequired(id.to_owned()));
         }
-        self.connection_credentials(id, url, connection, incoming, principal)
+        self.connection_credentials(id, url, connection, request_headers, principal, usage)
             .await
     }
 
@@ -806,8 +826,9 @@ impl GatewayService {
         id: &str,
         url: &str,
         connection: GatewayConnectionRow,
-        incoming: Option<&HeaderMap>,
+        request_headers: Option<&HeaderMap>,
         principal: Option<&Principal>,
+        usage: UpstreamUse,
     ) -> Result<Option<UpstreamCredentials>, ToolError> {
         let kind = connection.kind.as_str();
         let cipher = self.credential_cipher.as_ref();
@@ -874,6 +895,37 @@ impl GatewayService {
                 } else {
                     None
                 }
+            } else if config.is_token_exchange() {
+                let upstream = self
+                    .upstream
+                    .with_timeout_cap(self.gateway_oauth.request_timeout);
+                if let Some(discovery) = matches!(usage, UpstreamUse::Discovery)
+                    .then(|| config.discovery_config())
+                    .flatten()
+                {
+                    Some(
+                        discovery
+                            .authorization(&upstream, credentials.tls.as_ref())
+                            .await
+                            .map_err(|_| ToolError::Unavailable)?,
+                    )
+                } else if let Some(principal) = principal {
+                    let subject = request_headers
+                        .and_then(|headers| principal.verified_bearer(headers))
+                        .ok_or(ToolError::OAuthExchangeFailed)?;
+                    Some(self.exchanged_tokens.authorization(
+                        ExchangeConnection {gateway_id:id,version:connection.version,
+                            upstream:&upstream,config:&config,tls:credentials.tls.as_ref()},
+                        principal, subject,
+                    ).await.map_err(|error| {
+                        tracing::warn!(gateway=%id, %error, "upstream OAuth exchange failed");
+                            ToolError::OAuthExchangeFailed
+                    })?)
+                } else if matches!(usage, UpstreamUse::Discovery) {
+                    None
+                } else {
+                    return Err(ToolError::OAuthExchangeFailed);
+                }
             } else {
                 Some(config.authorization(&self.upstream, credentials.tls.as_ref()).await.map_err(|error| {
                     tracing::warn!(gateway = %id, %error, "could not obtain upstream OAuth token");
@@ -886,7 +938,9 @@ impl GatewayService {
                     .insert(header::AUTHORIZATION, authorization);
             }
         }
-        if let Some(incoming) = incoming {
+        if let Some(incoming) =
+            request_headers.filter(|headers| self.header_forwarding.needs_config(headers))
+        {
             let managed = matches!(kind, "basic" | "bearer" | "authheaders" | "sigv4" | "oauth");
             self.header_forwarding
                 .apply(
@@ -1011,6 +1065,8 @@ pub(crate) enum ToolError {
     Unavailable,
     #[error("OAuth authorization required. Visit /oauth/authorize/{0} to complete the flow.")]
     OAuthRequired(String),
+    #[error("Upstream OAuth token exchange failed")]
+    OAuthExchangeFailed,
     #[error("Request cancelled")]
     Cancelled,
     #[error("Invalid cursor")]
@@ -1232,6 +1288,21 @@ async fn register(
         ));
     }
     if let Some(config) = input.auth.oauth_config_mut() {
+        if config.is_token_exchange() && !principal.is_global_admin() {
+            return Err(RegistrationResponse::new(
+                StatusCode::FORBIDDEN,
+                TOKEN_EXCHANGE_ADMIN_REQUIRED,
+            ));
+        }
+        config.normalize_exchange();
+        config
+            .validate_exchange_endpoints(&service.upstream)
+            .map_err(|_| {
+                RegistrationResponse::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "OAuth token endpoint is invalid or disallowed",
+                )
+            })?;
         service
             .gateway_oauth
             .discover_endpoints(&service.upstream, config)
@@ -1289,10 +1360,10 @@ async fn register(
     } else {
         None
     };
-    let oauth_for_user = input
+    let defer_oauth_discovery = input
         .auth
         .oauth_config()
-        .is_some_and(OAuthConfig::is_authorization_code);
+        .is_some_and(OAuthConfig::defers_discovery);
     if let Some(config) = input.auth.oauth_config()
         && let Some(auth) = &mut auth
     {
@@ -1308,8 +1379,11 @@ async fn register(
             .map_err(|_| encryption_error())?;
         auth.encoded_oauth = Some(encoded);
         auth.masked["oauthConfig"] = masked;
-        if lifecycle.is_none() && !oauth_for_user {
-            let authorization = config
+        if lifecycle.is_none() && !defer_oauth_discovery {
+            let discovery = config.discovery_config();
+            let authorization = discovery
+                .as_ref()
+                .unwrap_or(config)
                 .authorization(&service.upstream, tls.as_ref())
                 .await
                 .map_err(|error| {
@@ -1341,7 +1415,7 @@ async fn register(
         .as_mut()
         .map_or(&mut anonymous_credentials, |auth| &mut auth.credentials);
     discovery_credentials.tls = tls;
-    let (discovery, metadata) = if lifecycle.is_some() || oauth_for_user {
+    let (discovery, metadata) = if lifecycle.is_some() || defer_oauth_discovery {
         (
             DiscoveredCatalog {
                 capabilities: json!({}),

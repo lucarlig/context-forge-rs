@@ -2,6 +2,7 @@
 
 mod authorization_code;
 mod discovery;
+mod token_exchange;
 
 use std::time::Duration;
 
@@ -71,6 +72,22 @@ pub(crate) struct OAuthConfig {
     dcr_available: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     endpoints_discovered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_token_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_token_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_token_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor_token_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor_token_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<token_exchange::ServiceOAuthOverride>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor: Option<token_exchange::ServiceOAuthOverride>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -101,6 +118,7 @@ impl OAuthConfig {
     }
 
     pub(crate) fn resolve_masks(&mut self, stored: Option<&Self>) -> Result<(), EnvelopeError> {
+        self.resolve_service_masks(stored)?;
         let keep_secret = self.client_secret.as_deref() == Some(MASKED);
         let keep_key = self.private_key.as_deref() == Some(MASKED);
         if !keep_secret && !keep_key {
@@ -177,6 +195,8 @@ impl OAuthConfig {
                             .authorization_url
                             .as_ref()
                             .is_some_and(|url| !url.is_empty())))
+        } else if self.is_token_exchange() {
+            self.valid_exchange()
         } else {
             self.grant_type
                 .as_deref()
@@ -214,13 +234,13 @@ impl OAuthConfig {
         vault: &SecretEnvelope,
     ) -> Result<(String, Value), EnvelopeError> {
         let mut stored = self.clone();
-        for field in [&mut stored.client_secret, &mut stored.private_key] {
+        for field in stored.secret_fields() {
             if let Some(secret) = field.take() {
                 *field = Some(vault.seal(Zeroizing::new(secret)).await?);
             }
         }
         let encoded = serde_json::to_string(&stored).map_err(|_| EnvelopeError)?;
-        for field in [&mut stored.client_secret, &mut stored.private_key] {
+        for field in stored.secret_fields() {
             if field.is_some() {
                 *field = Some(MASKED.to_owned());
             }
@@ -251,7 +271,7 @@ impl OAuthConfig {
 
     pub(crate) async fn load(vault: &SecretEnvelope, encoded: &str) -> Result<Self, EnvelopeError> {
         let mut config: Self = serde_json::from_str(encoded).map_err(|_| EnvelopeError)?;
-        for field in [&mut config.client_secret, &mut config.private_key] {
+        for field in config.secret_fields() {
             if let Some(secret) = field.take() {
                 *field = Some(if SecretEnvelope::is_encrypted(&secret) {
                     vault.open(secret).await?.to_string()
@@ -268,7 +288,7 @@ impl OAuthConfig {
         upstream: &UpstreamClient,
         tls: Option<&TlsMaterial>,
     ) -> Result<HeaderValue, UpstreamError> {
-        if self.is_authorization_code() {
+        if self.is_authorization_code() || self.is_token_exchange() {
             return Err(UpstreamError::InvalidCredentials);
         }
         let method = self
@@ -385,11 +405,12 @@ impl OAuthConfig {
                 form.append_pair("scope", &scope);
             }
         }
-        if let Some(audience) = self
-            .audience
-            .as_deref()
-            .map(str::trim)
-            .filter(|a| !a.is_empty())
+        if !self.is_token_exchange()
+            && let Some(audience) = self
+                .audience
+                .as_deref()
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
         {
             form.append_pair("audience", audience);
         }

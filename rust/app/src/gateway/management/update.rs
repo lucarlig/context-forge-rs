@@ -176,7 +176,34 @@ pub(crate) async fn update(
     let tls_changed = gateway.ca_certificate != previous.ca_certificate
         || gateway.client_cert != previous.client_cert
         || client_key.is_some();
+    if !principal.is_global_admin()
+        && (destination_changed || tls_changed || auth.has_update() || one_time_auth)
+        && previous
+            .oauth_config
+            .as_deref()
+            .is_some_and(oauth_api::is_token_exchange)
+    {
+        return Err(UpdateError::message(
+            StatusCode::FORBIDDEN,
+            TOKEN_EXCHANGE_ADMIN_REQUIRED,
+        ));
+    }
     if let Some(config) = auth.oauth_config_mut() {
+        if config.is_token_exchange() && !principal.is_global_admin() {
+            return Err(UpdateError::message(
+                StatusCode::FORBIDDEN,
+                TOKEN_EXCHANGE_ADMIN_REQUIRED,
+            ));
+        }
+        config.normalize_exchange();
+        config
+            .validate_exchange_endpoints(&service.upstream)
+            .map_err(|_| {
+                UpdateError::message(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "OAuth token endpoint is invalid or disallowed",
+                )
+            })?;
         service
             .gateway_oauth
             .discover_endpoints(&service.upstream, config)
@@ -550,12 +577,19 @@ async fn discover_updated_gateway(
         && connection
             .oauth
             .as_deref()
-            .is_some_and(oauth_api::requires_user)
+            .is_some_and(oauth_api::defers_discovery)
     {
         return Ok(None);
     }
     let Ok(credentials) = service
-        .connection_credentials(&gateway.id, &gateway.url, connection, None, None)
+        .connection_credentials(
+            &gateway.id,
+            &gateway.url,
+            connection,
+            None,
+            None,
+            UpstreamUse::Discovery,
+        )
         .await
     else {
         if connection_changed {

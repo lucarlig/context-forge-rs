@@ -148,7 +148,14 @@ impl GatewayService {
             return;
         };
         let Ok(credentials) = self
-            .connection_credentials(&record.id, &record.url, connection, None, None)
+            .connection_credentials(
+                &record.id,
+                &record.url,
+                connection,
+                None,
+                None,
+                UpstreamUse::Discovery,
+            )
             .await
         else {
             tracing::warn!(gateway = %record.id, "could not load upstream catalog listener credentials");

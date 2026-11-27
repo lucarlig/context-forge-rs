@@ -840,7 +840,7 @@ fn tool_error(error: ToolError) -> ErrorData {
         ToolError::NotFound => ErrorData::new(ErrorCode(0), "Unknown tool", None),
         ToolError::Cursor => ErrorData::invalid_params("Invalid cursor", None),
         ToolError::Unavailable => ErrorData::internal_error("Tool service unavailable", None),
-        error @ ToolError::OAuthRequired(_) => {
+        error @ (ToolError::OAuthRequired(_) | ToolError::OAuthExchangeFailed) => {
             ErrorData::new(ErrorCode(0), error.to_string(), None)
         }
         ToolError::Cancelled => ErrorData::internal_error("Request cancelled", None),

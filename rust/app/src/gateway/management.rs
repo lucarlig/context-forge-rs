@@ -27,8 +27,8 @@ const MASKED: &str = "*****";
 
 #[derive(Default, Deserialize)]
 pub(super) struct RefreshParameters {
-    include_resources: Option<String>,
-    include_prompts: Option<String>,
+    pub(super) include_resources: Option<String>,
+    pub(super) include_prompts: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -259,6 +259,7 @@ pub(super) async fn refresh(
             true,
             Some(&headers),
             Some(&principal),
+            UpstreamUse::Discovery,
         )
         .await
     {
@@ -406,7 +407,14 @@ async fn activate_catalog(
         return Ok(false);
     };
     let credentials = match service
-        .connection_credentials(&record.id, &record.url, connection, None, None)
+        .connection_credentials(
+            &record.id,
+            &record.url,
+            connection,
+            None,
+            None,
+            UpstreamUse::Discovery,
+        )
         .await
     {
         Ok(credentials) => credentials,

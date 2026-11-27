@@ -134,24 +134,40 @@ async fn fetch_tools(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    match visible_gateway(&service, &principal, &id).await {
-        Ok(gateway) if gateway.oauth_config.is_some() => {}
+    let exchange = match visible_gateway(&service, &principal, &id).await {
+        Ok(gateway) if gateway.oauth_config.is_some() => gateway
+            .oauth_config
+            .as_deref()
+            .is_some_and(is_token_exchange),
         Ok(_) => {
             return CatalogApiError::detail(StatusCode::BAD_REQUEST, "Failed to fetch tools")
                 .into_response();
         }
         Err(error) => return error.into_response(),
-    }
+    };
+    let query = if exchange {
+        super::management::RefreshParameters {
+            include_resources: Some("true".to_owned()),
+            include_prompts: Some("true".to_owned()),
+        }
+    } else {
+        super::management::RefreshParameters::default()
+    };
     let response = super::management::refresh(
         State(service.clone()),
         Extension(principal),
         Path(id.clone()),
-        Query(super::management::RefreshParameters::default()),
+        Query(query),
         headers,
     )
     .await;
     match response {
         Ok(Json(value)) if value["success"] == true => {
+            if exchange {
+                let count = value["toolsAdded"].as_u64().unwrap_or_default()
+                    + value["toolsUpdated"].as_u64().unwrap_or_default();
+                return Json(json!({"success":true,"message":format!("Successfully fetched and created {count} tools")})).into_response();
+            }
             let count = match service.database.gateway_records(&id).await {
                 Ok(rows) => match rows.into_iter().find(|row| row.id == id) {
                     Some(row) => row.tool_count,
@@ -337,10 +353,25 @@ fn parse_time(text: &str) -> Option<Timestamp> {
     iso.parse().or_else(|_| format!("{iso}Z").parse()).ok()
 }
 
-pub(super) fn requires_user(encoded: &str) -> bool {
+pub(super) fn is_authorization_code(encoded: &str) -> bool {
     serde_json::from_str::<Value>(encoded)
         .ok()
         .is_some_and(|value| value["grant_type"] == "authorization_code")
+}
+
+pub(super) fn is_token_exchange(encoded: &str) -> bool {
+    serde_json::from_str::<Value>(encoded)
+        .ok()
+        .is_some_and(|value| value["grant_type"] == "token-exchange")
+}
+
+pub(super) fn defers_discovery(encoded: &str) -> bool {
+    serde_json::from_str::<Value>(encoded)
+        .ok()
+        .is_some_and(|value| {
+            value["grant_type"] == "authorization_code"
+                || value["grant_type"] == "token-exchange" && !value["discovery"].is_object()
+        })
 }
 
 fn resource_origin(url: &str) -> Option<String> {

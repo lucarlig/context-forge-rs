@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{GatewayService, Principal, access, list_fingerprint};
+use super::{GatewayService, Principal, UpstreamUse, access, list_fingerprint};
 use crate::{
     catalog::{CatalogServer, ContentGateway},
     proxy_catalog_cache::{Manifest, Reservation, SnapshotPage},
@@ -104,7 +104,14 @@ impl GatewayService {
             .filter(|_| gateway.available)
             .ok_or_else(|| unavailable("Upstream gateway unavailable"))?;
         let credentials = self
-            .configured_upstream(&gateway.id, &gateway.url, true, headers, principal)
+            .configured_upstream(
+                &gateway.id,
+                &gateway.url,
+                true,
+                headers,
+                principal,
+                UpstreamUse::Invocation,
+            )
             .await
             .map_err(|_| unavailable("Upstream gateway unavailable"))?;
         let endpoint = UpstreamEndpoint {

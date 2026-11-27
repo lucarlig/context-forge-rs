@@ -287,7 +287,7 @@ impl OAuthConfig {
         })
     }
 
-    fn scope_string(&self) -> String {
+    pub(super) fn scope_string(&self) -> String {
         match &self.scopes {
             None => String::new(),
             Some(OAuthValues::One(value)) => value.clone(),

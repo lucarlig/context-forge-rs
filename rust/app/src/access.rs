@@ -55,6 +55,7 @@ pub struct Principal {
     catalog_scopes: Option<Vec<String>>,
     is_admin: bool,
     scopes: Vec<String>,
+    credential_hash: [u8; 32],
 }
 
 pub enum RoleContext<'a> {
@@ -308,6 +309,7 @@ impl Authorizer {
             catalog_scopes,
             is_admin: identity.is_admin,
             scopes,
+            credential_hash: Sha256::digest(token.as_bytes()).into(),
         })
     }
 
@@ -333,6 +335,7 @@ impl Authorizer {
             catalog_scopes: None,
             is_admin: identity.is_admin,
             scopes: Vec::new(),
+            credential_hash: Sha256::digest(token.as_bytes()).into(),
         })
     }
 
@@ -589,6 +592,16 @@ impl IntoResponse for AuthError {
 }
 
 impl Principal {
+    pub(crate) fn verified_bearer<'a>(&self, headers: &'a HeaderMap) -> Option<&'a str> {
+        let token = bearer(headers).ok()??;
+        let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        (actual == self.credential_hash).then_some(token)
+    }
+
+    pub(crate) fn credential_hash(&self) -> [u8; 32] {
+        self.credential_hash
+    }
+
     pub(crate) fn is_admin(&self) -> bool {
         self.is_admin
     }

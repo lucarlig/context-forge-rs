@@ -16,7 +16,10 @@ use rmcp::model::{
 };
 use serde_json::Value;
 
-use super::{DirectTarget, GatewayService, Principal, Session, ToolContext, UpstreamError, access};
+use super::{
+    DirectTarget, GatewayService, Principal, Session, ToolContext, UpstreamError, UpstreamUse,
+    access,
+};
 use crate::catalog::{CatalogServer, ContentGateway, PromptContentRecord, ResourceContentRecord};
 use crate::upstream::UpstreamEndpoint;
 
@@ -319,6 +322,7 @@ impl GatewayService {
                 gateway.needs_upstream_config,
                 context.request_headers,
                 principal,
+                UpstreamUse::Invocation,
             )
             .await
             .map_err(|_| ErrorData::internal_error("Upstream gateway unavailable", None))?;
