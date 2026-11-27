@@ -33,7 +33,10 @@ struct ToolDetailQuery {
 }
 
 pub(super) fn router() -> Router<Arc<GatewayService>> {
-    let mut routes = Router::new();
+    let mut routes = Router::new().route(
+        "/v1/tools/generate-schemas-from-openapi",
+        post(super::openapi::generate_schemas),
+    );
     for base in ["/tools", "/v1/tools"] {
         routes = routes
             .route(base, get(list).post(write::create))

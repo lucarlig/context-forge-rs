@@ -10,6 +10,7 @@ mod lifecycle;
 mod listeners;
 mod management;
 mod oauth_api;
+mod openapi;
 mod prompt_api;
 mod proxy;
 mod resource_api;
@@ -132,6 +133,7 @@ pub struct GatewayService {
     direct_proxy_timeout: Option<Duration>,
     proxy_catalog: ProxyCatalogCache,
     response_filters: crate::response_filter::ResponseFilters,
+    openapi: openapi::Documents,
     export: ExportSettings,
     imports: import_api::Imports,
 }
@@ -235,6 +237,7 @@ impl GatewayService {
             direct_proxy_timeout: None,
             proxy_catalog: ProxyCatalogCache::new(ProxyCatalogSettings::default()),
             response_filters: crate::response_filter::ResponseFilters::default(),
+            openapi: openapi::Documents::default(),
             export: ExportSettings::default(),
             imports: import_api::Imports::default(),
         }

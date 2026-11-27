@@ -159,7 +159,15 @@ form data, and multipart bodies. The Rust client pins the upstream destination.
 Fourteen scenarios matched the pinned gateway's results and outbound requests
 on SQLite and PostgreSQL. A Rust integration test verifies that wrong-team
 tokens, read-only tokens, and invalid URL arguments stop before outbound dispatch.
-OpenAPI import, direct passthrough, and gateway credential inheritance remain open.
+Gateway credential inheritance remains open. The pinned release stores REST
+passthrough settings as tool configuration.
+
+`POST /v1/tools/generate-schemas-from-openapi` generates schemas for a selected
+operation. It requires `tools.create` and accepts an explicit document URL or
+discovers `/openapi.json` on the tool origin. The fetch pins the destination,
+rejects redirects, and shares a bounded cache across requests. The replays
+cover schema extraction, error paths, and tool registration and invocation
+with the returned schemas. The admin route is part of the admin milestone.
 
 REST and cached MCP tools evaluate CEL response filters over `response`.
 Tool writes check syntax and free variables before saving. Seventeen scenarios

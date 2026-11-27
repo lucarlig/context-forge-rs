@@ -44,6 +44,8 @@ mod catalog_configuration_import;
 mod configuration_import;
 #[path = "gateway/configuration_server_import.rs"]
 mod configuration_server_import;
+#[path = "gateway/openapi.rs"]
+mod openapi;
 
 const KEY: &[u8] = &[0x36; 32];
 const PROTOCOL: &str = "2025-11-25";

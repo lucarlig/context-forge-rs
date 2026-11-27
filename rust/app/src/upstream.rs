@@ -1079,7 +1079,7 @@ impl UpstreamClient {
         })
     }
 
-    async fn pinned_client(
+    pub(crate) async fn pinned_client(
         &self,
         endpoint: &str,
         tls: Option<&TlsMaterial>,
@@ -2039,11 +2039,23 @@ fn response_media_type(response: &Response) -> Option<&str> {
     media_type.filter(|_| media_types.next().is_none())
 }
 
-async fn read_json_body(mut response: Response) -> Result<Vec<u8>, UpstreamError> {
-    check_message_length(&response)?;
+async fn read_json_body(response: Response) -> Result<Vec<u8>, UpstreamError> {
+    read_bounded_body(response, MAX_MESSAGE_BYTES).await
+}
+
+pub(crate) async fn read_bounded_body(
+    mut response: Response,
+    limit: usize,
+) -> Result<Vec<u8>, UpstreamError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(UpstreamError::LimitExceeded);
+    }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > MAX_MESSAGE_BYTES {
+        if chunk.len() > limit - body.len() {
             return Err(UpstreamError::LimitExceeded);
         }
         body.extend_from_slice(&chunk);
