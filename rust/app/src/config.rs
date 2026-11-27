@@ -7,9 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     gateway::{
-        CIMD_DOCUMENT_PATH, CatalogRefresh, CimdSettings, DcrSettings, GatewayHealth,
-        GatewayLifecycle, GatewayListeners, GatewayOAuthSettings, ListenerElection, Pagination,
-        ResourceLimits, RootSettings,
+        CIMD_DOCUMENT_PATH, CatalogRefresh, CimdSettings, DcrSettings, ExportSettings,
+        GatewayHealth, GatewayLifecycle, GatewayListeners, GatewayOAuthSettings, ListenerElection,
+        Pagination, ResourceLimits, RootSettings,
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     local_auth::{
@@ -1054,6 +1054,19 @@ impl Settings {
             base.to_owned()
         } else {
             format!("{base}/{root}")
+        })
+    }
+
+    pub fn export_settings(&self) -> Result<ExportSettings, Box<dyn Error + Send + Sync>> {
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        Ok(ExportSettings {
+            source_gateway: format!("http://{host}:{}", self.port),
+            root_path: value("APP_ROOT_PATH", "")?,
+            version: value("PROTOCOL_VERSION", "2025-11-25")?,
         })
     }
 

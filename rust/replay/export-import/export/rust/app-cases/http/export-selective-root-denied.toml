@@ -1,0 +1,15 @@
+[request]
+method = "POST"
+path = "/v1/export/selective"
+body = '{"roots":["https://example.invalid/declared"]}'
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer @export-team@"
+Content-Type = "application/json"
+
+[response]
+status = 403
+
+[response.headers]
+content-type = "application/json"

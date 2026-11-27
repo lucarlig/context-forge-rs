@@ -3,6 +3,7 @@
 mod catalog_api;
 mod content;
 mod exchanged_tokens;
+mod export_api;
 mod health;
 mod lifecycle;
 mod listeners;
@@ -85,6 +86,7 @@ enum UpstreamUse {
     Discovery,
 }
 
+pub use export_api::ExportSettings;
 pub use health::GatewayHealth;
 pub use lifecycle::GatewayLifecycle;
 pub use listeners::{GatewayListeners, ListenerElection};
@@ -127,6 +129,7 @@ pub struct GatewayService {
     identity_forwarding: IdentityForwarding,
     direct_proxy_timeout: Option<Duration>,
     proxy_catalog: ProxyCatalogCache,
+    export: ExportSettings,
 }
 
 pub struct CatalogRefresh {
@@ -227,7 +230,13 @@ impl GatewayService {
             identity_forwarding: IdentityForwarding::default(),
             direct_proxy_timeout: None,
             proxy_catalog: ProxyCatalogCache::new(ProxyCatalogSettings::default()),
+            export: ExportSettings::default(),
         }
+    }
+
+    pub fn with_export_settings(mut self, export: ExportSettings) -> Self {
+        self.export = export;
+        self
     }
 
     pub fn with_logging_filter(mut self, filter: reload::Handle<LevelFilter, Registry>) -> Self {
@@ -461,6 +470,7 @@ impl GatewayService {
             router
                 .merge(oauth_api::router())
                 .merge(roots::router())
+                .merge(export_api::router())
                 .merge(tags::router())
                 .merge(prompt_api::router(self.max_prompt_bytes))
                 .merge(tool_api::router())

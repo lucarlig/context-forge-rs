@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/export"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer @export-administrator@"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

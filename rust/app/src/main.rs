@@ -99,6 +99,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_token_issuer(email_auth_enabled, issuer)
         .with_gateway_oauth(Settings::gateway_oauth()?)
         .with_virtual_server_base(Settings::virtual_server_base()?)
+        .with_export_settings(settings.export_settings()?)
         .with_server_oauth_metadata(well_known, cache_max_age, allow_oauth_loopback)
         .with_logging_filter(handle)
         .with_management_page_sizes(management_page_size, management_max_page_size)

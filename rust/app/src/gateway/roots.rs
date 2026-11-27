@@ -107,6 +107,14 @@ impl RootRegistry {
         self.roots.lock().expect("root catalog")
     }
 
+    pub(super) fn export_configuration(&self, selected: Option<&[String]>) -> Vec<Value> {
+        self.items()
+            .iter()
+            .filter(|root| selected.is_none_or(|uris| uris.contains(&root.uri)))
+            .map(|root| json!({"uri":root.uri,"name":root.name}))
+            .collect()
+    }
+
     fn canonical(&self, uri: &str) -> Result<String, RootError> {
         canonical_uri(&self.settings, uri).map_err(RootError::Policy)
     }

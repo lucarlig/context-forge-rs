@@ -1,0 +1,15 @@
+[request]
+method = "POST"
+path = "/export/selective"
+body = '{"roots":[]}'
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer @export-team@"
+Content-Type = "application/json"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

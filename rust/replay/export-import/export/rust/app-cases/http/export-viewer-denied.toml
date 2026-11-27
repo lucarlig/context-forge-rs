@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/export?types=tools"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer @export-viewer@"
+
+[response]
+status = 403
+
+[response.headers]
+content-type = "application/json"

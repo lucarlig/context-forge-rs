@@ -62,6 +62,11 @@ database and starts when the native history is current.
 Historical Alembic upgrades and the remaining upstream tables are still
 part of the database migration milestone.
 
+Configuration export supports full and selective requests at both API prefixes.
+The pinned 14-case suite matched native SQLite, SQLite initialized by the pinned
+gateway, and PostgreSQL. Live checks covered authorization, scoped server links,
+and credential masking. [Export recordings](replay/export-import/export/README.md)
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

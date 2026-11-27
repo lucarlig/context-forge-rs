@@ -1,0 +1,15 @@
+[request]
+method = "POST"
+path = "/export/selective?include_dependencies=false"
+body = '{"tools":["export-tool","export-federated"],"gateways":["export-gateway"],"servers":["export-server"],"prompts":["private-prompt","hidden-prompt"],"resources":["fixture://docs/readme"]}'
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer @export-public@"
+Content-Type = "application/json"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/v1/export?types=TOOLS,servers,unknown&tags=fixture&include_dependencies=false"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer @export-team@"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
