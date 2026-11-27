@@ -512,7 +512,7 @@ impl GatewayService {
             .await?
             .ok_or(ToolError::Unavailable)?;
         let cipher = self.credential_cipher.as_ref();
-        let mut credentials = if matches!(kind.as_str(), "" | "none") {
+        let mut credentials = if matches!(kind.as_str(), "" | "none" | "one_time_auth") {
             Ok(UpstreamCredentials::default())
         } else if kind == "query_param" {
             validate_query_host(self.query_auth_hosts.as_ref(), url)
@@ -739,6 +739,8 @@ struct RegisterGateway {
     passthrough_headers: Option<Vec<String>>,
     #[serde(alias = "identityPropagation")]
     identity_propagation: Option<Value>,
+    #[serde(default, alias = "oneTimeAuth")]
+    one_time_auth: bool,
     #[serde(flatten)]
     auth: AuthInput,
 }
@@ -806,6 +808,7 @@ async fn register(
     }
 
     let url = input.url.trim();
+    let one_time_auth = input.one_time_auth || input.auth.is_one_time_marker();
     if let Some(identity) = &input.identity_propagation {
         service
             .identity_forwarding
@@ -922,10 +925,11 @@ async fn register(
             &registered_tools,
             &metadata,
             RegistrationOptions {
-                auth: auth.as_ref(),
+                auth: if one_time_auth { None } else { auth.as_ref() },
                 passthrough_headers: input.passthrough_headers.as_deref(),
                 identity: input.identity_propagation.as_ref(),
                 mode,
+                one_time_auth,
             },
         )
         .await?;
@@ -942,7 +946,9 @@ async fn register(
     if let Some(identity) = input.identity_propagation {
         response["identityPropagation"] = identity;
     }
-    if let Some(auth) = auth
+    if one_time_auth {
+        response["authType"] = "one_time_auth".into();
+    } else if let Some(auth) = auth
         && let Value::Object(masked) = auth.masked
     {
         response

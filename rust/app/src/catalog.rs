@@ -229,6 +229,7 @@ pub(crate) struct RegistrationOptions<'a> {
     pub(crate) passthrough_headers: Option<&'a [String]>,
     pub(crate) identity: Option<&'a Value>,
     pub(crate) mode: GatewayMode,
+    pub(crate) one_time_auth: bool,
 }
 
 pub struct RegisteredTool<'a> {
@@ -324,11 +325,11 @@ macro_rules! non_empty_json {
 macro_rules! gateway_policy {
     () => {
         concat!(
-            "(LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none', 'basic', 'bearer', 'authheaders', 'query_param')
+            "(LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth', 'basic', 'bearer', 'authheaders', 'query_param')
             OR COALESCE(g.ca_certificate, '') <> ''
             OR COALESCE(g.client_cert, '') <> ''
             OR COALESCE(g.client_key, '') <> ''
-            OR (LOWER(COALESCE(g.auth_type, 'none')) IN ('', 'none') AND ",
+            OR (LOWER(COALESCE(g.auth_type, 'none')) IN ('', 'none', 'one_time_auth') AND ",
             non_empty_json!("g.auth_value"),
             ")
             OR ",
@@ -376,7 +377,7 @@ macro_rules! tool_query {
              SELECT t.id, t.original_name, g.id, g.name, g.url, g.gateway_mode, g.transport, t.request_type,
                 (
                     ", gateway_policy!(), "
-                    OR ((LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none')
+                    OR ((LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth')
                         OR COALESCE(t.auth_value, '') <> '')
                         AND NOT (", configured_auth!(), "
                             AND LOWER(COALESCE(t.auth_type, '')) = LOWER(COALESCE(g.auth_type, ''))))
@@ -587,7 +588,7 @@ const CONFLICT_QUERY: &str = concat!(
                 ((g.visibility = 'public' AND $3 = 'public')
                  OR (g.visibility = 'team' AND $3 = 'team' AND g.team_id = $4)
                  OR (g.visibility = 'private' AND $3 = 'private' AND g.owner_email = $5))
-                AND LOWER(COALESCE(g.auth_type, 'none')) IN ('', 'none')
+                AND LOWER(COALESCE(g.auth_type, 'none')) IN ('', 'none', 'one_time_auth')
                 AND NOT (",
     non_empty_json!("g.auth_value"),
     ")
@@ -1196,7 +1197,7 @@ impl Database {
                     .bind(gateway.visibility)
                     .bind(gateway.team_id)
                     .bind(gateway.owner_email)
-                    .bind(auth.is_none())
+                    .bind(auth.is_none() && !options.one_time_auth)
                     .fetch_one(&mut *$tx)
                     .await?;
                 match conflict.as_deref() {
@@ -1240,7 +1241,7 @@ impl Database {
                     .bind(gateway.team_id)
                     .bind(gateway.visibility)
                     .bind(gateway.transport.name())
-                    .bind(auth.map(|auth| auth.kind))
+                    .bind(if options.one_time_auth { Some("one_time_auth") } else { auth.map(|auth| auth.kind) })
                     .bind(auth.and_then(|auth| auth.encoded_headers.as_deref()))
                     .bind(auth.and_then(|auth| auth.encoded_query.as_deref()))
                     .bind(passthrough)

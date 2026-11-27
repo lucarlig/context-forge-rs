@@ -134,6 +134,12 @@ pub(crate) enum AuthError {
 }
 
 impl AuthInput {
+    pub(crate) fn is_one_time_marker(&self) -> bool {
+        self.auth_type
+            .as_deref()
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("one_time_auth"))
+    }
+
     pub(crate) fn prepare<'a>(
         &self,
         cipher: Option<&'a CredentialCipher>,
@@ -148,7 +154,7 @@ impl AuthInput {
             .to_ascii_lowercase();
         let mut masked = json!({"authType": kind, "authValue": "*****"});
         let (kind, values) = match kind.as_str() {
-            "" | "none" => return Ok(None),
+            "" | "none" | "one_time_auth" => return Ok(None),
             "query_param" => {
                 validate_query_host(query_hosts, url)?;
                 let key = required(self.auth_query_param_key.as_deref())?;

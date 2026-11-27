@@ -12,6 +12,8 @@ Set `IDENTITY_PROPAGATION_ENABLED=true` to forward authenticated user identity. 
 
 Direct-proxy mode supports live tool calls and resource reads on root and virtual-server MCP routes. [Direct-proxy recordings](direct-proxy/README.md)
 
+One-time registration credentials apply during discovery. Later calls can supply a separate upstream credential. [One-time authentication recordings](one-time/README.md)
+
 For replay, register four public Streamable HTTP servers named `basic`, `bearer`, `headers`, and `query` in the fixture database. Each exposes an `echo` tool and prefixes its result with the gateway name. Use synthetic credentials that the upstream fixture requires and that the gateway stores using the configured encryption secret.
 
 ```sh
