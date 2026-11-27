@@ -19,6 +19,8 @@ pub(crate) use grants::SsoIdentityPolicy;
 pub(crate) use oidc::{is_id_token, unverified_jwt_claims, verify as verify_oidc_jwt};
 pub(super) use providers::bootstrap::bootstrap;
 
+pub(super) const ID_TOKEN_HINT_COOKIE: &str = "sso_id_token_hint";
+
 pub(crate) struct SsoSettings {
     pub(crate) upstream: UpstreamClient,
     pub(crate) vault: Option<SecretEnvelope>,

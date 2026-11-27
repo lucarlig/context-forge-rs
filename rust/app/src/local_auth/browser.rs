@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod forms;
+mod keycloak;
 mod recovery;
 mod sessions;
 
@@ -41,6 +42,7 @@ pub(crate) struct BrowserSettings {
     password_error_limit: usize,
     reset_form_minimum: usize,
     preserve_admin_auth: bool,
+    keycloak: Option<keycloak::KeycloakLogout>,
 }
 
 impl BrowserSettings {
@@ -84,6 +86,7 @@ impl BrowserSettings {
             reset_form_minimum: parse("PASSWORD_MIN_LENGTH", 8)?,
             preserve_admin_auth: flag("SSO_ENABLED")?.unwrap_or(false)
                 && flag("SSO_PRESERVE_ADMIN_AUTH")?.unwrap_or(true),
+            keycloak: keycloak::KeycloakLogout::from_env()?,
         }))
     }
 
@@ -420,13 +423,21 @@ async fn logout(
     let settings = settings_for(&accounts);
     let (parts, form) = Form::from_request(request).await?;
     csrf(settings, &parts, &form, false)?;
-    if let Some(token) = cookie(&parts.headers, "jwt_token") {
+    let token = cookie(&parts.headers, "jwt_token");
+    if let Some(token) = token {
         sessions::revoke(&accounts, token).await?;
     }
-    let mut response = if parts.method == Method::GET && !browser_request(&parts.headers) {
-        "Logged out".into_response()
-    } else {
-        settings.redirect(LOGIN)
+    let mut response = match parts.method {
+        Method::GET if !browser_request(&parts.headers) => "Logged out".into_response(),
+        Method::POST => settings
+            .keycloak
+            .as_ref()
+            .zip(token)
+            .and_then(|(keycloak, token)| {
+                keycloak.redirect(&accounts.access, token, &parts, &settings.root)
+            })
+            .unwrap_or_else(|| settings.redirect(LOGIN)),
+        _ => settings.redirect(LOGIN),
     };
     clear_session_cookies(&accounts.settings, settings, &mut response)?;
     Ok(response)

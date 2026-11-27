@@ -179,7 +179,7 @@ pub(super) async fn callback(
         &accounts.database,
         &accounts.settings.provisioning,
         &provider,
-        &identity,
+        &identity.claims,
         &settings.identity_policy,
     )
     .await?
@@ -192,6 +192,17 @@ pub(super) async fn callback(
     };
     let mut response = redirect(&format!("{}/admin", settings.root_path))?;
     response.headers_mut().append(header::SET_COOKIE, cookie);
+    if let Some(hint) = identity.logout_hint.as_deref()
+        && hint.len() <= 3800
+        && let Some(cookie) = make_cookie(
+            settings,
+            ID_TOKEN_HINT_COOKIE,
+            hint,
+            Some(accounts.settings.token_seconds as u32),
+        )
+    {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
     Ok(response)
 }
 
@@ -199,6 +210,11 @@ pub(super) async fn callback(
 struct ProviderToken {
     access_token: String,
     id_token: Option<String>,
+}
+
+struct ExchangedIdentity {
+    claims: Map<String, Value>,
+    logout_hint: Option<Zeroizing<String>>,
 }
 
 impl Drop for ProviderToken {
@@ -213,7 +229,7 @@ async fn exchange_identity(
     provider: &Provider,
     transaction: &SsoSession,
     code: &str,
-) -> Option<Map<String, Value>> {
+) -> Option<ExchangedIdentity> {
     let config = &provider.config;
     let secret = settings
         .vault
@@ -265,7 +281,7 @@ async fn exchange_identity(
         )
         .await
         .ok()?;
-    let tokens = if is_form && config.provider_type == "oauth2" {
+    let mut tokens = if is_form && config.provider_type == "oauth2" {
         ProviderToken {
             access_token: url::form_urlencoded::parse(&response)
                 .find(|(name, _)| name == "access_token")?
@@ -293,7 +309,10 @@ async fn exchange_identity(
     if provider.id == "adfs" {
         let mut claims = oidc_claims?;
         super::provider_claims::normalize_adfs(&mut claims);
-        return Some(claims);
+        return Some(ExchangedIdentity {
+            claims,
+            logout_hint: None,
+        });
     }
     if tokens.access_token.is_empty() {
         return None;
@@ -351,7 +370,15 @@ async fn exchange_identity(
         )
         .await;
     }
-    Some(user_info)
+    let logout_hint = if provider.id == "keycloak" && config.provider_type == "oidc" {
+        tokens.id_token.take().map(Zeroizing::new)
+    } else {
+        None
+    };
+    Some(ExchangedIdentity {
+        claims: user_info,
+        logout_hint,
+    })
 }
 
 fn sensitive_header(value: &str) -> Option<HeaderValue> {

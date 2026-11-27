@@ -244,7 +244,7 @@ pub(super) fn clear_session_cookies(
             account.csrf_httponly,
         ),
         (
-            "sso_id_token_hint",
+            sso::ID_TOKEN_HINT_COOKIE,
             settings.cookie_path(),
             settings.same_site.as_str(),
             settings.secure,
