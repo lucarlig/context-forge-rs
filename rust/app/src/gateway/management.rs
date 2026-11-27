@@ -181,9 +181,17 @@ pub(super) async fn delete(
     Extension(principal): Extension<Principal>,
     Path(key): Path<String>,
 ) -> Result<Response, ManagementError> {
+    remove(&service, &principal, key).await
+}
+
+pub(super) async fn remove(
+    service: &GatewayService,
+    principal: &Principal,
+    key: String,
+) -> Result<Response, ManagementError> {
     let mut record = manageable(
-        &service,
-        &principal,
+        service,
+        principal,
         key,
         "gateways.delete",
         "Only the owner can delete this gateway",
@@ -354,25 +362,39 @@ pub(super) async fn set_state(
         .map(|value| flag(Some(value)))
         .transpose()?
         .unwrap_or(true);
+    let record = change_state(&service, &principal, key, activate).await?;
+    let Value::Object(fields) = response(&record, service.credential_cipher.as_ref()) else {
+        unreachable!("gateway response is an object");
+    };
+    let gateway = fields
+        .into_iter()
+        .map(|(field, value)| (snake_case(&field), value))
+        .collect::<serde_json::Map<_, _>>();
+    let action = if activate { "activated" } else { "deactivated" };
+    Ok(Json(json!({
+        "status":"success","message":format!("Gateway {} {action}",record.id),"gateway":gateway,
+    })))
+}
+
+pub(super) async fn change_state(
+    service: &GatewayService,
+    principal: &Principal,
+    key: String,
+    activate: bool,
+) -> Result<GatewayRecord, ManagementError> {
     let ownership_error = if activate {
         "Only the owner can activate the gateway"
     } else {
         "Only the owner can deactivate the gateway"
     };
-    let mut record = manageable(
-        &service,
-        &principal,
-        key,
-        "gateways.update",
-        ownership_error,
-    )
-    .await?;
+    let mut record =
+        manageable(service, principal, key, "gateways.update", ownership_error).await?;
     if record.status != "active" {
         return Err(ManagementError::LifecycleInProgress);
     }
     if record.enabled != activate || !record.reachable {
         let rediscovered = if activate {
-            activate_catalog(&service, &record).await?
+            activate_catalog(service, &record).await?
         } else {
             false
         };
@@ -398,19 +420,9 @@ pub(super) async fn set_state(
                 record.owner_email.as_deref(),
             );
         }
-        record = lookup(&service, &principal, record.id).await?;
+        record = lookup(service, principal, record.id).await?;
     }
-    let Value::Object(fields) = response(&record, service.credential_cipher.as_ref()) else {
-        unreachable!("gateway response is an object");
-    };
-    let gateway = fields
-        .into_iter()
-        .map(|(field, value)| (snake_case(&field), value))
-        .collect::<serde_json::Map<_, _>>();
-    let action = if activate { "activated" } else { "deactivated" };
-    Ok(Json(json!({
-        "status":"success","message":format!("Gateway {} {action}",record.id),"gateway":gateway,
-    })))
+    Ok(record)
 }
 
 async fn activate_catalog(

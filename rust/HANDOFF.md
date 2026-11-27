@@ -194,8 +194,20 @@ credential masking.
 
 Five Rust Anything scenarios match on SQLite and PostgreSQL for row names,
 state, visibility, pagination, and links. Chromium verifies the dashboard
-sections, inactive filter, and page navigation. Admin writes and the remaining
-dashboard sections are open.
+sections, inactive filter, and page navigation.
+
+The dashboard enables, disables, and deletes entries in all five catalogs.
+Both admin route prefixes use the REST catalog write operations. Browser
+requests require CSRF proof and write permission. Deleting an entry requires
+confirmation in the dashboard. The routes accept URL-encoded and multipart
+forms with a 64 KiB limit. Multipart browser requests submit proof in the
+`X-CSRF-Token` header.
+
+Eight Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+redirects, stored state, deletion, multipart forms, CSRF, token scopes, and
+queued MCP server cleanup. Chromium verifies the three catalog actions in each
+dashboard section. Create and edit flows and the remaining dashboard sections
+are open.
 
 ## Gateway and protocol verification
 

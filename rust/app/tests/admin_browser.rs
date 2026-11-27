@@ -329,3 +329,112 @@ async fn admin_catalog_paginates_and_hides_inactive_servers_by_default() {
     assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn admin_catalog_mutations_require_proof_and_write_permission() {
+    let mut gateway = gateway().await;
+    let client = &gateway.client;
+    let origin = &gateway.origin;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL, "password":gateway.password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    let created = client
+        .post(format!("{origin}/servers"))
+        .bearer_auth(token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"server":{"name":"fixture-browser-action"},"visibility":"public"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&created.text().await.unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap();
+    let auth_cookie = format!("jwt_token={token}");
+    let home = client
+        .get(format!("{origin}/admin/"))
+        .header(header::COOKIE, &auth_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(home.status(), StatusCode::OK);
+    let proof = cookie(&home, "mcpgateway_csrf_token");
+    let cookies = format!("{auth_cookie}; mcpgateway_csrf_token={proof}");
+    let state = |submitted: &str| {
+        client
+            .post(format!("{origin}/admin/servers/{id}/state"))
+            .header(header::ORIGIN, origin)
+            .header(header::COOKIE, &cookies)
+            .header(header::ACCEPT, "text/html")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(format!(
+                "activate=false&is_inactive_checked=true&csrf_token={submitted}"
+            ))
+    };
+    assert_eq!(
+        state("wrong").send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let listing = |include_inactive: bool| async move {
+        let result = client
+            .get(format!(
+                "{origin}/admin/servers?include_inactive={include_inactive}"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&result.text().await.unwrap()).unwrap();
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .cloned()
+    };
+    assert_eq!(listing(false).await.unwrap()["enabled"], true);
+    let updated = state(proof).send().await.unwrap();
+    assert_eq!(updated.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        updated.headers()[header::LOCATION],
+        "/admin/?include_inactive=true#catalog"
+    );
+    assert!(listing(false).await.is_none());
+    assert_eq!(listing(true).await.unwrap()["enabled"], false);
+
+    let issued = client
+        .post(format!("{origin}/tokens"))
+        .bearer_auth(token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"name":"catalog-read","expires_in_days":1,"scope":{"permissions":["admin.dashboard","servers.read"]}}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued: serde_json::Value = serde_json::from_str(&issued.text().await.unwrap()).unwrap();
+    let read_only = issued["access_token"].as_str().unwrap();
+    let delete = |credential| {
+        client
+            .post(format!("{origin}/v1/admin/servers/{id}/delete"))
+            .bearer_auth(credential)
+    };
+    assert_eq!(
+        delete(read_only).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(listing(true).await.is_some());
+    let deleted = delete(token).send().await.unwrap();
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(deleted.headers()[header::LOCATION], "/admin#catalog");
+    assert!(listing(true).await.is_none());
+    gateway.process.kill().await.unwrap();
+}

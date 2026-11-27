@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{future::Future, net::IpAddr};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    future::Future,
+    net::IpAddr,
+};
 
 use axum::http::{Uri, request::Parts};
 
 use super::*;
 use crate::{
-    gateway::{AdminListQuery, CatalogApiError, CatalogListing},
+    gateway::{AdminListQuery, CatalogApiError, CatalogListing, CatalogMutation},
     tokens::TokenRequest,
 };
 
@@ -27,7 +31,7 @@ pub(super) async fn list(
         return Ok(settings.redirect(CHANGE));
     }
     let team = sessions::request_team(request.uri(), &principal);
-    if !can_read(&accounts, &principal, kind, team.as_deref()).await? {
+    if !allows(&accounts, &principal, kind, "read", team.as_deref()).await? {
         return Ok(Denial(StatusCode::FORBIDDEN, "Permission denied", None)
             .response(settings, request.headers()));
     }
@@ -42,6 +46,113 @@ pub(super) async fn list(
             .await
             .map(|listing| Json(listing).into_response())
             .unwrap_or_else(IntoResponse::into_response)
+    };
+    Ok(with_usage(&accounts, &principal, &parts, peer.ip(), response).await)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Action {
+    State,
+    Delete,
+}
+
+impl Action {
+    pub(super) fn path(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Delete => "delete",
+        }
+    }
+
+    fn permission(self) -> &'static str {
+        match self {
+            Self::State => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+pub(super) async fn mutate(
+    State(accounts): State<Arc<Accounts>>,
+    Extension(service): Extension<Arc<GatewayService>>,
+    Extension((kind, action)): Extension<(ManagedCatalog, Action)>,
+    Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Result<Response, AccountError> {
+    let settings = settings_for(&accounts);
+    let Session { principal, .. } =
+        match access(&accounts, request.headers(), request.uri(), peer.ip()).await {
+            Ok(session) => session,
+            Err(denial) => return Ok(denial.response(settings, request.headers())),
+        };
+    if password_change_pending(&accounts, &principal).await? {
+        return Ok(settings.redirect(CHANGE));
+    }
+    let (parts, form) = Form::from_catalog_request(request).await?;
+    csrf(settings, &parts, &form, false)?;
+    if sessions::bearer_token(settings, &parts.headers).is_none()
+        && !browser_request(&parts.headers)
+    {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(json!({"detail":"Cookie authentication not allowed for API requests. Use Authorization header."})),
+        ).into_response());
+    }
+    let team = sessions::request_team(&parts.uri, &principal);
+    if !allows(
+        &accounts,
+        &principal,
+        kind,
+        action.permission(),
+        team.as_deref(),
+    )
+    .await?
+    {
+        return Err(AccountError::detail(
+            StatusCode::FORBIDDEN,
+            "Permission denied",
+        ));
+    }
+    let response = async {
+        let affirmative = |name| form.get(name).eq_ignore_ascii_case("true");
+        let mutation = match action {
+            Action::State => CatalogMutation::State(
+                form.value("activate")
+                    .is_none_or(|value| value.eq_ignore_ascii_case("true")),
+            ),
+            Action::Delete => CatalogMutation::Delete {
+                purge_metrics: affirmative("purge_metrics"),
+            },
+        };
+        let result = service
+            .mutate_admin_catalog(kind, &principal, id, mutation)
+            .await;
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        match result {
+            Err(error) => {
+                query.append_pair("error", error);
+            }
+            Ok(Some(message)) => {
+                query.append_pair("message", message);
+            }
+            Ok(None) => {}
+        }
+        if affirmative("is_inactive_checked") {
+            query.append_pair("include_inactive", "true");
+        }
+        if let Ok(team) = Uuid::parse_str(form.get("team_id")) {
+            query.append_pair("team_id", &team.simple().to_string());
+        }
+        let query = query.finish();
+        let fragment = fragment(kind);
+        let path = if query.is_empty() {
+            format!("/admin#{fragment}")
+        } else {
+            format!("/admin/?{query}#{fragment}")
+        };
+        settings.redirect(&path)
     };
     Ok(with_usage(&accounts, &principal, &parts, peer.ip(), response).await)
 }
@@ -79,23 +190,22 @@ pub(super) async fn with_usage(
     response
 }
 
-async fn can_read(
+async fn allows(
     accounts: &Accounts,
     principal: &Principal,
     kind: ManagedCatalog,
+    operation: &str,
     team: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
-    let permission = match kind {
-        ManagedCatalog::Tools => "tools.read",
-        ManagedCatalog::Servers => "servers.read",
-        ManagedCatalog::Resources => "resources.read",
-        ManagedCatalog::Prompts => "prompts.read",
-        ManagedCatalog::Gateways => "gateways.read",
-    };
     let role = team.map_or(RoleContext::AnyTeam, RoleContext::Team);
     accounts
         .access
-        .allows(principal, permission, role, false)
+        .allows(
+            principal,
+            &format!("{}.{operation}", kind.name()),
+            role,
+            false,
+        )
         .await
 }
 
@@ -114,6 +224,8 @@ pub(super) struct Dashboard {
     include_inactive: bool,
     team: Option<String>,
     selected: Option<String>,
+    error: Option<&'static str>,
+    message: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -126,8 +238,11 @@ struct Link {
 #[derive(Serialize)]
 struct Section {
     name: &'static str,
+    fragment: &'static str,
     label: &'static str,
     rows: Vec<Row>,
+    actions: bool,
+    purge_metrics: bool,
     total: i64,
     page: i64,
     pages: i64,
@@ -137,22 +252,57 @@ struct Section {
 
 #[derive(Serialize)]
 struct Row {
+    id: String,
     name: String,
     description: Option<String>,
     enabled: bool,
     visibility: Option<String>,
+    update: bool,
+    delete: bool,
 }
 
-impl From<Value> for Row {
-    fn from(value: Value) -> Self {
+async fn rows(
+    accounts: &Accounts,
+    principal: &Principal,
+    kind: ManagedCatalog,
+    data: &[Value],
+) -> Result<Vec<Row>, sqlx::Error> {
+    let mut permissions = HashMap::new();
+    let mut rows = Vec::with_capacity(data.len());
+    let global_admin = principal.is_global_admin();
+    for value in data {
+        let team = value["teamId"].as_str();
+        if let Entry::Vacant(entry) = permissions.entry(team) {
+            let (update, delete) = tokio::try_join!(
+                allows(accounts, principal, kind, "update", team),
+                allows(accounts, principal, kind, "delete", team),
+            )?;
+            let team_owner = if let Some(team) = team
+                && !global_admin
+                && (update || delete)
+            {
+                accounts.database.team_owner(&principal.email, team).await?
+            } else {
+                false
+            };
+            entry.insert((update, delete, team_owner));
+        }
+        let (update, delete, team_owner) = permissions[&team];
+        let owned = global_admin
+            || value["ownerEmail"].as_str() == Some(&principal.email)
+            || (value["visibility"].as_str() == Some("team") && team_owner);
         let field = |name: &str| value[name].as_str().map(str::to_owned);
-        Self {
+        rows.push(Row {
+            id: field("id").unwrap_or_default(),
             name: field("name").unwrap_or_default(),
             description: field("description").filter(|text| !text.is_empty()),
             enabled: value["enabled"].as_bool().unwrap_or(false),
             visibility: field("visibility"),
-        }
+            update: update && owned,
+            delete: delete && owned,
+        });
     }
+    Ok(rows)
 }
 
 pub(super) async fn dashboard(
@@ -166,7 +316,7 @@ pub(super) async fn dashboard(
     let include_inactive = query.include_inactive()?;
     let mut permitted = Vec::new();
     for kind in ManagedCatalog::ALL {
-        if can_read(accounts, principal, kind, team).await? {
+        if allows(accounts, principal, kind, "read", team).await? {
             permitted.push(kind);
         }
     }
@@ -207,10 +357,14 @@ pub(super) async fn dashboard(
                     } = service.admin_catalog(kind, principal, query, team).await?;
                     let page_link =
                         |page| href(Some(kind.name()), Some((page, pagination.per_page)));
+                    let rows = rows(accounts, principal, kind, &data).await?;
                     Ok::<_, CatalogApiError>(Section {
                         name: kind.name(),
+                        fragment: fragment(kind),
                         label: label(kind),
-                        rows: data.into_iter().map(Row::from).collect(),
+                        actions: rows.iter().any(|row| row.update || row.delete),
+                        rows,
+                        purge_metrics: !matches!(kind, ManagedCatalog::Gateways),
                         total: pagination.total_items,
                         page: pagination.page,
                         pages: pagination.total_pages,
@@ -227,7 +381,24 @@ pub(super) async fn dashboard(
         include_inactive,
         team: team.map(str::to_owned),
         selected: selected.map(str::to_owned),
+        error: match parameters.get("error").map(String::as_str) {
+            Some("conflict") => Some("This entry changed. Check its current state and try again."),
+            Some("delete_failed") => Some("Could not delete the entry."),
+            Some("name_conflict") => Some("A tool name conflicts with an existing tool."),
+            Some("permission_denied") => Some("You don’t have permission to change this entry."),
+            Some("state_change_failed") => Some("Could not change the state of the entry."),
+            _ => None,
+        },
+        message: (parameters.get("message").map(String::as_str) == Some("gateway_delete_pending"))
+            .then_some("MCP server deletion is pending."),
     })
+}
+
+fn fragment(kind: ManagedCatalog) -> &'static str {
+    match kind {
+        ManagedCatalog::Servers => "catalog",
+        _ => kind.name(),
+    }
 }
 
 fn label(kind: ManagedCatalog) -> &'static str {

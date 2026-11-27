@@ -361,23 +361,34 @@ pub(super) async fn set_state(
     Query(query): Query<StateQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
     let enabled = query.activate.is_none() || flag(query.activate.as_deref())?;
-    let (action, status) = if enabled {
-        ("activate the Prompt", "activated")
+    let updated = change_state(&service, &principal, &id, enabled).await?;
+    let status = if enabled { "activated" } else { "deactivated" };
+    Ok(Json(
+        json!({"status":"success","message": format!("Prompt {id} {status}"), "prompt":metadata(&updated, false)}),
+    ))
+}
+
+pub(in crate::gateway) async fn change_state(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    enabled: bool,
+) -> Result<PromptRecord, CatalogApiError> {
+    let action = if enabled {
+        "activate the Prompt"
     } else {
-        ("deactivate the Prompt", "deactivated")
+        "deactivate the Prompt"
     };
-    let previous = editable(&service, &principal, &id, "prompts.update", action).await?;
+    let previous = editable(service, principal, id, "prompts.update", action).await?;
     let updated = service
         .database
         .set_managed_prompt_state(&previous, enabled)
         .await
         .map_err(|error| persistence_error(error, &previous))?;
     if previous.enabled != enabled {
-        publish(&service, &updated);
+        publish(service, &updated);
     }
-    Ok(Json(
-        json!({"status":"success","message": format!("Prompt {id} {status}"), "prompt":metadata(&updated, false)}),
-    ))
+    Ok(updated)
 }
 
 pub(super) async fn delete(
@@ -386,23 +397,33 @@ pub(super) async fn delete(
     Path(id): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
+    remove(&service, &principal, &id, query.purge_metrics.as_deref()).await?;
+    Ok(Json(
+        json!({"status":"success","message":format!("Prompt {id} deleted")}),
+    ))
+}
+
+pub(in crate::gateway) async fn remove(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    purge_metrics: Option<&str>,
+) -> Result<(), CatalogApiError> {
     let previous = editable(
-        &service,
-        &principal,
-        &id,
+        service,
+        principal,
+        id,
         "prompts.delete",
         "delete this prompt",
     )
     .await?;
     service
         .database
-        .delete_managed_prompt(&previous, flag(query.purge_metrics.as_deref())?)
+        .delete_managed_prompt(&previous, flag(purge_metrics)?)
         .await
         .map_err(|error| persistence_error(error, &previous))?;
-    publish(&service, &previous);
-    Ok(Json(
-        json!({"status":"success","message":format!("Prompt {id} deleted")}),
-    ))
+    publish(service, &previous);
+    Ok(())
 }
 
 async fn editable(

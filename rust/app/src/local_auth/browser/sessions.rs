@@ -18,12 +18,7 @@ pub(super) async fn access<'a>(
     peer: IpAddr,
 ) -> Result<Session<'a>, Denial> {
     let settings = settings_for(accounts);
-    let token = forms::header_text(headers, settings.auth_header.clone())
-        .and_then(|value| value.split_once(' '))
-        .filter(|(scheme, credential)| {
-            scheme.eq_ignore_ascii_case("bearer") && !credential.trim().is_empty()
-        })
-        .map(|(_, credential)| credential.trim())
+    let token = bearer_token(settings, headers)
         .or_else(|| auth_cookie(headers))
         .ok_or(Denial(
             StatusCode::UNAUTHORIZED,
@@ -98,6 +93,18 @@ pub(super) async fn access<'a>(
             None,
         )),
     }
+}
+
+pub(super) fn bearer_token<'a>(
+    settings: &BrowserSettings,
+    headers: &'a HeaderMap,
+) -> Option<&'a str> {
+    forms::header_text(headers, settings.auth_header.clone())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, credential)| {
+            scheme.eq_ignore_ascii_case("bearer") && !credential.trim().is_empty()
+        })
+        .map(|(_, credential)| credential.trim())
 }
 
 pub(super) fn request_team(uri: &Uri, principal: &Principal) -> Option<String> {

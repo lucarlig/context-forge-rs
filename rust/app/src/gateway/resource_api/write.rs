@@ -407,10 +407,23 @@ pub(super) async fn set_state(
         .map(|input| flag(Some(input)))
         .transpose()?
         .unwrap_or(true);
+    let record = change_state(&service, &principal, &id, enabled).await?;
+    let action = if enabled { "activated" } else { "deactivated" };
+    Ok(Json(
+        json!({"status":"success","message":format!("Resource {id} {action}"),"resource":metadata(&record,false)}),
+    ))
+}
+
+pub(in crate::gateway) async fn change_state(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    enabled: bool,
+) -> Result<ResourceRecord, ResourceError> {
     let previous = editable(
-        &service,
-        &principal,
-        &id,
+        service,
+        principal,
+        id,
         "resources.update",
         "change the state of",
     )
@@ -426,12 +439,9 @@ pub(super) async fn set_state(
         } else {
             ResourceEvent::Deactivated
         };
-        publish(&service, &record, event);
+        publish(service, &record, event);
     }
-    let action = if enabled { "activated" } else { "deactivated" };
-    Ok(Json(
-        json!({"status":"success","message":format!("Resource {id} {action}"),"resource":metadata(&record,false)}),
-    ))
+    Ok(record)
 }
 
 #[derive(Deserialize)]
@@ -445,16 +455,26 @@ pub(super) async fn delete(
     Path(id): Path<String>,
     Query(query): Query<DeleteRequest>,
 ) -> Result<Json<Value>, ResourceError> {
-    let resource = editable(&service, &principal, &id, "resources.delete", "delete").await?;
-    service
-        .database
-        .delete_managed_resource(&resource, flag(query.purge_metrics.as_deref())?)
-        .await
-        .map_err(|error| persistence_error(error, &resource))?;
-    publish(&service, &resource, ResourceEvent::Deleted);
+    remove(&service, &principal, &id, query.purge_metrics.as_deref()).await?;
     Ok(Json(
         json!({"status":"success","message":format!("Resource {id} deleted")}),
     ))
+}
+
+pub(in crate::gateway) async fn remove(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    purge_metrics: Option<&str>,
+) -> Result<(), ResourceError> {
+    let resource = editable(service, principal, id, "resources.delete", "delete").await?;
+    service
+        .database
+        .delete_managed_resource(&resource, flag(purge_metrics)?)
+        .await
+        .map_err(|error| persistence_error(error, &resource))?;
+    publish(service, &resource, ResourceEvent::Deleted);
+    Ok(())
 }
 
 async fn editable(

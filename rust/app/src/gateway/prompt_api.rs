@@ -8,7 +8,7 @@ use super::{catalog_api::*, *};
 use crate::catalog::PromptRecord;
 
 mod write;
-pub(super) use write::import_prompt;
+pub(super) use write::{change_state, import_prompt, remove};
 
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]

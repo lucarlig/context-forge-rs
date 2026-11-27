@@ -376,12 +376,25 @@ pub(super) async fn set_state(
     Query(query): Query<StateQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
     let enabled = query.activate.is_none() || flag(query.activate.as_deref())?;
-    let (action, status) = if enabled {
-        ("activate the Tool", "activated")
+    let updated = change_state(&service, &principal, &id, enabled).await?;
+    let status = if enabled { "activated" } else { "deactivated" };
+    Ok(Json(
+        json!({"status":"success","message":format!("Tool {id} {status}"),"tool":metadata(&service,&updated,false,true,false)}),
+    ))
+}
+
+pub(in crate::gateway) async fn change_state(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    enabled: bool,
+) -> Result<ToolRecord, CatalogApiError> {
+    let action = if enabled {
+        "activate the Tool"
     } else {
-        ("deactivate the Tool", "deactivated")
+        "deactivate the Tool"
     };
-    let previous = editable(&service, &principal, &id, "tools.update", action).await?;
+    let previous = editable(service, principal, id, "tools.update", action).await?;
     if enabled && let Some(reason) = &previous.validation_refusal {
         return Err(CatalogApiError::detail(
             StatusCode::BAD_REQUEST,
@@ -397,11 +410,9 @@ pub(super) async fn set_state(
         .await
         .map_err(|error| persistence_error(error, &previous))?;
     if previous.enabled != updated.enabled || previous.reachable != updated.reachable {
-        publish(&service, &updated);
+        publish(service, &updated);
     }
-    Ok(Json(
-        json!({"status":"success","message":format!("Tool {id} {status}"),"tool":metadata(&service,&updated,false,true,false)}),
-    ))
+    Ok(updated)
 }
 
 pub(super) async fn delete(
@@ -410,23 +421,26 @@ pub(super) async fn delete(
     Path(id): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
-    let previous = editable(
-        &service,
-        &principal,
-        &id,
-        "tools.delete",
-        "delete this tool",
-    )
-    .await?;
-    service
-        .database
-        .delete_managed_tool(&previous, flag(query.purge_metrics.as_deref())?)
-        .await
-        .map_err(|error| persistence_error(error, &previous))?;
-    publish(&service, &previous);
+    remove(&service, &principal, &id, query.purge_metrics.as_deref()).await?;
     Ok(Json(
         json!({"status":"success","message":format!("Tool {id} permanently deleted")}),
     ))
+}
+
+pub(in crate::gateway) async fn remove(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    purge_metrics: Option<&str>,
+) -> Result<(), CatalogApiError> {
+    let previous = editable(service, principal, id, "tools.delete", "delete this tool").await?;
+    service
+        .database
+        .delete_managed_tool(&previous, flag(purge_metrics)?)
+        .await
+        .map_err(|error| persistence_error(error, &previous))?;
+    publish(service, &previous);
+    Ok(())
 }
 
 async fn editable(

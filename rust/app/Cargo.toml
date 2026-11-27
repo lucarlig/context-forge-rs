@@ -12,7 +12,7 @@ argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "pa
 async-compression = { version = "0.4.54", default-features = false, features = ["tokio", "brotli", "deflate", "gzip", "zlib", "zstd"] }
 aws-credential-types = "1.2.14"
 aws-sigv4 = "1.4.5"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.23"
 cel = "0.16.1"
 clap = { version = "4.5", features = ["derive"] }

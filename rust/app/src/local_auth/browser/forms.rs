@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use axum::{
     body::to_bytes,
+    extract::{DefaultBodyLimit, FromRequest, Multipart},
     http::{Uri, request::Parts},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -22,17 +23,15 @@ pub(super) const QUERY_ENCODE: AsciiSet = NON_ALPHANUMERIC
 
 pub(super) struct Form(HashMap<String, Zeroizing<String>>);
 
+const MAX_FORM_BYTES: usize = 65_536;
+
 impl Form {
     pub(super) async fn from_request(request: Request) -> Result<(Parts, Self), AccountError> {
         let (parts, body) = request.into_parts();
         let mut fields = HashMap::new();
-        if header_text(&parts.headers, header::CONTENT_TYPE).is_some_and(|value| {
-            value
-                .to_ascii_lowercase()
-                .starts_with("application/x-www-form-urlencoded")
-        }) {
+        if urlencoded(&parts.headers) {
             let bytes = Zeroizing::new(
-                to_bytes(body, 65_536)
+                to_bytes(body, MAX_FORM_BYTES)
                     .await
                     .map_err(|_| {
                         AccountError::detail(StatusCode::PAYLOAD_TOO_LARGE, "Form body too large")
@@ -47,9 +46,53 @@ impl Form {
         Ok((parts, Self(fields)))
     }
 
-    pub(super) fn get(&self, name: &str) -> &str {
-        self.0.get(name).map_or("", |field| field.as_str())
+    pub(super) async fn from_catalog_request(
+        request: Request,
+    ) -> Result<(Parts, Self), AccountError> {
+        if !has_media_type(request.headers(), "multipart/form-data") {
+            return Self::from_request(request).await;
+        }
+        let (parts, body) = request.into_parts();
+        let mut input = Request::new(body);
+        input.headers_mut().insert(
+            header::CONTENT_TYPE,
+            parts.headers[header::CONTENT_TYPE].clone(),
+        );
+        DefaultBodyLimit::max(MAX_FORM_BYTES).apply(&mut input);
+        let mut multipart = Multipart::from_request(input, &())
+            .await
+            .map_err(|error| AccountError::detail(error.status(), "Invalid multipart form"))?;
+        let mut fields = HashMap::new();
+        let invalid = |error: axum::extract::multipart::MultipartError| {
+            AccountError::detail(error.status(), "Invalid multipart form")
+        };
+        while let Some(field) = multipart.next_field().await.map_err(invalid)? {
+            if let Some(name) = field.name().map(str::to_owned)
+                && field.file_name().is_none()
+            {
+                fields.insert(name, Zeroizing::new(field.text().await.map_err(invalid)?));
+            }
+        }
+        Ok((parts, Self(fields)))
     }
+
+    pub(super) fn get(&self, name: &str) -> &str {
+        self.value(name).unwrap_or("")
+    }
+
+    pub(super) fn value(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(|field| field.as_str())
+    }
+}
+
+fn urlencoded(headers: &HeaderMap) -> bool {
+    has_media_type(headers, "application/x-www-form-urlencoded")
+}
+
+fn has_media_type(headers: &HeaderMap, media_type: &str) -> bool {
+    header_text(headers, header::CONTENT_TYPE)
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(media_type))
 }
 
 pub(super) fn nonce(headers: &HeaderMap) -> Result<String, AccountError> {
@@ -97,7 +140,8 @@ pub(super) fn csrf(
         return Err(forbidden("CSRF token cookie missing"));
     };
     let submitted = header_text(headers, HeaderName::from_static("x-csrf-token"))
-        .unwrap_or_else(|| form.get("csrf_token"));
+        .or_else(|| urlencoded(headers).then(|| form.get("csrf_token")))
+        .unwrap_or("");
     if !bool::from(proof.as_bytes().ct_eq(submitted.as_bytes())) {
         return Err(forbidden("CSRF token validation failed"));
     }

@@ -12,8 +12,8 @@ const MASK: &str = "*****";
 pub(super) const SECRET_HEADER: &str = "_mcpgateway_encrypted_header_value_v1";
 
 mod write;
-pub(super) use write::import_tool;
 pub(super) use write::protected_header;
+pub(super) use write::{change_state, import_tool, remove};
 
 pub(super) fn mapped_header_name(name: &str) -> Option<HeaderName> {
     let name = HeaderName::from_bytes(name.as_bytes()).ok()?;

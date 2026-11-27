@@ -29,7 +29,92 @@ pub(crate) struct CatalogListing {
     links: Option<Value>,
 }
 
+pub(crate) enum CatalogMutation {
+    State(bool),
+    Delete { purge_metrics: bool },
+}
+
 impl GatewayService {
+    pub(crate) async fn mutate_admin_catalog(
+        &self,
+        kind: ManagedCatalog,
+        principal: &Principal,
+        id: String,
+        mutation: CatalogMutation,
+    ) -> Result<Option<&'static str>, &'static str> {
+        match mutation {
+            CatalogMutation::State(enabled) => {
+                let result = match kind {
+                    ManagedCatalog::Tools => tool_api::change_state(self, principal, &id, enabled)
+                        .await
+                        .map(|_| ()),
+                    ManagedCatalog::Servers => {
+                        server_api::change_state(self, principal, &id, enabled)
+                            .await
+                            .map(|_| ())
+                    }
+                    ManagedCatalog::Resources => {
+                        resource_api::change_state(self, principal, &id, enabled)
+                            .await
+                            .map(|_| ())
+                    }
+                    ManagedCatalog::Prompts => {
+                        prompt_api::change_state(self, principal, &id, enabled)
+                            .await
+                            .map(|_| ())
+                    }
+                    ManagedCatalog::Gateways => {
+                        return management::change_state(self, principal, id, enabled)
+                            .await
+                            .map(|_| None)
+                            .map_err(|error| match error {
+                                management::ManagementError::ToolNameConflict => "name_conflict",
+                                other => flash_error(
+                                    other.into_response().status(),
+                                    "state_change_failed",
+                                ),
+                            });
+                    }
+                };
+                result.map(|_| None).map_err(|error| match (kind, error.0) {
+                    (ManagedCatalog::Tools | ManagedCatalog::Servers, StatusCode::CONFLICT) => {
+                        "conflict"
+                    }
+                    (_, status) => flash_error(status, "state_change_failed"),
+                })
+            }
+            CatalogMutation::Delete { purge_metrics } => {
+                let purge = purge_metrics.then_some("true");
+                let result = match kind {
+                    ManagedCatalog::Tools => tool_api::remove(self, principal, &id, purge).await,
+                    ManagedCatalog::Servers => {
+                        server_api::remove(self, principal, &id, purge).await
+                    }
+                    ManagedCatalog::Resources => {
+                        resource_api::remove(self, principal, &id, purge).await
+                    }
+                    ManagedCatalog::Prompts => {
+                        prompt_api::remove(self, principal, &id, purge).await
+                    }
+                    ManagedCatalog::Gateways => {
+                        return management::remove(self, principal, id)
+                            .await
+                            .map(|response| {
+                                (response.status() == StatusCode::ACCEPTED)
+                                    .then_some("gateway_delete_pending")
+                            })
+                            .map_err(|error| {
+                                flash_error(error.into_response().status(), "delete_failed")
+                            });
+                    }
+                };
+                result
+                    .map(|_| None)
+                    .map_err(|error| flash_error(error.0, "delete_failed"))
+            }
+        }
+    }
+
     pub(crate) async fn admin_catalog(
         &self,
         kind: ManagedCatalog,
@@ -138,5 +223,13 @@ impl GatewayService {
             pagination,
             links,
         })
+    }
+}
+
+fn flash_error(status: StatusCode, fallback: &'static str) -> &'static str {
+    if status == StatusCode::FORBIDDEN {
+        "permission_denied"
+    } else {
+        fallback
     }
 }

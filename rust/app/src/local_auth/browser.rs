@@ -148,6 +148,12 @@ pub(super) fn router(
                 &format!("{path}/{}", kind.name()),
                 get(catalog::list).layer(Extension(kind)),
             );
+            for action in [catalog::Action::State, catalog::Action::Delete] {
+                router = router.route(
+                    &format!("{path}/{}/{{id}}/{}", kind.name(), action.path()),
+                    post(catalog::mutate).layer(Extension((kind, action))),
+                );
+            }
         }
     }
     if settings.ui {

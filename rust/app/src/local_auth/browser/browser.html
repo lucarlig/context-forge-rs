@@ -21,6 +21,8 @@
     .catalog-nav a { padding: .45rem .65rem; border: 1px solid GrayText; border-radius: .35rem; }
     .catalog-nav [aria-current] { background: CanvasText; color: Canvas; }
     .toolbar form, .toolbar label { display: flex; align-items: center; }
+    .actions { display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem; }
+    .actions summary { cursor: pointer; }
     section { margin-block: 1.5rem; }
     .table-scroll { overflow-x: auto; }
     table { border-collapse: collapse; table-layout: auto; width: 100%; }
@@ -90,6 +92,8 @@
         <button type="submit">Sign out</button>
       </form>
     </header>
+    {% if catalog.error %}<p role="alert">{{ catalog.error }}</p>{% endif %}
+    {% if catalog.message %}<p role="status">{{ catalog.message }}</p>{% endif %}
     {% if catalog.navigation %}
     <div class="toolbar">
       <nav class="catalog-nav" aria-label="Catalog sections">
@@ -105,15 +109,39 @@
       </form>
     </div>
     {% for part in catalog.sections %}
-    <section aria-labelledby="heading-{{ part.name }}">
+    <section id="{{ part.fragment }}" aria-labelledby="heading-{{ part.name }}">
       <h2 id="heading-{{ part.name }}">{{ part.label }}</h2>
       {% if part.rows %}
       <div class="table-scroll">
         <table aria-labelledby="heading-{{ part.name }}">
-          <thead><tr><th scope="col">Name</th><th scope="col">Description</th><th scope="col">Status</th><th scope="col">Visibility</th></tr></thead>
+          <thead><tr><th scope="col">Name</th><th scope="col">Description</th><th scope="col">Status</th><th scope="col">Visibility</th>{% if part.actions %}<th scope="col">Actions</th>{% endif %}</tr></thead>
           <tbody>
             {% for item in part.rows %}
-            <tr><th scope="row">{{ item.name }}</th><td>{{ item.description|default('—', true) }}</td><td>{{ "Active" if item.enabled else "Inactive" }}</td><td>{{ item.visibility|default('—', true) }}</td></tr>
+            <tr>
+              <th scope="row">{{ item.name }}</th><td>{{ item.description|default('—', true) }}</td><td>{{ "Active" if item.enabled else "Inactive" }}</td><td>{{ item.visibility|default('—', true) }}</td>
+              {% if part.actions %}<td><div class="actions">
+                {% if item.update %}
+                <form method="post" action="{{ root }}/admin/{{ part.name }}/{{ item.id }}/state">
+                  <input type="hidden" name="csrf_token" value="{{ proof }}">
+                  {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}
+                  {% if catalog.include_inactive %}<input type="hidden" name="is_inactive_checked" value="true">{% endif %}
+                  <button type="submit" name="activate" value="{{ "false" if item.enabled else "true" }}">{{ "Disable" if item.enabled else "Enable" }}</button>
+                </form>
+                {% endif %}
+                {% if item.delete %}
+                <details>
+                  <summary>Delete</summary>
+                  <form method="post" action="{{ root }}/admin/{{ part.name }}/{{ item.id }}/delete">
+                    <input type="hidden" name="csrf_token" value="{{ proof }}">
+                    {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}
+                    {% if catalog.include_inactive %}<input type="hidden" name="is_inactive_checked" value="true">{% endif %}
+                    {% if part.purge_metrics %}<label><input type="checkbox" name="purge_metrics" value="true"> Delete metrics</label>{% endif %}
+                    <button type="submit">Confirm delete</button>
+                  </form>
+                </details>
+                {% endif %}
+              </div></td>{% endif %}
+            </tr>
             {% endfor %}
           </tbody>
         </table>

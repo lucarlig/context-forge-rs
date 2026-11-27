@@ -372,21 +372,31 @@ pub(super) async fn set_state(
     Query(query): Query<StateQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
     let active = query.activate.is_none() || flag(query.activate.as_deref())?;
+    let server = change_state(&service, &principal, &id, active).await?;
+    Ok(Json(with_links(&service, &principal, &server).await?))
+}
+
+pub(in crate::gateway) async fn change_state(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    active: bool,
+) -> Result<ServerRecord, CatalogApiError> {
     let action = if active {
         "activate the Server"
     } else {
         "deactivate the Server"
     };
-    let prior = editable(&service, &principal, &id, "servers.update", action).await?;
+    let prior = editable(service, principal, id, "servers.update", action).await?;
     let server = service
         .database
         .set_managed_server_state(&prior, active)
         .await
         .map_err(|error| persistence_error(error, &prior, false))?;
     if prior.enabled != server.enabled {
-        publish(&service, &server);
+        publish(service, &server);
     }
-    Ok(Json(with_links(&service, &principal, &server).await?))
+    Ok(server)
 }
 
 pub(super) async fn delete(
@@ -395,23 +405,33 @@ pub(super) async fn delete(
     Path(id): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
+    remove(&service, &principal, &id, query.purge_metrics.as_deref()).await?;
+    Ok(Json(
+        json!({"status":"success","message":format!("Server {id} deleted successfully")}),
+    ))
+}
+
+pub(in crate::gateway) async fn remove(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    purge_metrics: Option<&str>,
+) -> Result<(), CatalogApiError> {
     let server = editable(
-        &service,
-        &principal,
-        &id,
+        service,
+        principal,
+        id,
         "servers.delete",
         "delete this server",
     )
     .await?;
     service
         .database
-        .delete_managed_server(&server, flag(query.purge_metrics.as_deref())?)
+        .delete_managed_server(&server, flag(purge_metrics)?)
         .await
         .map_err(|error| persistence_error(error, &server, false))?;
-    publish(&service, &server);
-    Ok(Json(
-        json!({"status":"success","message":format!("Server {id} deleted successfully")}),
-    ))
+    publish(service, &server);
+    Ok(())
 }
 
 pub(super) async fn approve(

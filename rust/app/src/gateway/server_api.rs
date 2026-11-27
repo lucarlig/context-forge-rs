@@ -11,7 +11,7 @@ mod oauth;
 mod write;
 pub(super) use oauth::router as well_known_router;
 pub(crate) use oauth::{oauth_issuers, resource_metadata_url};
-pub(super) use write::import_server;
+pub(super) use write::{change_state, import_server, remove};
 
 pub(super) fn router() -> Router<Arc<GatewayService>> {
     let mut routes = Router::new();
