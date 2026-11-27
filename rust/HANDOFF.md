@@ -63,3 +63,9 @@ Tool management supports transactional creation, edits, state changes,
 deprecation, and deletion. The comparison verified credential masking and
 encrypted persistence on both databases.
 [Tool write verification](replay/tool-management/write.md)
+
+The gateway management and catalog milestone is verified. Standing upstream
+listeners reconcile the catalog after acknowledgment and apply subsequent
+tool, resource, and prompt changes. A two-worker Redis test verified that only
+one stream stays open and that the peer takes over during shutdown.
+[Standing listener verification](replay/gateway-management/listeners.md)

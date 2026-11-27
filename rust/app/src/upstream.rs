@@ -247,6 +247,12 @@ pub(crate) enum ResourceListenEvent {
     Updated,
 }
 
+pub(crate) enum CatalogListenChange {
+    All,
+    Resources,
+    Prompts,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ProxyCatalogKind {
     Tools,
@@ -275,7 +281,7 @@ struct ProxyListOptions<'a> {
     user: Option<&'a Value>,
 }
 
-pub(crate) enum ResourceListenEnd {
+pub(crate) enum ListenEnd {
     Legacy,
     Declined,
     Disconnected,
@@ -782,7 +788,80 @@ impl UpstreamClient {
         endpoint: UpstreamEndpoint<'_>,
         uri: &str,
         mut on_event: impl FnMut(ResourceListenEvent),
-    ) -> Result<ResourceListenEnd, UpstreamError> {
+    ) -> Result<ListenEnd, UpstreamError> {
+        let filter = SubscriptionFilter::builder()
+            .resource_subscription(uri)
+            .build();
+        self.listen_notifications(
+            endpoint,
+            filter,
+            |accepted| {
+                accepted
+                    .resource_subscriptions
+                    .as_ref()
+                    .is_some_and(|uris| uris.iter().any(|accepted| accepted == uri))
+            },
+            |notification| match notification {
+                ServerNotification::SubscriptionsAcknowledgedNotification(_) => {
+                    on_event(ResourceListenEvent::Acknowledged)
+                }
+                ServerNotification::ResourceUpdatedNotification(update)
+                    if update.params.uri == uri =>
+                {
+                    on_event(ResourceListenEvent::Updated)
+                }
+                _ => {}
+            },
+        )
+        .await
+    }
+
+    pub(crate) fn can_listen_catalog(&self) -> bool {
+        self.mode != ConnectMode::Legacy
+    }
+
+    pub(crate) async fn listen_catalog(
+        &self,
+        endpoint: UpstreamEndpoint<'_>,
+        mut notify: impl FnMut(CatalogListenChange),
+    ) -> Result<ListenEnd, UpstreamError> {
+        let mut filter = SubscriptionFilter::new();
+        filter.tools_list_changed = Some(true);
+        filter.prompts_list_changed = Some(true);
+        filter.resources_list_changed = Some(true);
+        self.listen_notifications(
+            endpoint,
+            filter,
+            |accepted| {
+                accepted.tools_list_changed == Some(true)
+                    || accepted.prompts_list_changed == Some(true)
+                    || accepted.resources_list_changed == Some(true)
+            },
+            |notification| match notification {
+                ServerNotification::SubscriptionsAcknowledgedNotification(_)
+                | ServerNotification::ToolListChangedNotification(_) => {
+                    notify(CatalogListenChange::All)
+                }
+                ServerNotification::PromptListChangedNotification(_) => {
+                    notify(CatalogListenChange::Prompts)
+                }
+                ServerNotification::ResourceListChangedNotification(_)
+                | ServerNotification::ResourceUpdatedNotification(_) => {
+                    notify(CatalogListenChange::Resources)
+                }
+                _ => {}
+            },
+        )
+        .await
+    }
+
+    async fn listen_notifications(
+        &self,
+        endpoint: UpstreamEndpoint<'_>,
+        filter: SubscriptionFilter,
+        accepts: impl Fn(&SubscriptionFilter) -> bool,
+        mut on_notification: impl FnMut(ServerNotification),
+    ) -> Result<ListenEnd, UpstreamError> {
         let deadline = self.deadline()?;
         let session = self.open_session(endpoint, deadline).await?;
         let Some(version) = session
@@ -791,11 +870,8 @@ impl UpstreamClient {
             .filter(|version| !version.has_initialize())
         else {
             session.close().await;
-            return Ok(ResourceListenEnd::Legacy);
+            return Ok(ListenEnd::Legacy);
         };
-        let filter = SubscriptionFilter::builder()
-            .resource_subscription(uri)
-            .build();
         let request =
             SubscriptionsListenRequest::new(SubscriptionsListenRequestParams::new(filter));
         let (mut response, id) = timeout_at(
@@ -838,7 +914,7 @@ impl UpstreamClient {
                 let message = decode_message(&frame)?;
                 let JsonRpcMessage::Notification(notification) = message else {
                     if take_result(message, id)?.is_some() {
-                        return Ok(ResourceListenEnd::Disconnected);
+                        return Ok(ListenEnd::Disconnected);
                     }
                     continue;
                 };
@@ -853,28 +929,21 @@ impl UpstreamClient {
                     ServerNotification::SubscriptionsAcknowledgedNotification(ack)
                         if !acknowledged =>
                     {
-                        if !ack
-                            .params
-                            .notifications
-                            .resource_subscriptions
-                            .as_ref()
-                            .is_some_and(|uris| uris.iter().any(|accepted| accepted == uri))
-                        {
-                            return Ok(ResourceListenEnd::Declined);
+                        if !accepts(&ack.params.notifications) {
+                            return Ok(ListenEnd::Declined);
                         }
                         acknowledged = true;
-                        on_event(ResourceListenEvent::Acknowledged);
+                        on_notification(ServerNotification::SubscriptionsAcknowledgedNotification(
+                            ack,
+                        ));
                     }
-                    ServerNotification::ResourceUpdatedNotification(update)
-                        if acknowledged && update.params.uri == uri =>
-                    {
-                        on_event(ResourceListenEvent::Updated);
-                    }
+                    ServerNotification::SubscriptionsAcknowledgedNotification(_) => {}
                     ServerNotification::CancelledNotification(cancel)
                         if cancel.params.request_id == Some(subscription_id.clone()) =>
                     {
-                        return Ok(ResourceListenEnd::Disconnected);
+                        return Ok(ListenEnd::Disconnected);
                     }
+                    notification if acknowledged => on_notification(notification),
                     _ => {}
                 }
             }
@@ -882,7 +951,7 @@ impl UpstreamClient {
                 return Err(UpstreamError::LimitExceeded);
             }
         }
-        Ok(ResourceListenEnd::Disconnected)
+        Ok(ListenEnd::Disconnected)
     }
 
     fn deadline(&self) -> Result<Instant, UpstreamError> {

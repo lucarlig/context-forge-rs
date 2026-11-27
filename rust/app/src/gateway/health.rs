@@ -19,6 +19,19 @@ pub struct GatewayHealth {
     pub auto_refresh: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct RefreshSelection {
+    pub(super) resources: bool,
+    pub(super) prompts: bool,
+}
+
+impl RefreshSelection {
+    pub(super) const ALL: Self = Self {
+        resources: true,
+        prompts: true,
+    };
+}
+
 impl GatewayService {
     pub async fn run_gateway_health(
         self: Arc<Self>,
@@ -157,7 +170,13 @@ impl GatewayService {
         };
         if should_refresh
             && self
-                .refresh_healthy_gateway(record, &upstream, endpoint, recovering)
+                .refresh_healthy_gateway(
+                    record,
+                    &upstream,
+                    endpoint,
+                    recovering,
+                    RefreshSelection::ALL,
+                )
                 .await?
         {
             return Ok(0);
@@ -185,17 +204,21 @@ impl GatewayService {
             >= i64::from(interval)
     }
 
-    async fn refresh_healthy_gateway(
+    pub(super) async fn refresh_healthy_gateway(
         &self,
         record: &GatewayRecord,
         upstream: &UpstreamClient,
         endpoint: UpstreamEndpoint<'_>,
         recovering: bool,
+        selection: RefreshSelection,
     ) -> Result<bool, sqlx::Error> {
         let Some(_guard) = self.try_catalog_refresh(&record.id) else {
             return Ok(false);
         };
-        let (catalog, metadata) = match upstream.discover_catalog(endpoint).await {
+        let (catalog, metadata) = match upstream
+            .discover_selected_catalog(endpoint, selection.resources, selection.prompts)
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 tracing::warn!(gateway = %record.id, %error, "could not refresh healthy gateway catalog");
@@ -224,8 +247,8 @@ impl GatewayService {
                     tools: &tools,
                     capabilities: &catalog.capabilities,
                     metadata: &metadata,
-                    include_resources: true,
-                    include_prompts: true,
+                    include_resources: selection.resources,
+                    include_prompts: selection.prompts,
                     completion,
                 },
             )

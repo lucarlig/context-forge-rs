@@ -4,6 +4,7 @@ mod catalog_api;
 mod content;
 mod health;
 mod lifecycle;
+mod listeners;
 mod management;
 mod prompt_api;
 mod proxy;
@@ -72,6 +73,7 @@ use proxy::DirectTarget;
 
 pub use health::GatewayHealth;
 pub use lifecycle::GatewayLifecycle;
+pub use listeners::{GatewayListeners, ListenerElection};
 pub(crate) use proxy::GATEWAY_ID_HEADER;
 pub use resource_api::ResourceLimits;
 pub use roots::{RootSettings, RootSetupError};

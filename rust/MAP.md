@@ -17,7 +17,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Resources, prompts, completions, logging, and subscriptions
 - [x] Legacy SSE, WebSocket, and stdio transports and translation
 - [x] Authenticated MCP upstreams, identity forwarding, and direct proxy mode
-- [ ] Gateway update, delete, refresh, health lifecycle, and full catalog APIs (in progress)
+- [x] Gateway update, delete, refresh, health lifecycle, and full catalog APIs
 - [ ] Virtual-server management and OAuth resource metadata
 - [ ] API token issuance, usage limits, and lifecycle
 - [ ] User, team, role, and local login management

@@ -18,7 +18,7 @@ use crate::{
     catalog::ResourceSubscriptionTarget,
     credentials::UpstreamCredentials,
     upstream::{
-        ResourceListenEnd, ResourceListenEvent, UpstreamClient, UpstreamEndpoint, UpstreamError,
+        ListenEnd, ResourceListenEvent, UpstreamClient, UpstreamEndpoint, UpstreamError,
         UpstreamTransport,
     },
 };
@@ -229,7 +229,7 @@ async fn relay_forever(
             })
             .await;
         match result {
-            Ok(ResourceListenEnd::Legacy) => {
+            Ok(ListenEnd::Legacy) => {
                 if let Some(state) = state.upgrade() {
                     state
                         .lock()
@@ -239,9 +239,9 @@ async fn relay_forever(
                 }
                 return;
             }
-            Ok(ResourceListenEnd::Declined)
+            Ok(ListenEnd::Declined)
             | Err(UpstreamError::BlockedDestination | UpstreamError::InvalidUrl) => return,
-            Ok(ResourceListenEnd::Disconnected) => {}
+            Ok(ListenEnd::Disconnected) => {}
             Err(error) => {
                 tracing::debug!(%error, gateway = %target.resource.gateway_id, "upstream resource subscription disconnected");
             }

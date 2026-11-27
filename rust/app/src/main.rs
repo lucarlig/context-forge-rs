@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (management_page_size, management_max_page_size) = Settings::management_page_sizes()?;
     let catalog_refresh = Settings::catalog_refresh()?;
     let health_settings = Settings::gateway_health(&catalog_refresh)?;
+    let gateway_listeners = settings.gateway_listeners()?;
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
@@ -94,7 +95,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     .clone()
                     .run_gateway_health(health_settings, shutdown.clone()),
             ),
-            tokio::spawn(service.run_gateway_lifecycle(shutdown.clone())),
+            tokio::spawn(service.clone().run_gateway_lifecycle(shutdown.clone())),
+            tokio::spawn(service.run_gateway_listeners(gateway_listeners, shutdown.clone())),
         ]
     });
     tracing::info!(address = %listener.local_addr()?, "gateway listening");

@@ -7,7 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     gateway::{
-        CatalogRefresh, GatewayHealth, GatewayLifecycle, Pagination, ResourceLimits, RootSettings,
+        CatalogRefresh, GatewayHealth, GatewayLifecycle, GatewayListeners, ListenerElection,
+        Pagination, ResourceLimits, RootSettings,
     },
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
@@ -28,6 +29,7 @@ pub struct Settings {
     pub redis: Option<RedisSettings>,
 }
 
+#[derive(Clone)]
 pub struct RedisSettings {
     pub url: String,
     pub connect_timeout: Duration,
@@ -641,6 +643,49 @@ impl Settings {
 
     pub fn tool_preview_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
         Ok(flag("MCPGATEWAY_TOOL_PREVIEW_ENABLED")?.unwrap_or(true))
+    }
+
+    pub fn gateway_listeners(
+        &self,
+    ) -> Result<Option<GatewayListeners>, Box<dyn Error + Send + Sync>> {
+        if !flag("GATEWAY_MODERN_LISTENERS_ENABLED")?.unwrap_or(false) {
+            return Ok(None);
+        }
+        let path = env::var_os("PRIMARY_WORKER_LOCK_PATH")
+            .filter(|path| !path.is_empty())
+            .map_or_else(
+                || env::temp_dir().join(format!("mcpgw_plugin_primary_{}.lock", self.port)),
+                Into::into,
+            );
+        let election = match value("PRIMARY_WORKER_ELECTION_BACKEND", "filelock")?.as_str() {
+            "filelock" => ListenerElection::File(path),
+            "redis" => {
+                let lease = positive_seconds("PRIMARY_WORKER_LEASE_TTL", 15.0)?;
+                let heartbeat = positive_seconds("PRIMARY_WORKER_HEARTBEAT_INTERVAL", 5.0)?;
+                if heartbeat >= lease / 2 {
+                    return Err(
+                        "PRIMARY_WORKER_HEARTBEAT_INTERVAL must be less than half the lease TTL"
+                            .into(),
+                    );
+                }
+                let file_fallback =
+                    match value("PRIMARY_WORKER_REDIS_UNAVAILABLE_POLICY", "fail_closed")?.as_str()
+                    {
+                        "fail_closed" => None,
+                        "filelock_fallback" => Some(path),
+                        _ => return Err("invalid PRIMARY_WORKER_REDIS_UNAVAILABLE_POLICY".into()),
+                    };
+                ListenerElection::Redis {
+                    connection: self.redis.clone(),
+                    key: value("PRIMARY_WORKER_REDIS_KEY", "mcpgw:primary_worker")?,
+                    lease,
+                    heartbeat,
+                    file_fallback,
+                }
+            }
+            _ => return Err("invalid PRIMARY_WORKER_ELECTION_BACKEND".into()),
+        };
+        Ok(Some(GatewayListeners { election }))
     }
 
     pub fn resource_limits() -> Result<ResourceLimits, Box<dyn Error + Send + Sync>> {
