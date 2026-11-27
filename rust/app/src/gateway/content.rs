@@ -299,7 +299,7 @@ impl GatewayService {
         Ok(())
     }
 
-    async fn request_content(
+    pub(super) async fn request_content(
         &self,
         gateway: &ContentGateway,
         request: ClientRequest,
@@ -402,7 +402,7 @@ fn prompt_completions(
         .map_err(|_| ErrorData::internal_error("Invalid prompt completions", None))
 }
 
-fn local_resource(record: ResourceContentRecord, uri: String) -> ResourceContents {
+pub(super) fn local_resource(record: ResourceContentRecord, uri: String) -> ResourceContents {
     if let Some(blob) = record.blob {
         ResourceContents::blob(BASE64_STANDARD.encode(blob), uri).with_mime_type(
             record

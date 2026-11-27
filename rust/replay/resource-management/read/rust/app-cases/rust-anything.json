@@ -1,0 +1,25 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-rs",
+  "run": [
+    "/tmp/context-forge-port-tools/context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "input-001-get-resources",
+    "input-002-get-v1",
+    "input-003-get-resources",
+    "input-004-get-v1",
+    "input-005-get-v1",
+    "input-006-get-v1",
+    "input-007-get-v1",
+    "input-008-get-resources",
+    "input-009-get-v1",
+    "input-010-get-v1",
+    "input-011-get-v1"
+  ]
+}

@@ -1,0 +1,1 @@
+{"_meta":{},"next_cursor":null,"resource_templates":[{"id":"resource-template","uriTemplate":"file:///fixture/catalog/{name}","name":"Templated","description":null,"mimeType":"text/plain","annotations":null,"_meta":null}]}

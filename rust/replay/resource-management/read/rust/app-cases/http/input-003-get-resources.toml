@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/resources/resource-fixture/info"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc2NzIyNTYwMCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJyZXNvdXJjZS1hZG1pbi1maXh0dXJlLXN0YXRpYyIsImlzX2FkbWluIjp0cnVlLCJ0ZWFtcyI6bnVsbCwidG9rZW5fdXNlIjoiYXBpIiwidXNlciI6eyJlbWFpbCI6ImFkbWluQGV4YW1wbGUuY29tIiwiaXNfYWRtaW4iOnRydWV9fQ.hDwMpVlX3BMe4NxaLaOus5EHiNJJ6v6v6mrt4CmU7nE"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

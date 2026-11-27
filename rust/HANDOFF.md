@@ -41,3 +41,5 @@ The opt-in asynchronous lifecycle accepts create, update, and delete operations 
 The root management APIs support canonically identified network and file roots, configuration export, and an SSE changes stream. The HTTP recordings verify the URI policy and the unrestricted administrator requirement. [Root management verification](replay/root-management/README.md)
 
 The tag APIs aggregate counts and list tagged entities within the caller's catalog scope. SQLite and PostgreSQL matched all ten pinned replays. [Tag management verification](replay/tag-management/README.md)
+
+Resource REST reads cover metadata, templates, and content by ID and URI. The recordings verify filtering and scoped access, including against SQLite created by the pinned gateway. [Resource read verification](replay/resource-management/read/README.md)

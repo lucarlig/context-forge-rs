@@ -15,6 +15,9 @@ use crate::{
     upstream::{DiscoveredMetadata, UpstreamTransport},
 };
 
+mod resources;
+pub(crate) use resources::{ResourceFilters, ResourceRecord};
+
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
 pub(crate) const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
 
@@ -155,10 +158,19 @@ pub(crate) struct ResourceSubscriptionTarget {
 }
 
 pub(crate) struct ResourceContentRecord {
+    pub(crate) id: String,
+    pub(crate) uri: String,
     pub(crate) mime: Option<String>,
     pub(crate) text: Option<String>,
     pub(crate) blob: Option<Vec<u8>>,
     pub(crate) gateway: Option<ContentGateway>,
+}
+
+enum ResourceLookup<'a> {
+    Uri(&'a str),
+    Template(&'a str),
+    Id(&'a str),
+    Templates,
 }
 
 pub(crate) struct PromptContentRecord {
@@ -513,11 +525,13 @@ macro_rules! resource_content_query {
     ($teams:literal) => {
         metadata_query!($teams,
             concat!("item.uri_template, item.mime_type, CASE WHEN item.gateway_id IS NULL THEN item.text_content END,
-            CASE WHEN item.gateway_id IS NULL THEN item.binary_content END, ", content_gateway_columns!()),
+            CASE WHEN item.gateway_id IS NULL THEN item.binary_content END, ", content_gateway_columns!(), ", item.uri"),
             "resources", "server_resource_association", "resource_id",
-            "((CAST($8 AS TEXT) IS NOT NULL AND item.uri = $8)
+            "((CAST($10 AS TEXT) IS NOT NULL AND item.id = $10)
+                OR (CAST($8 AS TEXT) IS NOT NULL AND item.uri = $8)
                 OR (CAST($9 AS TEXT) IS NOT NULL AND item.uri_template = $9)
-                OR (CAST($8 AS TEXT) IS NULL AND CAST($9 AS TEXT) IS NULL AND item.uri_template IS NOT NULL))")
+                OR (CAST($8 AS TEXT) IS NULL AND CAST($9 AS TEXT) IS NULL
+                    AND CAST($10 AS TEXT) IS NULL AND item.uri_template IS NOT NULL))")
     };
 }
 
@@ -551,6 +565,7 @@ type ResourceContentRow = (
     Option<String>,
     bool,
     bool,
+    String,
 );
 type PromptContentRow = (
     String,
@@ -755,19 +770,82 @@ pub(crate) const SQLITE_TOOL_INSERT: &str = insert_tool!("json($8)", "json($9)",
 pub(crate) const POSTGRES_TOOL_INSERT: &str =
     insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)");
 
+macro_rules! resource_management_columns {
+    ($prefix:literal) => {
+        [
+            ("created_by", concat!($prefix, "created_by VARCHAR(255)")),
+            (
+                "created_from_ip",
+                concat!($prefix, "created_from_ip VARCHAR(45)"),
+            ),
+            ("created_via", concat!($prefix, "created_via VARCHAR(100)")),
+            (
+                "created_user_agent",
+                concat!($prefix, "created_user_agent TEXT"),
+            ),
+            ("modified_by", concat!($prefix, "modified_by VARCHAR(255)")),
+            (
+                "modified_from_ip",
+                concat!($prefix, "modified_from_ip VARCHAR(45)"),
+            ),
+            (
+                "modified_via",
+                concat!($prefix, "modified_via VARCHAR(100)"),
+            ),
+            (
+                "modified_user_agent",
+                concat!($prefix, "modified_user_agent TEXT"),
+            ),
+            (
+                "import_batch_id",
+                concat!($prefix, "import_batch_id VARCHAR(36)"),
+            ),
+            (
+                "federation_source",
+                concat!($prefix, "federation_source VARCHAR(255)"),
+            ),
+            (
+                "version",
+                concat!($prefix, "version INTEGER NOT NULL DEFAULT 1"),
+            ),
+        ]
+    };
+}
+
 impl Database {
     pub async fn migrate_catalog(&self) -> Result<(), sqlx::Error> {
+        macro_rules! migrate {
+            ($tx:ident, $columns:literal) => {{
+                sqlx::raw_sql(MIGRATION).execute(&mut *$tx).await?;
+                let existing = sqlx::query_scalar::<_, String>($columns)
+                    .fetch_all(&mut *$tx)
+                    .await?;
+                for (name, statement) in
+                    resource_management_columns!("ALTER TABLE resources ADD COLUMN ")
+                {
+                    if !existing.iter().any(|column| column == name) {
+                        sqlx::query(statement).execute(&mut *$tx).await?;
+                    }
+                }
+                $tx.commit().await
+            }};
+        }
         match self {
             Self::Sqlite(pool) => {
                 let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
-                transaction.commit().await
+                migrate!(
+                    transaction,
+                    "SELECT name FROM pragma_table_info('resources')"
+                )
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
                 sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
-                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
-                transaction.commit().await
+                migrate!(
+                    transaction,
+                    "SELECT CAST(column_name AS TEXT) FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = 'resources'"
+                )
             }
         }
     }
@@ -898,7 +976,7 @@ impl Database {
         uri: &str,
     ) -> Result<Option<ResourceContentRecord>, sqlx::Error> {
         let mut exact = self
-            .resource_content_rows(scope, server, Some(uri), None, None, 2)
+            .resource_content_rows(scope, server, ResourceLookup::Uri(uri), None, 2)
             .await?;
         if exact.len() > 1 {
             return Err(sqlx::Error::Protocol(
@@ -911,7 +989,13 @@ impl Database {
         let mut after = None;
         loop {
             let rows = self
-                .resource_content_rows(scope, server, None, None, after.as_deref(), 64)
+                .resource_content_rows(
+                    scope,
+                    server,
+                    ResourceLookup::Templates,
+                    after.as_deref(),
+                    64,
+                )
                 .await?;
             let remaining = rows.len() == 64;
             for row in rows {
@@ -937,7 +1021,18 @@ impl Database {
         template: &str,
     ) -> Result<Option<ResourceContentRecord>, sqlx::Error> {
         let mut rows = self
-            .resource_content_rows(scope, server, None, Some(template), None, 1)
+            .resource_content_rows(scope, server, ResourceLookup::Template(template), None, 1)
+            .await?;
+        Ok(rows.pop().map(resource_content_record))
+    }
+
+    pub(crate) async fn resource_content_by_id(
+        &self,
+        scope: CatalogScope<'_>,
+        id: &str,
+    ) -> Result<Option<ResourceContentRecord>, sqlx::Error> {
+        let mut rows = self
+            .resource_content_rows(scope, None, ResourceLookup::Id(id), None, 1)
             .await?;
         Ok(rows.pop().map(resource_content_record))
     }
@@ -1068,12 +1163,17 @@ impl Database {
         &self,
         scope: CatalogScope<'_>,
         server: Option<&str>,
-        uri: Option<&str>,
-        template: Option<&str>,
+        lookup: ResourceLookup<'_>,
         after: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ResourceContentRow>, sqlx::Error> {
         let teams = visible_team_ids(scope)?;
+        let (uri, template, id) = match lookup {
+            ResourceLookup::Uri(uri) => (Some(uri), None, None),
+            ResourceLookup::Template(template) => (None, Some(template), None),
+            ResourceLookup::Id(id) => (None, None, Some(id)),
+            ResourceLookup::Templates => (None, None, None),
+        };
         macro_rules! select {
             ($pool:ident, $teams:literal) => {
                 sqlx::query_as::<_, ResourceContentRow>(resource_content_query!($teams))
@@ -1086,6 +1186,7 @@ impl Database {
                     .bind(teams)
                     .bind(uri)
                     .bind(template)
+                    .bind(id)
                     .fetch_all($pool)
                     .await
             };
@@ -1531,14 +1632,30 @@ pub(crate) fn visible_team_ids(scope: CatalogScope<'_>) -> Result<String, sqlx::
 }
 
 fn resource_content_record(row: ResourceContentRow) -> ResourceContentRecord {
-    let (_, _, _, _, _, mime, text, blob, id, url, transport, available, needs_upstream_config) =
-        row;
+    let (
+        id,
+        _,
+        _,
+        _,
+        _,
+        mime,
+        text,
+        blob,
+        gateway,
+        url,
+        transport,
+        available,
+        needs_upstream_config,
+        uri,
+    ) = row;
     ResourceContentRecord {
+        id,
+        uri,
         mime,
         text,
         blob,
         gateway: content_gateway(
-            id,
+            gateway,
             url,
             transport.as_deref(),
             available,

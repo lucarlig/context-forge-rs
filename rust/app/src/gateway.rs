@@ -5,6 +5,7 @@ mod health;
 mod lifecycle;
 mod management;
 mod proxy;
+mod resource_api;
 mod roots;
 mod tags;
 
@@ -328,6 +329,7 @@ impl GatewayService {
             router
                 .merge(roots::router())
                 .merge(tags::router())
+                .merge(resource_api::router())
                 .with_state(self.clone()),
         )
     }
