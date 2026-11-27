@@ -297,11 +297,7 @@ async fn import(
     let rekey = request.rekey_secret.map(Zeroizing::new);
     let batch_id = job.import_id.clone();
     let team_id = if !request.dry_run && entries.iter().any(|entry| entry.kind != Entity::Roots) {
-        match service
-            .database
-            .personal_import_team(&principal.email)
-            .await
-        {
+        match service.database.owned_personal_team(&principal.email).await {
             Ok(team) => team,
             Err(error) => {
                 job.finish("failed");
@@ -539,7 +535,10 @@ fn timestamp() -> String {
 }
 
 impl Database {
-    async fn personal_import_team(&self, owner: &str) -> Result<Option<String>, sqlx::Error> {
+    pub(super) async fn owned_personal_team(
+        &self,
+        owner: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
         const QUERY: &str = "SELECT id FROM email_teams
             WHERE created_by=$1 AND is_personal=TRUE AND is_active=TRUE ORDER BY id LIMIT 1";
         match self {

@@ -7,7 +7,7 @@ use regex::Regex;
 
 use super::events::ResourceEvent;
 use super::{
-    super::catalog_api::{client_address, denied_team, format_bytes, normalized_tags, user_agent},
+    super::catalog_api::{WriteOrigin, denied_team, format_bytes, normalized_tags},
     *,
 };
 use crate::catalog::ResourceWriteError;
@@ -58,7 +58,7 @@ impl Default for ResourceLimits {
 }
 
 #[derive(Default, Deserialize)]
-pub(super) struct ResourceFields {
+pub(in crate::gateway) struct ResourceFields {
     uri: Option<String>,
     name: Option<String>,
     #[serde(alias = "customName")]
@@ -83,7 +83,7 @@ pub(super) struct ResourceFields {
 }
 
 #[derive(Deserialize)]
-pub(super) struct CreateRequest {
+pub(in crate::gateway) struct CreateRequest {
     resource: ResourceFields,
     #[serde(alias = "teamId")]
     team_id: Option<String>,
@@ -195,6 +195,17 @@ pub(super) async fn create(
     headers: HeaderMap,
     Json(request): Json<CreateRequest>,
 ) -> Result<Json<Value>, ResourceError> {
+    let origin = WriteOrigin::new(peer, &headers, None);
+    let record = create_record(&service, &principal, request, origin).await?;
+    Ok(Json(metadata(&record, true)))
+}
+
+pub(in crate::gateway) async fn create_record(
+    service: &GatewayService,
+    principal: &Principal,
+    request: CreateRequest,
+    origin: WriteOrigin,
+) -> Result<ResourceRecord, ResourceError> {
     let mut fields = request.resource;
     if request
         .team_id
@@ -211,8 +222,8 @@ pub(super) async fn create(
         .unwrap_or("public");
     validate_visibility(visibility)?;
     let team = registration_team(
-        &service,
-        &principal,
+        service,
+        principal,
         visibility,
         request.team_id.as_deref().or(fields.team_id.as_deref()),
     )
@@ -223,7 +234,7 @@ pub(super) async fn create(
         .map_or(RoleContext::AnyTeam, RoleContext::Team);
     if !service
         .access
-        .allows(&principal, "resources.create", role, true)
+        .allows(principal, "resources.create", role, true)
         .await?
     {
         return Err(ResourceError::detail(
@@ -255,13 +266,14 @@ pub(super) async fn create(
         team_id: team,
         visibility: visibility.to_owned(),
         created_by: Some(principal.email.clone()),
-        created_from_ip: client_address(peer),
-        created_user_agent: user_agent(&headers),
+        created_via: origin.via.map(str::to_owned),
+        created_from_ip: origin.address,
+        created_user_agent: origin.agent,
         ..ResourceRecord::default()
     };
     record.gateway_id = resolve_gateway_id(fields.gateway_id.take(), fields.mcp_server_id.take())?;
     if let Some(gateway_id) = record.gateway_id.as_deref() {
-        let scope = access::catalog_scope(Some(&principal));
+        let scope = access::catalog_scope(Some(principal));
         let visible = service
             .database
             .gateway_records(gateway_id)
@@ -294,8 +306,8 @@ pub(super) async fn create(
         .save_managed_resource(None, &record, Some(body.trim()))
         .await
         .map_err(|error| persistence_error(error, &record))?;
-    publish(&service, &record, ResourceEvent::Added);
-    Ok(Json(metadata(&record, true)))
+    publish(service, &record, ResourceEvent::Added);
+    Ok(record)
 }
 
 pub(super) async fn update(
@@ -304,9 +316,21 @@ pub(super) async fn update(
     Path(id): Path<String>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    Json(mut fields): Json<ResourceFields>,
+    Json(fields): Json<ResourceFields>,
 ) -> Result<Json<Value>, ResourceError> {
-    let previous = editable(&service, &principal, &id, "resources.update", "update").await?;
+    let origin = WriteOrigin::new(peer, &headers, None);
+    let record = update_record(&service, &principal, &id, fields, origin).await?;
+    Ok(Json(metadata(&record, true)))
+}
+
+pub(in crate::gateway) async fn update_record(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    mut fields: ResourceFields,
+    origin: WriteOrigin,
+) -> Result<ResourceRecord, ResourceError> {
+    let previous = editable(service, principal, id, "resources.update", "update").await?;
     let mut record = previous.clone();
     if let Some(visibility) = fields.visibility.take() {
         validate_visibility(&visibility)?;
@@ -360,11 +384,11 @@ pub(super) async fn update(
         record.custom_name_slug = Some(slug);
     }
     record.modified_by = Some(principal.email.clone());
-    record.modified_via = Some("api".into());
-    if let Some(ip) = client_address(peer) {
+    record.modified_via = Some(origin.via.unwrap_or("api").to_owned());
+    if let Some(ip) = origin.address {
         record.modified_from_ip = Some(ip);
     }
-    if let Some(agent) = user_agent(&headers) {
+    if let Some(agent) = origin.agent {
         record.modified_user_agent = Some(agent);
     }
     let body = fields.content.take();
@@ -386,8 +410,8 @@ pub(super) async fn update(
             previous.owner_email.as_deref(),
         );
     }
-    publish(&service, &record, ResourceEvent::Updated);
-    Ok(Json(metadata(&record, true)))
+    publish(service, &record, ResourceEvent::Updated);
+    Ok(record)
 }
 
 #[derive(Deserialize)]
@@ -477,7 +501,7 @@ pub(in crate::gateway) async fn remove(
     Ok(())
 }
 
-async fn editable(
+pub(in crate::gateway) async fn editable(
     service: &GatewayService,
     principal: &Principal,
     id: &str,

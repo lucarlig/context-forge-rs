@@ -21,14 +21,14 @@ pub(super) const QUERY_ENCODE: AsciiSet = NON_ALPHANUMERIC
     .remove(b'~')
     .remove(b'/');
 
-pub(super) struct Form(HashMap<String, Zeroizing<String>>);
+pub(super) struct Form(HashMap<String, Vec<Zeroizing<String>>>);
 
 const MAX_FORM_BYTES: usize = 65_536;
 
 impl Form {
     pub(super) async fn from_request(request: Request) -> Result<(Parts, Self), AccountError> {
         let (parts, body) = request.into_parts();
-        let mut fields = HashMap::new();
+        let mut form = Self(HashMap::new());
         if urlencoded(&parts.headers) {
             let bytes = Zeroizing::new(
                 to_bytes(body, MAX_FORM_BYTES)
@@ -38,12 +38,11 @@ impl Form {
                     })?
                     .to_vec(),
             );
-            fields.extend(
-                url::form_urlencoded::parse(&bytes)
-                    .map(|(key, value)| (key.into_owned(), Zeroizing::new(value.into_owned()))),
-            );
+            for (key, value) in url::form_urlencoded::parse(&bytes) {
+                form.insert(key.into_owned(), value.into_owned());
+            }
         }
-        Ok((parts, Self(fields)))
+        Ok((parts, form))
     }
 
     pub(super) async fn from_catalog_request(
@@ -62,7 +61,7 @@ impl Form {
         let mut multipart = Multipart::from_request(input, &())
             .await
             .map_err(|error| AccountError::detail(error.status(), "Invalid multipart form"))?;
-        let mut fields = HashMap::new();
+        let mut form = Self(HashMap::new());
         let invalid = |error: axum::extract::multipart::MultipartError| {
             AccountError::detail(error.status(), "Invalid multipart form")
         };
@@ -70,10 +69,14 @@ impl Form {
             if let Some(name) = field.name().map(str::to_owned)
                 && field.file_name().is_none()
             {
-                fields.insert(name, Zeroizing::new(field.text().await.map_err(invalid)?));
+                form.insert(name, field.text().await.map_err(invalid)?);
             }
         }
-        Ok((parts, Self(fields)))
+        Ok((parts, form))
+    }
+
+    fn insert(&mut self, name: String, value: String) {
+        self.0.entry(name).or_default().push(Zeroizing::new(value));
     }
 
     pub(super) fn get(&self, name: &str) -> &str {
@@ -81,7 +84,15 @@ impl Form {
     }
 
     pub(super) fn value(&self, name: &str) -> Option<&str> {
-        self.0.get(name).map(|field| field.as_str())
+        self.0.get(name)?.last().map(|field| field.as_str())
+    }
+
+    pub(super) fn values(&self, name: &str) -> impl Iterator<Item = &str> {
+        self.0
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|value| value.as_str())
     }
 }
 

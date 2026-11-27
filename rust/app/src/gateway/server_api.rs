@@ -11,7 +11,9 @@ mod oauth;
 mod write;
 pub(super) use oauth::router as well_known_router;
 pub(crate) use oauth::{oauth_issuers, resource_metadata_url};
-pub(super) use write::{change_state, import_server, remove};
+pub(super) use write::{
+    change_state, create_record, editable, import_server, remove, update_record,
+};
 
 pub(super) fn router() -> Router<Arc<GatewayService>> {
     let mut routes = Router::new();
@@ -202,7 +204,7 @@ async fn find_visible(
     Ok(server)
 }
 
-async fn with_links(
+pub(super) async fn with_links(
     service: &GatewayService,
     principal: &Principal,
     server: &ServerRecord,

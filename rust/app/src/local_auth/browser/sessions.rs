@@ -198,6 +198,27 @@ pub(super) async fn create_session(
     Ok(response)
 }
 
+pub(super) fn proof(
+    accounts: &Accounts,
+    headers: &HeaderMap,
+    principal: &Principal,
+    token: &str,
+) -> Result<String, AccountError> {
+    match accounts
+        .access
+        .verify_gateway_token(token)
+        .ok()
+        .and_then(|jwt| {
+            accounts
+                .settings
+                .csrf
+                .issue(&principal.email, jwt.jti()?, Timestamp::now().as_second())
+        }) {
+        Some(proof) => Ok(proof),
+        None => forms::nonce(headers),
+    }
+}
+
 pub(super) fn set_proof(
     response: &mut Response,
     settings: &BrowserSettings,

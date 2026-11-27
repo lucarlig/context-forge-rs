@@ -4,6 +4,7 @@ use serde::Deserializer;
 use serde_json::Map;
 
 use super::*;
+use crate::gateway::catalog_api::WriteOrigin;
 use crate::{
     catalog::{
         CatalogEntryFilters, CatalogScope, ServerInterfaceInput, ServerLinkUpdate, ServerWriteError,
@@ -12,7 +13,7 @@ use crate::{
 };
 
 #[derive(Deserialize)]
-pub(super) struct CreateServer {
+pub(in crate::gateway) struct CreateServer {
     server: Option<Value>,
     virtual_server: Option<Value>,
     #[serde(alias = "teamId")]
@@ -22,7 +23,7 @@ pub(super) struct CreateServer {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ServerFields {
+pub(in crate::gateway) struct ServerFields {
     id: Option<String>,
     name: Option<String>,
     description: Option<String>,
@@ -233,6 +234,20 @@ pub(super) async fn create(
     headers: HeaderMap,
     Json(request): Json<CreateServer>,
 ) -> Result<(StatusCode, Json<Value>), CatalogApiError> {
+    let origin = WriteOrigin::new(peer, &headers, None);
+    let record = create_record(&service, &principal, request, origin).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(with_links(&service, &principal, &record).await?),
+    ))
+}
+
+pub(in crate::gateway) async fn create_record(
+    service: &GatewayService,
+    principal: &Principal,
+    request: CreateServer,
+    origin: WriteOrigin,
+) -> Result<ServerRecord, CatalogApiError> {
     if request
         .server
         .as_ref()
@@ -262,8 +277,8 @@ pub(super) async fn create(
         return Err(denied_team());
     }
     let team_id = write_scope(
-        &service,
-        &principal,
+        service,
+        principal,
         visibility,
         request.team_id.as_deref().or(fields.team_id.as_deref()),
         "servers.create",
@@ -290,27 +305,25 @@ pub(super) async fn create(
         visibility: visibility.to_owned(),
         owner_email: Some(principal.email.clone()),
         created_by: Some(principal.email.clone()),
-        created_from_ip: client_address(peer),
-        created_user_agent: user_agent(&headers),
+        created_via: origin.via.map(str::to_owned),
+        created_from_ip: origin.address,
+        created_user_agent: origin.agent,
         tags: "[]".to_owned(),
         ..ServerRecord::default()
     };
-    let links = apply_fields(&service, &principal, &mut server, fields, true).await?;
+    let links = apply_fields(service, principal, &mut server, fields, true).await?;
     let server = service
         .database
         .save_managed_server(
             None,
             &server,
             &links,
-            access::catalog_scope(Some(&principal)),
+            access::catalog_scope(Some(principal)),
         )
         .await
         .map_err(|error| persistence_error(error, &server, true))?;
-    publish(&service, &server);
-    Ok((
-        StatusCode::CREATED,
-        Json(with_links(&service, &principal, &server).await?),
-    ))
+    publish(service, &server);
+    Ok(server)
 }
 
 pub(super) async fn update(
@@ -319,12 +332,24 @@ pub(super) async fn update(
     Path(id): Path<String>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    Json(mut fields): Json<ServerFields>,
+    Json(fields): Json<ServerFields>,
 ) -> Result<Json<Value>, CatalogApiError> {
+    let origin = WriteOrigin::new(peer, &headers, None);
+    let record = update_record(&service, &principal, &id, fields, origin).await?;
+    Ok(Json(with_links(&service, &principal, &record).await?))
+}
+
+pub(in crate::gateway) async fn update_record(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    mut fields: ServerFields,
+    origin: WriteOrigin,
+) -> Result<ServerRecord, CatalogApiError> {
     let prior = editable(
-        &service,
-        &principal,
-        &id,
+        service,
+        principal,
+        id,
         "servers.update",
         "update this server",
     )
@@ -340,29 +365,60 @@ pub(super) async fn update(
         let visibility = fields.visibility.as_deref().unwrap_or(&server.visibility);
         let team = fields.team_id.as_deref().or(server.team_id.as_deref());
         server.team_id =
-            write_scope(&service, &principal, visibility, team, "servers.update").await?;
+            write_scope(service, principal, visibility, team, "servers.update").await?;
         server.visibility = visibility.to_owned();
     }
-    let links = apply_fields(&service, &principal, &mut server, fields, false).await?;
+    if origin.via == Some("ui")
+        && let Some(Some(config)) = fields.oauth_config.as_mut()
+    {
+        merge_oauth_form(&server, config);
+    }
+    let links = apply_fields(service, principal, &mut server, fields, false).await?;
     server.modified_by = Some(principal.email.clone());
-    server.modified_via = Some("api".into());
-    server.modified_from_ip = client_address(peer).or(server.modified_from_ip);
-    server.modified_user_agent = user_agent(&headers).or(server.modified_user_agent);
+    server.modified_via = Some(origin.via.unwrap_or("api").to_owned());
+    server.modified_from_ip = origin.address.or(server.modified_from_ip);
+    server.modified_user_agent = origin.agent.or(server.modified_user_agent);
     let server = service
         .database
         .save_managed_server(
             Some(&prior),
             &server,
             &links,
-            access::catalog_scope(Some(&principal)),
+            access::catalog_scope(Some(principal)),
         )
         .await
         .map_err(|error| persistence_error(error, &server, false))?;
     if prior.visibility != server.visibility || prior.team_id != server.team_id {
-        publish(&service, &prior);
+        publish(service, &prior);
     }
-    publish(&service, &server);
-    Ok(Json(with_links(&service, &principal, &server).await?))
+    publish(service, &server);
+    Ok(server)
+}
+
+fn merge_oauth_form(server: &ServerRecord, submitted: &mut Map<String, Value>) {
+    let Value::Object(mut existing) = decode_config(server.oauth_config.as_deref()) else {
+        return;
+    };
+    if let Some(issuers) = submitted
+        .get_mut("authorization_servers")
+        .and_then(Value::as_array_mut)
+        && let Some(previous) = existing
+            .get("authorization_servers")
+            .and_then(Value::as_array)
+    {
+        issuers.extend(previous.iter().skip(1).cloned());
+    }
+    existing.remove("authorization_server");
+    existing.remove("scopes");
+    existing.remove("scopes_supported");
+    existing.remove("token_endpoint");
+    existing.remove("audience");
+    let mut stored = Value::Object(existing);
+    mask_oauth_fields(&mut stored);
+    if let Value::Object(mut existing) = stored {
+        existing.append(submitted);
+        *submitted = existing;
+    }
 }
 
 pub(super) async fn set_state(
@@ -472,7 +528,7 @@ pub(super) async fn approve(
     ))
 }
 
-async fn editable(
+pub(in crate::gateway) async fn editable(
     service: &GatewayService,
     principal: &Principal,
     id: &str,

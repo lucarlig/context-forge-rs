@@ -206,8 +206,19 @@ forms with a 64 KiB limit. Multipart browser requests submit proof in the
 Eight Rust Anything scenarios match on SQLite and PostgreSQL. They cover
 redirects, stored state, deletion, multipart forms, CSRF, token scopes, and
 queued MCP server cleanup. Chromium verifies the three catalog actions in each
-dashboard section. Create and edit flows and the remaining dashboard sections
-are open.
+dashboard section.
+
+Tools, virtual servers, resources, and prompts also support create and edit
+forms through both admin route prefixes. The forms use the REST validators
+and store the request source as `ui`. Virtual server forms accept repeated
+association IDs. The editor preserves resource content when the replacement
+field is blank.
+
+Five Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+URL-encoded and multipart forms, stored fields, validation failures, scoped
+credentials, and virtual server associations. Chromium verifies both editor
+pages in all four sections. MCP server create and edit and the remaining
+dashboard sections are open.
 
 ## Gateway and protocol verification
 

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub(super) mod editor;
+
 use std::{
     collections::{HashMap, hash_map::Entry},
     future::Future,
@@ -80,41 +82,12 @@ pub(super) async fn mutate(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Response, AccountError> {
-    let settings = settings_for(&accounts);
-    let Session { principal, .. } =
-        match access(&accounts, request.headers(), request.uri(), peer.ip()).await {
-            Ok(session) => session,
-            Err(denial) => return Ok(denial.response(settings, request.headers())),
+    let (principal, parts, form) =
+        match authorized_form(&accounts, kind, action.permission(), request, peer.ip()).await {
+            Ok(form) => form,
+            Err(response) => return Ok(*response),
         };
-    if password_change_pending(&accounts, &principal).await? {
-        return Ok(settings.redirect(CHANGE));
-    }
-    let (parts, form) = Form::from_catalog_request(request).await?;
-    csrf(settings, &parts, &form, false)?;
-    if sessions::bearer_token(settings, &parts.headers).is_none()
-        && !browser_request(&parts.headers)
-    {
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            Json(json!({"detail":"Cookie authentication not allowed for API requests. Use Authorization header."})),
-        ).into_response());
-    }
-    let team = sessions::request_team(&parts.uri, &principal);
-    if !allows(
-        &accounts,
-        &principal,
-        kind,
-        action.permission(),
-        team.as_deref(),
-    )
-    .await?
-    {
-        return Err(AccountError::detail(
-            StatusCode::FORBIDDEN,
-            "Permission denied",
-        ));
-    }
+    let settings = settings_for(&accounts);
     let response = async {
         let affirmative = |name| form.get(name).eq_ignore_ascii_case("true");
         let mutation = match action {
@@ -155,6 +128,50 @@ pub(super) async fn mutate(
         settings.redirect(&path)
     };
     Ok(with_usage(&accounts, &principal, &parts, peer.ip(), response).await)
+}
+
+async fn authorized_form(
+    accounts: &Accounts,
+    kind: ManagedCatalog,
+    permission: &str,
+    request: Request,
+    peer: IpAddr,
+) -> Result<(Principal, Parts, Form), Box<Response>> {
+    let settings = settings_for(accounts);
+    let Session { principal, .. } =
+        match access(accounts, request.headers(), request.uri(), peer).await {
+            Ok(session) => session,
+            Err(denial) => return Err(Box::new(denial.response(settings, request.headers()))),
+        };
+    if password_change_pending(accounts, &principal)
+        .await
+        .map_err(|error| Box::new(error.into_response()))?
+    {
+        return Err(Box::new(settings.redirect(CHANGE)));
+    }
+    let (parts, form) = Form::from_catalog_request(request)
+        .await
+        .map_err(|error| Box::new(error.into_response()))?;
+    csrf(settings, &parts, &form, false).map_err(|error| Box::new(error.into_response()))?;
+    if sessions::bearer_token(settings, &parts.headers).is_none()
+        && !browser_request(&parts.headers)
+    {
+        return Err(Box::new((
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(json!({"detail":"Cookie authentication not allowed for API requests. Use Authorization header."})),
+        ).into_response()));
+    }
+    let team = sessions::request_team(&parts.uri, &principal);
+    if !allows(accounts, &principal, kind, permission, team.as_deref())
+        .await
+        .map_err(|error| Box::new(AccountError::from(error).into_response()))?
+    {
+        return Err(Box::new(
+            AccountError::detail(StatusCode::FORBIDDEN, "Permission denied").into_response(),
+        ));
+    }
+    Ok((principal, parts, form))
 }
 
 pub(super) async fn with_usage(
@@ -242,6 +259,8 @@ struct Section {
     label: &'static str,
     rows: Vec<Row>,
     actions: bool,
+    create: bool,
+    editor: bool,
     purge_metrics: bool,
     total: i64,
     page: i64,
@@ -358,12 +377,18 @@ pub(super) async fn dashboard(
                     let page_link =
                         |page| href(Some(kind.name()), Some((page, pagination.per_page)));
                     let rows = rows(accounts, principal, kind, &data).await?;
+                    let editor = editor::supported(kind);
+                    let create =
+                        editor && allows(accounts, principal, kind, "create", team).await?;
+
                     Ok::<_, CatalogApiError>(Section {
                         name: kind.name(),
                         fragment: fragment(kind),
                         label: label(kind),
                         actions: rows.iter().any(|row| row.update || row.delete),
                         rows,
+                        create,
+                        editor,
                         purge_metrics: !matches!(kind, ManagedCatalog::Gateways),
                         total: pagination.total_items,
                         page: pagination.page,

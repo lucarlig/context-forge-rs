@@ -252,6 +252,22 @@ impl CatalogApiError {
         Self(status, json!({"detail":detail.into()}))
     }
 
+    pub(crate) fn form_message(&self) -> &str {
+        self.1["message"]
+            .as_str()
+            .or_else(|| self.1["detail"].as_str())
+            .or_else(|| self.1["detail"]["message"].as_str())
+            .unwrap_or("Could not save the entry.")
+    }
+
+    pub(crate) fn form_response(self) -> Response {
+        (
+            self.0,
+            Json(json!({"message":self.form_message(),"success":false})),
+        )
+            .into_response()
+    }
+
     pub(super) fn unavailable() -> Self {
         Self::detail(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -318,6 +334,26 @@ pub(super) fn user_agent(headers: &HeaderMap) -> Option<String> {
 
 pub(super) fn client_address(peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<String> {
     peer.map(|Extension(ConnectInfo(peer))| peer.ip().to_string())
+}
+
+pub(super) struct WriteOrigin {
+    pub(super) address: Option<String>,
+    pub(super) agent: Option<String>,
+    pub(super) via: Option<&'static str>,
+}
+
+impl WriteOrigin {
+    pub(super) fn new(
+        peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+        headers: &HeaderMap,
+        via: Option<&'static str>,
+    ) -> Self {
+        Self {
+            address: client_address(peer),
+            agent: user_agent(headers),
+            via,
+        }
+    }
 }
 
 pub(super) fn denied_team() -> CatalogApiError {

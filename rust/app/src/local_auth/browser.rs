@@ -144,10 +144,29 @@ pub(super) fn router(
             .route(&format!("{path}/"), get(home))
             .route(path, get(home));
         for kind in ManagedCatalog::ALL {
-            router = router.route(
-                &format!("{path}/{}", kind.name()),
-                get(catalog::list).layer(Extension(kind)),
-            );
+            let base = format!("{path}/{}", kind.name());
+            let mut listing = get(catalog::list);
+            if catalog::editor::supported(kind) {
+                listing = listing.post(catalog::editor::save);
+                router = router
+                    .route(
+                        &format!("{base}/new"),
+                        get(catalog::editor::page).layer(Extension(kind)),
+                    )
+                    .route(
+                        &format!("{base}/{{id}}/edit"),
+                        get(catalog::editor::page)
+                            .post(catalog::editor::save)
+                            .layer(Extension(kind)),
+                    );
+                if matches!(kind, ManagedCatalog::Tools) {
+                    router = router.route(
+                        &format!("{base}/{{id}}/edit/"),
+                        post(catalog::editor::save).layer(Extension(kind)),
+                    );
+                }
+            }
+            router = router.route(&base, listing.layer(Extension(kind)));
             for action in [catalog::Action::State, catalog::Action::Delete] {
                 router = router.route(
                     &format!("{path}/{}/{{id}}/{}", kind.name(), action.path()),
@@ -311,19 +330,7 @@ async fn home(
             .map_or_else(String::new, |query| format!("?{query}"));
         return Ok(Redirect::temporary(&format!("{}{path}{query}", settings.root)).into_response());
     }
-    let proof = match accounts
-        .access
-        .verify_gateway_token(token)
-        .ok()
-        .and_then(|jwt| {
-            accounts
-                .settings
-                .csrf
-                .issue(&principal.email, jwt.jti()?, Timestamp::now().as_second())
-        }) {
-        Some(proof) => proof,
-        None => forms::nonce(request.headers())?,
-    };
+    let proof = sessions::proof(&accounts, request.headers(), &principal, token)?;
     let (parts, _) = request.into_parts();
     let response = async {
         let catalog =

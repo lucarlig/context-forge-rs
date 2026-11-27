@@ -4,13 +4,14 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::catalog::ToolWriteError;
+use crate::gateway::catalog_api::WriteOrigin;
 use crate::gateway::import_api::{ImportScope, Outcome, Strategy};
 
 mod authentication;
 pub(in crate::gateway) use authentication::protected_header;
 
 #[derive(Deserialize)]
-pub(super) struct CreateTool {
+pub(in crate::gateway) struct CreateTool {
     tool: ToolFields,
     #[serde(alias = "teamId")]
     team_id: Option<String>,
@@ -18,7 +19,7 @@ pub(super) struct CreateTool {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ToolFields {
+pub(in crate::gateway) struct ToolFields {
     name: Option<String>,
     #[serde(alias = "custom_name")]
     custom_name: Option<String>,
@@ -269,6 +270,17 @@ pub(super) async fn create(
     headers: HeaderMap,
     Json(request): Json<CreateTool>,
 ) -> Result<Json<Value>, CatalogApiError> {
+    let origin = WriteOrigin::new(peer, &headers, None);
+    let record = create_record(&service, &principal, request, origin).await?;
+    Ok(Json(metadata(&service, &record, true, true, true)))
+}
+
+pub(in crate::gateway) async fn create_record(
+    service: &GatewayService,
+    principal: &Principal,
+    request: CreateTool,
+    origin: WriteOrigin,
+) -> Result<ToolRecord, CatalogApiError> {
     let fields = request.tool;
     if request
         .team_id
@@ -279,8 +291,8 @@ pub(super) async fn create(
         return Err(denied_team());
     }
     let (team_id, visibility) = write_scope(
-        &service,
-        &principal,
+        service,
+        principal,
         fields.visibility.as_deref().unwrap_or("public"),
         request.team_id.as_deref().or(fields.team_id.as_deref()),
         "tools.create",
@@ -305,21 +317,22 @@ pub(super) async fn create(
         team_id,
         visibility,
         created_by: Some(principal.email.clone()),
-        created_from_ip: client_address(peer),
-        created_user_agent: user_agent(&headers),
+        created_via: origin.via.map(str::to_owned),
+        created_from_ip: origin.address,
+        created_user_agent: origin.agent,
         expose_passthrough: true,
         ..ToolRecord::default()
     };
-    set_gateway(&service, &principal, &mut record, &fields).await?;
-    apply_fields(&service, &mut record, fields, true).await?;
+    set_gateway(service, principal, &mut record, &fields).await?;
+    apply_fields(service, &mut record, fields, true).await?;
     record.original_description.clone_from(&record.description);
     let created = service
         .database
         .save_managed_tool(None, &record)
         .await
         .map_err(|error| persistence_error(error, &record))?;
-    publish(&service, &created);
-    Ok(Json(metadata(&service, &created, true, true, true)))
+    publish(service, &created);
+    Ok(created)
 }
 
 pub(super) async fn update(
@@ -330,19 +343,24 @@ pub(super) async fn update(
     headers: HeaderMap,
     Json(fields): Json<ToolFields>,
 ) -> Result<Json<Value>, CatalogApiError> {
-    let previous = editable(
-        &service,
-        &principal,
-        &id,
-        "tools.update",
-        "update this tool",
-    )
-    .await?;
+    let origin = WriteOrigin::new(peer, &headers, None);
+    let record = update_record(&service, &principal, &id, fields, origin).await?;
+    Ok(Json(metadata(&service, &record, true, true, true)))
+}
+
+pub(in crate::gateway) async fn update_record(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    fields: ToolFields,
+    origin: WriteOrigin,
+) -> Result<ToolRecord, CatalogApiError> {
+    let previous = editable(service, principal, id, "tools.update", "update this tool").await?;
     let mut record = previous.clone();
     if fields.visibility.is_some() || fields.team_id.is_some() {
         let (team_id, visibility) = write_scope(
-            &service,
-            &principal,
+            service,
+            principal,
             fields.visibility.as_deref().unwrap_or(&record.visibility),
             fields.team_id.as_deref().or(record.team_id.as_deref()),
             "tools.update",
@@ -351,22 +369,22 @@ pub(super) async fn update(
         record.team_id = team_id;
         record.visibility = visibility;
     }
-    set_gateway(&service, &principal, &mut record, &fields).await?;
-    apply_fields(&service, &mut record, fields, false).await?;
+    set_gateway(service, principal, &mut record, &fields).await?;
+    apply_fields(service, &mut record, fields, false).await?;
     record.modified_by = Some(principal.email.clone());
-    record.modified_via = Some("api".into());
-    record.modified_from_ip = client_address(peer).or(record.modified_from_ip);
-    record.modified_user_agent = user_agent(&headers).or(record.modified_user_agent);
+    record.modified_via = Some(origin.via.unwrap_or("api").to_owned());
+    record.modified_from_ip = origin.address.or(record.modified_from_ip);
+    record.modified_user_agent = origin.agent.or(record.modified_user_agent);
     let updated = service
         .database
         .save_managed_tool(Some(&previous), &record)
         .await
         .map_err(|error| persistence_error(error, &record))?;
     if previous.visibility != updated.visibility || previous.team_id != updated.team_id {
-        publish(&service, &previous);
+        publish(service, &previous);
     }
-    publish(&service, &updated);
-    Ok(Json(metadata(&service, &updated, true, true, true)))
+    publish(service, &updated);
+    Ok(updated)
 }
 
 pub(super) async fn set_state(
@@ -443,7 +461,7 @@ pub(in crate::gateway) async fn remove(
     Ok(())
 }
 
-async fn editable(
+pub(in crate::gateway) async fn editable(
     service: &GatewayService,
     principal: &Principal,
     id: &str,

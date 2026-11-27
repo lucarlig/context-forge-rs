@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod editor;
+
 use super::{
     catalog_api::{PaginationMeta, flag},
     *,

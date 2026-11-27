@@ -12,6 +12,8 @@
     form, label { display: grid; gap: .45rem; }
     form { gap: 1rem; }
     input, button { padding: .65rem; font: inherit; }
+    select, textarea { padding: .65rem; font: inherit; }
+    textarea { resize: vertical; }
     [role=alert] { border-inline-start: .2rem solid; padding-inline-start: .75rem; }
     body.dashboard { display: block; }
     .dashboard main { width: min(100%, 76rem); margin: 0 auto; border: 0; padding: 1rem; }
@@ -84,6 +86,48 @@
     </form>
     {% endif %}
     <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
+    {% elif page == "catalog-editor" %}
+    <h1>{{ editor.heading }}</h1>
+    {% if editor.error %}<p role="alert">{{ editor.error }}</p>{% endif %}
+    {% set values = editor.values %}
+    <form method="post" action="{{ root }}{{ editor.action }}">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <input type="hidden" name="_dashboard" value="true">
+      <label>Name <input name="name" value="{{ values.name }}" required></label>
+      <label>Description <textarea name="description" rows="3">{{ values.description }}</textarea></label>
+      {% if editor.kind == "tools" %}
+      <label>Endpoint URL <input type="url" name="url" value="{{ values.url }}" required></label>
+      <label>Display name <input name="displayName" value="{{ values.displayName }}"></label>
+      <label>Integration type <input name="integrationType" value="{{ values.integrationType|default('REST', true) }}" required></label>
+      <label>Request method or transport <input name="requestType" value="{{ values.requestType|default('GET', true) }}" required></label>
+      <label>Input schema (JSON) <textarea name="input_schema" rows="5">{{ values.inputSchema }}</textarea></label>
+      <label>Output schema (JSON) <textarea name="output_schema" rows="5">{{ values.outputSchema }}</textarea></label>
+      {% elif editor.kind == "resources" %}
+      <label>URI <input name="uri" value="{{ values.uri }}" required></label>
+      <label>URI template <input name="uri_template" value="{{ values.uriTemplate }}"></label>
+      <label>MIME type <input name="mimeType" value="{{ values.mimeType|default('text/plain', true) }}"></label>
+      <label>{{ "Replacement content (blank keeps current content)" if editor.editing else "Content" }} <textarea name="content" rows="8">{{ values.content|default('', true) }}</textarea></label>
+      {% elif editor.kind == "prompts" %}
+      <label>Display name <input name="displayName" value="{{ values.displayName }}"></label>
+      <label>Template <textarea name="template" rows="8" required>{{ values.template }}</textarea></label>
+      <label>Arguments (JSON) <textarea name="arguments" rows="5">{{ values.arguments|default('[]', true) }}</textarea></label>
+      {% elif editor.kind == "servers" %}
+      <label>Icon URL <input type="url" name="icon" value="{{ values.icon }}"></label>
+      <label>Instructions <textarea name="instructions" rows="6">{{ values.instructions }}</textarea></label>
+      {% endif %}
+      <label>Visibility
+        <select name="visibility">
+          {% set default_visibility = "public" if editor.kind == "resources" else "private" %}
+          {% for option in ["private", "team", "public"] %}
+          <option value="{{ option }}"{% if values.visibility|default(default_visibility, true) == option %} selected{% endif %}>{{ option|title }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Team ID <input name="team_id" value="{{ values.teamId }}"></label>
+      <label>Tags <input name="tags" value="{{ values.tags }}" placeholder="Comma-separated"></label>
+      <button type="submit">{{ "Save changes" if editor.editing else "Create" }}</button>
+    </form>
+    <p><a href="{{ root }}{{ editor.back }}">Back to catalog</a></p>
     {% else %}
     <header>
       <div><h1>ContextForge</h1><p>Signed in as {{ email }}.</p></div>
@@ -111,6 +155,8 @@
     {% for part in catalog.sections %}
     <section id="{{ part.fragment }}" aria-labelledby="heading-{{ part.name }}">
       <h2 id="heading-{{ part.name }}">{{ part.label }}</h2>
+      {% if part.editor %}{% set editor_query = "?include_inactive=" ~ ("true" if catalog.include_inactive else "false") ~ ("&team_id=" ~ catalog.team if catalog.team else "") %}{% endif %}
+      {% if part.create %}<p><a href="{{ root }}/admin/{{ part.name }}/new{{ editor_query }}">Add entry</a></p>{% endif %}
       {% if part.rows %}
       <div class="table-scroll">
         <table aria-labelledby="heading-{{ part.name }}">
@@ -121,6 +167,7 @@
               <th scope="row">{{ item.name }}</th><td>{{ item.description|default('—', true) }}</td><td>{{ "Active" if item.enabled else "Inactive" }}</td><td>{{ item.visibility|default('—', true) }}</td>
               {% if part.actions %}<td><div class="actions">
                 {% if item.update %}
+                {% if part.editor %}<a href="{{ root }}/admin/{{ part.name }}/{{ item.id }}/edit{{ editor_query }}">Edit</a>{% endif %}
                 <form method="post" action="{{ root }}/admin/{{ part.name }}/{{ item.id }}/state">
                   <input type="hidden" name="csrf_token" value="{{ proof }}">
                   {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}

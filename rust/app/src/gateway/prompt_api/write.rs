@@ -2,11 +2,12 @@
 
 use super::*;
 use crate::catalog::{PromptWriteError, slugify};
+use crate::gateway::catalog_api::WriteOrigin;
 use crate::gateway::import_api::{ImportScope, Outcome, Strategy};
 use serde_json::Map;
 
 #[derive(Deserialize)]
-pub(super) struct CreatePrompt {
+pub(in crate::gateway) struct CreatePrompt {
     prompt: PromptFields,
     #[serde(alias = "teamId")]
     team_id: Option<String>,
@@ -15,7 +16,7 @@ pub(super) struct CreatePrompt {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct PromptFields {
+pub(in crate::gateway) struct PromptFields {
     name: Option<String>,
     #[serde(alias = "custom_name")]
     custom_name: Option<String>,
@@ -197,6 +198,17 @@ pub(super) async fn create(
     headers: HeaderMap,
     Json(request): Json<CreatePrompt>,
 ) -> Result<Json<Value>, CatalogApiError> {
+    let origin = WriteOrigin::new(peer, &headers, None);
+    let record = create_record(&service, &principal, request, origin).await?;
+    Ok(Json(metadata(&record, true)))
+}
+
+pub(in crate::gateway) async fn create_record(
+    service: &GatewayService,
+    principal: &Principal,
+    request: CreatePrompt,
+    origin: WriteOrigin,
+) -> Result<PromptRecord, CatalogApiError> {
     let fields = request.prompt;
     if request
         .team_id
@@ -213,14 +225,14 @@ pub(super) async fn create(
         .unwrap_or("public");
     validate_visibility(visibility)?;
     let team_id = registration_team(
-        &service,
-        &principal,
+        service,
+        principal,
         visibility,
         request.team_id.as_deref().or(fields.team_id.as_deref()),
     )
     .await
     .map_err(|error| CatalogApiError(error.status, json!({"message":error.message})))?;
-    require_target_permission(&service, &principal, "prompts.create", team_id.as_deref()).await?;
+    require_target_permission(service, principal, "prompts.create", team_id.as_deref()).await?;
     let gateway_id = fields
         .gateway_id
         .as_deref()
@@ -233,7 +245,7 @@ pub(super) async fn create(
     {
         return Err(invalid("gateway_id and mcp_server_id conflict"));
     }
-    let scope = access::catalog_scope(Some(&principal));
+    let scope = access::catalog_scope(Some(principal));
     let gateway = if let Some(id) = gateway_id {
         Some(
             service
@@ -280,20 +292,21 @@ pub(super) async fn create(
         team_id,
         visibility: visibility.to_owned(),
         created_by: Some(principal.email.clone()),
-        created_from_ip: client_address(peer),
-        created_user_agent: user_agent(&headers),
+        created_via: origin.via.map(str::to_owned),
+        created_from_ip: origin.address,
+        created_user_agent: origin.agent,
         ..PromptRecord::default()
     };
     set_names(&mut record)?;
     record.display_name = Some(record.custom_name.clone());
-    apply_fields(&service, &mut record, fields, true)?;
+    apply_fields(service, &mut record, fields, true)?;
     let created = service
         .database
         .save_managed_prompt(None, &record)
         .await
         .map_err(|error| persistence_error(error, &record))?;
-    publish(&service, &created);
-    Ok(Json(metadata(&created, true)))
+    publish(service, &created);
+    Ok(created)
 }
 
 pub(super) async fn update(
@@ -304,10 +317,22 @@ pub(super) async fn update(
     headers: HeaderMap,
     Json(fields): Json<PromptFields>,
 ) -> Result<Json<Value>, CatalogApiError> {
+    let origin = WriteOrigin::new(peer, &headers, None);
+    let record = update_record(&service, &principal, &id, fields, origin).await?;
+    Ok(Json(metadata(&record, true)))
+}
+
+pub(in crate::gateway) async fn update_record(
+    service: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    fields: PromptFields,
+    origin: WriteOrigin,
+) -> Result<PromptRecord, CatalogApiError> {
     let previous = editable(
-        &service,
-        &principal,
-        &id,
+        service,
+        principal,
+        id,
         "prompts.update",
         "update this prompt",
     )
@@ -330,28 +355,28 @@ pub(super) async fn update(
         let visibility = fields.visibility.as_deref().unwrap_or(&record.visibility);
         validate_visibility(visibility)?;
         let team = fields.team_id.as_deref().or(record.team_id.as_deref());
-        let team = registration_team(&service, &principal, visibility, team)
+        let team = registration_team(service, principal, visibility, team)
             .await
             .map_err(|error| CatalogApiError(error.status, json!({"message":error.message})))?;
-        require_target_permission(&service, &principal, "prompts.update", team.as_deref()).await?;
+        require_target_permission(service, principal, "prompts.update", team.as_deref()).await?;
         record.team_id = team;
         record.visibility = visibility.to_owned();
     }
     record.modified_by = Some(principal.email.clone());
-    record.modified_via = Some("api".into());
-    record.modified_from_ip = client_address(peer).or(record.modified_from_ip);
-    record.modified_user_agent = user_agent(&headers).or(record.modified_user_agent);
-    apply_fields(&service, &mut record, fields, false)?;
+    record.modified_via = Some(origin.via.unwrap_or("api").to_owned());
+    record.modified_from_ip = origin.address.or(record.modified_from_ip);
+    record.modified_user_agent = origin.agent.or(record.modified_user_agent);
+    apply_fields(service, &mut record, fields, false)?;
     let updated = service
         .database
         .save_managed_prompt(Some(&previous), &record)
         .await
         .map_err(|error| persistence_error(error, &record))?;
     if previous.visibility != updated.visibility || previous.team_id != updated.team_id {
-        publish(&service, &previous);
+        publish(service, &previous);
     }
-    publish(&service, &updated);
-    Ok(Json(metadata(&updated, true)))
+    publish(service, &updated);
+    Ok(updated)
 }
 
 pub(super) async fn set_state(
@@ -426,7 +451,7 @@ pub(in crate::gateway) async fn remove(
     Ok(())
 }
 
-async fn editable(
+pub(in crate::gateway) async fn editable(
     service: &GatewayService,
     principal: &Principal,
     id: &str,

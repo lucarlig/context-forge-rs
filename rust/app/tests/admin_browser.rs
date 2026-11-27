@@ -438,3 +438,64 @@ async fn admin_catalog_mutations_require_proof_and_write_permission() {
     assert!(listing(true).await.is_none());
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn admin_prompt_editor_preserves_the_row_when_validation_fails() {
+    let mut gateway = gateway().await;
+    let client = &gateway.client;
+    let origin = &gateway.origin;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL, "password":gateway.password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    let create = client
+        .post(format!("{origin}/v1/admin/prompts"))
+        .bearer_auth(token)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("name=fixture-editor&visibility=public&template=Draft")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let listing = || async {
+        let response = client
+            .get(format!("{origin}/admin/prompts"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let data: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        data["data"][0].clone()
+    };
+    let draft = listing().await;
+    let id = draft["id"].as_str().unwrap();
+    assert_eq!(draft["template"], "Draft");
+    assert_eq!(draft["createdVia"], "ui");
+    let update = |arguments| {
+        client
+            .post(format!("{origin}/admin/prompts/{id}/edit"))
+            .bearer_auth(token)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(format!(
+                "name=fixture-editor&visibility=public&template=Published&arguments={arguments}"
+            ))
+    };
+    let rejected = update("invalid").send().await.unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(listing().await, draft);
+    let published = update("%5B%5D").send().await.unwrap();
+    assert_eq!(published.status(), StatusCode::OK);
+    let updated = listing().await;
+    assert_eq!(updated["template"], "Published");
+    assert_eq!(updated["modifiedVia"], "ui");
+    gateway.process.kill().await.unwrap();
+}
