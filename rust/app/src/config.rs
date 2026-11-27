@@ -247,6 +247,13 @@ impl Settings {
         })
     }
 
+    pub fn direct_proxy_timeout() -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
+        flag("MCPGATEWAY_DIRECT_PROXY_ENABLED")?
+            .unwrap_or(false)
+            .then(|| positive_seconds("MCPGATEWAY_DIRECT_PROXY_TIMEOUT", 30.0))
+            .transpose()
+    }
+
     pub fn mcp_requires_auth() -> Result<bool, Box<dyn Error + Send + Sync>> {
         match flag("MCP_REQUIRE_AUTH")? {
             Some(required) => Ok(required),

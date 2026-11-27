@@ -188,7 +188,9 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
                     assert_eq!(message["params"]["_meta"]["user"], json!({
                         "id":"admin@example.test", "email":"admin@example.test", "auth_method":"jwt", "is_admin":true
                     }));
-                    json!({"content":[{"type":"text","text":"Authorized tool"}]})
+                    let name = message["params"]["name"].as_str().unwrap();
+                    assert!(matches!(name, "echo" | "fresh"));
+                    json!({"content":[{"type":"text","text":format!("Authorized tool: {name}")}]})
                 }
                 "resources/list" => {
                     json!({"resources":[{"name":"note","uri":"fixture://auth/note"}]})
@@ -219,7 +221,8 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
             Pagination::new(100, 900, None),
             CatalogRefresh::default(),
         )
-        .with_credential_secret(Some("synthetic encryption key for the gateway test")),
+        .with_credential_secret(Some("synthetic encryption key for the gateway test"))
+        .with_direct_proxy(Some(Duration::from_secs(4))),
     );
     let app = Running::start(
         service
@@ -234,7 +237,7 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
         .unwrap();
     let admin = token("admin", Value::Null, json!({"is_admin":true}));
     let mut registration = json!({"name":"protected","url":upstream.url("/mcp"),"transport":"STREAMABLEHTTP",
-        "authType":"bearer","authToken":"upstream-fixture","identityPropagation":{"enabled":true,"mode":"meta"}});
+        "gatewayMode":"direct_proxy","authType":"bearer","authToken":"upstream-fixture","identityPropagation":{"enabled":true,"mode":"meta"}});
     let (status, response) = send(
         &client,
         app.url("/gateways"),
@@ -246,6 +249,8 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
     assert_eq!(response["authType"], "bearer");
     assert_eq!(response["authValue"], "*****");
     assert_eq!(response["authToken"], "*****");
+    assert_eq!(response["gatewayMode"], "direct_proxy");
+    let gateway_id = response["id"].as_str().unwrap();
     let Database::Sqlite(pool) = &database else {
         unreachable!()
     };
@@ -269,7 +274,7 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
         (
             "tools/call",
             json!({"name":"protected-echo","arguments":{},"_meta":{"user":{"id":"caller-supplied"}}}),
-            "Authorized tool",
+            "Authorized tool: echo",
         ),
         (
             "resources/read",
@@ -287,6 +292,19 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
         assert_eq!(status, StatusCode::OK);
         assert!(result["result"].to_string().contains(text), "{result}");
     }
+    let reply = client.post(app.url("/mcp"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .header("x-context-forge-gateway-id", gateway_id)
+        .bearer_auth(&admin)
+        .body(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fresh","arguments":{}}}).to_string())
+        .send().await.unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    let reply: Value = serde_json::from_slice(&reply.bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "Authorized tool: fresh"
+    );
 }
 
 #[tokio::test]

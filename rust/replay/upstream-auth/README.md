@@ -10,6 +10,8 @@ Configured header forwarding and explicit upstream authorization use the same de
 
 Set `IDENTITY_PROPAGATION_ENABLED=true` to forward authenticated user identity. The `IDENTITY_PROPAGATION_MODE` setting selects `headers`, `meta`, or `both`. Gateways may override the setting with `identityPropagation`. Claim signing uses a dedicated `IDENTITY_CLAIMS_SECRET` and binds the HS256 token to the gateway ID for 60 seconds. [Identity forwarding observations](identity.md)
 
+Direct-proxy mode supports live tool calls and resource reads on root and virtual-server MCP routes. [Direct-proxy recordings](direct-proxy/README.md)
+
 For replay, register four public Streamable HTTP servers named `basic`, `bearer`, `headers`, and `query` in the fixture database. Each exposes an `echo` tool and prefixes its result with the gateway name. Use synthetic credentials that the upstream fixture requires and that the gateway stores using the configured encryption secret.
 
 ```sh

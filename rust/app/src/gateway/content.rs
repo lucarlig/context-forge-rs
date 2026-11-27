@@ -3,6 +3,7 @@
 use std::{
     fmt,
     io::{self, Write},
+    time::Duration,
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -15,7 +16,7 @@ use rmcp::model::{
 };
 use serde_json::Value;
 
-use super::{GatewayService, Principal, Session, ToolContext, UpstreamError, access};
+use super::{DirectTarget, GatewayService, Principal, Session, ToolContext, UpstreamError, access};
 use crate::catalog::{CatalogServer, ContentGateway, PromptContentRecord, ResourceContentRecord};
 use crate::upstream::UpstreamEndpoint;
 
@@ -30,30 +31,41 @@ impl GatewayService {
     ) -> Result<ReadResourceResponse, ErrorData> {
         self.check_mcp_permission(principal, server, "resources.read")
             .await?;
-        let resource = self
-            .database
-            .resource_content(
-                access::catalog_scope(principal),
-                server.map(|server| server.id.as_str()),
-                &params.uri,
-            )
+        let uri = params.uri.clone();
+        let unknown = || ErrorData::invalid_params(format!("Unknown resource: {uri}"), None);
+        let (gateway, direct_timeout) = match self
+            .direct_target(context.request_headers, principal)
             .await
             .map_err(content_database_error)?
-            .ok_or_else(|| {
-                ErrorData::invalid_params(format!("Unknown resource: {}", params.uri), None)
-            })?;
-        let uri = params.uri.clone();
-        let Some(gateway) = resource.gateway.as_ref() else {
-            return Ok(ReadResourceResult::new(vec![local_resource(resource, uri)]).into());
+        {
+            DirectTarget::Found(gateway, timeout) => (gateway, Some(timeout)),
+            DirectTarget::Denied => return Err(unknown()),
+            DirectTarget::Fallback => {
+                let mut resource = self
+                    .database
+                    .resource_content(
+                        access::catalog_scope(principal),
+                        server.map(|server| server.id.as_str()),
+                        &uri,
+                    )
+                    .await
+                    .map_err(content_database_error)?
+                    .ok_or_else(unknown)?;
+                let Some(gateway) = resource.gateway.take() else {
+                    return Ok(ReadResourceResult::new(vec![local_resource(resource, uri)]).into());
+                };
+                (gateway, None)
+            }
         };
         params.meta = None;
         let result = self
             .request_content(
-                gateway,
+                &gateway,
                 ReadResourceRequest::new(params).into(),
                 principal,
                 context,
                 downstream,
+                direct_timeout,
             )
             .await?;
         if result["resultType"] == "input_required" {
@@ -63,6 +75,9 @@ impl GatewayService {
         }
         let mut result: ReadResourceResult =
             serde_json::from_value(result).map_err(|_| invalid_upstream_result())?;
+        if direct_timeout.is_some() {
+            return Ok(result.into());
+        }
         let first = result.contents.into_iter().next();
         let first = match first {
             Some(ResourceContents::TextResourceContents {
@@ -150,6 +165,7 @@ impl GatewayService {
                 principal,
                 context,
                 downstream,
+                None,
             )
             .await?;
         if result["resultType"] == "input_required" {
@@ -250,6 +266,7 @@ impl GatewayService {
                 principal,
                 context,
                 downstream,
+                None,
             )
             .await?;
         let mut result: CompleteResult =
@@ -287,6 +304,7 @@ impl GatewayService {
         principal: Option<&Principal>,
         context: ToolContext<'_>,
         downstream: Option<&Session>,
+        timeout: Option<Duration>,
     ) -> Result<Value, ErrorData> {
         let transport = gateway
             .transport
@@ -316,7 +334,8 @@ impl GatewayService {
         });
         let modern = context.client_capabilities.is_some();
         let completion = matches!(request, ClientRequest::CompleteRequest(_));
-        self.upstream.request_with_context(endpoint, request, context, association.as_deref())
+        let client = timeout.map(|timeout| self.upstream.with_timeout_cap(timeout));
+        client.as_ref().unwrap_or(&self.upstream).request_with_context(endpoint, request, context, association.as_deref())
             .await.map_err(|error| match error {
                 UpstreamError::CompletionUnsupported => ErrorData::new(
                     ErrorCode::METHOD_NOT_FOUND,

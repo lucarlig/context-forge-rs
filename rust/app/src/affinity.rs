@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::{
     forward_headers::{hop_header_name, nominated_hop_header},
+    gateway::GATEWAY_ID_HEADER,
     mcp::MAX_REQUEST_BODY_BYTES,
     redis_sessions::RedisSessionDirectory,
 };
@@ -54,6 +55,7 @@ const CORE_HEADERS: &[&str] = &[
     "mcp-protocol-version",
     "mcp-session-id",
     "x-upstream-authorization",
+    GATEWAY_ID_HEADER,
 ];
 
 #[derive(Clone)]

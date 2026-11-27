@@ -431,6 +431,13 @@ impl UpstreamAssociation {
 }
 
 impl UpstreamClient {
+    pub(crate) fn with_timeout_cap(&self, timeout: Duration) -> Self {
+        Self {
+            timeout: self.timeout.min(timeout),
+            ..self.clone()
+        }
+    }
+
     pub fn new(policy: EgressPolicy, timeout: Duration) -> Self {
         Self {
             policy,

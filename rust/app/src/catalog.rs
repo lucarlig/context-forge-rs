@@ -128,6 +128,23 @@ pub(crate) struct ContentGateway {
     pub(crate) needs_upstream_config: bool,
 }
 
+pub(crate) struct DirectGateway {
+    pub(crate) content: ContentGateway,
+    visibility: String,
+    team_id: Option<String>,
+    owner_email: Option<String>,
+}
+
+impl DirectGateway {
+    pub(crate) fn is_visible(&self, scope: CatalogScope<'_>) -> bool {
+        scope.visible(
+            &self.visibility,
+            self.team_id.as_deref(),
+            self.owner_email.as_deref(),
+        )
+    }
+}
+
 #[derive(Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ResourceSubscriptionTarget {
     pub(crate) gateway_id: String,
@@ -187,6 +204,30 @@ pub struct GatewayRegistration<'a> {
     pub team_id: Option<&'a str>,
     pub owner_email: &'a str,
     pub tags: &'a [String],
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) enum GatewayMode {
+    #[default]
+    Cache,
+    DirectProxy,
+}
+
+impl GatewayMode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::DirectProxy => "direct_proxy",
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RegistrationOptions<'a> {
+    pub(crate) auth: Option<&'a PreparedAuth<'a>>,
+    pub(crate) passthrough_headers: Option<&'a [String]>,
+    pub(crate) identity: Option<&'a Value>,
+    pub(crate) mode: GatewayMode,
 }
 
 pub struct RegisteredTool<'a> {
@@ -407,7 +448,13 @@ macro_rules! metadata_query {
 
 macro_rules! content_gateway_columns {
     () => {
-        concat!("g.id, g.url, g.transport, COALESCE(UPPER(g.transport) IN ('SSE', 'STREAMABLEHTTP') AND g.gateway_mode = 'cache' AND NOT ", gateway_policy!(), ", FALSE), ", connection_configured!())
+        concat!(
+            "g.id, g.url, g.transport, COALESCE(UPPER(g.transport) IN ('SSE', 'STREAMABLEHTTP')
+            AND g.gateway_mode IN ('cache', 'direct_proxy') AND NOT ",
+            gateway_policy!(),
+            ", FALSE), ",
+            connection_configured!()
+        )
     };
 }
 
@@ -568,9 +615,17 @@ const CONNECTION_CONFIG: &str = concat!(
     "SELECT LOWER(COALESCE(g.auth_type, '')), CAST(g.auth_value AS TEXT), CAST(g.auth_query_params AS TEXT),
         CAST(g.passthrough_headers AS TEXT), CAST(g.identity_propagation AS TEXT) FROM gateways g
     WHERE g.id = $1 AND g.url = $2 AND g.enabled = TRUE AND g.status = 'active'
-        AND g.gateway_mode = 'cache' AND NOT ",
+        AND g.gateway_mode IN ('cache', 'direct_proxy') AND NOT ",
     gateway_policy!()
 );
+const DIRECT_GATEWAY_QUERY: &str = concat!(
+    "SELECT g.url, g.transport, g.visibility, g.team_id, g.owner_email,
+        (g.enabled = TRUE AND g.status = 'active' AND NOT ",
+    gateway_policy!(),
+    ")
+    FROM gateways g WHERE g.id = $1 AND g.gateway_mode = 'direct_proxy'"
+);
+type DirectGatewayRow = (String, String, String, Option<String>, Option<String>, bool);
 pub(crate) type GatewayConnectionRow = (
     String,
     Option<String>,
@@ -602,7 +657,7 @@ macro_rules! insert_gateway {
                 updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status,
                 auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
-                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, 'cache', 'active',
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, $17, 'active',
                 $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ")"
         )
     };
@@ -1095,9 +1150,7 @@ impl Database {
             gateway,
             tools,
             &DiscoveredMetadata::default(),
-            None,
-            None,
-            None,
+            RegistrationOptions::default(),
         )
         .await
     }
@@ -1107,16 +1160,17 @@ impl Database {
         gateway: &GatewayRegistration<'_>,
         tools: &[RegisteredTool<'_>],
         metadata: &DiscoveredMetadata,
-        auth: Option<&PreparedAuth<'_>>,
-        passthrough_headers: Option<&[String]>,
-        identity: Option<&Value>,
+        options: RegistrationOptions<'_>,
     ) -> Result<(), RegistrationError> {
         validate_registration(gateway, tools)?;
         let capabilities = gateway.capabilities.to_string();
         let tags = serde_json::to_string(gateway.tags)
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
-        let passthrough = passthrough_headers.map(|headers| json!(headers).to_string());
-        let identity = identity.map(Value::to_string);
+        let auth = options.auth;
+        let passthrough = options
+            .passthrough_headers
+            .map(|headers| json!(headers).to_string());
+        let identity = options.identity.map(Value::to_string);
         let names: Vec<_> = tools.iter().map(|tool| tool.name).collect();
         if names.iter().copied().collect::<HashSet<_>>().len() != names.len() {
             return Err(RegistrationError::ToolNameConflict);
@@ -1182,6 +1236,7 @@ impl Database {
                     .bind(auth.and_then(|auth| auth.encoded_query.as_deref()))
                     .bind(passthrough)
                     .bind(identity)
+                    .bind(options.mode.name())
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1316,6 +1371,38 @@ impl Database {
             Self::Sqlite(pool) => fetch!(pool),
             Self::Postgres(pool) => fetch!(pool),
         }
+    }
+
+    pub(crate) async fn direct_gateway(
+        &self,
+        id: &str,
+    ) -> Result<Option<DirectGateway>, sqlx::Error> {
+        macro_rules! fetch {
+            ($pool:expr) => {
+                sqlx::query_as::<_, DirectGatewayRow>(DIRECT_GATEWAY_QUERY)
+                    .bind(id)
+                    .fetch_optional($pool)
+                    .await?
+            };
+        }
+        let row = match self {
+            Self::Sqlite(pool) => fetch!(pool),
+            Self::Postgres(pool) => fetch!(pool),
+        };
+        Ok(row.map(
+            |(url, transport, visibility, team_id, owner_email, available)| DirectGateway {
+                content: ContentGateway {
+                    id: id.to_owned(),
+                    url,
+                    transport: UpstreamTransport::from_name(&transport),
+                    available,
+                    needs_upstream_config: true,
+                },
+                visibility,
+                team_id,
+                owner_email,
+            },
+        ))
     }
 
     pub(crate) async fn global_passthrough_headers(&self) -> Result<Option<String>, sqlx::Error> {

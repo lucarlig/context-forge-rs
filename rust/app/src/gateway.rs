@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod content;
+mod proxy;
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
@@ -28,8 +29,8 @@ use crate::{
     access::{self, Authorizer, Principal, RoleContext},
     auth::TeamVisibility,
     catalog::{
-        CatalogList, CatalogServer, CatalogTool, GatewayRegistration, RegisteredTool,
-        RegistrationError, ToolDefinition, slugify,
+        CatalogList, CatalogServer, CatalogTool, ContentGateway, GatewayMode, GatewayRegistration,
+        RegisteredTool, RegistrationError, RegistrationOptions, ToolDefinition, slugify,
     },
     config::{HeaderForwarding, IdentityForwarding},
     credentials::{
@@ -43,6 +44,9 @@ use crate::{
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
     upstream::{ToolContext, UpstreamClient, UpstreamEndpoint, UpstreamError, UpstreamTransport},
 };
+use proxy::DirectTarget;
+
+pub(crate) use proxy::GATEWAY_ID_HEADER;
 
 pub struct GatewayService {
     pub(crate) access: Arc<Authorizer>,
@@ -56,6 +60,7 @@ pub struct GatewayService {
     query_auth_hosts: Option<HashSet<String>>,
     header_forwarding: HeaderForwarding,
     identity_forwarding: IdentityForwarding,
+    direct_proxy_timeout: Option<Duration>,
 }
 
 pub struct CatalogRefresh {
@@ -122,6 +127,7 @@ impl GatewayService {
             query_auth_hosts: None,
             header_forwarding: HeaderForwarding::default(),
             identity_forwarding: IdentityForwarding::default(),
+            direct_proxy_timeout: None,
         }
     }
 
@@ -156,6 +162,11 @@ impl GatewayService {
 
     pub fn with_identity_forwarding(mut self, forwarding: IdentityForwarding) -> Self {
         self.identity_forwarding = forwarding;
+        self
+    }
+
+    pub fn with_direct_proxy(mut self, timeout: Option<Duration>) -> Self {
+        self.direct_proxy_timeout = timeout;
         self
     }
 
@@ -383,43 +394,71 @@ impl GatewayService {
         mut context: ToolContext<'_>,
         downstream: Option<&Session>,
     ) -> Result<Value, ToolError> {
-        let tool = tokio::select! {
+        let target = tokio::select! {
             biased;
             () = context.cancellation.cancelled() => return Err(ToolError::Cancelled),
-            result = self.lookup_invokable_tool(principal, server, &request.name) => result?,
-        }
-        .ok_or(ToolError::NotFound)?;
-        let transport =
-            UpstreamTransport::from_name(&tool.gateway_transport).ok_or(ToolError::Unavailable)?;
-        if tool.gateway_mode != "cache"
-            || UpstreamTransport::from_name(&tool.request_type) != Some(transport)
-            || tool.requires_gateway_policy
-        {
-            return Err(ToolError::Unavailable);
-        }
+            result = async {
+                self.check_tool_execution(principal, server).await?;
+                self.direct_target(context.request_headers, principal).await.map_err(ToolError::from)
+            } => result?,
+        };
+        let (gateway, direct_timeout) = match target {
+            DirectTarget::Found(gateway, timeout) => (gateway, Some(timeout)),
+            DirectTarget::Denied => {
+                return tool_result_error(format!("Tool not found: {}", request.name));
+            }
+            DirectTarget::Fallback => {
+                let tool = tokio::select! {
+                    biased;
+                    () = context.cancellation.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.lookup_tool(principal, server, &request.name) => result?,
+                }
+                .ok_or(ToolError::NotFound)?;
+                let transport = UpstreamTransport::from_name(&tool.gateway_transport);
+                let available = matches!(tool.gateway_mode.as_str(), "cache" | "direct_proxy")
+                    && UpstreamTransport::from_name(&tool.request_type) == transport
+                    && !tool.requires_gateway_policy;
+                request.name = tool.original_name.into();
+                (
+                    ContentGateway {
+                        id: tool.gateway_id,
+                        url: tool.gateway_url,
+                        transport,
+                        available,
+                        needs_upstream_config: tool.needs_upstream_config,
+                    },
+                    None,
+                )
+            }
+        };
+        let transport = gateway
+            .transport
+            .filter(|_| gateway.available)
+            .ok_or(ToolError::Unavailable)?;
         let credentials = self
             .configured_upstream(
-                &tool.gateway_id,
-                &tool.gateway_url,
-                tool.needs_upstream_config,
+                &gateway.id,
+                &gateway.url,
+                gateway.needs_upstream_config,
                 context.request_headers,
                 principal,
             )
             .await?;
         let endpoint = UpstreamEndpoint {
-            url: &tool.gateway_url,
+            url: &gateway.url,
             transport,
             credentials: credentials.as_ref(),
         };
         let association = downstream.and_then(|session| {
             let authorization = principal.map(Principal::authorization_fingerprint);
             context.notifications = session.passive_journal(authorization);
-            session.upstream(&tool.gateway_id, endpoint, authorization)
+            session.upstream(&gateway.id, endpoint, authorization)
         });
-        request.name = tool.original_name.into();
         let legacy_caller = context.client_capabilities.is_none();
-        let result = self
-            .upstream
+        let client = direct_timeout.map(|timeout| self.upstream.with_timeout_cap(timeout));
+        let result = client
+            .as_ref()
+            .unwrap_or(&self.upstream)
             .call_tool_with_context(endpoint, request, context, association.as_deref())
             .await;
         match result {
@@ -434,8 +473,12 @@ impl GatewayService {
                 input_error_result(&message, Some(code))
             }
             Err(error) => {
-                tracing::warn!(%error, gateway = %tool.gateway_id, "upstream tool call failed");
-                Err(ToolError::Unavailable)
+                tracing::warn!(%error, gateway = %gateway.id, "upstream tool call failed");
+                if direct_timeout.is_some() {
+                    tool_result_error("Direct proxy tool invocation failed")
+                } else {
+                    Err(ToolError::Unavailable)
+                }
             }
         }
     }
@@ -516,18 +559,18 @@ impl GatewayService {
         server: Option<&CatalogServer>,
         name: &str,
     ) -> Result<Option<ToolDefinition>, ToolError> {
+        self.check_tool_execution(principal, server).await?;
         Ok(self
-            .lookup_invokable_tool(principal, server, name)
+            .lookup_tool(principal, server, name)
             .await?
             .map(|tool| tool.definition))
     }
 
-    async fn lookup_invokable_tool(
+    async fn check_tool_execution(
         &self,
         principal: Option<&Principal>,
         server: Option<&CatalogServer>,
-        name: &str,
-    ) -> Result<Option<CatalogTool>, ToolError> {
+    ) -> Result<(), ToolError> {
         if let Some(principal) = principal
             && !self
                 .access
@@ -541,7 +584,15 @@ impl GatewayService {
         {
             return Err(ToolError::Denied);
         }
+        Ok(())
+    }
 
+    async fn lookup_tool(
+        &self,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        name: &str,
+    ) -> Result<Option<CatalogTool>, ToolError> {
         Ok(self
             .database
             .find_mcp_tool(
@@ -551,6 +602,12 @@ impl GatewayService {
             )
             .await?)
     }
+}
+
+fn tool_result_error(message: impl Into<String>) -> Result<Value, ToolError> {
+    let mut result = CallToolResult::error(vec![ContentBlock::text(message.into())]);
+    result.result_type = None;
+    serde_json::to_value(result).map_err(|_| ToolError::Unavailable)
 }
 
 fn input_error_result(message: &str, code: Option<i64>) -> Result<Value, ToolError> {
@@ -698,16 +755,22 @@ async fn register(
                 "Unsupported gateway transport, mode, or authentication",
             )
         })?;
-    if input
-        .gateway_mode
-        .as_deref()
-        .is_some_and(|mode| mode != "cache")
-    {
-        return Err(RegistrationResponse::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Unsupported gateway transport, mode, or authentication",
-        ));
-    }
+    let mode = match input.gateway_mode.as_deref().unwrap_or("cache") {
+        "cache" => GatewayMode::Cache,
+        "direct_proxy" if service.direct_proxy_timeout.is_some() => GatewayMode::DirectProxy,
+        "direct_proxy" => {
+            return Err(RegistrationResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unexpected error",
+            ));
+        }
+        _ => {
+            return Err(RegistrationResponse::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Unsupported gateway transport, mode, or authentication",
+            ));
+        }
+    };
 
     let visibility = input.visibility.as_deref().unwrap_or("public");
     if !matches!(visibility, "public" | "team" | "private") {
@@ -848,9 +911,12 @@ async fn register(
             &registration,
             &registered_tools,
             &metadata,
-            auth.as_ref(),
-            input.passthrough_headers.as_deref(),
-            input.identity_propagation.as_ref(),
+            RegistrationOptions {
+                auth: auth.as_ref(),
+                passthrough_headers: input.passthrough_headers.as_deref(),
+                identity: input.identity_propagation.as_ref(),
+                mode,
+            },
         )
         .await?;
     service.subscriptions.registered(&registration);
@@ -859,6 +925,7 @@ async fn register(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
     let mut response = registration_response(&registration, address, agent);
+    response["gatewayMode"] = mode.name().into();
     if let Some(headers) = input.passthrough_headers {
         response["passthroughHeaders"] = json!(headers);
     }

@@ -8,6 +8,7 @@ use regex::Regex;
 use crate::{
     config::{HeaderForwarding, HeaderSource},
     database::Database,
+    gateway::GATEWAY_ID_HEADER,
 };
 
 const EXPLICIT_AUTH: &str = "x-upstream-authorization";
@@ -85,7 +86,13 @@ fn blocked(name: &HeaderName, incoming: &HeaderMap) -> bool {
         || name.starts_with("x-forwarded-user")
         || matches!(
             name,
-            "accept" | "content-type" | "content-length" | "host" | "expect" | EXPLICIT_AUTH
+            "accept"
+                | "content-type"
+                | "content-length"
+                | "host"
+                | "expect"
+                | EXPLICIT_AUTH
+                | GATEWAY_ID_HEADER
         )
         || nominated_hop_header(incoming, name)
 }
