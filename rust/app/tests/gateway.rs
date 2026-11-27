@@ -45,6 +45,8 @@ mod catalog_configuration_import;
 mod configuration_import;
 #[path = "gateway/configuration_server_import.rs"]
 mod configuration_server_import;
+#[path = "gateway/grpc_lifecycle.rs"]
+mod grpc_lifecycle;
 #[path = "gateway/openapi.rs"]
 mod openapi;
 #[path = "gateway/rest_credentials.rs"]
@@ -57,6 +59,7 @@ const CALL: &str = include_str!("../../replay/mcp-legacy/rust/app-cases/http/04-
 
 #[tokio::test]
 async fn grpc_feature_gate_and_parent_scope_prevent_dispatch() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let target = upstream.local_addr().unwrap().to_string();
     let database = database().await;

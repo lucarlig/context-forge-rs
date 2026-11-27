@@ -257,26 +257,7 @@ impl Database {
         macro_rules! delete {
             ($tx:ident, $lock:literal, $exists:literal) => {{
                 let id = check_revision!($tx, expected, $lock);
-                for (table, statement) in [
-                    ("tool_metrics", "DELETE FROM tool_metrics WHERE tool_id=$1"),
-                    (
-                        "tool_metrics_hourly",
-                        "DELETE FROM tool_metrics_hourly WHERE tool_id=$1",
-                    ),
-                ] {
-                    if (table == "tool_metrics" || purge_metrics)
-                        && sqlx::query_scalar::<_, bool>($exists)
-                            .bind(table)
-                            .fetch_one(&mut *$tx)
-                            .await?
-                    {
-                        sqlx::query(statement).bind(&id).execute(&mut *$tx).await?;
-                    }
-                }
-                sqlx::query("DELETE FROM server_tool_association WHERE tool_id=$1")
-                    .bind(&id)
-                    .execute(&mut *$tx)
-                    .await?;
+                crate::catalog::delete_tool_dependencies!($tx, &id, purge_metrics, $exists);
                 sqlx::query("DELETE FROM tools WHERE id=$1")
                     .bind(id)
                     .execute(&mut *$tx)

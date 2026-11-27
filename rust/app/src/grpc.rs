@@ -40,6 +40,9 @@ pub struct GrpcSettings {
     pub allow_public_visibility: bool,
     pub timeout: Duration,
     pub max_message_bytes: usize,
+    pub min_page_size: u32,
+    pub max_page_offset: i64,
+    pub include_page_links: bool,
 }
 
 impl Default for GrpcSettings {
@@ -50,6 +53,9 @@ impl Default for GrpcSettings {
             allow_public_visibility: true,
             timeout: Duration::from_secs(30),
             max_message_bytes: 4 * 1024 * 1024,
+            min_page_size: 1,
+            max_page_offset: 100_000,
+            include_page_links: true,
         }
     }
 }

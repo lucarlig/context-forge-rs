@@ -231,8 +231,15 @@ protobuf JSON defaults, and invocation errors on SQLite and PostgreSQL.
 Rust returns the scoped record for `GET /admin/grpc/{id}`. The pinned gateway
 returned HTTP 500 in the same fixture.
 Registration stores gRPC metadata. The unary caller follows v1.1.2's behavior
-for that metadata, which stays in the registry. Service listing, updates, state
-changes, deletion, re-reflection, TLS parity, and CLI translation remain open.
+for that metadata, which stays in the registry.
+
+The admin API lists, updates, enables, disables, deletes, and re-reflects
+services. The lifecycle replay matched page links, stable slugs, duplicate-name
+conflicts, stale-method removal, and retained tool IDs on SQLite and PostgreSQL.
+A failed reflection keeps the last successful descriptors. Rust omits disabled
+services' tools from MCP listings. The pinned gateway listed those tools.
+Native tests cover team-scoped writes, concurrent reflection, and dependent
+record cleanup. TLS parity and CLI translation remain open.
 
 ## Gateway management
 

@@ -138,8 +138,13 @@ impl Default for HeaderForwarding {
 impl Settings {
     pub fn grpc_federation() -> Result<crate::grpc::GrpcSettings, Box<dyn Error + Send + Sync>> {
         let max_message_bytes = parse("MCPGATEWAY_GRPC_MAX_MESSAGE_SIZE", 4 * 1024 * 1024)?;
+        let min_page_size = parse("PAGINATION_MIN_PAGE_SIZE", 1)?;
+        let max_page_offset = parse("PAGINATION_MAX_OFFSET", 100_000)?;
         if max_message_bytes == 0 {
             return Err("invalid MCPGATEWAY_GRPC_MAX_MESSAGE_SIZE".into());
+        }
+        if min_page_size == 0 || max_page_offset < 0 {
+            return Err("invalid pagination limits".into());
         }
         Ok(crate::grpc::GrpcSettings {
             enabled: flag("MCPGATEWAY_GRPC_ENABLED")?.unwrap_or(false),
@@ -148,6 +153,9 @@ impl Settings {
             allow_public_visibility: flag("ALLOW_PUBLIC_VISIBILITY")?.unwrap_or(true),
             timeout: positive_seconds("MCPGATEWAY_GRPC_TIMEOUT", 30.0)?,
             max_message_bytes,
+            min_page_size,
+            max_page_offset,
+            include_page_links: flag("PAGINATION_INCLUDE_LINKS")?.unwrap_or(true),
         })
     }
 

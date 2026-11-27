@@ -32,6 +32,36 @@ pub(crate) use tools::{ToolRecord, ToolWriteError};
 
 pub(crate) const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
 
+macro_rules! delete_tool_dependencies {
+    ($tx:ident, $id:expr, $purge_hourly:expr, $table_exists:expr) => {{
+        for (table, statement) in [
+            (
+                "tool_metrics",
+                "DELETE FROM tool_metrics WHERE tool_id = $1",
+            ),
+            (
+                "tool_metrics_hourly",
+                "DELETE FROM tool_metrics_hourly WHERE tool_id = $1",
+            ),
+        ] {
+            if (table == "tool_metrics" || $purge_hourly)
+                && sqlx::query_scalar::<_, bool>($table_exists)
+                    .bind(table)
+                    .fetch_one(&mut *$tx)
+                    .await?
+            {
+                sqlx::query(statement).bind($id).execute(&mut *$tx).await?;
+            }
+        }
+        sqlx::query("DELETE FROM server_tool_association WHERE tool_id = $1")
+            .bind($id)
+            .execute(&mut *$tx)
+            .await?;
+    }};
+}
+
+pub(crate) use delete_tool_dependencies;
+
 #[derive(Clone, Copy)]
 pub struct CatalogScope<'a> {
     pub email: Option<&'a str>,
