@@ -62,50 +62,142 @@ pub(super) fn decode_text<'a>(body: &'a [u8], content_type: Option<&str>) -> Cow
 
 pub(super) fn decode_json(body: &[u8]) -> Result<Value, String> {
     let text: Cow<'_, str> = match body {
-        [0, 0, 0xfe, 0xff, rest @ ..] => utf32_json(rest, false)?,
-        [0xff, 0xfe, 0, 0, rest @ ..] => utf32_json(rest, true)?,
-        [0xfe, 0xff, rest @ ..] => utf16_json(rest, UTF_16BE)?,
-        [0xff, 0xfe, rest @ ..] => utf16_json(rest, UTF_16LE)?,
+        [0, 0, 0xfe, 0xff, ..] => utf32_json(body, false, 4)?,
+        [0xff, 0xfe, 0, 0, ..] => utf32_json(body, true, 4)?,
+        [0xfe, 0xff, ..] => utf16_json(body, UTF_16BE, 2)?,
+        [0xff, 0xfe, ..] => utf16_json(body, UTF_16LE, 2)?,
         [0xef, 0xbb, 0xbf, rest @ ..] => utf8_json(rest)?,
-        [0, 0, _, _, ..] => utf32_json(body, false)?,
-        [0, _, _, _, ..] | [0, _] => utf16_json(body, UTF_16BE)?,
-        [_, 0, 0, 0, ..] => utf32_json(body, true)?,
-        [_, 0, _, _, ..] | [_, 0] => utf16_json(body, UTF_16LE)?,
+        [0, 0, _, _, ..] => utf32_json(body, false, 0)?,
+        [0, _, _, _, ..] | [0, _] => utf16_json(body, UTF_16BE, 0)?,
+        [_, 0, 0, 0, ..] => utf32_json(body, true, 0)?,
+        [_, 0, _, _, ..] | [_, 0] => utf16_json(body, UTF_16LE, 0)?,
         _ => utf8_json(body)?,
     };
     serde_json::from_str(&text).map_err(|error| diagnostics::syntax_error(&error, &text))
 }
 
-fn utf32_chars(bytes: &[u8], little_endian: bool) -> impl Iterator<Item = Option<char>> {
+fn utf32_units(bytes: &[u8], little_endian: bool) -> impl Iterator<Item = Option<u32>> {
     bytes.chunks(4).map(move |chunk| {
         let bytes = chunk.try_into().ok()?;
-        let code = if little_endian {
+        Some(if little_endian {
             u32::from_le_bytes(bytes)
         } else {
             u32::from_be_bytes(bytes)
-        };
-        char::from_u32(code)
+        })
     })
 }
 
 fn utf32_text(bytes: &[u8], little_endian: bool) -> Cow<'_, str> {
-    utf32_chars(bytes, little_endian)
-        .map(|value| value.unwrap_or(char::REPLACEMENT_CHARACTER))
+    utf32_units(bytes, little_endian)
+        .map(|value| {
+            value
+                .and_then(char::from_u32)
+                .unwrap_or(char::REPLACEMENT_CHARACTER)
+        })
         .collect::<String>()
         .into()
 }
 
-fn utf32_json(bytes: &[u8], little_endian: bool) -> Result<Cow<'_, str>, String> {
-    utf32_chars(bytes, little_endian)
-        .collect::<Option<String>>()
-        .map(Cow::Owned)
-        .ok_or_else(|| "Invalid UTF-32 encoding".into())
+fn utf32_json(bytes: &[u8], little_endian: bool, bom: usize) -> Result<Cow<'_, str>, String> {
+    let encoding = if little_endian {
+        "utf-32-le"
+    } else {
+        "utf-32-be"
+    };
+    let mut text = String::new();
+    let mut surrogate = None;
+    for (index, unit) in utf32_units(&bytes[bom..], little_endian).enumerate() {
+        let offset = bom + index * 4;
+        match unit {
+            None => {
+                return Err(encoding_error(
+                    encoding,
+                    bytes,
+                    offset,
+                    bytes.len() - offset,
+                    "truncated data",
+                ));
+            }
+            Some(0xd800..=0xdfff) => {
+                surrogate.get_or_insert(offset);
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+            Some(code) => {
+                let character = char::from_u32(code).ok_or_else(|| {
+                    encoding_error(
+                        encoding,
+                        bytes,
+                        offset,
+                        4,
+                        "code point not in range(0x110000)",
+                    )
+                })?;
+                text.push(character);
+            }
+        }
+    }
+    if let Some(offset) = surrogate {
+        let reason = encoding_error(encoding, bytes, offset, 4, "surrogates not allowed");
+        return Err(surrogate_error(&text, reason));
+    }
+    Ok(Cow::Owned(text))
 }
 
-fn utf16_json<'a>(bytes: &'a [u8], encoding: &'static Encoding) -> Result<Cow<'a, str>, String> {
-    encoding
-        .decode_without_bom_handling_and_without_replacement(bytes)
-        .ok_or_else(|| "Invalid UTF-16 encoding".into())
+fn utf16_json<'a>(
+    bytes: &'a [u8],
+    encoding: &'static Encoding,
+    bom: usize,
+) -> Result<Cow<'a, str>, String> {
+    let payload = &bytes[bom..];
+    if let Some(text) = encoding.decode_without_bom_handling_and_without_replacement(payload) {
+        return Ok(text);
+    }
+    let name = if encoding == UTF_16LE {
+        "utf-16-le"
+    } else {
+        "utf-16-be"
+    };
+    let (units, remainder) = payload.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(encoding_error(
+            name,
+            bytes,
+            bytes.len() - 1,
+            1,
+            "truncated data",
+        ));
+    }
+    let units = units.iter().copied().map(|bytes| {
+        if encoding == UTF_16LE {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    });
+    let mut offset = bom;
+    let mut invalid = None;
+    for character in char::decode_utf16(units) {
+        match character {
+            Ok(character) => offset += character.len_utf16() * 2,
+            Err(_) => {
+                invalid = Some(offset);
+                break;
+            }
+        }
+    }
+    let reason = invalid.map_or_else(
+        || "Invalid UTF-16 encoding".into(),
+        |offset| encoding_error(name, bytes, offset, 2, "surrogates not allowed"),
+    );
+    let (text, _) = encoding.decode_without_bom_handling(payload);
+    Err(surrogate_error(&text, reason))
+}
+
+fn surrogate_error(text: &str, reason: String) -> String {
+    match serde_json::from_str::<Value>(text) {
+        Ok(_) => reason,
+        Err(error) => diagnostics::syntax_error(&error, text),
+    }
 }
 
 fn utf8_json(bytes: &[u8]) -> Result<Cow<'_, str>, String> {
@@ -122,12 +214,22 @@ fn utf8_error(bytes: &[u8], error: Utf8Error) -> String {
         Some(length) if (0xc2..=0xf4).contains(&first) => (length, "invalid continuation byte"),
         Some(length) => (length, "invalid start byte"),
     };
+    encoding_error("utf-8", bytes, offset, length, reason)
+}
+
+fn encoding_error(
+    encoding: &str,
+    bytes: &[u8],
+    offset: usize,
+    length: usize,
+    reason: &str,
+) -> String {
     let description = if length == 1 {
-        format!("byte {first:#04x} in position {offset}")
+        format!("byte {:#04x} in position {offset}", bytes[offset])
     } else {
         format!("bytes in position {offset}-{}", offset + length - 1)
     };
-    format!("'utf-8' codec can't decode {description}: {reason}")
+    format!("'{encoding}' codec can't decode {description}: {reason}")
 }
 
 #[cfg(test)]

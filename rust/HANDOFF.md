@@ -153,7 +153,8 @@ deprecation, and deletion. The comparison verified credential masking and
 encrypted persistence on both databases.
 [Tool write verification](replay/tool-management/write.md)
 
-MCP clients can discover and invoke registered REST tools through the scoped
+The REST federation milestone is verified through the live gateway. MCP
+clients can discover and invoke registered REST tools through the scoped
 catalog. Requests support URL templates, query and header mappings, JSON,
 form data, and multipart bodies. The Rust client pins the upstream destination.
 Fourteen scenarios matched the pinned gateway's results and outbound requests
@@ -186,8 +187,15 @@ available for the next request after validation finishes.
 REST parses UTF-8, UTF-16, and UTF-32 JSON bodies. Text fallback uses the
 declared HTTP charset through `encoding_rs`. Ten response cases matched on
 SQLite and PostgreSQL, including multibyte JSON, legacy text charsets, and
-malformed JSON escapes. Compressed REST responses and diagnostics for
-malformed UTF-16 and UTF-32 remain open.
+malformed JSON escapes.
+
+The REST client negotiates gzip, deflate, Brotli, and Zstandard. It honors an
+explicit `Accept-Encoding` header, decodes stacked encodings in reverse
+order, and applies the body size limit at every layer. Twenty-two compression
+and malformed Unicode cases matched on SQLite and PostgreSQL. Two additional
+fixtures containing isolated Unicode surrogates still differ. Rust returns
+a decoding error. The pinned gateway returns a text representation of the
+object.
 
 Authenticated `POST /rpc` and `POST /rpc/` serve tool calls, legacy tool
 names, catalog reads, resource reads, prompt retrieval, and initialization.

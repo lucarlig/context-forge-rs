@@ -9,6 +9,7 @@ default-run = "context-forge-rs"
 
 [dependencies]
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash", "zeroize"] }
+async-compression = { version = "0.4.54", default-features = false, features = ["tokio", "brotli", "deflate", "gzip", "zlib", "zstd"] }
 aws-credential-types = "1.2.14"
 aws-sigv4 = "1.4.5"
 axum = { version = "0.8", features = ["ws"] }

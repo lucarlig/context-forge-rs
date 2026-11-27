@@ -24,7 +24,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] OAuth, SSO, dynamic registration, and external identities
 - [x] Encrypted credential storage and rotation
 - [ ] Remaining database schema, migration history, import, and export
-- [ ] REST tool federation
+- [x] REST tool federation
 - [ ] gRPC tool federation
 - [ ] A2A federation and task lifecycle
 - [ ] Native plugins, policy evaluation, and external extensions

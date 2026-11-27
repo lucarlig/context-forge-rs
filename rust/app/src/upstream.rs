@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Outbound MCP Streamable HTTP and SSE over validated, pinned destinations.
 
+mod rest_body;
+
 use std::{
     collections::HashSet,
     io,
@@ -18,7 +20,7 @@ use ipnet::IpNet;
 use reqwest::{
     Client, Method, Response,
     dns::{Name, Resolve, Resolving},
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
+    header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
@@ -1136,6 +1138,10 @@ impl UpstreamClient {
                 .pinned_client(request.url().as_str(), None, None)
                 .await?;
             *request.url_mut() = url;
+            request
+                .headers_mut()
+                .entry(ACCEPT_ENCODING)
+                .or_insert(rest_body::ACCEPTED);
             let retry = signer.and_then(|_| request.try_clone());
             let mut response = send_rest_request(&client, request, signer).await?;
             if response.status() == reqwest::StatusCode::UNAUTHORIZED
@@ -1147,7 +1153,7 @@ impl UpstreamClient {
             Ok(RestResponse {
                 status: response.status(),
                 content_type: response.headers().get(CONTENT_TYPE).cloned(),
-                body: read_bounded_body(response, MAX_MESSAGE_BYTES).await?,
+                body: rest_body::read(response).await?,
             })
         })
         .await
