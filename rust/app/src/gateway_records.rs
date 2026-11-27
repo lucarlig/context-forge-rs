@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::{
     auth::TeamVisibility,
-    catalog::{CATALOG_LOCK, CatalogScope, visible_team_ids},
+    catalog::{CATALOG_LOCK, CatalogScope, managed_visibility, visible_team_ids},
     database::Database,
 };
 
@@ -83,6 +83,7 @@ pub(crate) struct GatewayList<'a> {
     pub(crate) team: Option<&'a str>,
     pub(crate) after: Option<(&'a str, &'a str)>,
     pub(crate) limit: i64,
+    pub(crate) offset: i64,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -126,17 +127,22 @@ macro_rules! gateway_select {
 macro_rules! list_gateways_query {
     ($teams:literal, $date:literal) => {
         concat!(
-            "WITH visible_team_ids(id) AS (", $teams, ") ",
+            "WITH visible_team_ids(id) AS (",
+            $teams,
+            ") ",
             gateway_select!(),
             " WHERE ($1 OR g.enabled)
                 AND (CAST($2 AS TEXT) IS NULL OR g.visibility = $2)
                 AND (CAST($3 AS TEXT) IS NULL OR g.team_id = $3)
-                AND (CAST($4 AS TEXT) IS NULL OR g.created_at < ", $date,
-                " OR (g.created_at = ", $date, " AND g.id < $5))
-                AND (g.visibility = 'public'
-                     OR (g.visibility = 'team' AND ($8 OR g.team_id IN (SELECT id FROM visible_team_ids)))
-                     OR (g.visibility = 'private' AND $9 AND g.owner_email = $7))
-              ORDER BY g.created_at DESC, g.id DESC LIMIT $6"
+                AND (CAST($4 AS TEXT) IS NULL OR g.created_at < ",
+            $date,
+            " OR (g.created_at = ",
+            $date,
+            " AND g.id < $5))
+                AND ",
+            managed_visibility!("g", "$8", "$9", "$7", "visible_team_ids"),
+            "
+              ORDER BY g.created_at DESC, g.id DESC LIMIT $6 OFFSET $11"
         )
     };
 }
@@ -400,6 +406,7 @@ impl Database {
                     .bind(scope.visibility == &TeamVisibility::Admin)
                     .bind(scope.can_own())
                     .bind(teams)
+                    .bind(list.offset)
                     .fetch_all($pool)
                     .await
             };

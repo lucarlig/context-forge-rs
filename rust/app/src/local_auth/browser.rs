@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod catalog;
 mod forms;
 mod keycloak;
 mod recovery;
@@ -23,6 +24,7 @@ use super::*;
 use crate::{
     access::{auth_cookie, cookie},
     auth::TeamVisibility,
+    catalog::ManagedCatalog,
     config::{flag, parse, value},
     http_boundary::allowed_origins,
     jwt::TokenUse,
@@ -117,7 +119,11 @@ impl BrowserSettings {
     }
 }
 
-pub(super) fn router(accounts: Arc<Accounts>, settings: &BrowserSettings) -> Router {
+pub(super) fn router(
+    accounts: Arc<Accounts>,
+    settings: &BrowserSettings,
+    catalog: Arc<GatewayService>,
+) -> Router {
     let mut router = Router::new();
     for path in ["/admin", "/v1/admin"] {
         router = router
@@ -137,6 +143,12 @@ pub(super) fn router(accounts: Arc<Accounts>, settings: &BrowserSettings) -> Rou
             )
             .route(&format!("{path}/"), get(home))
             .route(path, get(home));
+        for kind in ManagedCatalog::ALL {
+            router = router.route(
+                &format!("{path}/{}", kind.name()),
+                get(catalog::list).layer(Extension(kind)),
+            );
+        }
     }
     if settings.ui {
         router = router.route(
@@ -146,7 +158,7 @@ pub(super) fn router(accounts: Arc<Accounts>, settings: &BrowserSettings) -> Rou
             }),
         );
     }
-    router.with_state(accounts)
+    router.with_state(accounts).layer(Extension(catalog))
 }
 
 fn settings_for(accounts: &Accounts) -> &BrowserSettings {
@@ -245,6 +257,7 @@ async fn login(
 async fn home(
     State(accounts): State<Arc<Accounts>>,
     Extension(ConnectInfo(peer)): Extension<ConnectInfo<SocketAddr>>,
+    Extension(service): Extension<Arc<GatewayService>>,
     request: Request,
 ) -> Result<Response, AccountError> {
     let settings = settings_for(&accounts);
@@ -253,12 +266,14 @@ async fn home(
             Ok(session) => session,
             Err(denial) => return Ok(denial.response(settings, request.headers())),
         };
-    if accounts.settings.enforce_password_change
-        && principal.token_use == TokenUse::Session
-        && let Some(user) = accounts.database.local_user(&principal.email).await?
-        && requires_password_change(&accounts, &user, false).await?
-    {
+    if password_change_pending(&accounts, &principal).await? {
         return Ok(settings.redirect(CHANGE));
+    }
+    if let Some(team) = forms::query(request.uri()).get("team_id")
+        && !team.is_empty()
+        && Uuid::parse_str(team).is_err()
+    {
+        return Err(AccountError::bad_request("Invalid team ID"));
     }
     let team = sessions::request_team(request.uri(), &principal);
     if !accounts
@@ -303,20 +318,48 @@ async fn home(
         Some(proof) => proof,
         None => forms::nonce(request.headers())?,
     };
-    let mut response = render(context! {
-        title => "ContextForge",
-        page => "home",
-        root => settings.root,
-        email => principal.email,
-        proof => proof,
-    })?;
-    sessions::set_proof(
-        &mut response,
-        settings,
-        accounts.settings.token_seconds,
-        &proof,
-    )?;
-    Ok(response)
+    let (parts, _) = request.into_parts();
+    let response = async {
+        let catalog =
+            match catalog::dashboard(&accounts, &service, &principal, &parts.uri, team.as_deref())
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(error) => return error.into_response(),
+            };
+        render(context! {
+            title => "ContextForge",
+            page => "home",
+            root => settings.root,
+            email => principal.email,
+            proof => proof,
+            catalog => catalog,
+        })
+        .and_then(|mut response| {
+            sessions::set_proof(
+                &mut response,
+                settings,
+                accounts.settings.token_seconds,
+                &proof,
+            )?;
+            Ok(response)
+        })
+        .unwrap_or_else(IntoResponse::into_response)
+    };
+    Ok(catalog::with_usage(&accounts, &principal, &parts, peer.ip(), response).await)
+}
+
+async fn password_change_pending(
+    accounts: &Accounts,
+    principal: &Principal,
+) -> Result<bool, AccountError> {
+    if accounts.settings.enforce_password_change
+        && principal.token_use == TokenUse::Session
+        && let Some(user) = accounts.database.local_user(&principal.email).await?
+    {
+        return requires_password_change(accounts, &user, false).await;
+    }
+    Ok(false)
 }
 
 async fn password_page(

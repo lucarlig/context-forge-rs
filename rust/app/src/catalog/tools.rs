@@ -143,7 +143,7 @@ impl Database {
             scope,
             CatalogEntryFilters::associated(inactive),
             tool_select!(),
-            "EXISTS(SELECT 1 FROM server_tool_association a WHERE a.server_id=$13 AND a.tool_id=r.id)",
+            "EXISTS(SELECT 1 FROM server_tool_association a WHERE a.server_id=$14 AND a.tool_id=r.id)",
             server
         )
     }
@@ -165,11 +165,12 @@ impl Database {
                 gateway: None,
                 after: None,
                 limit: 2,
+                offset: 0,
                 tags: &[],
             },
             tool_select!(),
-            "r.name=$13 AND (CAST($14 AS TEXT) IS NULL OR EXISTS (
-                SELECT 1 FROM server_tool_association a WHERE a.tool_id=r.id AND a.server_id=$14
+            "r.name=$14 AND (CAST($15 AS TEXT) IS NULL OR EXISTS (
+                SELECT 1 FROM server_tool_association a WHERE a.tool_id=r.id AND a.server_id=$15
             )) AND (r.gateway_id IS NULL OR (g.enabled AND g.status='active' AND
                 (g.visibility='public'
                  OR (g.visibility='team' AND ($9 OR g.team_id IN (SELECT id FROM visible_teams)))

@@ -135,6 +135,7 @@ pub(in crate::gateway) async fn test(
                 team: team.as_deref(),
                 after: None,
                 limit: i64::MAX,
+                offset: 0,
             },
         )
         .await?;

@@ -91,6 +91,7 @@ pub(super) async fn list(
                     .as_ref()
                     .map(|(date, id)| (date.as_str(), id.as_str())),
                 limit: page_size.map_or(i64::MAX, |size| i64::from(size) + 1),
+                offset: 0,
             },
         )
         .await?;

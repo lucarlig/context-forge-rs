@@ -29,7 +29,7 @@ pub(crate) use agent_tasks::{AgentTask, AgentTaskCursor, TaskContinuation, termi
 pub(crate) use agents::{
     AgentInteraction, AgentLookup, AgentRecord, AgentWriteError, NewAgentCard,
 };
-pub(crate) use entry_filters::CatalogEntryFilters;
+pub(crate) use entry_filters::{CatalogEntryFilters, ManagedCatalog, managed_visibility};
 pub(crate) use metrics::{ExecutionMetrics, MetricEntity};
 pub(crate) use prompts::{PromptRecord, PromptWriteError};
 pub(crate) use resources::{ResourceRecord, ResourceWriteError};

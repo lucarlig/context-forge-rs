@@ -53,7 +53,7 @@ async fn list(
         .managed_resources(
             access::catalog_scope(Some(&principal)),
             page.filters(),
-            false,
+            Some(false),
         )
         .await?;
     Ok(Json(page.envelope(
@@ -83,9 +83,10 @@ async fn templates(
                 gateway: None,
                 after: None,
                 limit: i64::MAX,
+                offset: 0,
                 tags: &tags,
             },
-            true,
+            Some(true),
         )
         .await?;
     let templates = records.into_iter().map(|resource| json!({

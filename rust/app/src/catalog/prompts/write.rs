@@ -80,7 +80,7 @@ impl Database {
             scope,
             CatalogEntryFilters::associated(true),
             prompt_select!(),
-            "r.gateway_id IS NULL AND r.name = $13",
+            "r.gateway_id IS NULL AND r.name = $14",
             name
         )
     }

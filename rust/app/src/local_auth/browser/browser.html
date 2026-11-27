@@ -13,9 +13,22 @@
     form { gap: 1rem; }
     input, button { padding: .65rem; font: inherit; }
     [role=alert] { border-inline-start: .2rem solid; padding-inline-start: .75rem; }
+    body.dashboard { display: block; }
+    .dashboard main { width: min(100%, 76rem); margin: 0 auto; border: 0; padding: 1rem; }
+    .dashboard header, .toolbar, .catalog-nav, .page-links { display: flex; flex-wrap: wrap; gap: .75rem 1rem; align-items: center; }
+    .dashboard header, .toolbar { justify-content: space-between; }
+    .catalog-nav { margin-block: 1.25rem; }
+    .catalog-nav a { padding: .45rem .65rem; border: 1px solid GrayText; border-radius: .35rem; }
+    .catalog-nav [aria-current] { background: CanvasText; color: Canvas; }
+    .toolbar form, .toolbar label { display: flex; align-items: center; }
+    section { margin-block: 1.5rem; }
+    .table-scroll { overflow-x: auto; }
+    table { border-collapse: collapse; table-layout: auto; width: 100%; }
+    th, td { padding: .7rem; text-align: start; border-block-end: 1px solid GrayText; overflow-wrap: anywhere; vertical-align: top; }
+    th { white-space: nowrap; }
   </style>
 </head>
-<body>
+<body{% if page == "home" %} class="dashboard"{% endif %}>
   <main>
     {% if page == "login" %}
     <h1>Sign in to ContextForge</h1>
@@ -70,12 +83,54 @@
     {% endif %}
     <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
     {% else %}
-    <h1>ContextForge</h1>
-    <p>Signed in as {{ email }}.</p>
-    <form method="post" action="{{ root }}/admin/logout">
-      <input type="hidden" name="csrf_token" value="{{ proof }}">
-      <button type="submit">Sign out</button>
-    </form>
+    <header>
+      <div><h1>ContextForge</h1><p>Signed in as {{ email }}.</p></div>
+      <form method="post" action="{{ root }}/admin/logout">
+        <input type="hidden" name="csrf_token" value="{{ proof }}">
+        <button type="submit">Sign out</button>
+      </form>
+    </header>
+    {% if catalog.navigation %}
+    <div class="toolbar">
+      <nav class="catalog-nav" aria-label="Catalog sections">
+        {% for link in catalog.navigation %}
+        <a href="{{ link.href }}"{% if link.selected %} aria-current="page"{% endif %}>{{ link.label }}</a>
+        {% endfor %}
+      </nav>
+      <form method="get" action="{{ root }}/admin/">
+        {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}
+        {% if catalog.selected %}<input type="hidden" name="section" value="{{ catalog.selected }}">{% endif %}
+        <label><input type="checkbox" name="include_inactive" value="true"{% if catalog.include_inactive %} checked{% endif %}> Show inactive</label>
+        <button type="submit">Apply</button>
+      </form>
+    </div>
+    {% for part in catalog.sections %}
+    <section aria-labelledby="heading-{{ part.name }}">
+      <h2 id="heading-{{ part.name }}">{{ part.label }}</h2>
+      {% if part.rows %}
+      <div class="table-scroll">
+        <table aria-labelledby="heading-{{ part.name }}">
+          <thead><tr><th scope="col">Name</th><th scope="col">Description</th><th scope="col">Status</th><th scope="col">Visibility</th></tr></thead>
+          <tbody>
+            {% for item in part.rows %}
+            <tr><th scope="row">{{ item.name }}</th><td>{{ item.description|default('—', true) }}</td><td>{{ "Active" if item.enabled else "Inactive" }}</td><td>{{ item.visibility|default('—', true) }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="page-links">
+        <span>{{ part.total }} {{ "entry" if part.total == 1 else "entries" }}{% if part.pages > 1 %} · Page {{ part.page }} of {{ part.pages }}{% endif %}</span>
+        {% if part.previous %}<a href="{{ part.previous }}" rel="prev">Previous page</a>{% endif %}
+        {% if part.next %}<a href="{{ part.next }}" rel="next">Next page</a>{% endif %}
+      </p>
+      {% else %}
+      <p>No entries to display.</p>
+      {% endif %}
+    </section>
+    {% endfor %}
+    {% else %}
+    <p>Your account has no catalog read permissions.</p>
+    {% endif %}
     {% endif %}
   </main>
 </body>

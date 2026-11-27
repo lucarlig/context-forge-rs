@@ -115,7 +115,7 @@ impl Database {
             scope,
             CatalogEntryFilters::associated(inactive),
             prompt_select!(),
-            "EXISTS(SELECT 1 FROM server_prompt_association a WHERE a.server_id=$13 AND a.prompt_id=r.id)",
+            "EXISTS(SELECT 1 FROM server_prompt_association a WHERE a.server_id=$14 AND a.prompt_id=r.id)",
             server
         )
     }

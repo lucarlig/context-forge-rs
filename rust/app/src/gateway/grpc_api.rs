@@ -275,64 +275,10 @@ async fn list(
     let links = app
         .grpc
         .include_page_links
-        .then(|| pagination.links(include_inactive, team.as_deref()));
+        .then(|| pagination.links("/admin/grpc", include_inactive, team.as_deref()));
     Ok(Json(
         json!({"data":data,"pagination":pagination,"links":links}),
     ))
-}
-
-#[derive(Serialize)]
-struct PaginationMeta {
-    page: i64,
-    per_page: i64,
-    total_items: i64,
-    total_pages: i64,
-    has_next: bool,
-    has_prev: bool,
-    page_items: Option<i64>,
-    next_cursor: Option<String>,
-    prev_cursor: Option<String>,
-}
-
-impl PaginationMeta {
-    fn new(mut page: i64, per_page: i64, total_items: i64) -> Self {
-        let total_pages = total_items / per_page + i64::from(total_items % per_page != 0);
-        if total_pages > 0 {
-            page = page.min(total_pages);
-        }
-        Self {
-            page,
-            per_page,
-            total_items,
-            total_pages,
-            has_next: page < total_pages,
-            has_prev: page > 1,
-            page_items: None,
-            next_cursor: None,
-            prev_cursor: None,
-        }
-    }
-
-    fn links(&self, include_inactive: bool, team: Option<&str>) -> Value {
-        let link = |page| {
-            let mut query = url::form_urlencoded::Serializer::new(String::new());
-            if include_inactive {
-                query.append_pair("include_inactive", "True");
-            }
-            if let Some(team) = team {
-                query.append_pair("team_id", team);
-            }
-            query
-                .append_pair("page", &i64::to_string(&page))
-                .append_pair("per_page", &self.per_page.to_string());
-            format!("/admin/grpc?{}", query.finish())
-        };
-        json!({
-            "self":link(self.page), "first":link(1), "last":link(self.total_pages.max(1)),
-            "next":self.has_next.then(|| link(self.page + 1)),
-            "prev":self.has_prev.then(|| link(self.page - 1)),
-        })
-    }
 }
 
 fn validate_public_visibility(

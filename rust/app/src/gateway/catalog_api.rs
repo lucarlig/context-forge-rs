@@ -139,6 +139,7 @@ impl<'a> CatalogPage<'a> {
                 .as_ref()
                 .map(|(created, id)| (created.as_str(), id.as_str())),
             limit: self.limit.map_or(i64::MAX, |limit| limit + 1),
+            offset: 0,
             tags: &self.tags,
         }
     }
@@ -244,10 +245,10 @@ pub(super) fn camelcase_fields(response: Value) -> Value {
     Value::Object(aliased)
 }
 
-pub(super) struct CatalogApiError(pub(super) StatusCode, pub(super) Value);
+pub(crate) struct CatalogApiError(pub(super) StatusCode, pub(super) Value);
 
 impl CatalogApiError {
-    pub(super) fn detail(status: StatusCode, detail: impl Into<String>) -> Self {
+    pub(crate) fn detail(status: StatusCode, detail: impl Into<String>) -> Self {
         Self(status, json!({"detail":detail.into()}))
     }
 
@@ -326,4 +327,64 @@ pub(super) fn denied_team() -> CatalogApiError {
             "message":"Access issue: This API token does not have the required permissions for this team."
         }),
     )
+}
+
+#[derive(Serialize)]
+pub(crate) struct PaginationMeta {
+    pub(crate) page: i64,
+    pub(crate) per_page: i64,
+    pub(crate) total_items: i64,
+    pub(crate) total_pages: i64,
+    pub(crate) has_next: bool,
+    pub(crate) has_prev: bool,
+    page_items: Option<i64>,
+    next_cursor: Option<String>,
+    prev_cursor: Option<String>,
+}
+
+impl PaginationMeta {
+    pub(super) fn new(mut page: i64, per_page: i64, total_items: i64) -> Self {
+        let total_pages = total_items / per_page + i64::from(total_items % per_page != 0);
+        if total_pages > 0 {
+            page = page.min(total_pages);
+        }
+        Self {
+            page,
+            per_page,
+            total_items,
+            total_pages,
+            has_next: page < total_pages,
+            has_prev: page > 1,
+            page_items: None,
+            next_cursor: None,
+            prev_cursor: None,
+        }
+    }
+
+    pub(super) fn offset(&self, max_offset: i64) -> i64 {
+        (self.page - 1)
+            .saturating_mul(self.per_page)
+            .min(max_offset)
+    }
+
+    pub(super) fn links(&self, base: &str, include_inactive: bool, team: Option<&str>) -> Value {
+        let link = |page| {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            if include_inactive {
+                query.append_pair("include_inactive", "True");
+            }
+            if let Some(team) = team {
+                query.append_pair("team_id", team);
+            }
+            query
+                .append_pair("page", &i64::to_string(&page))
+                .append_pair("per_page", &self.per_page.to_string());
+            format!("{base}?{}", query.finish())
+        };
+        json!({
+            "self":link(self.page), "first":link(1), "last":link(self.total_pages.max(1)),
+            "next":self.has_next.then(|| link(self.page + 1)),
+            "prev":self.has_prev.then(|| link(self.page - 1)),
+        })
+    }
 }

@@ -231,7 +231,7 @@ async fn configuration(
     if request.includes("resources") {
         let records = service
             .database
-            .managed_resources(scope, request.catalog_filter(), false)
+            .managed_resources(scope, request.catalog_filter(), Some(false))
             .await?;
         let resources = selected(records, request.selective(), |row| &row.id)
             .into_iter()
@@ -370,6 +370,7 @@ async fn export_gateways(
                 team: None,
                 after: None,
                 limit: i64::MAX,
+                offset: 0,
             },
         )
         .await?;

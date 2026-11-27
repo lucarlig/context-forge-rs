@@ -98,21 +98,7 @@ async fn list_payload(
             .managed_tools(scope, page.filters())
             .await?
     };
-    let mut teams = HashMap::new();
-    if scope.can_own() && !principal.is_global_admin() {
-        for tool in &tools {
-            if tool.visibility == "team"
-                && tool.headers.is_some()
-                && let Some(team) = tool.team_id.as_deref()
-                && !teams.contains_key(team)
-            {
-                teams.insert(
-                    team,
-                    service.database.team_owner(&principal.email, team).await?,
-                );
-            }
-        }
-    }
+    let teams = header_team_owners(service, principal, &tools).await?;
     let mut response = page.envelope(
         service,
         tools.iter().collect(),
@@ -303,6 +289,29 @@ pub(super) fn can_view_headers(principal: &Principal, tool: &ToolRecord, team_ow
         || (access::catalog_scope(Some(principal)).can_own()
             && (tool.owner_email.as_deref() == Some(&principal.email)
                 || (tool.visibility == "team" && team_owner)))
+}
+
+pub(super) async fn header_team_owners<'a>(
+    service: &GatewayService,
+    principal: &Principal,
+    tools: &'a [ToolRecord],
+) -> Result<HashMap<&'a str, bool>, sqlx::Error> {
+    let mut teams = HashMap::new();
+    if access::catalog_scope(Some(principal)).can_own() && !principal.is_global_admin() {
+        for tool in tools {
+            if tool.visibility == "team"
+                && tool.headers.is_some()
+                && let Some(team) = tool.team_id.as_deref()
+                && !teams.contains_key(team)
+            {
+                teams.insert(
+                    team,
+                    service.database.team_owner(&principal.email, team).await?,
+                );
+            }
+        }
+    }
+    Ok(teams)
 }
 
 pub(super) fn metadata(

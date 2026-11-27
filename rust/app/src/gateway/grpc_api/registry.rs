@@ -256,7 +256,7 @@ impl Database {
                 .fetch_one(&mut *$tx)
                 .await?;
                 let meta = PaginationMeta::new(page, per_page, total_items);
-                let offset = (meta.page - 1).saturating_mul(per_page).min(max_offset);
+                let offset = meta.offset(max_offset);
                 let records = scoped!(sqlx::query_as(scoped_services!(
                     $team_ids,
                     select_service!(),

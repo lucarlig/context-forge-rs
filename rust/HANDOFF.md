@@ -169,7 +169,7 @@ A Rust integration test covers cross-origin sign-in and missing logout proof.
 The pinned SQLite profile writes a revocation row and still accepts the last
 session after logout. The native gateway stores the revoking user's email and
 rejects that session immediately. Live checks verify the native result on SQLite
-and PostgreSQL. Dashboard management sections remain open.
+and PostgreSQL.
 
 The browser password reset forms share the API's token storage, password
 policy, rate limits, and session revocation. Six Rust Anything scenarios match
@@ -183,6 +183,19 @@ local session. The OIDC callback stores verified ID tokens of up to 3,800 bytes
 in an HttpOnly cookie that meets the browser size limit. Seven Rust Anything
 scenarios match the redirect and cookies, including a signed OIDC exchange.
 Expired or oversized hints stay out of the redirect.
+
+## Admin catalog
+
+The dashboard shows tools, virtual servers, resources, prompts, and MCP
+servers. Each section checks its read permission and uses the gateway's token
+visibility rules. The numbered JSON endpoints serve under both `/admin` and
+`/v1/admin`. The native listing reuses the REST catalog's serializers and
+credential masking.
+
+Five Rust Anything scenarios match on SQLite and PostgreSQL for row names,
+state, visibility, pagination, and links. Chromium verifies the dashboard
+sections, inactive filter, and page navigation. Admin writes and the remaining
+dashboard sections are open.
 
 ## Gateway and protocol verification
 

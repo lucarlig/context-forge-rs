@@ -74,7 +74,7 @@ impl Database {
             scope,
             CatalogEntryFilters::associated(true),
             resource_select!(),
-            "r.gateway_id IS NULL AND r.uri = $13",
+            "r.gateway_id IS NULL AND r.uri = $14",
             uri
         )
     }

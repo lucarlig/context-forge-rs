@@ -217,7 +217,11 @@ async fn with_links(
     Ok(metadata(service, server, &links))
 }
 
-fn metadata(service: &GatewayService, server: &ServerRecord, links: &ServerLinks) -> Value {
+pub(super) fn metadata(
+    service: &GatewayService,
+    server: &ServerRecord,
+    links: &ServerLinks,
+) -> Value {
     let mut response = json!(server);
     response["created_at"] = server.created_at.replacen(' ', "T", 1).into();
     response["updated_at"] = server.updated_at.replacen(' ', "T", 1).into();

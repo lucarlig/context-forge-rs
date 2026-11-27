@@ -222,3 +222,110 @@ fn cookie<'a>(response: &'a Response, name: &str) -> &'a str {
         .find_map(|(key, value)| (key == name && !value.is_empty()).then_some(value))
         .unwrap()
 }
+
+#[tokio::test]
+async fn admin_catalog_paginates_and_hides_inactive_servers_by_default() {
+    let mut gateway = gateway().await;
+    let signin = gateway
+        .client
+        .post(format!("{}/auth/email/login", gateway.origin))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL, "password":gateway.password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signin.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&signin.text().await.unwrap()).unwrap();
+    let token = body["access_token"].as_str().unwrap();
+    for name in ["fixture-active-server", "fixture-inactive-server"] {
+        let response = gateway
+            .client
+            .post(format!("{}/servers", gateway.origin))
+            .bearer_auth(token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({"server":{"name":name}, "visibility":"public"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        gateway.fixture.0.join("mcp.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE servers SET enabled=FALSE WHERE name='fixture-inactive-server'")
+        .execute(&database)
+        .await
+        .unwrap();
+    database.close().await;
+
+    let cookie = format!("jwt_token={token}");
+    let home = gateway
+        .client
+        .get(format!("{}/admin/", gateway.origin))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(home.status(), StatusCode::OK);
+    let html = home.text().await.unwrap();
+    assert!(html.contains("fixture-active-server"));
+    assert!(!html.contains("fixture-inactive-server"));
+
+    let response = gateway
+        .client
+        .get(format!(
+            "{}/v1/admin/servers?include_inactive=true&per_page=1&page=999",
+            gateway.origin
+        ))
+        .header(header::COOKIE, cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(body["pagination"]["page"], 2);
+    assert_eq!(body["pagination"]["total_items"], 2);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["links"]["prev"],
+        "/admin/servers?include_inactive=True&page=1&per_page=1"
+    );
+    let issued = gateway
+        .client
+        .post(format!("{}/tokens", gateway.origin))
+        .bearer_auth(token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::json!({
+                "name":"catalog-limit","expires_in_days":1,
+                "scope":{"usage_limits":{"requests_per_hour":1}}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued: serde_json::Value = serde_json::from_str(&issued.text().await.unwrap()).unwrap();
+    let limited = issued["access_token"].as_str().unwrap();
+    let first = gateway
+        .client
+        .get(format!("{}/admin/servers", gateway.origin))
+        .bearer_auth(limited)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let blocked = gateway
+        .client
+        .get(format!("{}/admin/", gateway.origin))
+        .bearer_auth(limited)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    gateway.process.kill().await.unwrap();
+}

@@ -34,6 +34,7 @@ use crate::{
     access::{Authorizer, Principal, RoleContext},
     config::SecretKdf,
     database::Database,
+    gateway::GatewayService,
     http_boundary::csrf::CsrfTokens,
     jwt::JwtIssuer,
 };
@@ -141,6 +142,7 @@ pub async fn router(
     access: Arc<Authorizer>,
     signer: JwtIssuer,
     mut settings: AccountSettings,
+    catalog: Arc<GatewayService>,
 ) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     let bootstrap = settings.bootstrap_password.take();
     let dummy_hash = passwords::hash(Zeroizing::new(Uuid::new_v4().to_string()), settings.kdf)
@@ -229,7 +231,7 @@ pub async fn router(
             "Authentication required",
         ));
     if let Some(settings) = state.settings.browser.as_ref() {
-        router = router.merge(browser::router(state.clone(), settings));
+        router = router.merge(browser::router(state.clone(), settings, catalog));
     }
     if let Some(settings) = state.settings.sso.as_ref() {
         sso::bootstrap(&state.database, settings).await;

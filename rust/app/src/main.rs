@@ -81,21 +81,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let http_boundary = HttpBoundary::from_env(settings.port, access.clone(), database.clone())?;
     let email_auth_enabled = Settings::email_auth_enabled()?;
     let issuer = Settings::jwt_issuer()?;
-    let accounts = match issuer
-        .as_ref()
-        .filter(|_| email_auth_enabled && catalog_available)
-    {
-        Some(issuer) => {
-            local_auth::router(
-                database.clone(),
-                access.clone(),
-                issuer.clone(),
-                Settings::local_accounts()?,
-            )
-            .await?
-        }
-        None => axum::Router::new(),
-    };
     let (management_page_size, management_max_page_size) = Settings::management_page_sizes()?;
     let catalog_refresh = Settings::catalog_refresh()?;
     let health_settings = Settings::gateway_health(&catalog_refresh)?;
@@ -106,7 +91,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
-            access,
+            access.clone(),
             Settings::upstream_client()?,
             Settings::mcp_pagination()?,
             catalog_refresh,
@@ -124,7 +109,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_a2a_metrics(Settings::a2a_metrics()?)
         .with_uaid_settings(Settings::uaid_settings(a2a_enabled)?)
         .with_schema_validation(Settings::schema_validation()?)
-        .with_token_issuer(email_auth_enabled, issuer)
+        .with_token_issuer(email_auth_enabled, issuer.clone())
         .with_gateway_oauth(Settings::gateway_oauth()?)
         .with_virtual_server_base(Settings::virtual_server_base()?)
         .with_export_settings(settings.export_settings()?)
@@ -141,6 +126,22 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_proxy_catalog(settings.proxy_catalog()?)
         .with_listen_settings(Settings::mcp_listen_settings(shutdown.clone())?),
     );
+    let accounts = match issuer
+        .as_ref()
+        .filter(|_| email_auth_enabled && catalog_available)
+    {
+        Some(issuer) => {
+            local_auth::router(
+                database.clone(),
+                access.clone(),
+                issuer.clone(),
+                Settings::local_accounts()?,
+                service.clone(),
+            )
+            .await?
+        }
+        None => axum::Router::new(),
+    };
     let mut http_options = settings.mcp_http_options()?;
     if let Some(settings) = &mut http_options.sessions {
         settings.shutdown = shutdown.clone();

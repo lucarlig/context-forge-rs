@@ -83,7 +83,7 @@ impl Database {
         &self,
         scope: CatalogScope<'_>,
         filter: CatalogEntryFilters<'_>,
-        templates: bool,
+        templates: Option<bool>,
     ) -> Result<Vec<ResourceRecord>, sqlx::Error> {
         fetch_catalog_entries!(
             self,
@@ -91,7 +91,7 @@ impl Database {
             scope,
             filter,
             resource_select!(),
-            "(r.uri_template IS NOT NULL) = $13",
+            "(CAST($14 AS BOOLEAN) IS NULL OR (r.uri_template IS NOT NULL) = $14)",
             templates
         )
     }
@@ -108,7 +108,7 @@ impl Database {
             scope,
             CatalogEntryFilters::associated(inactive),
             resource_select!(),
-            "EXISTS(SELECT 1 FROM server_resource_association a WHERE a.server_id=$13 AND a.resource_id=r.id)",
+            "EXISTS(SELECT 1 FROM server_resource_association a WHERE a.server_id=$14 AND a.resource_id=r.id)",
             server
         )
     }
