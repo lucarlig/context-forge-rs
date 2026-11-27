@@ -373,7 +373,9 @@ async fn register(
         "token_endpoint_auth_method":settings.auth_method, "application_type":application_type,
         "scope":scope,
     });
-    let response: RegistrationResponse = upstream.oauth_document(endpoint, Some(&form)).await?;
+    let response: RegistrationResponse = upstream
+        .oauth_document(endpoint, None, None, Some(&form))
+        .await?;
     if response.client_id.is_empty()
         || response.client_id.len() > 500
         || response

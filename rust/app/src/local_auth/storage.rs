@@ -58,7 +58,8 @@ pub(super) struct NewUser {
     pub(super) full_name: Option<String>,
     pub(super) is_admin: bool,
     pub(super) is_active: bool,
-    pub(super) password_hash: String,
+    pub(super) password_hash: Option<String>,
+    pub(super) auth_provider: String,
     pub(super) password_change_required: bool,
     pub(super) granted_by: Option<String>,
     pub(super) admin_origin: Option<&'static str>,
@@ -129,9 +130,10 @@ const CREATE_LOCAL_USER: &str = "INSERT INTO email_users
     (id,email,password_hash,full_name,is_admin,is_active,auth_provider,admin_origin,
      password_hash_type,failed_login_attempts,password_change_required,
      email_verified_at,password_changed_at,created_at,updated_at)
-    VALUES($1,$2,$3,$4,$5,$6,'local',$7,'argon2id',0,$8,
+    VALUES($1,$2,$3,$4,$5,$6,$10,$7,'argon2id',0,$8,
         CASE WHEN $9 THEN CURRENT_TIMESTAMP ELSE NULL END,
-        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+        CASE WHEN $3 IS NOT NULL THEN CURRENT_TIMESTAMP ELSE NULL END,
+        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
     ON CONFLICT(email) DO NOTHING";
 
 const INSERT_PERSONAL_TEAM: &str = "INSERT INTO email_teams
@@ -271,9 +273,9 @@ impl Database {
         macro_rules! create {
             ($tx:ident,$permissions:literal) => {{
                 let inserted=sqlx::query(CREATE_LOCAL_USER).bind(Uuid::new_v4().to_string())
-                    .bind(&user.email).bind(&user.password_hash).bind(user.full_name.as_deref())
+                    .bind(&user.email).bind(user.password_hash.as_deref()).bind(user.full_name.as_deref())
                     .bind(user.is_admin).bind(user.is_active).bind(user.admin_origin)
-                    .bind(user.password_change_required).bind(user.granted_by.is_some())
+                    .bind(user.password_change_required).bind(user.granted_by.is_some()).bind(&user.auth_provider)
                     .execute(&mut *$tx).await?;
                 if inserted.rows_affected()==0 {
                     return Ok(false);

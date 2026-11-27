@@ -45,6 +45,20 @@ CREATE TABLE IF NOT EXISTS sso_providers (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS sso_auth_sessions (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    provider_id VARCHAR(50) NOT NULL REFERENCES sso_providers(id) ON DELETE CASCADE,
+    state VARCHAR(128) NOT NULL UNIQUE,
+    code_verifier VARCHAR(128),
+    nonce VARCHAR(128),
+    redirect_uri VARCHAR(500) NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    user_email VARCHAR(255) REFERENCES email_users(email),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sso_auth_sessions_expiration ON sso_auth_sessions(expires_at);
+
 CREATE TABLE IF NOT EXISTS email_teams (
     id VARCHAR(36) PRIMARY KEY NOT NULL,
     name VARCHAR(255) NOT NULL,

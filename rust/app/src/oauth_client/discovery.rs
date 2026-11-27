@@ -44,22 +44,25 @@ impl IssuerMetadataCache {
         let origin = base.origin().ascii_serialization();
         let path = base.path().trim_end_matches('/');
         let rfc8414 = format!("{origin}/.well-known/oauth-authorization-server{path}");
-        let metadata: IssuerMetadata = match upstream.oauth_document(&rfc8414, None).await {
-            Ok(metadata) => metadata,
-            Err(
-                UpstreamError::Status(400..=599)
-                | UpstreamError::Transport
-                | UpstreamError::Timeout,
-            ) => {
-                upstream
-                    .oauth_document(
-                        &format!("{origin}{path}/.well-known/openid-configuration"),
-                        None,
-                    )
-                    .await?
-            }
-            Err(error) => return Err(error),
-        };
+        let metadata: IssuerMetadata =
+            match upstream.oauth_document(&rfc8414, None, None, None).await {
+                Ok(metadata) => metadata,
+                Err(
+                    UpstreamError::Status(400..=599)
+                    | UpstreamError::Transport
+                    | UpstreamError::Timeout,
+                ) => {
+                    upstream
+                        .oauth_document(
+                            &format!("{origin}{path}/.well-known/openid-configuration"),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
         if metadata.issuer.trim_end_matches('/') != issuer {
             return Err(UpstreamError::InvalidResponse);
         }

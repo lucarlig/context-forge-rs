@@ -1059,17 +1059,22 @@ impl UpstreamClient {
     pub(crate) async fn oauth_document<T: DeserializeOwned>(
         &self,
         endpoint: &str,
+        tls: Option<&TlsMaterial>,
+        authorization: Option<&HeaderValue>,
         body: Option<&Value>,
     ) -> Result<T, UpstreamError> {
         timeout_at(self.deadline()?, async {
-            let (client, url) = self.pinned_client(endpoint, None, None).await?;
-            let request = match body {
+            let (client, url) = self.pinned_client(endpoint, tls, None).await?;
+            let mut request = match body {
                 Some(body) => client
                     .post(url)
                     .header(CONTENT_TYPE, "application/json")
                     .body(body.to_string()),
                 None => client.get(url),
             };
+            if let Some(authorization) = authorization {
+                request = request.header(AUTHORIZATION, authorization.clone());
+            }
             let response = request.header(ACCEPT, "application/json").send().await?;
             let status = response.status().as_u16();
             if status != 200 && (body.is_none() || status != 201) {

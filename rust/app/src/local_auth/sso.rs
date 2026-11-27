@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod flow;
+mod oidc;
 mod providers;
 
 use std::collections::HashSet;
@@ -11,13 +13,22 @@ pub(crate) struct SsoSettings {
     pub(crate) upstream: UpstreamClient,
     pub(crate) vault: Option<SecretEnvelope>,
     pub(crate) allowed_issuers: HashSet<String>,
+    pub(crate) binding_key: Option<ring::hmac::Key>,
+    pub(crate) app_domain: url::Url,
+    pub(crate) allowed_origins: HashSet<String>,
+    pub(crate) root_path: String,
+    pub(crate) secure_cookies: bool,
+    pub(crate) same_site: String,
 }
 
 pub(super) fn routers() -> (Router<Arc<Accounts>>, Router<Arc<Accounts>>) {
     let mut public = Router::new();
     let mut protected = Router::new();
     for base in ["/auth/sso", "/v1/auth/sso"] {
-        public = public.route(&format!("{base}/providers"), get(providers::public_list));
+        public = public
+            .route(&format!("{base}/providers"), get(providers::public_list))
+            .route(&format!("{base}/login/{{id}}"), get(flow::login))
+            .route(&format!("{base}/callback/{{id}}"), get(flow::callback));
         protected = protected
             .route(
                 &format!("{base}/admin/providers"),

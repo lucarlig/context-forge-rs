@@ -162,7 +162,8 @@ pub async fn router(
                 full_name: Some(state.settings.bootstrap_name.clone()),
                 is_admin: true,
                 is_active: true,
-                password_hash,
+                password_hash: Some(password_hash),
+                auth_provider: "local".to_owned(),
                 password_change_required,
                 granted_by: Some(bootstrap_email),
                 admin_origin: Some("bootstrap"),
@@ -511,7 +512,8 @@ async fn create_account(
         full_name: input.full_name,
         is_admin: input.is_admin,
         is_active: input.is_active.unwrap_or(true),
-        password_hash: hash,
+        password_hash: Some(hash),
+        auth_provider: "local".to_owned(),
         password_change_required: require_change,
         granted_by: actor.map(str::to_owned),
         admin_origin: input.is_admin.then_some("api"),
@@ -684,13 +686,39 @@ async fn session_response(
     user: &storage::LocalUser,
     set_csrf: bool,
 ) -> Result<Response, AccountError> {
+    let (token, jti, now) = issue_local_session(accounts, user).await?;
+    let mut response = Json(json!({
+        "access_token":token.as_str(),
+        "token_type":"bearer",
+        "expires_in":accounts.settings.token_seconds,
+        "user":user.metadata(),
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if set_csrf && let Some(cookie) = csrf_cookie(&accounts.settings, &user.email, &jti, now) {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    Ok(response)
+}
+
+async fn issue_local_session(
+    accounts: &Accounts,
+    user: &storage::LocalUser,
+) -> Result<(Zeroizing<String>, String, i64), AccountError> {
     let now = Timestamp::now().as_second();
     let jti = Uuid::new_v4().to_string();
     let expires = now + accounts.settings.token_seconds;
+    let permissions = if user.auth_provider == "local" || user.is_admin {
+        &["*"][..]
+    } else {
+        &[][..]
+    };
     let claims = json!({
         "sub":user.id, "jti":jti, "iat":now, "exp":expires, "last_activity":now,
         "token_use":"session", "auth_provider":user.auth_provider,
-        "scopes":{"server_id":null,"permissions":["*"],"ip_restrictions":[],"time_restrictions":{}},
+        "scopes":{"server_id":null,"permissions":permissions,"ip_restrictions":[],"time_restrictions":{}},
     });
     let token = Zeroizing::new(
         accounts
@@ -708,20 +736,7 @@ async fn session_response(
             "Invalid authentication credentials",
         ));
     }
-    let mut response = Json(json!({
-        "access_token":token.as_str(),
-        "token_type":"bearer",
-        "expires_in":accounts.settings.token_seconds,
-        "user":user.metadata(),
-    }))
-    .into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if set_csrf && let Some(cookie) = csrf_cookie(&accounts.settings, &user.email, &jti, now) {
-        response.headers_mut().append(header::SET_COOKIE, cookie);
-    }
-    Ok(response)
+    Ok((token, jti, now))
 }
 
 fn csrf_cookie(

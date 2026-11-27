@@ -192,33 +192,33 @@ pub(super) struct CreateProvider {
     config: ProviderConfig,
 }
 
-#[derive(Deserialize, Serialize, sqlx::FromRow)]
-struct ProviderConfig {
+#[derive(Deserialize, Serialize, PartialEq, sqlx::FromRow)]
+pub(super) struct ProviderConfig {
     name: String,
     display_name: String,
-    provider_type: String,
+    pub(super) provider_type: String,
     #[serde(default = "yes")]
-    is_enabled: bool,
-    client_id: String,
-    authorization_url: String,
-    token_url: String,
-    userinfo_url: String,
-    issuer: Option<String>,
-    jwks_uri: Option<String>,
-    ca_certificate: Option<String>,
+    pub(super) is_enabled: bool,
+    pub(super) client_id: String,
+    pub(super) authorization_url: String,
+    pub(super) token_url: String,
+    pub(super) userinfo_url: String,
+    pub(super) issuer: Option<String>,
+    pub(super) jwks_uri: Option<String>,
+    pub(super) ca_certificate: Option<String>,
     #[serde(default)]
     trusted_for_api_auth: bool,
     api_audience: Option<String>,
     #[serde(default)]
-    trusted_domains: DbJson<Vec<String>>,
+    pub(super) trusted_domains: DbJson<Vec<String>>,
     #[serde(default = "default_scope")]
-    scope: String,
+    pub(super) scope: String,
     #[serde(default = "yes")]
-    auto_create_users: bool,
+    pub(super) auto_create_users: bool,
     #[serde(default)]
     team_mapping: DbJson<Map<String, Value>>,
     #[serde(default)]
-    provider_metadata: DbJson<Map<String, Value>>,
+    pub(super) provider_metadata: DbJson<Map<String, Value>>,
 }
 
 fn yes() -> bool {
@@ -294,13 +294,13 @@ impl SsoSettings {
 }
 
 #[derive(sqlx::FromRow)]
-struct Provider {
-    id: String,
+pub(super) struct Provider {
+    pub(super) id: String,
     #[sqlx(flatten)]
-    config: ProviderConfig,
-    client_secret_encrypted: String,
+    pub(super) config: ProviderConfig,
+    pub(super) client_secret_encrypted: String,
     created_at: String,
-    updated_at: String,
+    pub(super) updated_at: String,
 }
 
 impl Provider {
@@ -390,11 +390,13 @@ const LIST: &str = concat!(
     provider_columns!(),
     " FROM sso_providers ORDER BY created_at,id"
 );
-const WRITE: &str = concat!(
+macro_rules! write_sql {
+    ($stamp:literal) => { concat!(
     "INSERT INTO sso_providers(id,name,display_name,provider_type,is_enabled,client_id,client_secret_encrypted,
        authorization_url,token_url,userinfo_url,issuer,jwks_uri,ca_certificate,trusted_for_api_auth,
-       api_audience,trusted_domains,scope,auto_create_users,team_mapping,provider_metadata)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+       api_audience,trusted_domains,scope,auto_create_users,team_mapping,provider_metadata,created_at,updated_at)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,",
+     $stamp, ",", $stamp, ")
      ON CONFLICT(id) DO UPDATE SET name=excluded.name,display_name=excluded.display_name,
        provider_type=excluded.provider_type,is_enabled=excluded.is_enabled,client_id=excluded.client_id,
        client_secret_encrypted=excluded.client_secret_encrypted,authorization_url=excluded.authorization_url,
@@ -402,14 +404,18 @@ const WRITE: &str = concat!(
        ca_certificate=excluded.ca_certificate,trusted_for_api_auth=excluded.trusted_for_api_auth,
        api_audience=excluded.api_audience,trusted_domains=excluded.trusted_domains,scope=excluded.scope,
        auto_create_users=excluded.auto_create_users,team_mapping=excluded.team_mapping,
-       provider_metadata=excluded.provider_metadata,updated_at=CURRENT_TIMESTAMP
+       provider_metadata=excluded.provider_metadata,updated_at=excluded.updated_at
      WHERE $21 RETURNING ", provider_columns!()
-);
+    ) };
+}
+
+const SQLITE_WRITE: &str = write_sql!("$22");
+const POSTGRES_WRITE: &str = write_sql!("CAST(CAST($22 AS TEXT) AS TIMESTAMPTZ)");
 
 macro_rules! bind_provider {
-    ($id:expr,$config:expr,$secret:expr,$update:expr) => {{
+    ($sql:ident,$id:expr,$config:expr,$secret:expr,$update:expr) => {{
         let config = $config;
-        sqlx::query_as::<_, Provider>(WRITE)
+        sqlx::query_as::<_, Provider>($sql)
             .bind($id)
             .bind(&config.name)
             .bind(&config.display_name)
@@ -431,6 +437,7 @@ macro_rules! bind_provider {
             .bind(&config.team_mapping)
             .bind(&config.provider_metadata)
             .bind($update)
+            .bind(Timestamp::now().to_string())
     }};
 }
 
@@ -452,7 +459,7 @@ impl Database {
         }
     }
 
-    async fn sso_provider(&self, id: &str) -> Result<Option<Provider>, sqlx::Error> {
+    pub(super) async fn sso_provider(&self, id: &str) -> Result<Option<Provider>, sqlx::Error> {
         match self {
             Self::Sqlite(pool) => sqlx::query_as(GET).bind(id).fetch_optional(pool).await,
             Self::Postgres(pool) => sqlx::query_as(GET).bind(id).fetch_optional(pool).await,
@@ -467,12 +474,12 @@ impl Database {
     ) -> Result<Option<Provider>, sqlx::Error> {
         match self {
             Self::Sqlite(pool) => {
-                bind_provider!(id, config, secret, false)
+                bind_provider!(SQLITE_WRITE, id, config, secret, false)
                     .fetch_optional(pool)
                     .await
             }
             Self::Postgres(pool) => {
-                bind_provider!(id, config, secret, false)
+                bind_provider!(POSTGRES_WRITE, id, config, secret, false)
                     .fetch_optional(pool)
                     .await
             }
@@ -487,7 +494,7 @@ impl Database {
         settings: &SsoSettings,
     ) -> Result<Option<Provider>, AccountError> {
         macro_rules! update {
-            ($tx:ident,$query:expr) => {{
+            ($tx:ident,$query:expr,$sql:ident) => {{
                 let Some(mut provider) = sqlx::query_as::<_, Provider>($query)
                     .bind(id)
                     .fetch_optional(&mut *$tx)
@@ -497,6 +504,7 @@ impl Database {
                 };
                 provider.apply_patch(patch, secret, settings)?;
                 let updated = bind_provider!(
+                    $sql,
                     id,
                     &provider.config,
                     &provider.client_secret_encrypted,
@@ -504,6 +512,10 @@ impl Database {
                 )
                 .fetch_one(&mut *$tx)
                 .await?;
+                sqlx::query("DELETE FROM sso_auth_sessions WHERE provider_id=$1")
+                    .bind(id)
+                    .execute(&mut *$tx)
+                    .await?;
                 $tx.commit().await?;
                 Ok(Some(updated))
             }};
@@ -511,29 +523,44 @@ impl Database {
         match self {
             Self::Sqlite(pool) => {
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-                update!(tx, GET)
+                update!(tx, GET, SQLITE_WRITE)
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                update!(tx, GET_FOR_UPDATE)
+                update!(tx, GET_FOR_UPDATE, POSTGRES_WRITE)
             }
         }
     }
 
     async fn delete_sso_provider(&self, id: &str) -> Result<bool, sqlx::Error> {
-        const SQL: &str = "DELETE FROM sso_providers WHERE id=$1";
-        let rows = match self {
-            Self::Sqlite(pool) => sqlx::query(SQL)
-                .bind(id)
-                .execute(pool)
-                .await?
-                .rows_affected(),
-            Self::Postgres(pool) => sqlx::query(SQL)
-                .bind(id)
-                .execute(pool)
-                .await?
-                .rows_affected(),
-        };
-        Ok(rows != 0)
+        macro_rules! delete {
+            ($tx:ident) => {{
+                sqlx::query("DELETE FROM sso_auth_sessions WHERE provider_id=$1")
+                    .bind(id)
+                    .execute(&mut *$tx)
+                    .await?;
+                let rows = sqlx::query("DELETE FROM sso_providers WHERE id=$1")
+                    .bind(id)
+                    .execute(&mut *$tx)
+                    .await?
+                    .rows_affected();
+                $tx.commit().await?;
+                Ok(rows != 0)
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                delete!(tx)
+            }
+            Self::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                sqlx::query("SELECT id FROM sso_providers WHERE id=$1 FOR UPDATE")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                delete!(tx)
+            }
+        }
     }
 }

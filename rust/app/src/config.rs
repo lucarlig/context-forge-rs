@@ -466,8 +466,12 @@ impl Settings {
             return Ok(None);
         }
         let kdf = Self::secret_kdf()?;
-        let vault = Self::auth_encryption_secret()?.map(|secret| {
-            let mut vault = crate::secret_envelope::SecretEnvelope::new(&secret);
+        let secret = Self::auth_encryption_secret()?.map(zeroize::Zeroizing::new);
+        let binding_key = secret
+            .as_ref()
+            .map(|secret| ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes()));
+        let vault = secret.as_ref().map(|secret| {
+            let mut vault = crate::secret_envelope::SecretEnvelope::new(secret);
             vault.kdf = kdf;
             vault
         });
@@ -475,6 +479,13 @@ impl Settings {
             upstream: Self::upstream_client()?,
             vault,
             allowed_issuers: allowlist("SSO_ISSUERS")?,
+            binding_key,
+            app_domain: url::Url::parse(&value("APP_DOMAIN", "http://localhost:4444")?)?,
+            allowed_origins: allowlist("ALLOWED_ORIGINS")?,
+            root_path: value("APP_ROOT_PATH", "")?.trim_end_matches('/').to_owned(),
+            secure_cookies: flag("SECURE_COOKIES")?.unwrap_or(true)
+                || value("ENVIRONMENT", "development")? == "production",
+            same_site: value("COOKIE_SAMESITE", "lax")?,
         }))
     }
 
