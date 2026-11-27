@@ -1626,10 +1626,26 @@ pub(crate) fn catalog_event_capabilities() -> ServerCapabilities {
     capabilities
 }
 
+pub(crate) struct RelayContext {
+    headers: HeaderMap,
+    correlation: Option<crate::http_boundary::Correlation>,
+}
+
+impl RelayContext {
+    pub(crate) async fn capture(gateway: &GatewayService, request: Request) -> Self {
+        let (parts, _) = request.into_parts();
+        Self {
+            headers: gateway.relay_headers(&parts.headers).await,
+            correlation: parts.extensions.get().cloned(),
+        }
+    }
+}
+
 pub(crate) async fn legacy_transport_reply(
     service: &Arc<GatewayService>,
     principal: Option<&Principal>,
     server: Option<&CatalogServer>,
+    relay: &RelayContext,
     mut request: Value,
 ) -> Option<Value> {
     let method = request["method"].as_str()?;
@@ -1672,9 +1688,13 @@ pub(crate) async fn legacy_transport_reply(
         None,
         request,
         false,
-        None,
-    )
-    .await;
+        (!relay.headers.is_empty()).then(|| relay.headers.clone()),
+    );
+    let id_for_request = relay
+        .correlation
+        .as_ref()
+        .map(|settings| settings.resolve(&relay.headers));
+    let reply = crate::http_boundary::with_correlation(id_for_request, Box::pin(reply)).await;
     let payload = match to_bytes(reply.into_body(), MAX_REQUEST_BODY_BYTES * 2).await {
         Ok(body) => serde_json::from_slice::<Value>(&body).ok(),
         Err(_) => None,

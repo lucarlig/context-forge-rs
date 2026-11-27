@@ -112,8 +112,12 @@ Eleven outbound Rust Anything cases match the pinned gateway for legacy and
 modern Streamable HTTP tool calls, A2A invocations, MCP-generated A2A tools,
 and UAID peers. The active ID uses the standard `X-Correlation-ID` outbound
 header even when the client-facing header name changes. Pooled MCP sessions
-keep per-request IDs out of connection headers. Correlation for calls relayed
-over the legacy SSE and WebSocket entry points remains open.
+keep per-request IDs out of connection headers.
+
+Twelve live relay cases match legacy SSE and WebSocket correlation behavior.
+Each command receives its own ID unless preservation is enabled and a
+passthrough rule admits the opening request's ID. Both relays capture allowed
+headers at connection setup and exclude gateway identity and routing headers.
 
 ## Gateway and protocol verification
 

@@ -455,6 +455,12 @@ impl GatewayService {
         self.header_forwarding.enabled
     }
 
+    pub(crate) async fn relay_headers(&self, incoming: &HeaderMap) -> HeaderMap {
+        self.header_forwarding
+            .for_relay(&self.database, incoming)
+            .await
+    }
+
     pub fn with_identity_forwarding(mut self, forwarding: IdentityForwarding) -> Self {
         self.identity_forwarding = forwarding;
         self

@@ -200,10 +200,24 @@ async fn limit_headers(
 }
 
 #[derive(Clone)]
-struct Correlation {
+pub(crate) struct Correlation {
     name: HeaderName,
     preserve: bool,
     respond: bool,
+}
+
+impl Correlation {
+    pub(crate) fn resolve(&self, headers: &HeaderMap) -> CorrelationId {
+        let incoming = headers
+            .get(&self.name)
+            .filter(|_| self.preserve)
+            .map(|value| value.as_bytes().trim_ascii())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| HeaderValue::from_bytes(value).ok());
+        CorrelationId(incoming.unwrap_or_else(|| {
+            HeaderValue::from_str(&Uuid::new_v4().simple().to_string()).expect("UUID is ASCII")
+        }))
+    }
 }
 
 #[derive(Clone)]
@@ -235,22 +249,14 @@ async fn correlate(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let incoming = request
-        .headers()
-        .get(&settings.name)
-        .filter(|_| settings.preserve)
-        .map(|value| value.as_bytes().trim_ascii())
-        .filter(|value| !value.is_empty())
-        .and_then(|value| HeaderValue::from_bytes(value).ok());
-    let id = incoming.unwrap_or_else(|| {
-        HeaderValue::from_str(&Uuid::new_v4().simple().to_string()).expect("UUID is ASCII")
-    });
-    let correlation = CorrelationId(id.clone());
+    let correlation = settings.resolve(request.headers());
+    let id = correlation.0.clone();
+    request.extensions_mut().insert(settings.clone());
     request.extensions_mut().insert(correlation.clone());
     let span = tracing::info_span!("request", request_id = ?id, method = %request.method());
     let mut response =
         with_correlation(Some(correlation), next.run(request).instrument(span)).await;
-    if settings.respond {
+    if settings.respond && response.status() != StatusCode::SWITCHING_PROTOCOLS {
         response.headers_mut().insert(settings.name, id);
     }
     response

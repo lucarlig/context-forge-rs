@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::{
     access,
     gateway::GatewayService,
-    mcp::{MAX_REQUEST_BODY_BYTES, legacy_transport_reply},
+    mcp::{MAX_REQUEST_BODY_BYTES, RelayContext, legacy_transport_reply},
     tokens::TokenRequest,
 };
 
@@ -74,9 +74,10 @@ async fn open(
         return StatusCode::FORBIDDEN.into_response();
     }
     let headers = request.headers().clone();
+    let context = RelayContext::capture(&state.gateway, request).await;
     upgrade
         .max_message_size(MAX_REQUEST_BODY_BYTES)
-        .on_upgrade(move |socket| relay(socket, state, headers, peer))
+        .on_upgrade(move |socket| relay(socket, state, headers, peer, context))
 }
 
 async fn relay(
@@ -84,6 +85,7 @@ async fn relay(
     state: Arc<WebSocketState>,
     headers: HeaderMap,
     peer: Option<IpAddr>,
+    context: RelayContext,
 ) {
     let run = async {
         while let Some(Ok(message)) = socket.recv().await {
@@ -101,7 +103,7 @@ async fn relay(
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
             };
-            let Some(reply) = respond(&state, &headers, peer, &text).await else {
+            let Some(reply) = respond(&state, &headers, peer, &context, &text).await else {
                 break;
             };
             if socket.send(Message::Text(reply.into())).await.is_err() {
@@ -120,6 +122,7 @@ async fn respond(
     state: &WebSocketState,
     headers: &HeaderMap,
     peer: Option<IpAddr>,
+    context: &RelayContext,
     text: &str,
 ) -> Option<String> {
     let Ok(mut request) = serde_json::from_str::<Value>(text) else {
@@ -223,9 +226,15 @@ async fn respond(
     let mut reply = if notification {
         json!({"jsonrpc":"2.0","id":id,"result":{}})
     } else {
-        legacy_transport_reply(&state.gateway, principal.as_ref(), server.as_ref(), request)
-            .await
-            .unwrap_or_else(|| invalid_request(id))
+        legacy_transport_reply(
+            &state.gateway,
+            principal.as_ref(),
+            server.as_ref(),
+            context,
+            request,
+        )
+        .await
+        .unwrap_or_else(|| invalid_request(id))
     };
     if reply["error"]["code"] == -32601 {
         reply["error"] =

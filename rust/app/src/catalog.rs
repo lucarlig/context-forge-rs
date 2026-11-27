@@ -1658,6 +1658,17 @@ impl Database {
         };
         Ok(headers.flatten())
     }
+
+    pub(crate) async fn gateway_passthrough_header_lists(
+        &self,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        const QUERY: &str = "SELECT DISTINCT CAST(passthrough_headers AS TEXT)
+                             FROM gateways WHERE passthrough_headers IS NOT NULL";
+        match self {
+            Self::Sqlite(pool) => sqlx::query_scalar(QUERY).fetch_all(pool).await,
+            Self::Postgres(pool) => sqlx::query_scalar(QUERY).fetch_all(pool).await,
+        }
+    }
 }
 
 pub(crate) fn visible_team_ids(scope: CatalogScope<'_>) -> Result<String, sqlx::Error> {

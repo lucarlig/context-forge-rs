@@ -33,7 +33,7 @@ use crate::{
     gateway::GatewayService,
     legacy_sse_cache::{Access, CacheResult, RedisQueue, Scope, SharedQueue},
     legacy_sse_database::DatabaseQueue,
-    mcp::{MAX_REQUEST_BODY_BYTES, legacy_transport_reply},
+    mcp::{MAX_REQUEST_BODY_BYTES, RelayContext, legacy_transport_reply},
     redis_sessions::RedisSessionDirectory,
 };
 
@@ -161,6 +161,7 @@ async fn open(State(state): State<Arc<SseState>>, request: Request) -> Response 
     let Ok(permit) = state.capacity.clone().try_acquire_owned() else {
         return detail(StatusCode::SERVICE_UNAVAILABLE, "SSE connection failed");
     };
+    let relay = RelayContext::capture(&state.gateway, request).await;
     let (outbox, outgoing) = mpsc::channel(QUEUE_LENGTH);
     let cancel = state.settings.shutdown.child_token();
     let connection = StreamConnection {
@@ -202,6 +203,7 @@ async fn open(State(state): State<Arc<SseState>>, request: Request) -> Response 
         connection.state.gateway.clone(),
         principal,
         server,
+        relay,
         connection.cancel.clone(),
         inbox,
         outbox,
@@ -422,6 +424,7 @@ async fn respond(
     gateway: Arc<GatewayService>,
     principal: Option<Principal>,
     server: Option<CatalogServer>,
+    relay: RelayContext,
     cancel: CancellationToken,
     mut incoming: Inbox,
     outgoing: mpsc::Sender<Value>,
@@ -429,9 +432,14 @@ async fn respond(
     let run = async {
         while let Some(request) = incoming.receive().await {
             let initialized = request["method"] == "initialize";
-            let Some(reply) =
-                legacy_transport_reply(&gateway, principal.as_ref(), server.as_ref(), request)
-                    .await
+            let Some(reply) = legacy_transport_reply(
+                &gateway,
+                principal.as_ref(),
+                server.as_ref(),
+                &relay,
+                request,
+            )
+            .await
             else {
                 continue;
             };
