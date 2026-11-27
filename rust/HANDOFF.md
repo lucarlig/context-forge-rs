@@ -175,8 +175,14 @@ when output validation fails. The replays cover 53 invocation scenarios on
 SQLite and PostgreSQL, including nested error paths, local schema references,
 older schema drafts, regex subject limits, and malformed HTTP responses. They
 also compare catalog schemas and result shaping for 2025 and 2026 clients.
-Rust validates offline with native regex limits. The reference sandbox's
-wall-clock timeout and unusual parser diagnostics still need parity checks.
+REST calls and dry-run previews validate schemas with `pattern` or
+`patternProperties` in isolated Rust workers. `REGEX_WORKERS` limits
+concurrency, `REGEX_MAX_SUBJECT_BYTES` limits the validation input, and
+`REGEX_TIMEOUT_SECONDS` covers worker startup and execution. The replay
+compared timeout and size-limit errors and verified that saturated requests
+stop before dispatch on SQLite and PostgreSQL. The worker slot remains
+available for the next request after validation finishes. Unusual response
+parser diagnostics still need parity checks.
 
 Authenticated `POST /rpc` and `POST /rpc/` serve tool calls, legacy tool
 names, catalog reads, resource reads, prompt retrieval, and initialization.

@@ -18,10 +18,15 @@ use tracing_subscriber::{
 };
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    if std::env::args().nth(1).as_deref() == Some(context_forge_rs::response_filter::WORKER_ARG) {
-        return context_forge_rs::response_filter::worker().map_err(Into::into);
+    match std::env::args().nth(1).as_deref() {
+        Some(context_forge_rs::response_filter::WORKER_ARG) => {
+            context_forge_rs::response_filter::worker().map_err(Into::into)
+        }
+        Some(context_forge_rs::schema_validation::WORKER_ARG) => {
+            context_forge_rs::schema_validation::worker().map_err(Into::into)
+        }
+        _ => run(),
     }
-    run()
 }
 
 #[tokio::main]
@@ -109,7 +114,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_tool_preview(Settings::tool_preview_enabled()?)
         .with_response_filters(Settings::response_filters()?)
         .with_rest_tool_limits(rest_timeout, rest_response_text_limit)
-        .with_regex_max_subject_bytes(Settings::regex_max_subject_bytes()?)
+        .with_schema_validation(Settings::schema_validation()?)
         .with_token_issuer(email_auth_enabled, issuer)
         .with_gateway_oauth(Settings::gateway_oauth()?)
         .with_virtual_server_base(Settings::virtual_server_base()?)

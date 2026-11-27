@@ -136,7 +136,7 @@ pub struct GatewayService {
     response_filters: crate::response_filter::ResponseFilters,
     rest_timeout: Duration,
     rest_response_text_limit: usize,
-    regex_max_subject_bytes: usize,
+    schema_validation: crate::schema_validation::SchemaValidation,
     openapi: openapi::Documents,
     export: ExportSettings,
     imports: import_api::Imports,
@@ -243,7 +243,7 @@ impl GatewayService {
             response_filters: crate::response_filter::ResponseFilters::default(),
             rest_timeout: Duration::from_secs(60),
             rest_response_text_limit: 5000,
-            regex_max_subject_bytes: 262_144,
+            schema_validation: crate::schema_validation::SchemaValidation::default(),
             openapi: openapi::Documents::default(),
             export: ExportSettings::default(),
             imports: import_api::Imports::default(),
@@ -269,8 +269,11 @@ impl GatewayService {
         self
     }
 
-    pub fn with_regex_max_subject_bytes(mut self, bytes: usize) -> Self {
-        self.regex_max_subject_bytes = bytes;
+    pub fn with_schema_validation(
+        mut self,
+        validation: crate::schema_validation::SchemaValidation,
+    ) -> Self {
+        self.schema_validation = validation;
         self
     }
 

@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    io::{self, Read},
-    process::Stdio,
-    sync::Arc,
-    time::Duration,
-};
+use std::{io, sync::Arc, time::Duration};
 
+use crate::process_sandbox::{self, ProcessSandbox, SandboxError};
 use cel::{Context, Env, ExecutionError, RuntimeOptions, Value as CelValue, objects::Key};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    sync::Semaphore,
-    time::timeout,
-};
 
 #[doc(hidden)]
 pub const WORKER_ARG: &str = "--cel-response-filter-worker";
@@ -24,8 +14,7 @@ const MAX_PACKET: usize = 4 * 1024 * 1024 + 64 * 1024;
 const MAX_ITERATIONS: u64 = 100_000;
 
 pub struct ResponseFilters {
-    workers: Semaphore,
-    timeout: Duration,
+    sandbox: ProcessSandbox,
 }
 
 #[derive(Debug, Serialize, Deserialize, thiserror::Error)]
@@ -76,8 +65,7 @@ impl Default for ResponseFilters {
 impl ResponseFilters {
     pub(crate) fn new(workers: usize, timeout: Duration) -> Self {
         Self {
-            workers: Semaphore::new(workers),
-            timeout,
+            sandbox: ProcessSandbox::new(workers, timeout),
         }
     }
 
@@ -112,92 +100,25 @@ impl ResponseFilters {
         if expression.chars().count() > MAX_EXPRESSION || expression.starts_with(['.', '$']) {
             return Err(FilterError::Syntax);
         }
-        let _permit = self.workers.try_acquire().map_err(|_| FilterError::Busy)?;
         let job = input.map_or(Job::Check, Job::Evaluate);
-        let data = serde_json::to_vec(&Work {
+        let work = Work {
             expression: expression.to_owned(),
             job,
-        })
-        .map_err(|_| FilterError::Evaluation)?;
-        if data.len() > MAX_PACKET {
-            return Err(FilterError::Evaluation);
-        }
-        let bytes = timeout(self.timeout, exchange(&data))
+        };
+        self.sandbox
+            .run(WORKER_ARG, MAX_PACKET, work)
             .await
-            .map_err(|_| FilterError::Timeout)?
-            .map_err(|_| FilterError::Evaluation)?;
-        serde_json::from_slice(&bytes).map_err(|_| FilterError::Evaluation)?
+            .map_err(|error| match error {
+                SandboxError::Busy => FilterError::Busy,
+                SandboxError::Timeout => FilterError::Timeout,
+                SandboxError::Worker(_) => FilterError::Evaluation,
+            })?
     }
-}
-
-async fn exchange(data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut child = Command::new(std::env::current_exe()?)
-        .arg(WORKER_ARG)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut stdin = child.stdin.take().expect("piped worker input");
-    let mut stdout = child
-        .stdout
-        .take()
-        .expect("piped worker output")
-        .take(MAX_PACKET as u64 + 1);
-    let mut bytes = Vec::new();
-    tokio::try_join!(
-        async move { stdin.write_all(data).await },
-        stdout.read_to_end(&mut bytes),
-    )?;
-    if bytes.len() > MAX_PACKET || !child.wait().await?.success() {
-        return Err(io::Error::other("CEL response filter worker failed"));
-    }
-    Ok(bytes)
 }
 
 #[doc(hidden)]
 pub fn worker() -> io::Result<()> {
-    #[cfg(unix)]
-    limit_worker()?;
-    let mut bytes = Vec::new();
-    io::stdin()
-        .lock()
-        .take(MAX_PACKET as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_PACKET {
-        return Err(io::Error::other("CEL request exceeds its size limit"));
-    }
-    let work: Work = serde_json::from_slice(&bytes)?;
-    let reply = evaluate(work);
-    serde_json::to_writer(io::stdout().lock(), &reply)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn limit_worker() -> io::Result<()> {
-    let set_limit = |resource, ceiling| {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // The pointer addresses a live rlimit object through both system calls.
-        unsafe {
-            if libc::getrlimit(resource, &mut limit) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            limit.rlim_max = limit.rlim_max.min(ceiling);
-            limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
-            if libc::setrlimit(resource, &limit) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
-    };
-    set_limit(libc::RLIMIT_CORE, 0)?;
-    #[cfg(target_os = "linux")]
-    set_limit(libc::RLIMIT_AS, 256 * 1024 * 1024)?;
-    Ok(())
+    process_sandbox::worker(MAX_PACKET, evaluate)
 }
 
 fn evaluate(work: Work) -> Result<Value, FilterError> {

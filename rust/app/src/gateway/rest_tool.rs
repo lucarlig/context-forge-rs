@@ -11,6 +11,7 @@ use super::*;
 use crate::{
     catalog::RestTool,
     forward_headers::hop_header_name,
+    schema_validation::Target,
     sigv4::{SigV4Config, has_query_signature},
 };
 
@@ -41,14 +42,13 @@ pub(super) async fn execute(
     }) {
         let schema = input_schema.clone();
         let data = Value::Object(arguments.clone());
-        let limit = service.regex_max_subject_bytes;
-        let validation = tokio::task::spawn_blocking(move || {
-            diagnostics::validate(&schema, &data, diagnostics::Target::Input, limit)
-        })
-        .await;
+        let validation = service
+            .schema_validation
+            .validate(schema, data, Target::Input)
+            .await;
         match validation {
-            Ok(None) => {}
-            Ok(Some(error)) => {
+            Ok((_, None)) => {}
+            Ok((_, Some(error))) => {
                 return Err(ToolError::InvalidArguments(format!(
                     "Invalid arguments for tool '{}': {error}",
                     params.name
@@ -181,10 +181,8 @@ pub(super) async fn execute(
     };
     match result {
         Ok((status, body)) => Ok(response_result(
-            &service.response_filters,
+            service,
             &tool.response_filter,
-            service.rest_response_text_limit,
-            service.regex_max_subject_bytes,
             status,
             &body,
             tool.definition.output_schema.as_ref(),
@@ -590,10 +588,8 @@ fn multipart(headers: &mut HeaderMap, fields: Map<String, Value>) -> String {
 }
 
 async fn response_result(
-    filters: &crate::response_filter::ResponseFilters,
+    service: &GatewayService,
     expression: &str,
-    text_limit: usize,
-    regex_max_subject_bytes: usize,
     status: StatusCode,
     body: &[u8],
     output_schema: Option<&Value>,
@@ -601,6 +597,7 @@ async fn response_result(
     if status == StatusCode::NO_CONTENT {
         return text_result("Request completed successfully (No Content)", false);
     }
+    let text_limit = service.rest_response_text_limit;
     let text = String::from_utf8_lossy(body);
     let bounded: String = text.chars().take(text_limit).collect();
     let json_body: Result<Value, _> = serde_json::from_slice(body);
@@ -647,7 +644,7 @@ async fn response_result(
         Err(_) if body.is_empty() => json!({"error":"Empty response body"}),
         Err(_) => json!({"response_text":bounded}),
     };
-    let result = match filters.apply(expression, result).await {
+    let result = match service.response_filters.apply(expression, result).await {
         Ok(value) => value,
         Err(error) => return text_result(error.invocation_message(), true),
     };
@@ -680,18 +677,10 @@ async fn response_result(
             (!result.is_null()).then_some(&result)
         };
         if let Some(data) = data {
-            let data = data.clone();
-            let schema = schema.clone();
-            let validation = tokio::task::spawn_blocking(move || {
-                let error = diagnostics::validate(
-                    &schema,
-                    &data,
-                    diagnostics::Target::Output,
-                    regex_max_subject_bytes,
-                );
-                (data, error)
-            })
-            .await;
+            let validation = service
+                .schema_validation
+                .validate(schema.clone(), data.clone(), Target::Output)
+                .await;
             let Ok((data, error)) = validation else {
                 return text_result(
                     "Output validation error: REST validation could not complete",

@@ -145,12 +145,20 @@ impl Settings {
         Ok((timeout, chars))
     }
 
-    pub fn regex_max_subject_bytes() -> Result<usize, Box<dyn Error + Send + Sync>> {
+    pub fn schema_validation()
+    -> Result<crate::schema_validation::SchemaValidation, Box<dyn Error + Send + Sync>> {
+        let workers = parse("REGEX_WORKERS", 2)?;
+        let timeout = positive_seconds("REGEX_TIMEOUT_SECONDS", 1.0)?;
         let bytes = parse("REGEX_MAX_SUBJECT_BYTES", 262_144)?;
+        if !(1..=16).contains(&workers) || timeout > Duration::from_secs(60) {
+            return Err("invalid schema validation sandbox limits".into());
+        }
         if !(1024..=10_485_760).contains(&bytes) {
             return Err("invalid REGEX_MAX_SUBJECT_BYTES".into());
         }
-        Ok(bytes)
+        Ok(crate::schema_validation::SchemaValidation::new(
+            workers, timeout, bytes,
+        ))
     }
 
     pub fn response_filters()

@@ -242,17 +242,24 @@ async fn preview(
     }
     let schema = json_value(Some(&tool.input_schema));
     let arguments = Value::Object(input.arguments.unwrap_or_default());
-    let validator = jsonschema::options().offline().build(&schema);
-    let warnings = match validator {
-        Ok(validator) => validator.iter_errors(&arguments).next().map(
-            |error| json!({"code":"invalid_arguments", "hook":null,"message":error.to_string()}),
-        ),
-        Err(_) => Some(
-            json!({"code":"invalid_arguments", "hook":null,"message":"Invalid tool input schema"}),
-        ),
-    }
-    .into_iter()
-    .collect::<Vec<_>>();
+    let (arguments, warning) = if schema.is_null() {
+        (arguments, None)
+    } else {
+        service
+            .schema_validation
+            .validate(schema, arguments, crate::schema_validation::Target::Input)
+            .await
+            .map_err(|_| {
+                CatalogApiError::detail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Tool preview validation could not complete",
+                )
+            })?
+    };
+    let warnings = warning
+        .into_iter()
+        .map(|message| json!({"code":"invalid_arguments","hook":null,"message":message}))
+        .collect::<Vec<_>>();
     let annotations = json_value(tool.annotations.as_deref());
     Ok(Json(json!({
         "validated":warnings.is_empty(),
