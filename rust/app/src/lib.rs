@@ -6,6 +6,7 @@ pub mod auth;
 pub mod catalog;
 mod client_assertion;
 pub mod config;
+pub mod configuration_cli;
 pub mod credential_rotation;
 mod credentials;
 pub mod database;

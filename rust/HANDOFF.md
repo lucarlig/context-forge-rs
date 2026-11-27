@@ -71,6 +71,11 @@ Configuration import handles all six entity families, dry runs, job status,
 and cleanup at both API prefixes. Live checks cover scoped writes, conflict
 strategies, virtual-server tool links, and credential rekeying. [Import recordings](replay/export-import/import/README.md)
 
+The native configuration CLI matched the pinned command in the rust-anything
+round-trip replay. It exported a filtered bundle, previewed an import,
+applied only the selected tool, and returned exit code 1 for a failed item
+or missing authentication. The Rust check also verified Unix output mode `0600`.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

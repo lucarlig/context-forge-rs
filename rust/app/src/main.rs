@@ -25,6 +25,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             return context_forge_rs::credential_rotation::cli(args).await;
         }
         Some("migrate") => return schema::cli(args).await,
+        Some(command @ ("export" | "import")) => {
+            return context_forge_rs::configuration_cli::run(command, args).await;
+        }
         _ => {}
     }
     let (filter, handle) = reload::Layer::new(LevelFilter::INFO);

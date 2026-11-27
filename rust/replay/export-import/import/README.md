@@ -14,4 +14,4 @@ Rust applies only the selected entities. Job status and cleanup are scoped to th
 
 Virtual-server imports resolve visible tool IDs and names. Updates with no resolved tools preserve the existing links. An omitted instructions field preserves the override, and an explicit null clears it. [Pinned virtual-server outcomes](virtual-servers.expected.json)
 
-Gateway imports resolve visible name conflicts before discovery. The pinned gateway can attempt discovery first and report a tool-name conflict before it applies the gateway conflict strategy. Rust completes discovery and storage synchronously for import jobs. Plugin-defined tool validation policies remain part of the plugin milestone. [Pinned gateway outcomes](gateways.expected.json)
+Gateway imports resolve visible name conflicts before discovery and complete synchronously. The [gateway import notes](gateway.md) document credential handling and the reference replay.

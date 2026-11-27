@@ -18,6 +18,13 @@ The binary listens on `127.0.0.1:4444` and uses `sqlite:///./mcp.db` by default.
 
 Run `context-forge-rs migrate` to prepare the native database schema before starting the gateway. Set `MCPGATEWAY_SKIP_MIGRATIONS=true` on gateway workers to require a current native schema at startup.
 
+Set `MCPGATEWAY_BEARER_TOKEN` to use the configuration CLI. Both commands connect to the gateway at `HOST` and `PORT`.
+
+```sh
+context-forge-rs export --types tools --out backup.json
+context-forge-rs import backup.json --dry-run
+```
+
 MCP requires a signed bearer token from an active account by default. Set `JWT_SECRET_KEY` for HMAC verification or set `JWT_ALGORITHM` and `JWT_PUBLIC_KEY_PATH` for asymmetric verification. Authenticated MCP currently reads accounts and roles from an existing v1.1.2 database or a test fixture. Configure `MCP_ALLOWED_ORIGINS` and `MCP_ALLOWED_HOSTS` to enforce ingress allowlists.
 
 The registration path accepts `STREAMABLEHTTP` and `SSE` upstreams. Set `AUTH_ENCRYPTION_SECRET` to register Basic, bearer, custom-header, or query parameter credentials. For a local fixture, set `SSRF_ALLOW_LOCALHOST=true` to allow loopback connections. Readiness checks Redis when `CACHE_TYPE=redis` and `REDIS_URL` is set. [Upstream authentication](rust/replay/upstream-auth/README.md)
