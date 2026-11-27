@@ -278,8 +278,16 @@ test verifies that a response arriving after cancellation preserves the
 canceled state. The pinned gateway can overwrite that state.
 Rust also reads task history and page tokens created by v1.1.2 on SQLite.
 
-Agent updates, deletion, cards, OAuth, streaming, UAID routing, and push
-notification configuration remain open.
+The task push notification API validates callback URLs and encrypts bearer
+tokens. Identical retries preserve the record, timestamp, and ciphertext.
+Rust Anything matched create, rotation, scoped reads, and deletion on SQLite.
+The same scenarios matched on PostgreSQL. A Rust test verified concurrent
+retries, ownership checks, and blocked callback destinations. A v1.1.2
+SQLite database retained its settings and ciphertext across migration and
+an identical retry.
+
+Agent updates, deletion, cards, OAuth, streaming with webhook delivery, and
+UAID routing remain open.
 
 ## Gateway management
 

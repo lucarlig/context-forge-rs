@@ -303,7 +303,7 @@ pub(super) async fn record(
     }
 }
 
-async fn manageable(
+pub(super) async fn manageable(
     app: &GatewayService,
     principal: &Principal,
     id: &str,
@@ -334,6 +334,6 @@ fn invalid(message: impl Into<String>) -> CatalogApiError {
     CatalogApiError::detail(StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
-fn missing(task: &str) -> CatalogApiError {
+pub(super) fn missing(task: &str) -> CatalogApiError {
     CatalogApiError::detail(StatusCode::NOT_FOUND, format!("Task '{task}' not found"))
 }

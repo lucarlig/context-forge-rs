@@ -12,6 +12,7 @@ use crate::catalog::{AgentLookup, AgentRecord, AgentWriteError};
 use crate::schema_validation::Target;
 
 mod protocol;
+mod push_configs;
 mod tasks;
 
 const FAILURE: &str = "A2A agent invocation failed";
@@ -38,6 +39,14 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
             .route(
                 &format!("{base}/{{agent}}/tasks/{{task}}/messages"),
                 post(tasks::continue_task),
+            )
+            .route(
+                &format!("{base}/{{agent}}/tasks/{{task}}/pushNotificationConfigs"),
+                push_configs::collection(),
+            )
+            .route(
+                &format!("{base}/{{agent}}/tasks/{{task}}/pushNotificationConfigs/{{id}}"),
+                push_configs::item(),
             );
     }
     router
