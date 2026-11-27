@@ -569,7 +569,7 @@ impl GatewayService {
         }
         let connection = self
             .database
-            .gateway_connection(id, url, false)
+            .gateway_connection(id, url, false, None)
             .await?
             .ok_or(ToolError::Unavailable)?;
         self.connection_credentials(id, url, connection, incoming, principal)

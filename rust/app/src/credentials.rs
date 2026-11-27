@@ -17,10 +17,14 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
+    catalog::GatewayConnectionRow,
     oauth_client::OAuthConfig,
     sigv4::{SigV4, SigV4Config},
     upstream_tls::TlsMaterial,
 };
+
+mod update;
+pub(crate) use update::UpdateAuthError;
 
 pub(crate) struct CredentialCipher {
     key: LessSafeKey,

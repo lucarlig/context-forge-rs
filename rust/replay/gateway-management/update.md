@@ -9,3 +9,15 @@ Rust returned HTTP 409 when an update duplicated another gateway's destination a
 ```sh
 cargo test --locked --test gateway gateway_update_preserves_catalog_ids_and_rolls_back_a_failed_destination
 ```
+
+## Credential updates
+
+The pinned and Rust gateways both kept a masked bearer token, used a rotated token for discovery, rejected a bad token with HTTP 502, cleared authentication on request, and accepted a one-time token for discovery. The failed update preserved the last working token and version. Rust writes SQL NULL for cleared credential fields and verified that the one-time token is absent from storage.
+
+The Basic fixture changed the username while keeping the masked password. Both made successful requests with the new username, and Rust returned it in the update response. Both gateways also rotated one custom header while retaining another masked header. The query fixture changed the parameter name while keeping its stored value. Rust authenticated to the upstream with the new name. The pinned gateway returned HTTP 200 even though discovery used a rejected credential.
+
+Rust passed bearer, Basic, header, and query checks on SQLite and PostgreSQL, and the bearer rotation passed against SQLite populated by the pinned gateway. The integration test exercises rotation, rollback, and subsequent MCP invocation.
+
+```sh
+cargo test --locked --test gateway registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
+```

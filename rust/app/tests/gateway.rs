@@ -170,10 +170,19 @@ async fn registration_invokes_sse_upstream_and_rejects_cross_origin_message_endp
 #[tokio::test]
 async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let phase = Arc::new(AtomicUsize::new(0));
     let upstream = Running::start(Router::new().route(
         "/mcp",
-        post(async |headers: HeaderMap, Json(message): Json<Value>| {
-            assert_eq!(headers[header::AUTHORIZATION], "Bearer upstream-fixture");
+        post({
+            let phase = phase.clone();
+            async move |headers: HeaderMap, Json(message): Json<Value>| {
+            let expected = match phase.load(Ordering::SeqCst) {
+                0 => "Bearer upstream-fixture",
+                _ => "Bearer next-fixture",
+            };
+            if headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) != Some(expected) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
             if message["method"] == "notifications/initialized" {
                 return StatusCode::ACCEPTED.into_response();
             }
@@ -202,6 +211,7 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
                 method => panic!("unexpected upstream request {method}"),
             };
             Json(json!({"jsonrpc":"2.0","id":message["id"],"result":result})).into_response()
+            }
         }),
     ))
     .await;
@@ -304,6 +314,41 @@ async fn registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
     assert_eq!(
         reply["result"]["content"][0]["text"],
         "Authorized tool: fresh"
+    );
+
+    let endpoint = app.url(&format!("/gateways/{gateway_id}"));
+    let rotate = |token: &str| {
+        client
+            .put(&endpoint)
+            .bearer_auth(&admin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"authType":"bearer","authToken":token}).to_string())
+            .send()
+    };
+    let masked = rotate("*****").await.unwrap();
+    assert_eq!(masked.status(), StatusCode::OK);
+    phase.store(1, Ordering::SeqCst);
+    let rotated = rotate("next-fixture").await.unwrap();
+    assert_eq!(rotated.status(), StatusCode::OK);
+    let rotated: Value = serde_json::from_slice(&rotated.bytes().await.unwrap()).unwrap();
+    assert_eq!(rotated["authToken"], "*****");
+    assert_eq!(rotated["version"], 3);
+    assert_eq!(
+        rotate("wrong-token").await.unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
+
+    let (status, result) = send(
+        &client,
+        app.url("/mcp"),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"protected-echo","arguments":{}}}),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["result"]["content"][0]["text"],
+        "Authorized tool: echo"
     );
 }
 

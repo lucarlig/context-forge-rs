@@ -259,12 +259,19 @@ macro_rules! apply_gateway_metadata {
         {
             return Err(RegistrationError::NameConflict);
         }
-        if scope_changed || $after.url != $before.url {
+        let auth_changed = $after.auth_type != $before.auth_type
+            || $after.auth_value != $before.auth_value
+            || $after.auth_query_params != $before.auth_query_params
+            || $after.sigv4_config != $before.sigv4_config
+            || $after.oauth_config != $before.oauth_config;
+        if scope_changed || $after.url != $before.url || auth_changed {
             let candidates = sqlx::query_as::<_, AuthCandidate>(GATEWAY_URL_CANDIDATES)
                 .bind(&$after.id).bind(&$after.url).bind(&$after.visibility)
                 .bind($after.team_id.as_deref()).bind($after.owner_email.as_deref())
                 .fetch_all(&mut *$tx).await?;
-            if candidates.iter().any(|candidate| same_gateway_auth($after, candidate, $cipher)) {
+            if $after.auth_type.as_deref() != Some("one_time_auth")
+                && candidates.iter().any(|candidate| same_gateway_auth($after, candidate, $cipher))
+            {
                 return Err(RegistrationError::UrlConflict);
             }
         }
@@ -274,7 +281,11 @@ macro_rules! apply_gateway_metadata {
             ", identity_propagation = ", json_parameter!($dialect, "$9"),
             ", refresh_interval_seconds = $10, gateway_mode = $11,
             modified_by = $12, modified_from_ip = $13, modified_via = 'api', modified_user_agent = $14,
-            url = $15, transport = $16, reachable = $17,
+            url = $15, transport = $16, reachable = $17, auth_type = $18,
+            auth_value = ", json_parameter!($dialect, "$19"),
+            ", auth_query_params = ", json_parameter!($dialect, "$20"),
+            ", sigv4_config = ", json_parameter!($dialect, "$21"),
+            ", oauth_config = ", json_parameter!($dialect, "$22"), ",
             updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE id = $1"))
             .bind(&$after.id).bind(&$after.name).bind(&$after.slug).bind($after.description.as_deref())
             .bind(&$after.visibility).bind($after.team_id.as_deref()).bind(&$after.tags)
@@ -282,6 +293,9 @@ macro_rules! apply_gateway_metadata {
             .bind($after.refresh_interval_seconds).bind(&$after.gateway_mode).bind($after.modified_by.as_deref())
             .bind($after.modified_from_ip.as_deref()).bind($after.modified_user_agent.as_deref())
             .bind(&$after.url).bind(&$after.transport).bind($after.reachable)
+            .bind($after.auth_type.as_deref()).bind($after.auth_value.as_deref())
+            .bind($after.auth_query_params.as_deref()).bind($after.sigv4_config.as_deref())
+            .bind($after.oauth_config.as_deref())
             .execute(&mut *$tx).await?;
         if renamed {
             for statement in RENAMED_CATALOG_ITEMS {

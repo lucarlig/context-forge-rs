@@ -6,7 +6,10 @@ use axum::extract::ConnectInfo;
 use serde::Deserializer;
 
 use super::*;
-use crate::catalog::GatewayMode;
+use crate::{
+    catalog::{GatewayConnectionRow, GatewayMode},
+    credentials::UpdateAuthError,
+};
 
 #[derive(Deserialize)]
 pub(crate) struct GatewayUpdate {
@@ -30,6 +33,10 @@ pub(crate) struct GatewayUpdate {
     refresh_interval_seconds: Option<Option<i32>>,
     #[serde(alias = "gatewayMode")]
     gateway_mode: Option<String>,
+    #[serde(default, alias = "oneTimeAuth")]
+    one_time_auth: Option<bool>,
+    #[serde(flatten)]
+    auth: AuthInput,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -62,7 +69,7 @@ pub(crate) async fn update(
         return Err(ManagementError::LifecycleInProgress.into());
     }
     let mut gateway = previous.clone();
-    apply_fields(&service, &principal, &mut gateway, input).await?;
+    let (mut auth, one_time_auth) = apply_fields(&service, &principal, &mut gateway, input).await?;
     gateway.modified_by = Some(principal.email.clone());
     if let Some(Extension(ConnectInfo(address))) = peer {
         gateway.modified_from_ip = Some(address.ip().to_string());
@@ -82,7 +89,47 @@ pub(crate) async fn update(
     })?;
     let destination_changed =
         gateway.url != previous.url || gateway.transport != previous.transport;
-    let discovered = discover_updated_gateway(&service, &previous, &gateway, transport).await?;
+    let mut connection = service
+        .database
+        .gateway_connection(&previous.id, &previous.url, true, Some(previous.version))
+        .await
+        .map_err(ManagementError::from)?;
+    let auth_changed = if let Some(connection) = &mut connection {
+        let changed = auth.apply_update(
+            connection,
+            service.credential_cipher.as_ref(),
+            service.query_auth_hosts.as_ref(),
+            &gateway.url,
+        )?;
+        if changed && !one_time_auth {
+            gateway.auth_type = Some(connection.kind.clone());
+            gateway.auth_value.clone_from(&connection.headers);
+            gateway.auth_query_params.clone_from(&connection.query);
+            gateway.sigv4_config.clone_from(&connection.sigv4);
+            gateway.oauth_config.clone_from(&connection.oauth);
+        }
+        changed || one_time_auth
+    } else {
+        if auth.has_update() || one_time_auth {
+            return Err(ManagementError::ConcurrentChange.into());
+        }
+        false
+    };
+    let discovered = discover_updated_gateway(
+        &service,
+        &gateway,
+        transport,
+        connection,
+        destination_changed || auth_changed,
+    )
+    .await?;
+    if one_time_auth {
+        gateway.auth_type = Some("one_time_auth".into());
+        gateway.auth_value = None;
+        gateway.auth_query_params = None;
+        gateway.oauth_config = None;
+        gateway.sigv4_config = None;
+    }
     if discovered.is_some() {
         gateway.reachable = true;
     }
@@ -133,6 +180,7 @@ pub(crate) async fn update(
         }
     }
     if destination_changed
+        || auth_changed
         || previous.visibility != gateway.visibility
         || previous.team_id != gateway.team_id
     {
@@ -164,7 +212,7 @@ async fn apply_fields(
     principal: &Principal,
     gateway: &mut GatewayRecord,
     input: GatewayUpdate,
-) -> Result<(), UpdateError> {
+) -> Result<(AuthInput, bool), UpdateError> {
     let GatewayUpdate {
         name,
         description,
@@ -177,6 +225,8 @@ async fn apply_fields(
         identity_propagation,
         refresh_interval_seconds,
         gateway_mode,
+        one_time_auth,
+        auth,
         extra,
     } = input;
     if let Some(name) = name {
@@ -346,7 +396,7 @@ async fn apply_fields(
             })?;
         gateway.identity_propagation = Some(identity.to_string());
     }
-    if extra.keys().any(|name| {
+    if extra.iter().any(|(name, value)| {
         let normalized = name
             .chars()
             .filter(|character| *character != '_')
@@ -354,39 +404,28 @@ async fn apply_fields(
             .to_ascii_lowercase();
         matches!(
             normalized.as_str(),
-            "authtype"
-                | "authvalue"
-                | "authusername"
-                | "authpassword"
-                | "authtoken"
-                | "authheaders"
-                | "authheaderkey"
-                | "authheadervalue"
-                | "authqueryparamkey"
-                | "authqueryparamvalue"
-                | "oauthconfig"
-                | "sigv4config"
-                | "cacertificate"
+            "cacertificate"
                 | "cacertificatesig"
                 | "signingalgorithm"
                 | "clientcert"
                 | "clientkey"
                 | "toolvalidationpolicy"
-        )
+        ) || normalized == "authvalue" && !value.is_null() && value.as_str() != Some("*****")
     }) {
         return Err(UpdateError::message(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Unsupported gateway configuration update",
         ));
     }
-    Ok(())
+    Ok((auth, one_time_auth.unwrap_or(false)))
 }
 
 async fn discover_updated_gateway(
     service: &GatewayService,
-    previous: &GatewayRecord,
     gateway: &GatewayRecord,
     transport: UpstreamTransport,
+    connection: Option<GatewayConnectionRow>,
+    connection_changed: bool,
 ) -> Result<
     Option<(
         Vec<ToolDefinition>,
@@ -395,15 +434,8 @@ async fn discover_updated_gateway(
     )>,
     UpdateError,
 > {
-    let destination_changed =
-        gateway.url != previous.url || gateway.transport != previous.transport;
-    let Some(connection) = service
-        .database
-        .gateway_connection(&previous.id, &previous.url, true)
-        .await
-        .map_err(ManagementError::from)?
-    else {
-        if destination_changed {
+    let Some(connection) = connection else {
+        if connection_changed {
             return Err(UpdateError::message(
                 StatusCode::BAD_GATEWAY,
                 "Could not load upstream authentication",
@@ -415,7 +447,7 @@ async fn discover_updated_gateway(
         .connection_credentials(&gateway.id, &gateway.url, connection, None, None)
         .await
     else {
-        if destination_changed {
+        if connection_changed {
             return Err(UpdateError::message(
                 StatusCode::BAD_GATEWAY,
                 "Could not load upstream authentication",
@@ -447,14 +479,14 @@ async fn discover_updated_gateway(
             Ok(Some((tools, catalog.capabilities, metadata)))
         }
         Err(UpstreamError::InvalidUrl | UpstreamError::BlockedDestination)
-            if destination_changed =>
+            if connection_changed =>
         {
             Err(UpdateError::message(
                 StatusCode::BAD_REQUEST,
                 "Gateway URL is invalid or disallowed",
             ))
         }
-        Err(error) if destination_changed => {
+        Err(error) if connection_changed => {
             let endpoint = url::Url::parse(&gateway.url)
                 .ok()
                 .map(|mut url| {
@@ -511,6 +543,18 @@ impl From<ManagementError> for UpdateError {
                 Self::message(StatusCode::CONFLICT, "Gateway changed during request")
             }
             _ => Self::message(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
+        }
+    }
+}
+
+impl From<UpdateAuthError> for UpdateError {
+    fn from(error: UpdateAuthError) -> Self {
+        match error {
+            UpdateAuthError::Auth(AuthError::Encryption(_)) => Self::message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway credential encryption unavailable",
+            ),
+            error => Self::validation("auth_type", &error.to_string(), "value_error", None),
         }
     }
 }

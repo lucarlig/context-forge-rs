@@ -659,11 +659,13 @@ const CONNECTION_CONFIG: &str = concat!(
         CAST(g.passthrough_headers AS TEXT) AS passthrough, CAST(g.identity_propagation AS TEXT) AS identity,
         g.ca_certificate, g.client_cert, g.client_key FROM gateways g
     WHERE g.id = $1 AND g.url = $2 AND (g.enabled = TRUE OR $3) AND g.status = 'active'
+        AND (CAST($4 AS INTEGER) IS NULL OR g.version = $4)
         AND g.gateway_mode IN ('cache', 'direct_proxy') AND NOT ",
     gateway_policy!()
 );
 const DIRECT_GATEWAY_QUERY: &str = concat!(
-    "SELECT g.url, g.transport, g.visibility, g.team_id, g.owner_email, CAST(g.updated_at AS TEXT),
+    "SELECT g.url, g.transport, g.visibility, g.team_id, g.owner_email,
+        CAST(g.updated_at AS TEXT) || ':' || CAST(g.version AS TEXT),
         (g.enabled = TRUE AND g.status = 'active' AND NOT ",
     gateway_policy!(),
     ")
@@ -1431,6 +1433,7 @@ impl Database {
         id: &str,
         url: &str,
         allow_disabled: bool,
+        version: Option<i32>,
     ) -> Result<Option<GatewayConnectionRow>, sqlx::Error> {
         macro_rules! fetch {
             ($pool:expr) => {
@@ -1438,6 +1441,7 @@ impl Database {
                     .bind(id)
                     .bind(url)
                     .bind(allow_disabled)
+                    .bind(version)
                     .fetch_optional($pool)
                     .await
             };

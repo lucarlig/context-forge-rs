@@ -386,7 +386,7 @@ async fn activate_catalog(
     };
     let Some(connection) = service
         .database
-        .gateway_connection(&record.id, &record.url, true)
+        .gateway_connection(&record.id, &record.url, true, Some(record.version))
         .await?
     else {
         return Ok(false);
