@@ -39,3 +39,5 @@ Gateway health checks update reachability and refresh the catalog on recovery. T
 The opt-in asynchronous lifecycle accepts create, update, and delete operations and completes them in a database-backed worker. The live checks verified status transitions and recovery after a worker exited while holding a claim. [Gateway lifecycle verification](replay/gateway-management/lifecycle.md)
 
 The root management APIs support canonically identified network and file roots, configuration export, and an SSE changes stream. The HTTP recordings verify the URI policy and the unrestricted administrator requirement. [Root management verification](replay/root-management/README.md)
+
+The tag APIs aggregate counts and list tagged entities within the caller's catalog scope. SQLite and PostgreSQL matched all ten pinned replays. [Tag management verification](replay/tag-management/README.md)

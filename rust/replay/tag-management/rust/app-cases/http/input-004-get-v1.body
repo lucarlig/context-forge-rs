@@ -1,0 +1,1 @@
+[{"id":"tag-prompt","name":"fixture-prompt","type":"prompt","description":"Fixture prompt"},{"id":"tag-tool","name":"public-fixture-echo","type":"tool","description":"Fixture tool"}]

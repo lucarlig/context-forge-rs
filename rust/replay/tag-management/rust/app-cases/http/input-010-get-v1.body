@@ -1,0 +1,1 @@
+[{"id":"tag-tool","name":"public-fixture-echo","type":"tool","description":"Fixture tool"},{"id":"tag-resource","name":"Fixture resource","type":"resource","description":null},{"id":"tag-server","name":"Fixture virtual server","type":"server","description":null},{"id":"tag-gateway-01","name":"public-fixture","type":"gateway","description":"Fixture upstream"}]

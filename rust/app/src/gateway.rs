@@ -6,6 +6,7 @@ mod lifecycle;
 mod management;
 mod proxy;
 mod roots;
+mod tags;
 
 use std::{
     collections::HashSet,
@@ -323,8 +324,12 @@ impl GatewayService {
                     post(management::set_state),
                 );
         }
-        self.access
-            .protect_api(router.merge(roots::router()).with_state(self.clone()))
+        self.access.protect_api(
+            router
+                .merge(roots::router())
+                .merge(tags::router())
+                .with_state(self.clone()),
+        )
     }
 
     pub fn mcp_router(self: &Arc<Self>, require_auth: bool, mode: ProtocolMode) -> Router {
