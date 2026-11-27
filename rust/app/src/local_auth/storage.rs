@@ -25,7 +25,14 @@ macro_rules! account_tables {
                 issued_at TIMESTAMP WITH TIME ZONE NOT NULL,
                 expires_at TIMESTAMP WITH TIME ZONE NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS cf_local_sessions_owner_expiry ON cf_local_sessions(user_email,expires_at);"
+            CREATE INDEX IF NOT EXISTS cf_local_sessions_owner_expiry ON cf_local_sessions(user_email,expires_at);
+            CREATE TABLE IF NOT EXISTS password_history(
+                id VARCHAR(36) PRIMARY KEY NOT NULL,
+                user_email VARCHAR(255) NOT NULL REFERENCES email_users(email) ON DELETE CASCADE,
+                password_hash TEXT NOT NULL,
+                changed_at TIMESTAMP WITH TIME ZONE NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_password_history_user_email_changed_at ON password_history(user_email,changed_at);"
         )
     };
 }
@@ -480,3 +487,5 @@ fn team_slug(name: &str) -> String {
         .take(240)
         .collect()
 }
+
+mod user_writes;

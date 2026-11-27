@@ -314,6 +314,8 @@ impl Settings {
             password_min_user: parse("PASSWORD_MIN_LENGTH_USER", 12)?,
             password_min_admin: parse("PASSWORD_MIN_LENGTH_PRIVILEGED", 22)?,
             password_policy: enabled("PASSWORD_POLICY_ENABLED", true)?,
+            password_history: parse("PASSWORD_HISTORY_COUNT", 5)?,
+            invalidate_sessions: Self::invalidate_sessions_on_password_change()?,
             protect_admins: enabled("PROTECT_ALL_ADMINS", true)?,
             lockout_attempts: attempts,
             lockout_seconds: lockout * 60,

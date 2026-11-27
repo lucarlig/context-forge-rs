@@ -2,6 +2,7 @@
 
 mod passwords;
 mod storage;
+mod user_lifecycle;
 
 use std::{
     net::SocketAddr,
@@ -47,6 +48,8 @@ pub struct AccountSettings {
     pub(crate) password_min_user: usize,
     pub(crate) password_min_admin: usize,
     pub(crate) password_policy: bool,
+    pub(crate) password_history: u32,
+    pub(crate) invalidate_sessions: bool,
     pub(crate) protect_admins: bool,
     pub(crate) lockout_attempts: i32,
     pub(crate) lockout_seconds: i64,
@@ -165,13 +168,26 @@ pub async fn router(
             .route(&format!("{base}/register"), post(register));
         protected = protected
             .route(&format!("{base}/me"), get(profile))
+            .route(
+                &format!("{base}/change-password"),
+                post(user_lifecycle::change_password),
+            )
             .route(&format!("{base}/events"), get(events))
             .route(&format!("{base}/admin/events"), get(admin_events))
             .route(
                 &format!("{base}/admin/users"),
                 get(list_users).post(create_user),
             )
-            .route(&format!("{base}/admin/users/{{email}}"), get(get_user));
+            .route(
+                &format!("{base}/admin/users/{{email}}"),
+                get(get_user)
+                    .patch(user_lifecycle::edit_user)
+                    .delete(user_lifecycle::delete_user),
+            )
+            .route(
+                &format!("{base}/admin/users/{{email}}/unlock"),
+                post(user_lifecycle::unlock_user),
+            );
     }
     Ok(public
         .with_state(state.clone())
@@ -251,7 +267,6 @@ async fn login(
     headers: HeaderMap,
     Json(input): Json<Login>,
 ) -> Result<Response, AccountError> {
-    let commenced = Instant::now();
     let email = input.email.trim().to_ascii_lowercase();
     let password = Zeroizing::new(input.password);
     if !valid_email(&email) {
@@ -262,69 +277,13 @@ async fn login(
     }
     let client = Client::new(Some(peer), &headers);
     let now = Timestamp::now();
-    let initial = accounts.database.local_user(&email).await?;
-    let mut failure = match initial.as_ref() {
-        None => Some("User not found"),
-        Some(user) if !user.is_active => Some("Account is disabled"),
-        Some(user) if user.locked(now) && !(user.is_admin && accounts.settings.protect_admins) => {
-            Some("Account is locked")
-        }
-        Some(user) if user.password_hash.is_none() => {
-            Some("Local password authentication disabled")
-        }
-        Some(_) => None,
-    };
-    let hash = initial
-        .as_ref()
-        .filter(|_| failure.is_none())
-        .and_then(|user| user.password_hash.clone())
-        .unwrap_or_else(|| accounts.dummy_hash.clone());
     let using_default = *password == *accounts.settings.default_password;
-    let verified = passwords::verify(password, hash).await?;
-    let Some(user) = initial.as_ref().filter(|_| failure.is_none() && verified) else {
-        if let Some(user) = initial.as_ref().filter(|_| failure.is_none()) {
-            let lockout = accounts
-                .database
-                .record_login_failure(user, &accounts.settings)
-                .await?;
-            failure = Some(if lockout {
-                "Account locked due to too many failed attempts"
-            } else {
-                "Invalid password"
-            });
-            if lockout {
-                accounts
-                    .database
-                    .local_event(&email, "ACCOUNT_LOCKED", true, &client, None)
-                    .await?;
-            }
-        }
-        accounts
-            .database
-            .local_event(&email, "login", false, &client, failure)
-            .await?;
-        tokio::time::sleep(
-            accounts
-                .settings
-                .failure_floor
-                .saturating_sub(commenced.elapsed()),
-        )
-        .await;
+    let Some(user) = verify_local_password(&accounts, &email, password, &client).await? else {
         return Err(AccountError::detail(
             StatusCode::UNAUTHORIZED,
             "Invalid email or password",
         ));
     };
-    let Some(user) = accounts.database.record_successful_login(user).await? else {
-        return Err(AccountError::detail(
-            StatusCode::UNAUTHORIZED,
-            "Invalid email or password",
-        ));
-    };
-    accounts
-        .database
-        .local_event(&email, "login", true, &client, None)
-        .await?;
     if accounts.settings.enforce_password_change {
         let flagged = user.password_change_required;
         let age = user
@@ -357,6 +316,73 @@ async fn login(
         }
     }
     session_response(&accounts, &user, true).await
+}
+
+async fn verify_local_password(
+    accounts: &Accounts,
+    email: &str,
+    password: Zeroizing<String>,
+    client: &Client,
+) -> Result<Option<storage::LocalUser>, AccountError> {
+    let commenced = Instant::now();
+    let now = Timestamp::now();
+    let initial = accounts.database.local_user(email).await?;
+    let mut failure = match initial.as_ref() {
+        None => Some("User not found"),
+        Some(user) if !user.is_active => Some("Account is disabled"),
+        Some(user) if user.locked(now) && !(user.is_admin && accounts.settings.protect_admins) => {
+            Some("Account is locked")
+        }
+        Some(user) if user.password_hash.is_none() => {
+            Some("Local password authentication disabled")
+        }
+        Some(_) => None,
+    };
+    let hash = initial
+        .as_ref()
+        .filter(|_| failure.is_none())
+        .and_then(|user| user.password_hash.clone())
+        .unwrap_or_else(|| accounts.dummy_hash.clone());
+    let verified = passwords::verify(password, hash).await?;
+    let Some(user) = initial.as_ref().filter(|_| failure.is_none() && verified) else {
+        if let Some(user) = initial.as_ref().filter(|_| failure.is_none()) {
+            let lockout = accounts
+                .database
+                .record_login_failure(user, &accounts.settings)
+                .await?;
+            failure = Some(if lockout {
+                "Account locked due to too many failed attempts"
+            } else {
+                "Invalid password"
+            });
+            if lockout {
+                accounts
+                    .database
+                    .local_event(email, "ACCOUNT_LOCKED", true, client, None)
+                    .await?;
+            }
+        }
+        accounts
+            .database
+            .local_event(email, "login", false, client, failure)
+            .await?;
+        tokio::time::sleep(
+            accounts
+                .settings
+                .failure_floor
+                .saturating_sub(commenced.elapsed()),
+        )
+        .await;
+        return Ok(None);
+    };
+    let Some(user) = accounts.database.record_successful_login(user).await? else {
+        return Ok(None);
+    };
+    accounts
+        .database
+        .local_event(email, "login", true, client, None)
+        .await?;
+    Ok(Some(user))
 }
 
 async fn register(
@@ -407,6 +433,12 @@ async fn create_user(
     Json(input): Json<ManagedUser>,
 ) -> Result<(StatusCode, Json<Value>), AccountError> {
     require_user_admin(&accounts, &principal).await?;
+    if input.is_admin && !principal.is_global_admin() {
+        return Err(AccountError::detail(
+            StatusCode::FORBIDDEN,
+            "Administrator creation requires a platform administrator",
+        ));
+    }
     let user = create_account(&accounts, input, Some(&principal.email)).await?;
     Ok((StatusCode::CREATED, Json(user.metadata())))
 }

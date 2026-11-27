@@ -26,3 +26,14 @@ catalog. They also verified that administrator login survives switching from
 the pinned gateway to Rust with the same database and JWT configuration.
 Fresh native databases bootstrap a local administrator when
 `PLATFORM_ADMIN_PASSWORD` is set. Subsequent boots preserve the stored hash.
+
+The user lifecycle fixture exercised password changes and reuse checks,
+account lockout and unlock, administrator resets, deactivation, and deletion.
+Thirty-two of 36 normalized responses matched the pinned gateway on both
+databases. The role-list route was pending, two profiles exposed fresher
+last-login data, and the rejected session used a different error detail.
+
+Native password changes revoke both active API tokens and locally issued
+sessions in the transaction that changes the password. This also covers
+sessions issued during the same second as the change. The fixture verified
+both credential types through the normal HTTP endpoints.

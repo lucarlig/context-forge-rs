@@ -49,6 +49,56 @@ CREATE TABLE IF NOT EXISTS email_team_members (
 CREATE INDEX IF NOT EXISTS idx_email_team_members_user_team_active
     ON email_team_members (user_email, team_id, is_active);
 
+CREATE TABLE IF NOT EXISTS email_team_member_history (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    team_member_id VARCHAR(36) NOT NULL REFERENCES email_team_members(id),
+    team_id VARCHAR(36) NOT NULL REFERENCES email_teams(id),
+    user_email VARCHAR(255) NOT NULL REFERENCES email_users(email),
+    role VARCHAR(50) NOT NULL DEFAULT 'member',
+    action VARCHAR(50) NOT NULL,
+    action_by VARCHAR(255) REFERENCES email_users(email),
+    action_timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_team_member_history_team_id ON email_team_member_history(team_id);
+CREATE INDEX IF NOT EXISTS idx_email_team_member_history_user_email ON email_team_member_history(user_email);
+
+CREATE TABLE IF NOT EXISTS email_team_invitations (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    team_id VARCHAR(36) NOT NULL REFERENCES email_teams(id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
+    role VARCHAR(50) NOT NULL DEFAULT 'member',
+    invited_by VARCHAR(255) NOT NULL REFERENCES email_users(email),
+    invited_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    token VARCHAR(500) NOT NULL UNIQUE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_team_invitations_team_active_created
+    ON email_team_invitations(team_id,is_active,invited_at);
+CREATE INDEX IF NOT EXISTS idx_email_team_invitations_email_active_created
+    ON email_team_invitations(email,is_active,invited_at);
+
+CREATE TABLE IF NOT EXISTS email_team_join_requests (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    team_id VARCHAR(36) NOT NULL REFERENCES email_teams(id) ON DELETE CASCADE,
+    user_email VARCHAR(255) NOT NULL REFERENCES email_users(email),
+    message TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    requested_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    reviewed_at TIMESTAMP WITH TIME ZONE,
+    reviewed_by VARCHAR(255) REFERENCES email_users(email),
+    notes TEXT,
+    UNIQUE (team_id,user_email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_team_join_requests_team_status_time
+    ON email_team_join_requests(team_id,status,requested_at);
+CREATE INDEX IF NOT EXISTS idx_email_team_join_requests_user_status_time
+    ON email_team_join_requests(user_email,status,requested_at);
+
 CREATE TABLE IF NOT EXISTS roles (
     id VARCHAR(36) PRIMARY KEY NOT NULL,
     name VARCHAR(255) NOT NULL,
