@@ -20,3 +20,9 @@ trusted human and service identities through MCP and REST. The checks
 covered the provider's configured audience, expiry, ID-token rejection,
 trusted domains, account binding, and disabling a provider. Rust reads the
 persisted login timestamp when constructing an account response.
+
+With admin approval required, 23 normalized checks matched on both
+databases. An eligible caller entered the pending queue, a reviewer could
+approve or reject the request, and a rejected request stayed closed.
+Account creation consumed approval in the same transaction and required
+the same provider that requested it.

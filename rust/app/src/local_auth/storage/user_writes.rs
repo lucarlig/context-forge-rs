@@ -325,6 +325,8 @@ impl Database {
                     "DELETE FROM password_history WHERE user_email=$1",
                     "DELETE FROM password_reset_tokens WHERE user_email=$1",
                     "DELETE FROM email_auth_events WHERE user_email=$1",
+                    "UPDATE pending_user_approvals SET approved_by=NULL WHERE approved_by=$1",
+                    "DELETE FROM sso_auth_sessions WHERE user_email=$1",
                 ] {
                     sqlx::query(command).bind(email).execute(&mut *$tx).await?;
                 }

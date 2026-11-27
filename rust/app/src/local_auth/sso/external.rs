@@ -10,6 +10,7 @@ pub struct ExternalIdentitySettings {
     pub(crate) upstream: UpstreamClient,
     pub(crate) provisioning: UserProvisioning,
     pub(crate) internal_issuer: String,
+    pub(crate) approval_required: bool,
 }
 
 impl ExternalIdentitySettings {
@@ -92,11 +93,15 @@ impl ExternalIdentitySettings {
             claims.insert("email_verified".to_owned(), Value::Bool(true));
             claims.insert("name".to_owned(), format!("service:{client}").into());
         }
-        Ok(
-            authenticate_identity(database, &self.provisioning, &provider, &claims)
-                .await?
-                .map(|user| (user.email, expiry)),
+        Ok(authenticate_identity(
+            database,
+            &self.provisioning,
+            &provider,
+            &claims,
+            self.approval_required,
         )
+        .await?
+        .map(|user| (user.email, expiry)))
     }
 }
 

@@ -180,6 +180,7 @@ pub(super) async fn callback(
         &accounts.settings.provisioning,
         &provider,
         &identity,
+        settings.approval_required,
     )
     .await?
     else {

@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS sso_auth_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sso_auth_sessions_expiration ON sso_auth_sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS pending_user_approvals (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    full_name VARCHAR(255) NOT NULL,
+    auth_provider VARCHAR(50) NOT NULL,
+    sso_metadata JSON,
+    requested_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    approved_by VARCHAR(255) REFERENCES email_users(email),
+    approved_at TIMESTAMP WITH TIME ZONE,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    rejection_reason TEXT,
+    admin_notes TEXT
+);
+
 CREATE TABLE IF NOT EXISTS email_teams (
     id VARCHAR(36) PRIMARY KEY NOT NULL,
     name VARCHAR(255) NOT NULL,

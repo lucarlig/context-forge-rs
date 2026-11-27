@@ -60,6 +60,7 @@ pub(super) struct NewUser {
     pub(super) is_active: bool,
     pub(super) password_hash: Option<String>,
     pub(super) auth_provider: String,
+    pub(super) approval_required: bool,
     pub(super) password_change_required: bool,
     pub(super) granted_by: Option<String>,
     pub(super) admin_origin: Option<&'static str>,
@@ -271,7 +272,15 @@ impl Database {
         };
         let actor = user.granted_by.as_deref().unwrap_or(&user.email);
         macro_rules! create {
-            ($tx:ident,$permissions:literal) => {{
+            ($tx:ident,$permissions:literal,$fresh:literal) => {{
+                if user.approval_required {
+                    let consumed = sqlx::query(concat!("UPDATE pending_user_approvals SET status='completed'
+                        WHERE email=$1 AND auth_provider=$2 AND status='approved' AND ", $fresh))
+                        .bind(&user.email).bind(&user.auth_provider).execute(&mut *$tx).await?;
+                    if consumed.rows_affected() == 0 {
+                        return Ok(false);
+                    }
+                }
                 let inserted=sqlx::query(CREATE_LOCAL_USER).bind(Uuid::new_v4().to_string())
                     .bind(&user.email).bind(user.password_hash.as_deref()).bind(user.full_name.as_deref())
                     .bind(user.is_admin).bind(user.is_active).bind(user.admin_origin)
@@ -319,14 +328,22 @@ impl Database {
         match self {
             Self::Sqlite(pool) => {
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-                create!(tx, "json($6)")
+                create!(
+                    tx,
+                    "json($6)",
+                    "julianday(expires_at)>julianday(CURRENT_TIMESTAMP)"
+                )
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682073)")
                     .execute(&mut *tx)
                     .await?;
-                create!(tx, "CAST(CAST($6 AS TEXT) AS JSON)")
+                create!(
+                    tx,
+                    "CAST(CAST($6 AS TEXT) AS JSON)",
+                    "expires_at>clock_timestamp()"
+                )
             }
         }
     }

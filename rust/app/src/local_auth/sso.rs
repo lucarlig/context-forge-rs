@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod approvals;
 mod external;
 mod flow;
 mod identity;
@@ -22,6 +23,7 @@ pub(crate) struct SsoSettings {
     pub(crate) root_path: String,
     pub(crate) secure_cookies: bool,
     pub(crate) same_site: String,
+    pub(crate) approval_required: bool,
 }
 
 pub(super) fn routers() -> (Router<Arc<Accounts>>, Router<Arc<Accounts>>) {
@@ -42,6 +44,11 @@ pub(super) fn routers() -> (Router<Arc<Accounts>>, Router<Arc<Accounts>>) {
                 get(providers::read)
                     .put(providers::update)
                     .delete(providers::delete),
+            )
+            .route(&format!("{base}/pending-approvals"), get(approvals::list))
+            .route(
+                &format!("{base}/pending-approvals/{{id}}/action"),
+                post(approvals::review),
             );
     }
     (public, protected)

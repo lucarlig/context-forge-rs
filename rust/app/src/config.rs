@@ -477,6 +477,7 @@ impl Settings {
             upstream: Self::upstream_client()?,
             provisioning: Self::user_provisioning()?,
             internal_issuer: value("JWT_ISSUER", "mcpgateway")?,
+            approval_required: flag("SSO_REQUIRE_ADMIN_APPROVAL")?.unwrap_or(false),
         }))
     }
 
@@ -505,6 +506,7 @@ impl Settings {
             secure_cookies: flag("SECURE_COOKIES")?.unwrap_or(true)
                 || value("ENVIRONMENT", "development")? == "production",
             same_site: value("COOKIE_SAMESITE", "lax")?,
+            approval_required: flag("SSO_REQUIRE_ADMIN_APPROVAL")?.unwrap_or(false),
         }))
     }
 
