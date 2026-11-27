@@ -7,7 +7,9 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::catalog::{ResourceContentRecord, ResourceFilters, ResourceRecord};
 
+mod events;
 mod write;
+pub(crate) use events::ResourceEvents;
 pub use write::ResourceLimits;
 
 pub(super) fn router(max_resource_bytes: usize) -> Router<Arc<GatewayService>> {
@@ -17,6 +19,7 @@ pub(super) fn router(max_resource_bytes: usize) -> Router<Arc<GatewayService>> {
             .route(base, get(list).post(write::create))
             .route(&format!("{base}/"), get(list).post(write::create))
             .route(&format!("{base}/templates/list"), get(templates))
+            .route(&format!("{base}/subscribe"), post(events::subscribe))
             .route(&format!("{base}/test/{{*uri}}"), get(test_uri))
             .route(&format!("{base}/{{id}}/info"), get(info))
             .route(
@@ -229,15 +232,26 @@ async fn read(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ResourceError> {
     require_resources(&service, &principal, "resources.read", true).await?;
+    let server = headers
+        .get("x-server-id")
+        .map(http_server_id)
+        .transpose()?
+        .filter(|value| !value.is_empty());
     let record = service
         .database
-        .resource_content_by_id(access::catalog_scope(Some(&principal)), &id)
+        .resource_content_by_id(access::catalog_scope(Some(&principal)), server, &id)
         .await?
         .ok_or_else(|| ResourceError::missing(&id))?;
     let uri = record.uri.clone();
     Ok(Json(
         resource_content(&service, &principal, record, uri, &headers, false).await?,
     ))
+}
+
+fn http_server_id(value: &axum::http::HeaderValue) -> Result<&str, ResourceError> {
+    value
+        .to_str()
+        .map_err(|_| ResourceError::detail(StatusCode::BAD_REQUEST, "Invalid server ID"))
 }
 
 async fn test_uri(

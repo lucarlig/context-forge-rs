@@ -1029,10 +1029,11 @@ impl Database {
     pub(crate) async fn resource_content_by_id(
         &self,
         scope: CatalogScope<'_>,
+        server: Option<&str>,
         id: &str,
     ) -> Result<Option<ResourceContentRecord>, sqlx::Error> {
         let mut rows = self
-            .resource_content_rows(scope, None, ResourceLookup::Id(id), None, 1)
+            .resource_content_rows(scope, server, ResourceLookup::Id(id), None, 1)
             .await?;
         Ok(rows.pop().map(resource_content_record))
     }

@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 use percent_encoding::percent_decode_str;
 use regex::Regex;
 
+use super::events::ResourceEvent;
 use super::*;
 use crate::catalog::ResourceWriteError;
 
@@ -190,7 +191,7 @@ pub(super) async fn create(
         .save_managed_resource(None, &record, Some(body.trim()))
         .await
         .map_err(|error| persistence_error(error, &record))?;
-    publish(&service, &record);
+    publish(&service, &record, ResourceEvent::Added);
     Ok(Json(metadata(&record, true)))
 }
 
@@ -275,9 +276,13 @@ pub(super) async fn update(
         .await
         .map_err(|error| persistence_error(error, &record))?;
     if record.visibility != previous.visibility || record.team_id != previous.team_id {
-        publish(&service, &previous);
+        service.subscriptions.changed(
+            &previous.visibility,
+            previous.team_id.as_deref(),
+            previous.owner_email.as_deref(),
+        );
     }
-    publish(&service, &record);
+    publish(&service, &record, ResourceEvent::Updated);
     Ok(Json(metadata(&record, true)))
 }
 
@@ -312,7 +317,12 @@ pub(super) async fn set_state(
         .await
         .map_err(|error| persistence_error(error, &previous))?;
     if record.enabled != previous.enabled {
-        publish(&service, &record);
+        let event = if enabled {
+            ResourceEvent::Activated
+        } else {
+            ResourceEvent::Deactivated
+        };
+        publish(&service, &record, event);
     }
     let action = if enabled { "activated" } else { "deactivated" };
     Ok(Json(
@@ -337,7 +347,7 @@ pub(super) async fn delete(
         .delete_managed_resource(&resource, flag(query.purge_metrics.as_deref())?)
         .await
         .map_err(|error| persistence_error(error, &resource))?;
-    publish(&service, &resource);
+    publish(&service, &resource, ResourceEvent::Deleted);
     Ok(Json(
         json!({"status":"success","message":format!("Resource {id} deleted")}),
     ))
@@ -591,12 +601,13 @@ fn client_address(peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<St
     peer.map(|Extension(ConnectInfo(peer))| peer.ip().to_string())
 }
 
-fn publish(service: &GatewayService, record: &ResourceRecord) {
+fn publish(service: &GatewayService, record: &ResourceRecord, event: ResourceEvent) {
     service.subscriptions.changed(
         &record.visibility,
         record.team_id.as_deref(),
         record.owner_email.as_deref(),
     );
+    service.resource_events.publish(event, record);
 }
 
 fn invalid(detail: &'static str) -> ResourceError {

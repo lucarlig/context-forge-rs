@@ -84,6 +84,7 @@ pub struct GatewayService {
     lifecycle: Option<GatewayLifecycle>,
     roots: roots::RootRegistry,
     resource_limits: ResourceLimits,
+    resource_events: resource_api::ResourceEvents,
     active_refreshes: Mutex<HashSet<String>>,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
@@ -159,6 +160,9 @@ impl GatewayService {
             lifecycle: None,
             roots: roots::RootRegistry::default(),
             resource_limits: ResourceLimits::default(),
+            resource_events: resource_api::ResourceEvents::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
             active_refreshes: Mutex::default(),
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
@@ -184,6 +188,7 @@ impl GatewayService {
     }
 
     pub fn with_listen_settings(mut self, settings: ListenSettings) -> Self {
+        self.resource_events = resource_api::ResourceEvents::new(settings.shutdown.clone());
         self.subscriptions = CatalogSubscriptions::new(settings);
         self
     }
