@@ -9,8 +9,8 @@ mod handshake;
 pub(super) use handshake::HandshakeProbe;
 mod oauth;
 mod write;
-pub(crate) use oauth::resource_metadata_url;
 pub(super) use oauth::router as well_known_router;
+pub(crate) use oauth::{oauth_issuers, resource_metadata_url};
 
 pub(super) fn router() -> Router<Arc<GatewayService>> {
     let mut routes = Router::new();

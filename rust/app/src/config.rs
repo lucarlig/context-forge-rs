@@ -269,6 +269,10 @@ impl Settings {
         )?))
     }
 
+    pub fn jwt_issuer_name() -> Result<String, Box<dyn Error + Send + Sync>> {
+        value("JWT_ISSUER", "mcpgateway")
+    }
+
     pub fn email_auth_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
         Ok(flag("EMAIL_AUTH_ENABLED")?.unwrap_or(true))
     }

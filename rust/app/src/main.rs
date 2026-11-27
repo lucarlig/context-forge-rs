@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             verifier,
             Settings::invalidate_sessions_on_password_change()?,
         )
+        .with_internal_jwt_issuer(Settings::jwt_issuer_name()?)
         .with_external_identity(external_identity)
         .with_token_usage_logging(Settings::token_usage_logging()?),
     );

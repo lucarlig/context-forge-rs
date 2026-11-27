@@ -183,7 +183,7 @@ fn request_base(configured_base: &str, headers: &HeaderMap, uri: &Uri) -> String
     format!("{scheme}://{authority}{prefix}")
 }
 
-pub(super) fn oauth_issuers(config: &Value, allow_http_loopback: bool) -> Vec<&str> {
+pub(crate) fn oauth_issuers(config: &Value, allow_http_loopback: bool) -> Vec<&str> {
     let single = config.get("authorization_server").into_iter();
     let multiple = config
         .get("authorization_servers")

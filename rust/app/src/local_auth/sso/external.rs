@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Map;
 
 use super::{identity::authenticate_identity, oidc, *};
@@ -19,7 +18,9 @@ impl ExternalIdentitySettings {
         database: &Database,
         token: &str,
     ) -> Result<Option<(String, i64)>, sqlx::Error> {
-        let Some(unverified) = unverified_access_claims(token) else {
+        let Some(unverified) =
+            oidc::unverified_jwt_claims(token).filter(|claims| !oidc::is_id_token(claims))
+        else {
             return Ok(None);
         };
         let Some(issuer) = unverified
@@ -51,7 +52,7 @@ impl ExternalIdentitySettings {
         let Some(mut claims) = oidc::verify(
             &self.upstream,
             issuer,
-            audience,
+            &[audience],
             provider.config.jwks_uri.as_deref(),
             tls.as_ref(),
             token,
@@ -103,25 +104,6 @@ impl ExternalIdentitySettings {
         .await?
         .map(|user| (user.email, expiry)))
     }
-}
-
-fn unverified_access_claims(token: &str) -> Option<Map<String, Value>> {
-    if token.len() > 24 * 1024 {
-        return None;
-    }
-    let mut sections = token.split('.');
-    sections.next()?;
-    let payload = sections.next()?;
-    sections.next()?;
-    if sections.next().is_some() {
-        return None;
-    }
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: Map<String, Value> = serde_json::from_slice(&bytes).ok()?;
-    if claims.contains_key("nonce") || claims.contains_key("at_hash") {
-        return None;
-    }
-    Some(claims)
 }
 
 fn service_client(claims: &Map<String, Value>) -> Option<&str> {

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod server_oauth;
+
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -8,7 +10,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -26,6 +28,7 @@ use crate::{
     local_auth::ExternalIdentitySettings,
     tokens::{ApiTokenRecord, TokenIdentity, TokenRequest, TokenReservation, TokenUsageRecord},
 };
+pub(crate) use server_oauth::ServerOAuthVerifier;
 
 const GLOBAL_ONLY_PERMISSIONS: &[&str] = &[
     "admin.user_management",
@@ -42,6 +45,7 @@ pub struct Authorizer {
     invalidate_sessions_on_password_change: bool,
     log_token_usage: bool,
     external: Option<ExternalIdentitySettings>,
+    internal_jwt_issuer: String,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +74,7 @@ struct McpAccess {
     require_auth: bool,
     legacy_transport: bool,
     oauth_base: Option<Arc<str>>,
+    server_oauth: Option<ServerOAuthVerifier>,
 }
 
 impl Authorizer {
@@ -84,6 +89,7 @@ impl Authorizer {
             invalidate_sessions_on_password_change,
             log_token_usage: true,
             external: None,
+            internal_jwt_issuer: "mcpgateway".to_owned(),
         }
     }
 
@@ -94,6 +100,11 @@ impl Authorizer {
 
     pub fn with_external_identity(mut self, settings: Option<ExternalIdentitySettings>) -> Self {
         self.external = settings;
+        self
+    }
+
+    pub fn with_internal_jwt_issuer(mut self, issuer: String) -> Self {
+        self.internal_jwt_issuer = issuer;
         self
     }
 
@@ -137,7 +148,7 @@ impl Authorizer {
     }
 
     pub fn protect_mcp(self: &Arc<Self>, router: Router, require_auth: bool) -> Router {
-        self.protect_mcp_with_oauth(router, require_auth, "http://localhost:4444")
+        self.protect_mcp_with_oauth(router, require_auth, "http://localhost:4444", None)
     }
 
     pub(crate) fn protect_mcp_with_oauth(
@@ -145,6 +156,7 @@ impl Authorizer {
         router: Router,
         require_auth: bool,
         oauth_base: &str,
+        server_oauth: Option<ServerOAuthVerifier>,
     ) -> Router {
         router.route_layer(middleware::from_fn_with_state(
             McpAccess {
@@ -152,6 +164,7 @@ impl Authorizer {
                 require_auth,
                 legacy_transport: false,
                 oauth_base: Some(oauth_base.into()),
+                server_oauth,
             },
             authorize_mcp,
         ))
@@ -168,6 +181,7 @@ impl Authorizer {
                 require_auth,
                 legacy_transport: true,
                 oauth_base: None,
+                server_oauth: None,
             },
             authorize_mcp,
         ))
@@ -535,6 +549,11 @@ pub(crate) enum AuthError {
     Forbidden,
     ServerMissing(Option<String>),
     TeamRevoked,
+    ServerOAuth {
+        status: StatusCode,
+        detail: &'static str,
+        challenge: Option<HeaderValue>,
+    },
     Storage(sqlx::Error),
 }
 
@@ -572,6 +591,19 @@ impl IntoResponse for AuthError {
                 StatusCode::FORBIDDEN,
                 "Token invalid: User is no longer a member of the associated team",
             ),
+            Self::ServerOAuth {
+                status,
+                detail,
+                challenge,
+            } => {
+                let mut response = (status, Json(json!({"detail":detail}))).into_response();
+                if let Some(challenge) = challenge {
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, challenge);
+                }
+                return response;
+            }
             Self::Storage(error) => {
                 tracing::error!(%error, "authorization database lookup failed");
                 (
@@ -709,12 +741,34 @@ async fn authorize_mcp(
         }
         None if access.legacy_transport => return Err(AuthError::Forbidden),
         None => None,
-        Some(token) => Some(
-            access
-                .auth
-                .authenticate(token, peer(&request), server_id)
-                .await?,
-        ),
+        Some(token) => {
+            let server_principal = if let Some(verifier) = &access.server_oauth
+                && let Some(server) = server_id
+                && let Some(base) = access.oauth_base.as_deref()
+            {
+                verifier
+                    .authenticate(
+                        &access.auth,
+                        base,
+                        server,
+                        request.headers(),
+                        request.uri(),
+                        token,
+                    )
+                    .await?
+            } else {
+                None
+            };
+            Some(match server_principal {
+                Some(principal) => principal,
+                None => {
+                    access
+                        .auth
+                        .authenticate(token, peer(&request), server_id)
+                        .await?
+                }
+            })
+        }
     };
     let scope = catalog_scope(principal.as_ref());
     let server = match server_id {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{Jwk, KeyAlgorithm, KeyOperations, PublicKeyUse},
@@ -7,7 +8,7 @@ use jsonwebtoken::{
 use serde_json::Map;
 
 use super::{providers::Provider, *};
-use crate::upstream_tls::TlsMaterial;
+use crate::{upstream::UpstreamError, upstream_tls::TlsMaterial};
 
 #[derive(Deserialize)]
 struct OidcDiscovery {
@@ -35,7 +36,7 @@ pub(super) async fn id_token_claims(
     let claims = verify(
         &settings.upstream,
         issuer,
-        &provider.config.client_id,
+        &[provider.config.client_id.as_str()],
         provider.config.jwks_uri.as_deref(),
         tls,
         token,
@@ -56,15 +57,18 @@ pub(super) async fn id_token_claims(
     Some(claims)
 }
 
-pub(super) async fn verify(
+pub(crate) async fn verify(
     upstream: &UpstreamClient,
     issuer: &str,
-    audience: &str,
+    audiences: &[&str],
     jwks_uri: Option<&str>,
     tls: Option<&TlsMaterial>,
     token: &str,
 ) -> Option<Map<String, Value>> {
-    if token.len() > 24 * 1024 || audience.trim().is_empty() {
+    if token.len() > 24 * 1024
+        || audiences.is_empty()
+        || audiences.iter().all(|audience| audience.trim().is_empty())
+    {
         return None;
     }
     let header = decode_header(token).ok()?;
@@ -82,18 +86,29 @@ pub(super) async fn verify(
             if url.query().is_some() || url.fragment().is_some() {
                 return None;
             }
-            metadata = upstream
-                .oauth_document::<OidcDiscovery>(
-                    &format!(
-                        "{}/.well-known/openid-configuration",
-                        issuer.trim_end_matches('/')
-                    ),
-                    tls,
-                    None,
-                    None,
-                )
+            let path = url.path().trim_end_matches('/');
+            let base = url.origin().ascii_serialization();
+            let rfc8414 = format!("{base}/.well-known/oauth-authorization-server{path}");
+            metadata = match upstream
+                .oauth_document::<OidcDiscovery>(&rfc8414, tls, None, None)
                 .await
-                .ok()?;
+            {
+                Ok(metadata) => metadata,
+                Err(
+                    UpstreamError::Status(400..=599)
+                    | UpstreamError::Transport
+                    | UpstreamError::Timeout,
+                ) => upstream
+                    .oauth_document(
+                        &format!("{base}{path}/.well-known/openid-configuration"),
+                        tls,
+                        None,
+                        None,
+                    )
+                    .await
+                    .ok()?,
+                Err(_) => return None,
+            };
             if metadata.issuer.trim_end_matches('/') != issuer.trim_end_matches('/')
                 || crate::oauth_client::validate_endpoint(
                     upstream,
@@ -143,7 +158,7 @@ pub(super) async fn verify(
     let mut validation = Validation::new(header.alg);
     validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
     validation.set_issuer(&[issuer]);
-    validation.set_audience(&[audience]);
+    validation.set_audience(audiences);
     validation.validate_nbf = true;
     let claims = decode::<Map<String, Value>>(token, &key, &validation)
         .ok()?
@@ -160,4 +175,23 @@ pub(super) async fn verify(
         return None;
     }
     Some(claims)
+}
+
+pub(crate) fn unverified_jwt_claims(token: &str) -> Option<Map<String, Value>> {
+    if token.len() > 24 * 1024 {
+        return None;
+    }
+    let mut sections = token.split('.');
+    sections.next()?;
+    let payload = sections.next()?;
+    sections.next()?;
+    if sections.next().is_some() {
+        return None;
+    }
+    let raw = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+pub(crate) fn is_id_token(claims: &Map<String, Value>) -> bool {
+    claims.contains_key("nonce") || claims.contains_key("at_hash")
 }

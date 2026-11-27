@@ -163,10 +163,7 @@ pub(crate) fn router(
             json_response: options.json_response,
             service,
         }));
-    let router =
-        gateway
-            .access
-            .protect_mcp_with_oauth(router, require_auth, &gateway.virtual_server_base);
+    let router = gateway.protect_server_mcp(router, require_auth);
     if let Some((redis, timeout, concurrency, lock_timeout, shutdown)) = relay {
         affinity::spawn(
             redis,

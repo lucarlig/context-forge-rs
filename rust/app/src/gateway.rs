@@ -93,7 +93,7 @@ pub use oauth_api::{CimdSettings, DcrSettings, GatewayOAuthSettings};
 pub(crate) use proxy::GATEWAY_ID_HEADER;
 pub use resource_api::ResourceLimits;
 pub use roots::{RootSettings, RootSetupError};
-pub(crate) use server_api::resource_metadata_url;
+pub(crate) use server_api::{oauth_issuers, resource_metadata_url};
 
 pub struct GatewayService {
     pub(crate) access: Arc<Authorizer>,
@@ -174,6 +174,18 @@ impl Pagination {
 }
 
 impl GatewayService {
+    pub(crate) fn protect_server_mcp(&self, router: Router, require_auth: bool) -> Router {
+        self.access.protect_mcp_with_oauth(
+            router,
+            require_auth,
+            &self.virtual_server_base,
+            Some(access::ServerOAuthVerifier::new(
+                self.upstream.clone(),
+                self.allow_http_oauth_loopback,
+            )),
+        )
+    }
+
     pub fn new(
         database: Database,
         access: Arc<Authorizer>,
