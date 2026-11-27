@@ -95,4 +95,21 @@ impl Database {
             templates
         )
     }
+
+    pub(crate) async fn managed_server_resources(
+        &self,
+        scope: CatalogScope<'_>,
+        server: &str,
+        inactive: bool,
+    ) -> Result<Vec<ResourceRecord>, sqlx::Error> {
+        fetch_catalog_entries!(
+            self,
+            ResourceRecord,
+            scope,
+            CatalogEntryFilters::associated(inactive),
+            resource_select!(),
+            "EXISTS(SELECT 1 FROM server_resource_association a WHERE a.server_id=$13 AND a.resource_id=r.id)",
+            server
+        )
+    }
 }

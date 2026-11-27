@@ -1,0 +1,14 @@
+[request]
+method = "GET"
+path = "/.well-known/oauth-protected-resource/servers/385d718b52854aa39de43497ce61ce27/mcp"
+
+[request.headers]
+Accept = "application/json"
+Host = "gateway.fixture.test"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+cache-control = "public, max-age=3600"

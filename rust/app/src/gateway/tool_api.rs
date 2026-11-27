@@ -241,14 +241,14 @@ async fn find_visible(
         .ok_or_else(|| tool_missing(id))
 }
 
-fn can_view_headers(principal: &Principal, tool: &ToolRecord, team_owner: bool) -> bool {
+pub(super) fn can_view_headers(principal: &Principal, tool: &ToolRecord, team_owner: bool) -> bool {
     principal.is_global_admin()
         || (access::catalog_scope(Some(principal)).can_own()
             && (tool.owner_email.as_deref() == Some(&principal.email)
                 || (tool.visibility == "team" && team_owner)))
 }
 
-fn metadata(
+pub(super) fn metadata(
     service: &GatewayService,
     tool: &ToolRecord,
     aliases: bool,

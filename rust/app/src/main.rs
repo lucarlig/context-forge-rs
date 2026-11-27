@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let catalog_refresh = Settings::catalog_refresh()?;
     let health_settings = Settings::gateway_health(&catalog_refresh)?;
     let gateway_listeners = settings.gateway_listeners()?;
+    let (well_known, cache_max_age, allow_oauth_loopback) = Settings::server_oauth_metadata()?;
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
@@ -62,6 +63,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_resource_limits(Settings::resource_limits()?)
         .with_max_prompt_bytes(Settings::max_prompt_bytes()?)
         .with_tool_preview(Settings::tool_preview_enabled()?)
+        .with_virtual_server_base(Settings::virtual_server_base()?)
+        .with_server_oauth_metadata(well_known, cache_max_age, allow_oauth_loopback)
         .with_logging_filter(handle)
         .with_management_page_sizes(management_page_size, management_max_page_size)
         .with_credential_secret(Settings::auth_encryption_secret()?.as_deref())
@@ -86,7 +89,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let websocket = service.websocket_router(Settings::websocket_settings(shutdown.clone())?);
     let app = probes::router(database, redis)
         .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse).merge(websocket)))
-        .merge(service.registration_router());
+        .merge(service.registration_router())
+        .merge(service.server_oauth_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     let background = catalog_available.then(|| {
         [

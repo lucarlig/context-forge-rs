@@ -216,10 +216,16 @@ pub(super) fn http_server_id(value: &axum::http::HeaderValue) -> Result<&str, Ca
 }
 
 pub(super) fn alias_metadata(response: Value) -> Value {
+    let mut aliased = camelcase_fields(response);
+    aliased["_meta"] = Value::Null;
+    aliased
+}
+
+pub(super) fn camelcase_fields(response: Value) -> Value {
     let Value::Object(response) = response else {
         unreachable!()
     };
-    let mut aliased: serde_json::Map<_, _> = response
+    let aliased = response
         .into_iter()
         .map(|(key, value)| {
             let mut pieces = key.split('_');
@@ -234,7 +240,6 @@ pub(super) fn alias_metadata(response: Value) -> Value {
             (camel, value)
         })
         .collect();
-    aliased.insert("_meta".to_owned(), Value::Null);
     Value::Object(aliased)
 }
 

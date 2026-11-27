@@ -10,6 +10,20 @@ pub(crate) struct CatalogEntryFilters<'a> {
     pub(crate) tags: &'a [String],
 }
 
+impl CatalogEntryFilters<'_> {
+    pub(crate) fn associated(include_inactive: bool) -> Self {
+        Self {
+            include_inactive,
+            visibility: None,
+            team: None,
+            gateway: None,
+            after: None,
+            limit: i64::MAX,
+            tags: &[],
+        }
+    }
+}
+
 macro_rules! scoped_catalog_entries {
     ($select:expr, $predicate:literal, $teams:literal, $date:literal, $tag_filter:literal, $tags:literal, $entity_tag:literal) => {
         concat!(

@@ -1,0 +1,14 @@
+[request]
+method = "GET"
+path = "/v1/virtual-servers?include_inactive=true"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXJAZXhhbXBsZS5jb20iLCJpc3MiOiJtY3BnYXRld2F5IiwiYXVkIjoibWNwZ2F0ZXdheS1hcGkiLCJpYXQiOjE3NjcyMjU2MDAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoic2VydmVyLWFkbWluLWZpeHR1cmUtc3RhdGljIiwiaXNfYWRtaW4iOmZhbHNlLCJ0ZWFtcyI6W10sInRva2VuX3VzZSI6ImFwaSIsInVzZXIiOnsiZW1haWwiOiJ2aWV3ZXJAZXhhbXBsZS5jb20iLCJpc19hZG1pbiI6ZmFsc2V9fQ.ywd7Itvxn3uKBXRLBUHuZGcoKesrSMX46-AZ9vsnBuc"
+Host = "gateway.fixture.test"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

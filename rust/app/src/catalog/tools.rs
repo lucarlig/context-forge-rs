@@ -131,6 +131,23 @@ impl Database {
         fetch_catalog_entries!(self, ToolRecord, scope, filter, tool_select!(), "TRUE")
     }
 
+    pub(crate) async fn managed_server_tools(
+        &self,
+        scope: CatalogScope<'_>,
+        server: &str,
+        inactive: bool,
+    ) -> Result<Vec<ToolRecord>, sqlx::Error> {
+        fetch_catalog_entries!(
+            self,
+            ToolRecord,
+            scope,
+            CatalogEntryFilters::associated(inactive),
+            tool_select!(),
+            "EXISTS(SELECT 1 FROM server_tool_association a WHERE a.server_id=$13 AND a.tool_id=r.id)",
+            server
+        )
+    }
+
     pub(crate) async fn tool_preview_candidates(
         &self,
         scope: CatalogScope<'_>,

@@ -69,3 +69,7 @@ listeners reconcile the catalog after acknowledgment and apply subsequent
 tool, resource, and prompt changes. A two-worker Redis test verified that only
 one stream stays open and that the peer takes over during shutdown.
 [Standing listener verification](replay/gateway-management/listeners.md)
+
+Virtual-server reads list scoped servers, interfaces, and selected catalog
+associations. Public OAuth resource metadata is available for enabled servers
+with approved settings. [Virtual-server read verification](replay/server-management/read/README.md)

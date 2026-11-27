@@ -10,6 +10,7 @@ mod prompt_api;
 mod proxy;
 mod resource_api;
 mod roots;
+mod server_api;
 mod tags;
 mod tool_api;
 
@@ -90,6 +91,10 @@ pub struct GatewayService {
     roots: roots::RootRegistry,
     max_prompt_bytes: usize,
     tool_preview_enabled: bool,
+    virtual_server_base: String,
+    well_known_enabled: bool,
+    well_known_max_age: u32,
+    allow_http_oauth_loopback: bool,
     resource_limits: ResourceLimits,
     resource_events: resource_api::ResourceEvents,
     active_refreshes: Mutex<HashSet<String>>,
@@ -168,6 +173,10 @@ impl GatewayService {
             roots: roots::RootRegistry::default(),
             max_prompt_bytes: 10240,
             tool_preview_enabled: true,
+            virtual_server_base: "http://localhost:4444".to_owned(),
+            well_known_enabled: true,
+            well_known_max_age: 3600,
+            allow_http_oauth_loopback: false,
             resource_limits: ResourceLimits::default(),
             resource_events: resource_api::ResourceEvents::new(
                 tokio_util::sync::CancellationToken::new(),
@@ -229,6 +238,27 @@ impl GatewayService {
     pub fn with_tool_preview(mut self, enabled: bool) -> Self {
         self.tool_preview_enabled = enabled;
         self
+    }
+
+    pub fn with_virtual_server_base(mut self, base: String) -> Self {
+        self.virtual_server_base = base;
+        self
+    }
+
+    pub fn with_server_oauth_metadata(
+        mut self,
+        enabled: bool,
+        max_age: u32,
+        allow_loopback: bool,
+    ) -> Self {
+        self.well_known_enabled = enabled;
+        self.well_known_max_age = max_age;
+        self.allow_http_oauth_loopback = allow_loopback;
+        self
+    }
+
+    pub fn server_oauth_router(self: &Arc<Self>) -> Router {
+        server_api::well_known_router().with_state(self.clone())
     }
 
     pub fn with_credential_secret(mut self, secret: Option<&str>) -> Self {
@@ -363,6 +393,7 @@ impl GatewayService {
                 .merge(tags::router())
                 .merge(prompt_api::router(self.max_prompt_bytes))
                 .merge(tool_api::router())
+                .merge(server_api::router())
                 .merge(resource_api::router(self.resource_limits.max_bytes))
                 .with_state(self.clone()),
         )

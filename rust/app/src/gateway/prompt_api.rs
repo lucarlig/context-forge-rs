@@ -200,7 +200,7 @@ async fn retrieve(
     Ok(Json(result))
 }
 
-fn metadata(record: &PromptRecord, aliases: bool) -> Value {
+pub(super) fn metadata(record: &PromptRecord, aliases: bool) -> Value {
     let mut response = json!(record);
     response["created_at"] = record.created_at.replacen(' ', "T", 1).into();
     response["updated_at"] = record.updated_at.replacen(' ', "T", 1).into();

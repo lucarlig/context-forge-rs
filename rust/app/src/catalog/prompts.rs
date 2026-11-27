@@ -102,6 +102,23 @@ impl Database {
             }
         }
     }
+
+    pub(crate) async fn managed_server_prompts(
+        &self,
+        scope: CatalogScope<'_>,
+        server: &str,
+        inactive: bool,
+    ) -> Result<Vec<PromptRecord>, sqlx::Error> {
+        fetch_catalog_entries!(
+            self,
+            PromptRecord,
+            scope,
+            CatalogEntryFilters::associated(inactive),
+            prompt_select!(),
+            "EXISTS(SELECT 1 FROM server_prompt_association a WHERE a.server_id=$13 AND a.prompt_id=r.id)",
+            server
+        )
+    }
 }
 
 mod write;

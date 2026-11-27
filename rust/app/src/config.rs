@@ -645,6 +645,36 @@ impl Settings {
         Ok(flag("MCPGATEWAY_TOOL_PREVIEW_ENABLED")?.unwrap_or(true))
     }
 
+    pub fn virtual_server_base() -> Result<String, Box<dyn Error + Send + Sync>> {
+        let domain = value("APP_DOMAIN", "http://localhost:4444")?;
+        let url = reqwest::Url::parse(&domain).map_err(|_| "invalid APP_DOMAIN")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("invalid APP_DOMAIN".into());
+        }
+        let root = value("APP_ROOT_PATH", "")?;
+        let root = root.trim_matches('/');
+        let base = url.as_str().trim_end_matches('/');
+        Ok(if root.is_empty() || base.ends_with(&format!("/{root}")) {
+            base.to_owned()
+        } else {
+            format!("{base}/{root}")
+        })
+    }
+
+    pub fn server_oauth_metadata() -> Result<(bool, u32, bool), Box<dyn Error + Send + Sync>> {
+        Ok((
+            flag("WELL_KNOWN_ENABLED")?.unwrap_or(true),
+            parse("WELL_KNOWN_CACHE_MAX_AGE", 3600)?,
+            flag("SSRF_ALLOW_LOCALHOST")?.unwrap_or(false),
+        ))
+    }
+
     pub fn gateway_listeners(
         &self,
     ) -> Result<Option<GatewayListeners>, Box<dyn Error + Send + Sync>> {

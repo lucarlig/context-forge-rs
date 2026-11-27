@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/.well-known/oauth-protected-resource/servers/44fd5fb719b040e6b72940cf61732485/mcp"
+
+[request.headers]
+Accept = "application/json"
+Host = "gateway.fixture.test"
+
+[response]
+status = 404
+
+[response.headers]
+content-type = "application/json"

@@ -1,0 +1,1 @@
+{"detail":"This endpoint is deprecated and non-compliant with RFC 9728. Use the path-based endpoint: /.well-known/oauth-protected-resource/servers/{server_id}/mcp"}

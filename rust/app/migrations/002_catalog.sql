@@ -229,6 +229,20 @@ CREATE TABLE IF NOT EXISTS server_tool_association (
     PRIMARY KEY (server_id, tool_id)
 );
 
+CREATE TABLE IF NOT EXISTS server_interfaces (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    server_id VARCHAR(36) NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    protocol VARCHAR(50) NOT NULL,
+    binding VARCHAR(255) NOT NULL,
+    version VARCHAR(20),
+    tenant VARCHAR(255),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    config JSON,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (server_id, protocol, binding)
+);
+
 CREATE INDEX IF NOT EXISTS idx_server_tool_association_tool_id ON server_tool_association (tool_id);
 
 CREATE TABLE IF NOT EXISTS server_resource_association (

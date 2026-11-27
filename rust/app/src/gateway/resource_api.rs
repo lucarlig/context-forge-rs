@@ -239,7 +239,7 @@ async fn find_visible(
     Ok(record)
 }
 
-fn metadata(record: &ResourceRecord, aliases: bool) -> Value {
+pub(super) fn metadata(record: &ResourceRecord, aliases: bool) -> Value {
     let mut response = json!(record);
     response["created_at"] = record.created_at.replacen(' ', "T", 1).into();
     response["updated_at"] = record.updated_at.replacen(' ', "T", 1).into();

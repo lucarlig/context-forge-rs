@@ -1,0 +1,1 @@
+{"resource":"http://[..]/servers/385d718b52854aa39de43497ce61ce27/mcp","authorization_servers":["https://auth.fixture.test/tenant"],"bearer_methods_supported":["header"],"scopes_supported":["fixture.read"]}
