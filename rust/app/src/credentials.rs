@@ -16,6 +16,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::upstream_tls::TlsMaterial;
+
 pub(crate) struct CredentialCipher {
     key: LessSafeKey,
 }
@@ -80,6 +82,7 @@ pub(crate) struct UpstreamCredentials {
     pub(crate) query: QueryValues,
     pub(crate) identity_meta: Option<Value>,
     pub(crate) request_bound_header: Option<HeaderName>,
+    pub(crate) tls: Option<TlsMaterial>,
 }
 
 #[derive(Deserialize)]

@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .with_logging_filter(handle)
         .with_credential_secret(Settings::auth_encryption_secret()?.as_deref())
+        .with_secret_kdf(Settings::secret_kdf()?)
         .with_query_auth_hosts(Settings::query_auth_hosts()?)
         .with_header_forwarding(Settings::header_forwarding()?)
         .with_identity_forwarding(Settings::identity_forwarding()?)

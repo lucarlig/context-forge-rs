@@ -230,6 +230,16 @@ pub(crate) struct RegistrationOptions<'a> {
     pub(crate) identity: Option<&'a Value>,
     pub(crate) mode: GatewayMode,
     pub(crate) one_time_auth: bool,
+    pub(crate) tls: RegisteredTls<'a>,
+}
+
+#[derive(Default)]
+pub(crate) struct RegisteredTls<'a> {
+    pub(crate) ca_certificate: Option<&'a str>,
+    pub(crate) ca_certificate_sig: Option<&'a str>,
+    pub(crate) signing_algorithm: Option<&'a str>,
+    pub(crate) client_cert: Option<&'a str>,
+    pub(crate) client_key: Option<&'a str>,
 }
 
 pub struct RegisteredTool<'a> {
@@ -326,9 +336,6 @@ macro_rules! gateway_policy {
     () => {
         concat!(
             "(LOWER(COALESCE(g.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth', 'basic', 'bearer', 'authheaders', 'query_param')
-            OR COALESCE(g.ca_certificate, '') <> ''
-            OR COALESCE(g.client_cert, '') <> ''
-            OR COALESCE(g.client_key, '') <> ''
             OR (LOWER(COALESCE(g.auth_type, 'none')) IN ('', 'none', 'one_time_auth') AND ",
             non_empty_json!("g.auth_value"),
             ")
@@ -364,7 +371,8 @@ macro_rules! connection_configured {
             configured_auth!(),
             " OR ",
             non_empty_json!("g.identity_propagation"),
-            ")"
+            " OR COALESCE(g.ca_certificate, '') <> '' OR COALESCE(g.client_cert, '') <> ''
+            OR COALESCE(g.client_key, '') <> '')"
         )
     };
 }
@@ -615,7 +623,8 @@ const AUTH_CONFLICT_QUERY: &str = "
 
 const CONNECTION_CONFIG: &str = concat!(
     "SELECT LOWER(COALESCE(g.auth_type, '')), CAST(g.auth_value AS TEXT), CAST(g.auth_query_params AS TEXT),
-        CAST(g.passthrough_headers AS TEXT), CAST(g.identity_propagation AS TEXT) FROM gateways g
+        CAST(g.passthrough_headers AS TEXT), CAST(g.identity_propagation AS TEXT),
+        g.ca_certificate, g.client_cert, g.client_key FROM gateways g
     WHERE g.id = $1 AND g.url = $2 AND g.enabled = TRUE AND g.status = 'active'
         AND g.gateway_mode IN ('cache', 'direct_proxy') AND NOT ",
     gateway_policy!()
@@ -638,6 +647,9 @@ type DirectGatewayRow = (
 );
 pub(crate) type GatewayConnectionRow = (
     String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -665,10 +677,11 @@ macro_rules! insert_gateway {
             "INSERT INTO gateways (
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
                 updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status,
-                auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation
+                auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation,
+                ca_certificate, ca_certificate_sig, signing_algorithm, client_cert, client_key
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, $17, 'active',
-                $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ")"
+                $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ", $18, $19, $20, $21, $22)"
         )
     };
 }
@@ -1247,6 +1260,11 @@ impl Database {
                     .bind(passthrough)
                     .bind(identity)
                     .bind(options.mode.name())
+                    .bind(options.tls.ca_certificate)
+                    .bind(options.tls.ca_certificate_sig)
+                    .bind(options.tls.signing_algorithm)
+                    .bind(options.tls.client_cert)
+                    .bind(options.tls.client_key)
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {

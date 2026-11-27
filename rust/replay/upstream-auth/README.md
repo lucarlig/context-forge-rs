@@ -14,6 +14,8 @@ Direct-proxy mode supports live tool calls and resource reads on root and virtua
 
 One-time registration credentials apply during discovery. Later calls can supply a separate upstream credential. [One-time authentication recordings](one-time/README.md)
 
+Gateway registration accepts a private CA and an optional client certificate and key for HTTPS upstreams. The private key is encrypted in the database and masked in API responses. [TLS and mutual TLS recordings](tls/README.md)
+
 For replay, register four public Streamable HTTP servers named `basic`, `bearer`, `headers`, and `query` in the fixture database. Each exposes an `echo` tool and prefixes its result with the gateway name. Use synthetic credentials that the upstream fixture requires and that the gateway stores using the configured encryption secret.
 
 ```sh

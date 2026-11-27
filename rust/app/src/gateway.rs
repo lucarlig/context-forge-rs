@@ -24,15 +24,17 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing_subscriber::{Registry, filter::LevelFilter, reload};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     access::{self, Authorizer, Principal, RoleContext},
     auth::TeamVisibility,
     catalog::{
         CatalogList, CatalogServer, CatalogTool, ContentGateway, GatewayMode, GatewayRegistration,
-        RegisteredTool, RegistrationError, RegistrationOptions, ToolDefinition, slugify,
+        RegisteredTls, RegisteredTool, RegistrationError, RegistrationOptions, ToolDefinition,
+        slugify,
     },
-    config::{HeaderForwarding, IdentityForwarding, ProxyCatalogSettings},
+    config::{HeaderForwarding, IdentityForwarding, ProxyCatalogSettings, SecretKdf},
     credentials::{
         AuthError, AuthInput, CredentialCipher, CredentialError, UpstreamCredentials,
         decode_headers, decode_query, validate_query_host,
@@ -41,9 +43,11 @@ use crate::{
     forward_identity::IdentityError,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     proxy_catalog_cache::ProxyCatalogCache,
+    secret_envelope::SecretEnvelope,
     sessions::Session,
     subscriptions::{AcceptedSubscription, CatalogSubscriptions, ListenSettings},
     upstream::{ToolContext, UpstreamClient, UpstreamEndpoint, UpstreamError, UpstreamTransport},
+    upstream_tls::TlsMaterial,
 };
 use proxy::DirectTarget;
 
@@ -58,6 +62,7 @@ pub struct GatewayService {
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
     credential_cipher: Option<CredentialCipher>,
+    vault: Option<SecretEnvelope>,
     query_auth_hosts: Option<HashSet<String>>,
     header_forwarding: HeaderForwarding,
     identity_forwarding: IdentityForwarding,
@@ -126,6 +131,7 @@ impl GatewayService {
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
             credential_cipher: None,
+            vault: None,
             query_auth_hosts: None,
             header_forwarding: HeaderForwarding::default(),
             identity_forwarding: IdentityForwarding::default(),
@@ -146,6 +152,14 @@ impl GatewayService {
 
     pub fn with_credential_secret(mut self, secret: Option<&str>) -> Self {
         self.credential_cipher = secret.map(CredentialCipher::new);
+        self.vault = secret.map(SecretEnvelope::new);
+        self
+    }
+
+    pub fn with_secret_kdf(mut self, kdf: SecretKdf) -> Self {
+        if let Some(vault) = &mut self.vault {
+            vault.kdf = kdf;
+        }
         self
     }
 
@@ -506,7 +520,16 @@ impl GatewayService {
         if !needs_upstream_config && incoming.is_none() && !self.identity_forwarding.enabled {
             return Ok(None);
         }
-        let (kind, stored_headers, stored_query, passthrough, identity) = self
+        let (
+            kind,
+            stored_headers,
+            stored_query,
+            passthrough,
+            identity,
+            ca,
+            client_cert,
+            client_key,
+        ) = self
             .database
             .gateway_connection(id, url)
             .await?
@@ -539,6 +562,29 @@ impl GatewayService {
             tracing::warn!(gateway = %id, "could not load upstream authentication");
             ToolError::Unavailable
         })?;
+        let client_key = match client_key.filter(|key| !key.trim().is_empty()) {
+            Some(key) if key.trim_start().starts_with("-----BEGIN ") => Some(Zeroizing::new(key)),
+            Some(key) => Some(
+                self.vault
+                    .as_ref()
+                    .ok_or(ToolError::Unavailable)?
+                    .open(key)
+                    .await
+                    .map_err(|_| ToolError::Unavailable)?,
+            ),
+            None => None,
+        };
+        credentials.tls = TlsMaterial::from_pem(
+            ca.as_deref(),
+            client_cert
+                .as_deref()
+                .filter(|cert| !cert.trim().is_empty()),
+            client_key.as_ref().map(|key| key.as_str()),
+        )
+        .map_err(|_| {
+            tracing::warn!(gateway = %id, "could not load upstream TLS material");
+            ToolError::Unavailable
+        })?;
         if let Some(incoming) = incoming {
             let managed = matches!(kind.as_str(), "basic" | "bearer" | "authheaders");
             self.header_forwarding
@@ -559,6 +605,7 @@ impl GatewayService {
             })?;
         Ok((!credentials.headers.is_empty()
             || !credentials.query.is_empty()
+            || credentials.tls.is_some()
             || credentials.identity_meta.is_some())
         .then_some(credentials))
     }
@@ -739,6 +786,16 @@ struct RegisterGateway {
     passthrough_headers: Option<Vec<String>>,
     #[serde(alias = "identityPropagation")]
     identity_propagation: Option<Value>,
+    #[serde(alias = "caCertificate")]
+    ca_certificate: Option<String>,
+    #[serde(alias = "caCertificateSig")]
+    ca_certificate_sig: Option<String>,
+    #[serde(alias = "signingAlgorithm")]
+    signing_algorithm: Option<String>,
+    #[serde(alias = "clientCert")]
+    client_cert: Option<String>,
+    #[serde(alias = "clientKey")]
+    client_key: Option<String>,
     #[serde(default, alias = "oneTimeAuth")]
     one_time_auth: bool,
     #[serde(flatten)]
@@ -834,7 +891,7 @@ async fn register(
             "Invalid passthrough header name",
         ));
     }
-    let auth = input
+    let mut auth = input
         .auth
         .prepare(service.credential_cipher.as_ref(), service.query_auth_hosts.as_ref(), url)
         .map_err(|error| match error {
@@ -855,12 +912,48 @@ async fn register(
             AuthError::QueryHost => RegistrationResponse::new(StatusCode::UNPROCESSABLE_ENTITY,
                 "Query parameter authentication is not allowed for the upstream host."),
         })?;
+    let client_key = input.client_key.map(Zeroizing::new);
+    let tls = TlsMaterial::from_pem(
+        input.ca_certificate.as_deref(),
+        input.client_cert.as_deref(),
+        client_key.as_ref().map(|key| key.as_str()),
+    )
+    .map_err(|_| {
+        RegistrationResponse::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid upstream TLS certificate or private key",
+        )
+    })?;
+    let encrypted_client_key = if let Some(key) = client_key {
+        let encryption_error = || {
+            RegistrationResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway credential encryption unavailable",
+            )
+        };
+        Some(
+            service
+                .vault
+                .as_ref()
+                .ok_or_else(encryption_error)?
+                .seal(key)
+                .await
+                .map_err(|_| encryption_error())?,
+        )
+    } else {
+        None
+    };
+    let mut anonymous_credentials = UpstreamCredentials::default();
+    let discovery_credentials = auth
+        .as_mut()
+        .map_or(&mut anonymous_credentials, |auth| &mut auth.credentials);
+    discovery_credentials.tls = tls;
     let (discovery, metadata) = service
         .upstream
         .discover_catalog(UpstreamEndpoint {
             url,
             transport,
-            credentials: auth.as_ref().map(|auth| &auth.credentials),
+            credentials: Some(discovery_credentials),
         })
         .await
         .map_err(|error| {
@@ -930,6 +1023,13 @@ async fn register(
                 identity: input.identity_propagation.as_ref(),
                 mode,
                 one_time_auth,
+                tls: RegisteredTls {
+                    ca_certificate: input.ca_certificate.as_deref(),
+                    ca_certificate_sig: input.ca_certificate_sig.as_deref(),
+                    signing_algorithm: input.signing_algorithm.as_deref(),
+                    client_cert: input.client_cert.as_deref(),
+                    client_key: encrypted_client_key.as_deref(),
+                },
             },
         )
         .await?;
@@ -940,6 +1040,15 @@ async fn register(
         .and_then(|value| value.to_str().ok());
     let mut response = registration_response(&registration, address, agent);
     response["gatewayMode"] = mode.name().into();
+    response["caCertificate"] = json!(input.ca_certificate);
+    response["caCertificateSig"] = json!(input.ca_certificate_sig);
+    response["clientCert"] = json!(input.client_cert);
+    if let Some(algorithm) = input.signing_algorithm {
+        response["signingAlgorithm"] = algorithm.into();
+    }
+    if encrypted_client_key.is_some() {
+        response["clientKey"] = "*****".into();
+    }
     if let Some(headers) = input.passthrough_headers {
         response["passthroughHeaders"] = json!(headers);
     }

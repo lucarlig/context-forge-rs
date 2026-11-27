@@ -31,7 +31,6 @@ use rmcp::model::{
     ServerJsonRpcMessage, ServerNotification, ServerRequest, SubscriptionFilter,
     SubscriptionsListenRequest, SubscriptionsListenRequestParams,
 };
-use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -48,6 +47,7 @@ use crate::{
     credentials::{QueryValues, UpstreamCredentials},
     events::PassiveEvents,
     sessions::SessionLifetime,
+    upstream_tls,
 };
 
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST_WITH_INITIALIZE;
@@ -355,7 +355,9 @@ impl<'a> UpstreamEndpoint<'a> {
 
     fn fingerprint(self, catalog: bool) -> Option<[u8; 32]> {
         let credentials = self.credentials.filter(|credentials| {
-            !credentials.headers.is_empty() || !credentials.query.is_empty()
+            !credentials.headers.is_empty()
+                || !credentials.query.is_empty()
+                || credentials.tls.is_some()
         })?;
         let mut entries: Vec<_> = credentials.headers.iter().collect();
         if catalog {
@@ -387,6 +389,9 @@ impl<'a> UpstreamEndpoint<'a> {
         for (name, value) in &credentials.query {
             hash_field(&mut hash, name.as_bytes());
             hash_field(&mut hash, value.as_bytes());
+        }
+        if let Some(tls) = &credentials.tls {
+            hash_field(&mut hash, &tls.fingerprint());
         }
         Some(hash.finalize().into())
     }
@@ -876,6 +881,9 @@ impl UpstreamClient {
 
     async fn connect(&self, endpoint: UpstreamEndpoint<'_>) -> Result<Session, UpstreamError> {
         let url = self.policy.validate_url(endpoint.url)?;
+        let tls = endpoint
+            .credentials
+            .and_then(|credentials| credentials.tls.as_ref());
         let mut builder = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -883,7 +891,9 @@ impl UpstreamClient {
             .pool_max_idle_per_host(0)
             .connect_timeout(CONNECT_TIMEOUT.min(self.timeout))
             .dns_resolver(Arc::new(DenyDns))
-            .tls_backend_preconfigured(tls_config()?);
+            .tls_backend_preconfigured(
+                upstream_tls::client_config(tls).map_err(|_| UpstreamError::Transport)?,
+            );
         if let Some(credentials) = endpoint.credentials {
             builder = builder.default_headers(credentials.headers.clone());
         }
@@ -910,19 +920,6 @@ impl UpstreamClient {
             next_id: AtomicI64::new(1),
         })
     }
-}
-
-fn tls_config() -> Result<rustls::ClientConfig, UpstreamError> {
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|_| UpstreamError::Transport)?
-    .with_platform_verifier()
-    .map_err(|_| UpstreamError::Transport)?
-    .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(tls)
 }
 
 fn check_addresses(

@@ -57,6 +57,23 @@ pub struct ProxyCatalogSettings {
     pub(crate) max_snapshots: usize,
 }
 
+#[derive(Clone, Copy)]
+pub struct SecretKdf {
+    pub(crate) time_cost: u32,
+    pub(crate) memory_cost: u32,
+    pub(crate) parallelism: u32,
+}
+
+impl Default for SecretKdf {
+    fn default() -> Self {
+        Self {
+            time_cost: 3,
+            memory_cost: 65_536,
+            parallelism: 1,
+        }
+    }
+}
+
 impl Default for ProxyCatalogSettings {
     fn default() -> Self {
         Self {
@@ -109,6 +126,16 @@ impl Default for HeaderForwarding {
 }
 
 impl Settings {
+    pub fn secret_kdf() -> Result<SecretKdf, Box<dyn Error + Send + Sync>> {
+        let defaults = SecretKdf::default();
+        let settings = SecretKdf {
+            time_cost: parse("ARGON2ID_TIME_COST", defaults.time_cost)?,
+            memory_cost: parse("ARGON2ID_MEMORY_COST", defaults.memory_cost)?,
+            parallelism: parse("ARGON2ID_PARALLELISM", defaults.parallelism)?,
+        };
+        settings.params().map_err(|_| "invalid Argon2id settings")?;
+        Ok(settings)
+    }
     pub fn from_env() -> Result<Self, Box<dyn Error + Send + Sync>> {
         let redis = match value("CACHE_TYPE", "database")?.as_str() {
             "redis" => {
