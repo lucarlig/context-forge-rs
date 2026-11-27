@@ -48,6 +48,20 @@ live checks for tool SigV4 credentials and OAuth secrets inside nested arrays.
 The database values remained readable under the new key. Unwrapped legacy
 Fernet tokens require the historical schema migration before rotation.
 
+## Native schema upgrades
+
+The `migrate` command and gateway startup share an atomic native revision history
+for identity, catalog, and database-backed SSE. The pinned bootstrap and the
+Rust command matched both SQLite replays for the supported tables, database
+integrity, and preservation of existing account data. A live PostgreSQL check
+adopted the v1.1.2 schema and preserved its Alembic revision and seeded account.
+Concurrent migration commands recorded each native revision once on both
+backends. SQLite also verified that skip mode rejects an uninitialized
+database and starts when the native history is current.
+
+Historical Alembic upgrades and the remaining upstream tables are still
+part of the database migration milestone.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

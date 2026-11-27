@@ -870,8 +870,7 @@ mod tests {
             .await
             .unwrap();
         let database = Database::Sqlite(pool);
-        database.migrate_identity().await.unwrap();
-        database.migrate_catalog().await.unwrap();
+        database.migrate_schema().await.unwrap();
         database
     }
 

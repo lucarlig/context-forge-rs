@@ -560,7 +560,6 @@ async fn legacy_sse_workers_share_redis_sessions() {
 async fn verify_shared_legacy_sse(backend: impl Fn() -> SseBackend) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let database = database().await;
-    database.migrate_legacy_sse().await.unwrap();
     let Database::Sqlite(pool) = &database else {
         unreachable!()
     };
@@ -1885,8 +1884,7 @@ async fn database() -> Database {
         redis: None,
     })
     .unwrap();
-    database.migrate_identity().await.unwrap();
-    database.migrate_catalog().await.unwrap();
+    database.migrate_schema().await.unwrap();
     let Database::Sqlite(pool) = &database else {
         unreachable!()
     };

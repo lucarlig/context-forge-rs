@@ -12,8 +12,6 @@ use crate::{
     legacy_sse_cache::{Access, CacheResult, IDLE_POLL, MAX_MESSAGES, MAX_QUEUE_BYTES, Scope},
 };
 
-const MIGRATION: &str = include_str!("../migrations/003_legacy_sse.sql");
-
 const REGISTER: &str = "
     INSERT INTO context_forge_sse_sessions (id, owner_email, server_id, expires_at)
     VALUES ($1, $2, $3, $4)";
@@ -52,26 +50,6 @@ type QueueHead = (Option<i64>, Option<String>, Option<i64>);
 pub(crate) struct DatabaseQueue {
     database: Database,
     id: String,
-}
-
-impl Database {
-    pub async fn migrate_legacy_sse(&self) -> Result<(), sqlx::Error> {
-        match self {
-            Self::Sqlite(pool) => {
-                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
-                transaction.commit().await
-            }
-            Self::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                sqlx::query("SELECT pg_advisory_xact_lock(1128682068)")
-                    .execute(&mut *transaction)
-                    .await?;
-                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
-                transaction.commit().await
-            }
-        }
-    }
 }
 
 impl DatabaseQueue {

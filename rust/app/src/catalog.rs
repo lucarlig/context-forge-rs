@@ -30,7 +30,6 @@ pub(crate) use servers::{
 };
 pub(crate) use tools::{ToolRecord, ToolWriteError};
 
-const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
 pub(crate) const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";
 
 #[derive(Clone, Copy)]
@@ -786,106 +785,7 @@ pub(crate) const SQLITE_TOOL_INSERT: &str = insert_tool!("json($8)", "json($9)",
 pub(crate) const POSTGRES_TOOL_INSERT: &str =
     insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)");
 
-macro_rules! catalog_audit_columns {
-    ($prefix:literal) => {
-        [
-            ("created_by", concat!($prefix, "created_by VARCHAR(255)")),
-            (
-                "created_from_ip",
-                concat!($prefix, "created_from_ip VARCHAR(45)"),
-            ),
-            ("created_via", concat!($prefix, "created_via VARCHAR(100)")),
-            (
-                "created_user_agent",
-                concat!($prefix, "created_user_agent TEXT"),
-            ),
-            ("modified_by", concat!($prefix, "modified_by VARCHAR(255)")),
-            (
-                "modified_from_ip",
-                concat!($prefix, "modified_from_ip VARCHAR(45)"),
-            ),
-            (
-                "modified_via",
-                concat!($prefix, "modified_via VARCHAR(100)"),
-            ),
-            (
-                "modified_user_agent",
-                concat!($prefix, "modified_user_agent TEXT"),
-            ),
-            (
-                "import_batch_id",
-                concat!($prefix, "import_batch_id VARCHAR(36)"),
-            ),
-            (
-                "federation_source",
-                concat!($prefix, "federation_source VARCHAR(255)"),
-            ),
-            (
-                "version",
-                concat!($prefix, "version INTEGER NOT NULL DEFAULT 1"),
-            ),
-        ]
-    };
-}
-
 impl Database {
-    pub async fn migrate_catalog(&self) -> Result<(), sqlx::Error> {
-        macro_rules! add_columns {
-            ($tx:ident, $columns:literal, $definitions:expr) => {{
-                let existing = sqlx::query_scalar::<_, String>($columns)
-                    .fetch_all(&mut *$tx)
-                    .await?;
-                for (name, statement) in $definitions {
-                    if !existing.iter().any(|column| column == name) {
-                        sqlx::query(statement).execute(&mut *$tx).await?;
-                    }
-                }
-            }};
-        }
-        let resource_columns = catalog_audit_columns!("ALTER TABLE resources ADD COLUMN ");
-        let prompt_columns = catalog_audit_columns!("ALTER TABLE prompts ADD COLUMN ")
-            .into_iter()
-            .chain([(
-                "display_name",
-                "ALTER TABLE prompts ADD COLUMN display_name VARCHAR(255)",
-            )]);
-        match self {
-            Self::Sqlite(pool) => {
-                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
-                add_columns!(
-                    transaction,
-                    "SELECT name FROM pragma_table_info('resources')",
-                    resource_columns
-                );
-                add_columns!(
-                    transaction,
-                    "SELECT name FROM pragma_table_info('prompts')",
-                    prompt_columns
-                );
-                transaction.commit().await
-            }
-            Self::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
-                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
-                add_columns!(
-                    transaction,
-                    "SELECT CAST(column_name AS TEXT) FROM information_schema.columns
-                    WHERE table_schema = current_schema() AND table_name = 'resources'",
-                    resource_columns
-                );
-                add_columns!(
-                    transaction,
-                    "SELECT CAST(column_name AS TEXT) FROM information_schema.columns
-                    WHERE table_schema = current_schema() AND table_name = 'prompts'",
-                    prompt_columns
-                );
-                transaction.commit().await
-            }
-        }
-    }
-
     pub async fn catalog_server(&self, id: &str) -> Result<Option<CatalogServer>, sqlx::Error> {
         let row = match self {
             Self::Sqlite(pool) => {
@@ -1952,9 +1852,8 @@ mod tests {
             .await
             .unwrap();
         let database = Database::Sqlite(pool);
-        database.migrate_identity().await.unwrap();
-        database.migrate_catalog().await.unwrap();
-        database.migrate_catalog().await.unwrap();
+        database.migrate_schema().await.unwrap();
+        database.migrate_schema().await.unwrap();
         let Database::Sqlite(pool) = &database else {
             unreachable!();
         };

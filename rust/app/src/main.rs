@@ -8,8 +8,8 @@ use context_forge_rs::{
     database::Database,
     gateway::GatewayService,
     local_auth,
-    mcp::SseBackend,
     probes::{self, RedisProbe},
+    schema,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -20,8 +20,12 @@ use tracing_subscriber::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("rotate-credentials") {
-        return context_forge_rs::credential_rotation::cli(args).await;
+    match args.next().as_deref() {
+        Some("rotate-credentials") => {
+            return context_forge_rs::credential_rotation::cli(args).await;
+        }
+        Some("migrate") => return schema::cli(args).await,
+        _ => {}
     }
     let (filter, handle) = reload::Layer::new(LevelFilter::INFO);
     tracing_subscriber::registry()
@@ -39,12 +43,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let shutdown = CancellationToken::new();
     let sse = settings.gateway_sse_settings(shutdown.clone())?;
     let catalog_available = verifier.is_some() || external_identity.is_some() || !require_mcp_auth;
-    if catalog_available {
-        database.migrate_identity().await?;
-        database.migrate_catalog().await?;
-        if matches!(sse.backend, SseBackend::Database) {
-            database.migrate_legacy_sse().await?;
-        }
+    if schema::skip_migrations()? {
+        database
+            .require_current_schema()
+            .await
+            .map_err(|error| error.to_string())?;
+    } else if catalog_available {
+        database.migrate_schema().await?;
     }
     let access = Arc::new(
         Authorizer::new(

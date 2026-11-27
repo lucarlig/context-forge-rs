@@ -2,8 +2,6 @@
 
 use crate::{auth::TeamVisibility, database::Database};
 
-const MIGRATION: &str = include_str!("../migrations/001_identity.sql");
-
 const ACTIVE_MEMBERSHIPS: &str = "
     SELECT m.team_id FROM email_team_members m
     JOIN email_teams t ON t.id = m.team_id AND t.is_active = TRUE
@@ -50,37 +48,6 @@ impl Database {
         match self {
             Self::Sqlite(pool) => select!(pool),
             Self::Postgres(pool) => select!(pool),
-        }
-    }
-
-    /// Initialize the account, membership, role, and revocation tables.
-    pub async fn migrate_identity(&self) -> Result<(), sqlx::Error> {
-        match self {
-            Self::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
-                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
-                sqlx::raw_sql(crate::tokens::SQLITE_USAGE_MIGRATION)
-                    .execute(&mut *transaction)
-                    .await?;
-                sqlx::raw_sql(crate::local_auth::SQLITE_MIGRATION)
-                    .execute(&mut *transaction)
-                    .await?;
-                transaction.commit().await
-            }
-            Self::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                sqlx::query("SELECT pg_advisory_xact_lock(1128682066)")
-                    .execute(&mut *transaction)
-                    .await?;
-                sqlx::raw_sql(MIGRATION).execute(&mut *transaction).await?;
-                sqlx::raw_sql(crate::tokens::POSTGRES_USAGE_MIGRATION)
-                    .execute(&mut *transaction)
-                    .await?;
-                sqlx::raw_sql(crate::local_auth::POSTGRES_MIGRATION)
-                    .execute(&mut *transaction)
-                    .await?;
-                transaction.commit().await
-            }
         }
     }
 

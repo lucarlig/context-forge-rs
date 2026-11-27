@@ -56,7 +56,7 @@ async fn seeded_database(url: String) -> Database {
         redis: None,
     })
     .unwrap();
-    database.migrate_identity().await.unwrap();
+    database.migrate_schema().await.unwrap();
     apply(&database, FIXTURES).await;
     database
 }
@@ -70,7 +70,7 @@ async fn postgres_authorizes_against_the_native_identity_schema() {
     let Database::Postgres(_) = &database else {
         panic!("expected PostgreSQL");
     };
-    database.migrate_identity().await.unwrap();
+    database.migrate_schema().await.unwrap();
     let auth = authorizer(&database);
     let credential = token(json!({"teams":["beta"]}));
     let principal = auth.authenticate(&credential, None, None).await.unwrap();
