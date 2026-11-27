@@ -297,7 +297,20 @@ route accepts authorized calls in Rust. The pinned route returned 401 for
 the replay caller. An adopted SQLite database passed credential retention,
 rotation, clearing, and metric deletion checks through the live gateway.
 
-Cards, OAuth, streaming with webhook delivery, and UAID routing remain open.
+Card discovery normalizes A2A v0.3 and v1 documents, supports well-known
+fallback, and fetches extended cards over same-origin JSON-RPC. The fetch
+uses pinned addresses, a bounded response body, and `FEDERATION_TIMEOUT`.
+Registration stores fetched documents in the same transaction as the agent
+and derived MCP tool. Agent and virtual-server cards reflect the caller's
+catalog visibility. Stored extended cards require agent management access.
+
+Rust Anything matched discovery and stored-card scenarios on SQLite. The
+same scenarios matched on PostgreSQL. An adopted SQLite database retained
+public and extended card documents, versions, timestamps, and cache metadata.
+A Rust regression verifies the credential origin boundary, extended-card
+permissions, and virtual-server skill visibility.
+
+OAuth, streaming, webhook delivery, and UAID routing remain open.
 
 ## Gateway management
 

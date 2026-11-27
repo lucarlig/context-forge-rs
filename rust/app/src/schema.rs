@@ -17,7 +17,8 @@ const GRPC: &str = include_str!("../migrations/004_grpc.sql");
 const A2A: &str = include_str!("../migrations/005_a2a.sql");
 const A2A_TASKS: &str = include_str!("../migrations/006_a2a_tasks.sql");
 const A2A_PUSH_CONFIGS: &str = include_str!("../migrations/007_a2a_push_configs.sql");
-const MIGRATIONS: [&str; 9] = [
+const A2A_CARDS: &str = include_str!("../migrations/008_a2a_cards.sql");
+const MIGRATIONS: [&str; 10] = [
     "identity",
     "catalog",
     "legacy_sse",
@@ -27,6 +28,7 @@ const MIGRATIONS: [&str; 9] = [
     "a2a_agents",
     "a2a_tasks",
     "a2a_push_configs",
+    "a2a_cards",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -310,6 +312,9 @@ impl Database {
                             sqlx::raw_sql(A2A_PUSH_CONFIGS)
                                 .execute(&mut *$transaction)
                                 .await?;
+                        }
+                        9 => {
+                            sqlx::raw_sql(A2A_CARDS).execute(&mut *$transaction).await?;
                         }
                         _ => unreachable!("unknown migration implementation"),
                     }

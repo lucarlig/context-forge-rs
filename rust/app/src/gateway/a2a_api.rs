@@ -11,6 +11,7 @@ use super::{catalog_api::*, *};
 use crate::catalog::{AgentLookup, AgentRecord, AgentWriteError};
 use crate::schema_validation::Target;
 
+mod cards;
 mod lifecycle;
 mod protocol;
 mod push_configs;
@@ -31,6 +32,13 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
             .route(&format!("{base}/{{id}}/state"), post(lifecycle::set_state))
             .route(&format!("{base}/{{id}}/toggle"), post(lifecycle::set_state))
             .route(&format!("{base}/invoke"), post(invoke_by_id))
+            .route(&format!("{base}/fetch-card"), post(cards::discover))
+            .route(&format!("{base}/{{id}}/card"), get(cards::generated))
+            .route(&format!("{base}/{{id}}/stored-card"), get(cards::stored))
+            .route(
+                &format!("{base}/{{id}}/stored-card/extended"),
+                get(cards::stored_extended),
+            )
             .route(&format!("{base}/{{name}}/invoke"), post(invoke_by_name))
             .route(&format!("{base}/{{name}}/jsonrpc"), post(raw_rpc))
             .route(&format!("{base}/{{agent}}/tasks"), get(tasks::list))
@@ -100,6 +108,8 @@ struct AgentInput {
     tags: Vec<Value>,
     #[serde(default)]
     generate_uaid: bool,
+    #[serde(alias = "cardUrl")]
+    card_url: Option<String>,
     #[serde(flatten)]
     auth: AuthInput,
 }
@@ -205,6 +215,13 @@ async fn register(
         .map(serde_json::from_str)
         .transpose()
         .map_err(|_| CatalogApiError::unavailable())?;
+    let cards = cards::registration(
+        &app,
+        input.card_url.as_deref(),
+        endpoint,
+        auth.as_ref().map(|auth| &auth.credentials.headers),
+    )
+    .await?;
     let record = AgentRecord {
         id: Uuid::new_v4().simple().to_string(),
         name: name.to_owned(),
@@ -246,10 +263,17 @@ async fn register(
         uaid_registry: None,
         uaid_proto: None,
         uaid_native_id: None,
+        tenant: None,
+        icon_url: None,
+        oauth_config: None,
     };
     let agent = app
         .database
-        .insert_agent(&record, encoded_query.as_ref())
+        .insert_agent(
+            &record,
+            encoded_query.as_ref(),
+            &cards::stored_rows(cards.as_ref()),
+        )
         .await
         .map_err(|error| match error {
             AgentWriteError::Duplicate { id, enabled } => {

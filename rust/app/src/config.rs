@@ -143,6 +143,10 @@ impl Settings {
         ))
     }
 
+    pub fn a2a_card_timeout() -> Result<Duration, Box<dyn Error + Send + Sync>> {
+        positive_seconds("FEDERATION_TIMEOUT", 120.0)
+    }
+
     pub fn grpc_federation() -> Result<crate::grpc::GrpcSettings, Box<dyn Error + Send + Sync>> {
         let max_message_bytes = parse("MCPGATEWAY_GRPC_MAX_MESSAGE_SIZE", 4 * 1024 * 1024)?;
         let min_page_size = parse("PAGINATION_MIN_PAGE_SIZE", 1)?;

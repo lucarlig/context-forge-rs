@@ -42,11 +42,7 @@ pub(super) fn version_header(version: &str) -> String {
 }
 
 pub(super) fn rpc_request(mut input: Map<String, Value>, version: &str) -> Value {
-    let version = version_header(version);
-    let major = version.split('.').next().unwrap_or(&version);
-    let modern = major
-        .parse::<u32>()
-        .map_or_else(|_| major.starts_with('1'), |major| major >= 1);
+    let modern = is_modern(version);
     let id = input.remove("id").unwrap_or_else(|| json!(1));
     let mut method = input
         .remove("method")
@@ -100,6 +96,14 @@ pub(super) fn rpc_request(mut input: Map<String, Value>, version: &str) -> Value
         normalize_message(message, modern);
     }
     json!({"jsonrpc":"2.0","method":method,"params":params,"id":id})
+}
+
+pub(super) fn is_modern(version: &str) -> bool {
+    let version = version_header(version);
+    let major = version.split('.').next().unwrap_or(&version);
+    major
+        .parse::<u32>()
+        .map_or_else(|_| major.starts_with('1'), |major| major >= 1)
 }
 
 fn normalize_message(message: &mut Map<String, Value>, modern: bool) {

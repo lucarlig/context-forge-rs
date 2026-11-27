@@ -5,6 +5,7 @@ use super::*;
 use sqlx::types::Json as DbJson;
 
 mod lifecycle;
+pub(crate) use cards::NewAgentCard;
 
 #[derive(Clone, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +52,12 @@ pub(crate) struct AgentRecord {
     pub(crate) uaid_registry: Option<String>,
     pub(crate) uaid_proto: Option<String>,
     pub(crate) uaid_native_id: Option<String>,
+    #[serde(skip)]
+    pub(crate) tenant: Option<String>,
+    #[serde(skip)]
+    pub(crate) icon_url: Option<String>,
+    #[serde(skip)]
+    pub(crate) oauth_config: Option<DbJson<Value>>,
 }
 
 impl AgentRecord {
@@ -105,7 +112,7 @@ macro_rules! projection {
             r.created_by, r.created_from_ip, r.created_via, r.created_user_agent, r.modified_by,
             r.modified_from_ip, r.modified_via, r.modified_user_agent, r.import_batch_id,
             r.federation_source, CAST(r.last_interaction AS TEXT) AS last_interaction, r.version,
-            r.uaid, r.uaid_registry, r.uaid_proto, r.uaid_native_id
+            r.uaid, r.uaid_registry, r.uaid_proto, r.uaid_native_id, r.tenant, r.icon_url, r.oauth_config
          FROM (SELECT a.*, NULL AS gateway_id FROM a2a_agents a) r
          LEFT JOIN email_teams t ON t.id = r.team_id AND t.is_active = TRUE"
     };
@@ -115,6 +122,8 @@ const BY_NAME: &str = concat!(
     projection!(),
     " WHERE r.name = $1 ORDER BY r.created_at DESC, r.id DESC"
 );
+
+mod cards;
 
 const DUPLICATE: &str = "
     SELECT id, enabled FROM a2a_agents WHERE slug = $1 AND visibility = $2
@@ -228,6 +237,7 @@ impl Database {
         &self,
         agent: &AgentRecord,
         auth_query: Option<&Value>,
+        cards: &[NewAgentCard<'_>],
     ) -> Result<AgentRecord, AgentWriteError> {
         let original_name = format!("a2a_{}", agent.slug);
         let tool_id = (original_name.chars().count() <= 255)
@@ -295,6 +305,7 @@ impl Database {
                     .bind(&tool_id)
                     .execute(&mut *$tx)
                     .await?;
+                cards::insert_cards!($tx, &agent.id, cards);
                 let result = sqlx::query_as(BY_ID)
                     .bind(&agent.id)
                     .fetch_one(&mut *$tx)

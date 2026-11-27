@@ -137,6 +137,21 @@ macro_rules! server_agents {
 }
 
 impl Database {
+    pub(crate) async fn server_card_interface(
+        &self,
+        id: &str,
+    ) -> Result<Option<ServerInterface>, sqlx::Error> {
+        const SQL: &str = "
+            SELECT id,server_id,protocol,binding,version,tenant,enabled,CAST(config AS TEXT) AS config,
+                CAST(created_at AS TEXT) AS created_at,CAST(updated_at AS TEXT) AS updated_at
+            FROM server_interfaces WHERE server_id=$1 AND enabled AND LOWER(protocol) LIKE 'a2a%'
+            ORDER BY created_at DESC, id DESC LIMIT 1";
+        match self {
+            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(id).fetch_optional(pool).await,
+            Self::Postgres(pool) => sqlx::query_as(SQL).bind(id).fetch_optional(pool).await,
+        }
+    }
+
     pub(crate) async fn managed_server(
         &self,
         id: &str,

@@ -119,6 +119,7 @@ pub struct GatewayService {
     grpc: GrpcSettings,
     a2a_enabled: bool,
     a2a_timeout: Duration,
+    a2a_card_timeout: Duration,
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
     gateway_oauth: GatewayOAuthSettings,
@@ -227,6 +228,7 @@ impl GatewayService {
             grpc: GrpcSettings::default(),
             a2a_enabled: true,
             a2a_timeout: Duration::from_secs(30),
+            a2a_card_timeout: Duration::from_secs(120),
             email_auth_enabled: true,
             token_issuer: None,
             gateway_oauth: GatewayOAuthSettings::default(),
@@ -286,6 +288,11 @@ impl GatewayService {
     pub fn with_a2a_settings(mut self, enabled: bool, timeout: Duration) -> Self {
         self.a2a_enabled = enabled;
         self.a2a_timeout = timeout;
+        self
+    }
+
+    pub fn with_a2a_card_timeout(mut self, timeout: Duration) -> Self {
+        self.a2a_card_timeout = timeout;
         self
     }
 

@@ -39,6 +39,8 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+#[path = "gateway/a2a_cards.rs"]
+mod a2a_cards;
 #[path = "gateway/a2a_federation.rs"]
 mod a2a_federation;
 #[path = "gateway/a2a_tasks.rs"]
