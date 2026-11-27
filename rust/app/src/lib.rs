@@ -12,6 +12,7 @@ mod events;
 mod forward_headers;
 mod forward_identity;
 pub mod gateway;
+mod gateway_records;
 mod identity;
 pub mod jwt;
 mod legacy_sse;

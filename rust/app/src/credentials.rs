@@ -403,13 +403,19 @@ pub(crate) fn decode_headers(
     cipher: Option<&CredentialCipher>,
     stored: &str,
 ) -> Result<HeaderMap, CredentialError> {
+    http_headers(decode_header_values(cipher, stored)?.iter())
+}
+
+pub(crate) fn decode_header_values(
+    cipher: Option<&CredentialCipher>,
+    stored: &str,
+) -> Result<HeaderValues, CredentialError> {
     let value: Value = serde_json::from_str(stored).map_err(|_| CredentialError)?;
-    let values: HeaderValues = match value {
-        Value::String(encoded) => cipher.ok_or(CredentialError)?.open(&encoded)?,
-        Value::Object(_) => serde_json::from_value(value).map_err(|_| CredentialError)?,
-        _ => return Err(CredentialError),
-    };
-    http_headers(values.iter())
+    match value {
+        Value::String(encoded) => cipher.ok_or(CredentialError)?.open(&encoded),
+        Value::Object(_) => serde_json::from_value(value).map_err(|_| CredentialError),
+        _ => Err(CredentialError),
+    }
 }
 
 fn http_headers<'a>(

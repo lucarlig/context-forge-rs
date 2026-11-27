@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod content;
+mod management;
 mod proxy;
 
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
@@ -10,7 +11,7 @@ use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::get,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
@@ -60,6 +61,8 @@ pub struct GatewayService {
     database: Database,
     upstream: UpstreamClient,
     pagination: Pagination,
+    management_page_size: u32,
+    management_max_page_size: u32,
     refresh: CatalogRefresh,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
@@ -129,6 +132,8 @@ impl GatewayService {
             database,
             upstream,
             pagination,
+            management_page_size: 50,
+            management_max_page_size: 500,
             refresh,
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
@@ -144,6 +149,12 @@ impl GatewayService {
 
     pub fn with_logging_filter(mut self, filter: reload::Handle<LevelFilter, Registry>) -> Self {
         self.logging_filter = Some(filter);
+        self
+    }
+
+    pub fn with_management_page_sizes(mut self, default: u32, maximum: u32) -> Self {
+        self.management_page_size = default;
+        self.management_max_page_size = maximum;
         self
     }
 
@@ -250,15 +261,14 @@ impl GatewayService {
     }
 
     pub fn registration_router(self: &Arc<Self>) -> Router {
-        let router = Router::new()
-            .route("/gateways", post(register))
-            .route("/gateways/", post(register))
-            .route("/v1/gateways", post(register))
-            .route("/v1/gateways/", post(register))
-            .route("/v1/mcp-servers", post(register))
-            .route("/v1/mcp-servers/", post(register))
-            .with_state(self.clone());
-        self.access.protect_api(router)
+        let mut router = Router::new();
+        for route in ["/gateways", "/v1/gateways", "/v1/mcp-servers"] {
+            router = router
+                .route(route, get(management::list).post(register))
+                .route(&format!("{route}/"), get(management::list).post(register))
+                .route(&format!("{route}/{{key}}"), get(management::detail));
+        }
+        self.access.protect_api(router.with_state(self.clone()))
     }
 
     pub fn mcp_router(self: &Arc<Self>, require_auth: bool, mode: ProtocolMode) -> Router {
@@ -1096,6 +1106,10 @@ async fn register(
             definition: &tools[index],
         })
         .collect();
+    let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
     service
         .database
         .register_discovered_gateway(
@@ -1115,14 +1129,12 @@ async fn register(
                     client_cert: input.client_cert.as_deref(),
                     client_key: encrypted_client_key.as_deref(),
                 },
+                created_from_ip: address.as_deref(),
+                created_user_agent: agent,
             },
         )
         .await?;
     service.subscriptions.registered(&registration);
-    let address = peer.map(|Extension(ConnectInfo(address))| address.ip().to_string());
-    let agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok());
     let mut response = registration_response(&registration, address, agent);
     response["gatewayMode"] = mode.name().into();
     response["caCertificate"] = json!(input.ca_certificate);

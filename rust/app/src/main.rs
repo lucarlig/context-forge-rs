@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         verifier,
         Settings::invalidate_sessions_on_password_change()?,
     ));
+    let (management_page_size, management_max_page_size) = Settings::management_page_sizes()?;
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
@@ -53,6 +54,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Settings::catalog_refresh()?,
         )
         .with_logging_filter(handle)
+        .with_management_page_sizes(management_page_size, management_max_page_size)
         .with_credential_secret(Settings::auth_encryption_secret()?.as_deref())
         .with_secret_kdf(Settings::secret_kdf()?)
         .with_query_auth_hosts(Settings::query_auth_hosts()?)

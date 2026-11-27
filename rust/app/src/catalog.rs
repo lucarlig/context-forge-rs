@@ -25,7 +25,7 @@ pub struct CatalogScope<'a> {
 }
 
 impl CatalogScope<'_> {
-    fn can_own(&self) -> bool {
+    pub(crate) fn can_own(&self) -> bool {
         self.email.is_some() && self.visibility != &TeamVisibility::Public
     }
 
@@ -231,6 +231,8 @@ pub(crate) struct RegistrationOptions<'a> {
     pub(crate) mode: GatewayMode,
     pub(crate) one_time_auth: bool,
     pub(crate) tls: RegisteredTls<'a>,
+    pub(crate) created_from_ip: Option<&'a str>,
+    pub(crate) created_user_agent: Option<&'a str>,
 }
 
 #[derive(Default)]
@@ -680,10 +682,12 @@ macro_rules! insert_gateway {
             "INSERT INTO gateways (
                 id, name, slug, url, description, capabilities, tags, transport, enabled, created_at,
                 updated_at, last_seen, reachable, created_by, owner_email, team_id, visibility, gateway_mode, status,
+                created_from_ip, created_via, created_user_agent,
                 auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation,
                 ca_certificate, ca_certificate_sig, signing_algorithm, client_cert, client_key, sigv4_config, oauth_config
             ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, $8, $8, $9, $10, $17, 'active',
+                $25, 'api', $26,
                 $12, ", $auth_value, ", ", $auth_query, ", ", $passthrough, ", ", $identity, ", $18, $19, $20, $21, $22, ", $sigv4, ", ", $oauth, ")"
         )
     };
@@ -1275,6 +1279,8 @@ impl Database {
                     .bind(options.tls.client_key)
                     .bind(auth.and_then(|auth| auth.encoded_sigv4.as_deref()))
                     .bind(auth.and_then(|auth| auth.encoded_oauth.as_deref()))
+                    .bind(options.created_from_ip)
+                    .bind(options.created_user_agent)
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1469,7 +1475,7 @@ impl Database {
     }
 }
 
-fn visible_team_ids(scope: CatalogScope<'_>) -> Result<String, sqlx::Error> {
+pub(crate) fn visible_team_ids(scope: CatalogScope<'_>) -> Result<String, sqlx::Error> {
     let teams = match scope.visibility {
         TeamVisibility::Teams(teams) => teams.as_slice(),
         TeamVisibility::Admin | TeamVisibility::Public => &[],

@@ -126,6 +126,15 @@ impl Default for HeaderForwarding {
 }
 
 impl Settings {
+    pub fn management_page_sizes() -> Result<(u32, u32), Box<dyn Error + Send + Sync>> {
+        let default = parse("PAGINATION_DEFAULT_PAGE_SIZE", 50)?;
+        let maximum = parse("PAGINATION_MAX_PAGE_SIZE", 500)?;
+        if !(1..=1000).contains(&default) || !(1..=10000).contains(&maximum) {
+            return Err("invalid management pagination settings".into());
+        }
+        Ok((default, maximum))
+    }
+
     pub fn secret_kdf() -> Result<SecretKdf, Box<dyn Error + Send + Sync>> {
         let defaults = SecretKdf::default();
         let settings = SecretKdf {
