@@ -231,7 +231,7 @@ impl Authorizer {
             None
         };
         if let Some(token_row) = tracked.as_ref() {
-            if token_row.token_hash != crate::tokens::hash_api_token(token) {
+            if token_row.token_hash != crate::tokens::hash_token(token) {
                 return Err(AuthError::Invalid);
             }
             if token_row.is_revoked {

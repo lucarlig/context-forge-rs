@@ -37,3 +37,11 @@ Native password changes revoke both active API tokens and locally issued
 sessions in the transaction that changes the password. This also covers
 sessions issued during the same second as the change. The fixture verified
 both credential types through the normal HTTP endpoints.
+
+The password recovery fixture ran the pinned and Rust servers through a local
+SMTP relay. It verified generic forgot-password responses, per-address rate
+limits for known and unknown accounts, replacement of outstanding links,
+confirmation email, and login with the new password. The database stored the
+SHA-256 digest of the link token. On SQLite and PostgreSQL, two simultaneous
+submissions of the same Rust reset link produced one success and one rejection.
+The password and session revocations committed together.

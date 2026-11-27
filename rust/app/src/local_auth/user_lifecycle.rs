@@ -59,10 +59,13 @@ pub(super) async fn change_password(
         .edit_local_user(
             &user,
             &patch,
-            Some(&hash),
+            Some(storage::CredentialChange {
+                hash: &hash,
+                reason: "password_change",
+                reset_token: None,
+            }),
             &user.email,
             &accounts.settings,
-            "password_change",
         )
         .await?;
     accounts
@@ -126,10 +129,13 @@ pub(super) async fn edit_user(
         .edit_local_user(
             &user,
             &patch,
-            hash.as_deref(),
+            hash.as_deref().map(|hash| storage::CredentialChange {
+                hash,
+                reason: "admin_password_reset",
+                reset_token: None,
+            }),
             &principal.email,
             &accounts.settings,
-            "admin_password_reset",
         )
         .await?;
     Ok(Json(edited.metadata()))

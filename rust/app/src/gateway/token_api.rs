@@ -303,7 +303,7 @@ async fn issue(
             .sign(claims)
             .map_err(|_| CatalogApiError::unavailable())?,
     );
-    record.token_hash = crate::tokens::hash_api_token(signed.as_str());
+    record.token_hash = crate::tokens::hash_token(signed.as_str());
     let stored = service
         .database
         .issue_managed_token(&record)

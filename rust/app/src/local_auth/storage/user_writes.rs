@@ -3,6 +3,12 @@
 use super::*;
 use crate::local_auth::user_lifecycle::UserPatch;
 
+pub(in crate::local_auth) struct CredentialChange<'a> {
+    pub(in crate::local_auth) hash: &'a str,
+    pub(in crate::local_auth) reason: &'static str,
+    pub(in crate::local_auth) reset_token: Option<&'a str>,
+}
+
 const REVOKE_LOCAL_SESSIONS: &str = "INSERT INTO token_revocations
     (jti,revoked_at,revoked_by,reason,token_expiry)
     SELECT jti,CURRENT_TIMESTAMP,$2,$3,expires_at FROM cf_local_sessions WHERE user_email=$1
@@ -64,18 +70,33 @@ impl Database {
         &self,
         before: &LocalUser,
         patch: &UserPatch,
-        new_hash: Option<&str>,
+        credential: Option<CredentialChange<'_>>,
         actor: &str,
         settings: &AccountSettings,
-        reset_reason: &str,
     ) -> Result<LocalUser, AccountError> {
         let email = &before.email;
+        let new_hash = credential.as_ref().map(|credential| credential.hash);
+        let reset_token = credential
+            .as_ref()
+            .and_then(|credential| credential.reset_token);
         let change = patch.password_change_required.or(new_hash.map(|_| false));
         macro_rules! edit {
-            ($tx:ident,$lock:literal,$history_limit:literal) => {{
+            ($tx:ident,$lock:literal,$history_limit:literal,$not_expired:literal) => {{
                 let current:LocalUser = sqlx::query_as(concat!(
                     "SELECT ",local_user_fields!()," FROM email_users WHERE email=$1 ",$lock))
                     .bind(email).fetch_optional(&mut *$tx).await?.ok_or_else(AccountError::missing)?;
+                if let Some(hash)=reset_token {
+                    let updated=sqlx::query(concat!("UPDATE password_reset_tokens SET used_at=CURRENT_TIMESTAMP
+                        WHERE token_hash=$1 AND user_email=$2 AND used_at IS NULL AND ",$not_expired))
+                        .bind(hash).bind(email).execute(&mut *$tx).await?;
+                    if updated.rows_affected()==0 {
+                        let expiry:Option<String>=sqlx::query_scalar("SELECT CAST(expires_at AS TEXT)
+                            FROM password_reset_tokens WHERE token_hash=$1 AND user_email=$2 AND used_at IS NULL")
+                            .bind(hash).bind(email).fetch_optional(&mut *$tx).await?;
+                        return Err(if expiry.as_deref().and_then(parse_timestamp)
+                            .is_some_and(|expires|expires<=Timestamp::now()) { password_reset::expired() } else { password_reset::invalid() });
+                    }
+                }
                 if current.id!=before.id
                     || new_hash.is_some() && (before.password_hash!=current.password_hash
                         || before.is_admin!=current.is_admin || before.is_active!=current.is_active)
@@ -112,10 +133,17 @@ impl Database {
                       password_hash=COALESCE($7,password_hash),
                       password_changed_at=CASE WHEN CAST($7 AS TEXT) IS NULL THEN password_changed_at ELSE CURRENT_TIMESTAMP END,
                       password_hash_type=CASE WHEN CAST($7 AS TEXT) IS NULL THEN password_hash_type ELSE 'argon2id' END,
+                      locked_until=CASE WHEN $8 THEN NULL ELSE locked_until END,
+                      failed_login_attempts=CASE WHEN $8 THEN 0 ELSE failed_login_attempts END,
                       admin_origin=CASE WHEN $3 AND NOT is_admin THEN 'api' WHEN NOT $3 THEN NULL ELSE admin_origin END,
                       updated_at=CURRENT_TIMESTAMP WHERE email=$1 RETURNING ",local_user_fields!()))
                     .bind(email).bind(patch.full_name.as_deref()).bind(admin).bind(active)
-                    .bind(patch.email_verified).bind(change).bind(new_hash).fetch_one(&mut *$tx).await?;
+                    .bind(patch.email_verified).bind(change).bind(new_hash).bind(reset_token.is_some()).fetch_one(&mut *$tx).await?;
+                if new_hash.is_some() || current.is_active && !active {
+                    sqlx::query("UPDATE password_reset_tokens SET used_at=CURRENT_TIMESTAMP
+                        WHERE user_email=$1 AND used_at IS NULL")
+                        .bind(email).execute(&mut *$tx).await?;
+                }
                 let privilege_changed=current.is_admin!=admin;
                 if privilege_changed {
                     let (old,new)=if admin {(&settings.user_role,&settings.admin_role)}
@@ -132,10 +160,8 @@ impl Database {
                     Some("account_privileges_changed")
                 } else if current.is_active && !active {
                     Some("account_disabled")
-                } else if new_hash.is_some() && settings.invalidate_sessions {
-                    Some(reset_reason)
                 } else {
-                    None
+                    credential.as_ref().filter(|_|settings.invalidate_sessions).map(|credential|credential.reason)
                 };
                 if let Some(reason)=revoke {
                     revoke_credentials!($tx,email,actor,reason);
@@ -147,14 +173,19 @@ impl Database {
         match self {
             Self::Sqlite(pool) => {
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-                edit!(tx, "", "LIMIT -1")
+                edit!(
+                    tx,
+                    "",
+                    "LIMIT -1",
+                    "julianday(expires_at)>julianday(CURRENT_TIMESTAMP)"
+                )
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682073)")
                     .execute(&mut *tx)
                     .await?;
-                edit!(tx, "FOR UPDATE", "")
+                edit!(tx, "FOR UPDATE", "", "expires_at>clock_timestamp()")
             }
         }
     }
@@ -291,6 +322,7 @@ impl Database {
                     "DELETE FROM user_roles WHERE user_email=$1",
                     "DELETE FROM email_api_tokens WHERE user_email=$1",
                     "DELETE FROM password_history WHERE user_email=$1",
+                    "DELETE FROM password_reset_tokens WHERE user_email=$1",
                     "DELETE FROM email_auth_events WHERE user_email=$1",
                 ] {
                     sqlx::query(command).bind(email).execute(&mut *$tx).await?;

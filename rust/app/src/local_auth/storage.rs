@@ -32,7 +32,19 @@ macro_rules! account_tables {
                 password_hash TEXT NOT NULL,
                 changed_at TIMESTAMP WITH TIME ZONE NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS ix_password_history_user_email_changed_at ON password_history(user_email,changed_at);"
+            CREATE INDEX IF NOT EXISTS ix_password_history_user_email_changed_at ON password_history(user_email,changed_at);
+            CREATE TABLE IF NOT EXISTS password_reset_tokens(
+                id VARCHAR(36) PRIMARY KEY NOT NULL,
+                user_email VARCHAR(255) NOT NULL REFERENCES email_users(email) ON DELETE CASCADE,
+                token_hash VARCHAR(64) NOT NULL UNIQUE,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                used_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                ip_address VARCHAR(45),
+                user_agent TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_password_reset_tokens_user_email ON password_reset_tokens(user_email);
+            CREATE INDEX IF NOT EXISTS ix_password_reset_tokens_expires_at ON password_reset_tokens(expires_at);"
         )
     };
 }
@@ -488,4 +500,7 @@ fn team_slug(name: &str) -> String {
         .collect()
 }
 
+mod reset;
 mod user_writes;
+pub(super) use reset::{ResetRequest, ResetToken};
+pub(super) use user_writes::CredentialChange;

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) mod mail;
+mod password_reset;
 mod passwords;
 mod storage;
 mod user_lifecycle;
@@ -31,6 +33,7 @@ use crate::{
     jwt::JwtIssuer,
 };
 
+pub(crate) use password_reset::ResetSettings;
 pub(crate) use storage::{POSTGRES_MIGRATION, SQLITE_MIGRATION};
 
 pub struct AccountSettings {
@@ -50,6 +53,8 @@ pub struct AccountSettings {
     pub(crate) password_policy: bool,
     pub(crate) password_history: u32,
     pub(crate) invalidate_sessions: bool,
+    pub(crate) reset: ResetSettings,
+    pub(crate) mailer: Option<mail::Mailer>,
     pub(crate) protect_admins: bool,
     pub(crate) lockout_attempts: i32,
     pub(crate) lockout_seconds: i64,
@@ -165,7 +170,15 @@ pub async fn router(
     for base in ["/auth/email", "/v1/auth/email"] {
         public = public
             .route(&format!("{base}/login"), post(login))
-            .route(&format!("{base}/register"), post(register));
+            .route(&format!("{base}/register"), post(register))
+            .route(
+                &format!("{base}/forgot-password"),
+                post(password_reset::forgot),
+            )
+            .route(
+                &format!("{base}/reset-password/{{token}}"),
+                get(password_reset::validate).post(password_reset::complete),
+            );
         protected = protected
             .route(&format!("{base}/me"), get(profile))
             .route(
@@ -319,7 +332,7 @@ async fn login(
 }
 
 async fn verify_local_password(
-    accounts: &Accounts,
+    accounts: &Arc<Accounts>,
     email: &str,
     password: Zeroizing<String>,
     client: &Client,
@@ -360,6 +373,7 @@ async fn verify_local_password(
                     .database
                     .local_event(email, "ACCOUNT_LOCKED", true, client, None)
                     .await?;
+                password_reset::notify_lockout(accounts, email.to_owned(), user.full_name.clone());
             }
         }
         accounts

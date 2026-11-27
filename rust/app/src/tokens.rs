@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::database::Database;
 
-pub(crate) fn hash_api_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     use std::fmt::Write as _;
     let mut encoded = String::with_capacity(64);
     for byte in Sha256::digest(token.as_bytes()) {

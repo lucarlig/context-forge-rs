@@ -11,7 +11,10 @@ use crate::{
         Pagination, ResourceLimits, RootSettings,
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
-    local_auth::AccountSettings,
+    local_auth::{
+        AccountSettings, ResetSettings,
+        mail::{MailSettings, MailTls, Mailer},
+    },
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
         SessionSettings, SseBackend, SseSettings, WebSocketSettings,
@@ -316,6 +319,8 @@ impl Settings {
             password_policy: enabled("PASSWORD_POLICY_ENABLED", true)?,
             password_history: parse("PASSWORD_HISTORY_COUNT", 5)?,
             invalidate_sessions: Self::invalidate_sessions_on_password_change()?,
+            reset: Self::password_reset()?,
+            mailer: Self::account_mailer()?,
             protect_admins: enabled("PROTECT_ALL_ADMINS", true)?,
             lockout_attempts: attempts,
             lockout_seconds: lockout * 60,
@@ -335,6 +340,90 @@ impl Settings {
             max_page_size,
             kdf: Self::secret_kdf()?,
         })
+    }
+
+    fn password_reset() -> Result<ResetSettings, Box<dyn Error + Send + Sync>> {
+        let expires: i64 = parse("PASSWORD_RESET_TOKEN_EXPIRY_MINUTES", 60)?;
+        let window: i64 = parse("PASSWORD_RESET_RATE_WINDOW_MINUTES", 15)?;
+        let limit: i64 = parse("PASSWORD_RESET_RATE_LIMIT", 5)?;
+        if !(1..=525_600).contains(&expires) || !(1..=525_600).contains(&window) || limit < 1 {
+            return Err("invalid password reset settings".into());
+        }
+        let ui = env::var("UI_BASE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty());
+        let mut frontend = if let Some(url) = ui.as_deref() {
+            url.to_owned()
+        } else {
+            let domain = value("APP_DOMAIN", "http://localhost:4444")?;
+            let root = value("APP_ROOT_PATH", "")?;
+            let root = root.trim_matches('/');
+            if root.is_empty() {
+                domain
+            } else {
+                format!("{}/{root}", domain.trim_end_matches('/'))
+            }
+        };
+        let admin = ui.is_none() && flag("MCPGATEWAY_ADMIN_API_ENABLED")?.unwrap_or(false);
+        let mount = if admin { "/admin" } else { "/app" };
+        frontend.truncate(frontend.trim_end_matches('/').len());
+        let parsed = url::Url::parse(&frontend)?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err("invalid browser-facing URL for password reset".into());
+        }
+        if !parsed.path().ends_with(mount) {
+            frontend.push_str(mount);
+        }
+        Ok(ResetSettings {
+            enabled: flag("PASSWORD_RESET_ENABLED")?.unwrap_or(true),
+            lifetime: expires * 60,
+            window: window * 60,
+            limit,
+            response_floor: Duration::from_millis(parse("PASSWORD_RESET_MIN_RESPONSE_MS", 250)?),
+            lockout_email: flag("ACCOUNT_LOCKOUT_NOTIFICATION_ENABLED")?.unwrap_or(true),
+            frontend,
+        })
+    }
+
+    fn account_mailer() -> Result<Option<Mailer>, Box<dyn Error + Send + Sync>> {
+        if !flag("SMTP_ENABLED")?.unwrap_or(false) {
+            return Ok(None);
+        }
+        let host = value("SMTP_HOST", "")?;
+        let from_email = value("SMTP_FROM_EMAIL", "")?;
+        if host.is_empty() || from_email.is_empty() {
+            return Ok(None);
+        }
+        let tls = if flag("SMTP_USE_SSL")?.unwrap_or(false) {
+            MailTls::Implicit
+        } else if flag("SMTP_USE_TLS")?.unwrap_or(true) {
+            MailTls::StartTls
+        } else {
+            MailTls::Disabled
+        };
+        let auth = env::var("SMTP_USER")
+            .ok()
+            .filter(|username| !username.is_empty())
+            .zip(
+                env::var("SMTP_PASSWORD")
+                    .ok()
+                    .filter(|password| !password.is_empty())
+                    .map(zeroize::Zeroizing::new),
+            );
+        Ok(Some(Mailer::new(MailSettings {
+            host,
+            port: parse("SMTP_PORT", 587)?,
+            timeout: positive_seconds("SMTP_TIMEOUT_SECONDS", 15.0)?,
+            from_email,
+            from_name: value("SMTP_FROM_NAME", "ContextForge")?,
+            tls,
+            auth,
+        })?))
     }
 
     pub fn query_auth_hosts() -> Result<Option<HashSet<String>>, Box<dyn Error + Send + Sync>> {
