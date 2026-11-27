@@ -4,14 +4,19 @@ mod content;
 mod management;
 mod proxy;
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, State},
     http::{HeaderMap, HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
@@ -64,6 +69,7 @@ pub struct GatewayService {
     management_page_size: u32,
     management_max_page_size: u32,
     refresh: CatalogRefresh,
+    active_refreshes: Mutex<HashSet<String>>,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
     credential_cipher: Option<CredentialCipher>,
@@ -135,6 +141,7 @@ impl GatewayService {
             management_page_size: 50,
             management_max_page_size: 500,
             refresh,
+            active_refreshes: Mutex::default(),
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
             credential_cipher: None,
@@ -273,6 +280,10 @@ impl GatewayService {
                 .route(
                     &format!("{route}/{{key}}/impact-preview"),
                     get(management::impact_preview),
+                )
+                .route(
+                    &format!("{route}/{{key}}/tools/refresh"),
+                    post(management::refresh),
                 );
         }
         self.access.protect_api(router.with_state(self.clone()))

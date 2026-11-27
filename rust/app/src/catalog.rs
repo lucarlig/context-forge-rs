@@ -251,15 +251,46 @@ pub struct RegisteredTool<'a> {
     pub definition: &'a ToolDefinition,
 }
 
-struct ResourceRegistration<'a> {
-    uri: &'a str,
-    template: Option<&'a str>,
-    name: &'a str,
-    title: Option<&'a str>,
-    description: Option<&'a str>,
-    mime: &'a str,
-    size: Option<i32>,
+pub(crate) struct ResourceRegistration<'a> {
+    pub(crate) uri: &'a str,
+    pub(crate) template: Option<&'a str>,
+    pub(crate) name: &'a str,
+    pub(crate) title: Option<&'a str>,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) mime: &'a str,
+    pub(crate) size: Option<i32>,
 }
+
+pub(crate) fn resource_registrations(
+    metadata: &DiscoveredMetadata,
+) -> impl Iterator<Item = ResourceRegistration<'_>> {
+    let resources = metadata.resources.iter().map(|item| ResourceRegistration {
+        uri: &item.uri,
+        template: None,
+        name: &item.name,
+        title: item.title.as_deref(),
+        description: item.description.as_deref(),
+        mime: item.mime_type.as_deref().unwrap_or("text/plain"),
+        size: item.size.and_then(|size| i32::try_from(size).ok()),
+    });
+    let templates = metadata.templates.iter().map(|item| ResourceRegistration {
+        uri: &item.uri_template,
+        template: Some(&item.uri_template),
+        name: &item.name,
+        title: item.title.as_deref(),
+        description: item.description.as_deref(),
+        mime: item.mime_type.as_deref().unwrap_or("text/plain"),
+        size: None,
+    });
+    resources.chain(templates)
+}
+
+pub(crate) const INSERT_RESOURCE: &str = "INSERT INTO resources (
+    id, uri, uri_template, name, original_name, custom_name_slug, title, description,
+    mime_type, size, gateway_id, owner_email, team_id, visibility,
+    enabled, tags, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+        TRUE,'[]',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)";
 
 #[derive(Debug, Error)]
 pub enum RegistrationError {
@@ -699,12 +730,16 @@ macro_rules! insert_tool {
             "INSERT INTO tools (
                 id, gateway_id, name, original_name, custom_name_slug, custom_name, description, original_description,
                 title, input_schema, output_schema, annotations, url, enabled, reachable, created_at, updated_at,
-                jsonpath_filter, integration_type, request_type, created_by, owner_email, team_id, visibility
+                jsonpath_filter, integration_type, request_type, created_by, owner_email, team_id, visibility, tags
             ) VALUES ($1, $2, $3, $4, $5, $4, $6, $6, $7, ", $input_schema, ", ", $output_schema, ", ", $annotations, ",
-                $11, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '', 'MCP', $15, $12, $12, $13, $14)"
+                $11, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '', 'MCP', $15, $12, $12, $13, $14, '[]')"
         )
     };
 }
+
+pub(crate) const SQLITE_TOOL_INSERT: &str = insert_tool!("json($8)", "json($9)", "json($10)");
+pub(crate) const POSTGRES_TOOL_INSERT: &str =
+    insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)");
 
 impl Database {
     pub async fn migrate_catalog(&self) -> Result<(), sqlx::Error> {
@@ -1309,27 +1344,15 @@ impl Database {
                         .execute(&mut *$tx)
                         .await?;
                 }
-                let resources = metadata.resources.iter().map(|item| ResourceRegistration {
-                    uri: &item.uri, template: None, name: &item.name, title: item.title.as_deref(),
-                    description: item.description.as_deref(), mime: item.mime_type.as_deref().unwrap_or("text/plain"),
-                    size: item.size.and_then(|size| i32::try_from(size).ok()),
-                });
-                let templates = metadata.templates.iter().map(|item| ResourceRegistration {
-                    uri: &item.uri_template, template: Some(&item.uri_template), name: &item.name,
-                    title: item.title.as_deref(), description: item.description.as_deref(),
-                    mime: item.mime_type.as_deref().unwrap_or("text/plain"), size: None,
-                });
                 let mut uris = HashSet::new();
-                for resource in resources.chain(templates) {
+                for resource in resource_registrations(metadata) {
                     if !uris.insert((resource.uri, resource.template.is_some())) { continue; }
                     let slug = slugify(resource.name);
                     let name = format!("{}-{slug}", gateway.slug);
                     if slug.is_empty() || name.len() > 255 || resource.uri.is_empty() || resource.uri.len() > 767 {
                         return Err(RegistrationError::Invalid("Invalid upstream resource"));
                     }
-                    sqlx::query("INSERT INTO resources (id, uri, uri_template, name, original_name, custom_name_slug,
-                        title, description, mime_type, size, gateway_id, owner_email, team_id, visibility)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)")
+                    sqlx::query(INSERT_RESOURCE)
                         .bind(uuid::Uuid::new_v4().simple().to_string())
                         .bind(resource.uri).bind(resource.template).bind(name).bind(resource.name).bind(slug)
                         .bind(resource.title).bind(resource.description).bind(resource.mime).bind(resource.size)
@@ -1345,8 +1368,10 @@ impl Database {
                         return Err(RegistrationError::Invalid("Invalid upstream prompt"));
                     }
                     sqlx::query(concat!("INSERT INTO prompts (id, name, original_name, custom_name, custom_name_slug,
-                        title, description, argument_schema, gateway_id, owner_email, team_id, visibility)
-                        VALUES ($1,$2,$3,$3,$4,$5,$6,", $schema, ",$8,$9,$10,$11)"))
+                        title, description, argument_schema, gateway_id, owner_email, team_id, visibility,
+                        enabled, tags, created_at, updated_at)
+                        VALUES ($1,$2,$3,$3,$4,$5,$6,", $schema, ",$8,$9,$10,$11,
+                            TRUE,'[]',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"))
                         .bind(uuid::Uuid::new_v4().simple().to_string())
                         .bind(name).bind(&prompt.name).bind(slug).bind(&prompt.title).bind(&prompt.description)
                         .bind(prompt_argument_schema(prompt).to_string())
@@ -1373,7 +1398,7 @@ impl Database {
                         "json($23)",
                         "json($24)"
                     ),
-                    insert_tool!("json($8)", "json($9)", "json($10)"),
+                    SQLITE_TOOL_INSERT,
                     "json($7)"
                 );
             }
@@ -1393,7 +1418,7 @@ impl Database {
                         "CAST($23 AS JSON)",
                         "CAST($24 AS JSON)"
                     ),
-                    insert_tool!("CAST($8 AS JSON)", "CAST($9 AS JSON)", "CAST($10 AS JSON)"),
+                    POSTGRES_TOOL_INSERT,
                     "CAST($7 AS JSON)"
                 );
             }
@@ -1541,7 +1566,7 @@ fn uri_matches_template(uri: &str, mut template: &str) -> bool {
     regex::Regex::new(&pattern).is_ok_and(|matcher| matcher.is_match(path))
 }
 
-fn prompt_argument_schema(prompt: &rmcp::model::Prompt) -> Value {
+pub(crate) fn prompt_argument_schema(prompt: &rmcp::model::Prompt) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
     for argument in prompt.arguments.iter().flatten() {

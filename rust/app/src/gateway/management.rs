@@ -13,12 +13,18 @@ use serde_json::{Value, json};
 use crate::{
     catalog::slugify,
     credentials::{CredentialCipher, decode_header_values},
-    gateway_records::{GatewayList, GatewayRecord},
+    gateway_records::{CatalogChanges, CatalogRefreshInput, GatewayList, GatewayRecord},
 };
 
 use super::*;
 
 const MASKED: &str = "*****";
+
+#[derive(Deserialize)]
+pub(super) struct RefreshParameters {
+    include_resources: Option<String>,
+    include_prompts: Option<String>,
+}
 
 #[derive(Deserialize)]
 pub(super) struct ListParameters {
@@ -164,6 +170,162 @@ pub(super) async fn delete(
     Ok(Json(
         json!({"status":"success","message":format!("Gateway {} deleted", record.id)}),
     ))
+}
+
+pub(super) async fn refresh(
+    State(service): State<Arc<GatewayService>>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+    Query(query): Query<RefreshParameters>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ManagementError> {
+    if !service
+        .access
+        .allows(&principal, "gateways.update", RoleContext::AnyTeam, true)
+        .await?
+    {
+        return Err(ManagementError::Denied);
+    }
+    let started = std::time::Instant::now();
+    let include_resources = flag(query.include_resources.as_deref())?;
+    let include_prompts = flag(query.include_prompts.as_deref())?;
+    let record = lookup(&service, &principal, key.clone()).await?;
+    if record.id != key {
+        return Err(ManagementError::NotFound(key));
+    }
+    let context = record
+        .team_id
+        .as_deref()
+        .map_or(RoleContext::AnyTeam, RoleContext::Team);
+    if !service
+        .access
+        .allows(&principal, "gateways.update", context, true)
+        .await?
+    {
+        return Err(ManagementError::Denied);
+    }
+    if !record.enabled || !record.reachable || record.status != "active" {
+        return Ok(refresh_response(
+            &record.id,
+            started,
+            CatalogChanges::default(),
+            None,
+        ));
+    }
+    if !service
+        .active_refreshes
+        .lock()
+        .expect("active gateway refreshes")
+        .insert(record.id.clone())
+    {
+        return Err(ManagementError::RefreshInProgress(record.name));
+    }
+    let _refresh_guard = RefreshGuard {
+        gateways: &service.active_refreshes,
+        id: &record.id,
+    };
+    let failure = |error: String| {
+        refresh_response(&record.id, started, CatalogChanges::default(), Some(error))
+    };
+    let Some(transport) = UpstreamTransport::from_name(&record.transport) else {
+        return Ok(failure("Unsupported gateway transport".to_owned()));
+    };
+    let credentials = match service
+        .configured_upstream(
+            &record.id,
+            &record.url,
+            true,
+            Some(&headers),
+            Some(&principal),
+        )
+        .await
+    {
+        Ok(credentials) => credentials,
+        Err(_) => return Ok(failure("Could not load upstream authentication".to_owned())),
+    };
+    let (catalog, metadata) = match service
+        .upstream
+        .discover_selected_catalog(
+            UpstreamEndpoint {
+                url: &record.url,
+                transport,
+                credentials: credentials.as_ref(),
+            },
+            include_resources,
+            include_prompts,
+        )
+        .await
+    {
+        Ok(discovered) => discovered,
+        Err(error) => return Ok(failure(format!("Failed to initialize gateway: {error}"))),
+    };
+    let tools: Vec<ToolDefinition> = match catalog
+        .tools
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect()
+    {
+        Ok(tools) => tools,
+        Err(_) => return Ok(failure("Upstream returned an invalid tool".to_owned())),
+    };
+    let changes = match service
+        .database
+        .refresh_catalog(
+            &record,
+            CatalogRefreshInput {
+                tools: &tools,
+                capabilities: &catalog.capabilities,
+                metadata: &metadata,
+                include_resources,
+                include_prompts,
+            },
+        )
+        .await
+    {
+        Ok(Some(changes)) => changes,
+        Ok(None) => return Err(ManagementError::ConcurrentChange),
+        Err(RegistrationError::Database(error)) => return Err(error.into()),
+        Err(error) => return Ok(failure(error.to_string())),
+    };
+    if changes.changed() {
+        service.subscriptions.changed(
+            &record.visibility,
+            record.team_id.as_deref(),
+            record.owner_email.as_deref(),
+        );
+    }
+    Ok(refresh_response(&record.id, started, changes, None))
+}
+
+struct RefreshGuard<'a> {
+    gateways: &'a Mutex<HashSet<String>>,
+    id: &'a str,
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.gateways
+            .lock()
+            .expect("active gateway refreshes")
+            .remove(self.id);
+    }
+}
+
+fn refresh_response(
+    id: &str,
+    started: std::time::Instant,
+    changes: CatalogChanges,
+    error: Option<String>,
+) -> Json<Value> {
+    let mut body = json!(changes);
+    body["gatewayId"] = id.into();
+    body["mcpServerId"] = id.into();
+    body["success"] = error.is_none().into();
+    body["error"] = json!(error);
+    body["validationErrors"] = json!([]);
+    body["durationMs"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+    body["refreshedAt"] = Timestamp::now().to_string().into();
+    Json(body)
 }
 
 async fn manageable(
@@ -416,6 +578,7 @@ pub(super) enum ManagementError {
     NotFound(String),
     Conflict(String),
     ConcurrentChange,
+    RefreshInProgress(String),
     Internal,
 }
 
@@ -440,6 +603,10 @@ impl IntoResponse for ManagementError {
             Self::ConcurrentChange => (
                 StatusCode::CONFLICT,
                 "Gateway changed during request".to_owned(),
+            ),
+            Self::RefreshInProgress(name) => (
+                StatusCode::CONFLICT,
+                format!("Refresh already in progress for gateway {name}"),
             ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,

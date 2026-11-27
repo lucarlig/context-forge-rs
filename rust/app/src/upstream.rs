@@ -578,6 +578,15 @@ impl UpstreamClient {
         &self,
         endpoint: UpstreamEndpoint<'_>,
     ) -> Result<(DiscoveredCatalog, DiscoveredMetadata), UpstreamError> {
+        self.discover_selected_catalog(endpoint, true, true).await
+    }
+
+    pub(crate) async fn discover_selected_catalog(
+        &self,
+        endpoint: UpstreamEndpoint<'_>,
+        include_resources: bool,
+        include_prompts: bool,
+    ) -> Result<(DiscoveredCatalog, DiscoveredMetadata), UpstreamError> {
         let deadline = self.deadline()?;
         let session = self.open_session(endpoint, deadline).await?;
         let result = timeout_at(deadline, async {
@@ -593,7 +602,7 @@ impl UpstreamClient {
                 result => result?,
             };
             let mut metadata = DiscoveredMetadata::default();
-            if session.capabilities["resources"].is_object() {
+            if include_resources && session.capabilities["resources"].is_object() {
                 metadata.resources = session
                     .list_metadata("resources", |params| {
                         ListResourcesRequest::with_param(params).into()
@@ -609,7 +618,7 @@ impl UpstreamClient {
                     result => result?,
                 };
             }
-            if session.capabilities["prompts"].is_object() {
+            if include_prompts && session.capabilities["prompts"].is_object() {
                 metadata.prompts = session
                     .list_metadata("prompts", |params| {
                         ListPromptsRequest::with_param(params).into()

@@ -174,6 +174,32 @@ macro_rules! locked_gateway_query {
     };
 }
 
+macro_rules! delete_catalog_rows {
+    ($transaction:ident, $value:expr, $table_exists:literal, $optional:expr, $required:expr) => {{
+        for (table, statement) in $optional {
+            if sqlx::query_scalar::<_, bool>($table_exists)
+                .bind(table)
+                .fetch_one(&mut *$transaction)
+                .await?
+            {
+                sqlx::query(*statement)
+                    .bind($value)
+                    .execute(&mut *$transaction)
+                    .await?;
+            }
+        }
+        for statement in $required {
+            sqlx::query(*statement)
+                .bind($value)
+                .execute(&mut *$transaction)
+                .await?;
+        }
+    }};
+}
+
+mod refresh;
+pub(crate) use refresh::{CatalogChanges, CatalogRefreshInput};
+
 const OPTIONAL_GATEWAY_DELETES: &[(&str, &str)] = &[
     (
         "tool_metrics",
@@ -301,24 +327,13 @@ impl Database {
                 let Some(id) = id else {
                     return Ok(false);
                 };
-                for (table, statement) in OPTIONAL_GATEWAY_DELETES {
-                    if sqlx::query_scalar::<_, bool>($table_exists)
-                        .bind(table)
-                        .fetch_one(&mut *$transaction)
-                        .await?
-                    {
-                        sqlx::query(*statement)
-                            .bind(&id)
-                            .execute(&mut *$transaction)
-                            .await?;
-                    }
-                }
-                for statement in GATEWAY_DELETES {
-                    sqlx::query(*statement)
-                        .bind(&id)
-                        .execute(&mut *$transaction)
-                        .await?;
-                }
+                delete_catalog_rows!(
+                    $transaction,
+                    &id,
+                    $table_exists,
+                    OPTIONAL_GATEWAY_DELETES,
+                    GATEWAY_DELETES
+                );
                 $transaction.commit().await?;
                 Ok(true)
             }};

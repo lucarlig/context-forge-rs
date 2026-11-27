@@ -676,6 +676,143 @@ async fn modern_resource_fixture(
 }
 
 #[tokio::test]
+async fn manual_refresh_keeps_retained_tool_ids_and_reconciles_requested_metadata() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let phase = Arc::new(AtomicUsize::new(0));
+    let upstream = Running::start(
+        Router::new()
+            .route("/mcp", post(refresh_fixture))
+            .with_state(phase.clone()),
+    )
+    .await;
+    let database = database().await;
+    let Database::Sqlite(pool) = &database else {
+        unreachable!()
+    };
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database.clone()),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(5),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let gateway = Running::start(service.registration_router()).await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registered) = send(
+        &client,
+        gateway.url("/gateways"),
+        json!({"name":"refresh","url":upstream.url("/mcp"),"transport":"STREAMABLEHTTP"}),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let id = registered["id"].as_str().unwrap();
+    let endpoint = format!("/v1/mcp-servers/{id}/tools/refresh");
+    let retained_tool: String =
+        sqlx::query_scalar("SELECT id FROM tools WHERE gateway_id = $1 AND original_name = 'echo'")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query("INSERT INTO servers (id,name) VALUES ('v','Virtual')")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO server_tool_association (server_id,tool_id) VALUES ('v',$1)")
+        .bind(&retained_tool)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    phase.store(1, Ordering::SeqCst);
+    let (status, updated) = send(&client, gateway.url(&endpoint), json!({}), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["toolsAdded"], 1);
+    assert_eq!(updated["toolsRemoved"], 1);
+    assert_eq!(updated["toolsUpdated"], 1);
+    assert_eq!(updated["resourcesAdded"], 0);
+    assert_eq!(updated["promptsAdded"], 0);
+
+    let with_metadata = format!("{endpoint}?include_resources=true&include_prompts=true");
+    let (status, updated) = send(
+        &client,
+        gateway.url(&with_metadata),
+        json!({}),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    for field in [
+        "resourcesAdded",
+        "resourcesRemoved",
+        "promptsAdded",
+        "promptsRemoved",
+    ] {
+        assert_eq!(updated[field], 1, "{updated}");
+    }
+    let association: String = sqlx::query_scalar(
+        "SELECT a.tool_id FROM server_tool_association a JOIN tools t ON t.id = a.tool_id
+         WHERE t.original_name = 'echo' AND t.description = 'echo version 1'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(association, retained_tool);
+
+    phase.store(2, Ordering::SeqCst);
+    let (status, failed) = send(&client, gateway.url(&endpoint), json!({}), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{failed}");
+    assert_eq!(failed["success"], false);
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT original_name FROM tools WHERE gateway_id = $1 ORDER BY original_name",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(names, ["added", "echo"]);
+}
+
+async fn refresh_fixture(
+    State(phase): State<Arc<AtomicUsize>>,
+    Json(request): Json<Value>,
+) -> Response {
+    let phase = phase.load(Ordering::SeqCst);
+    if phase == 2 {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let changing_name = if phase == 0 { "retired" } else { "added" };
+    let result = match request["method"].as_str().unwrap() {
+        "initialize" => json!({
+            "protocolVersion": PROTOCOL, "serverInfo":{"name":"refresh fixture","version":"1"},
+            "capabilities":{"tools":{},"resources":{},"prompts":{}},
+        }),
+        "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+        "tools/list" => {
+            let tools = ["echo", changing_name].map(|name| json!({
+                "name":name,"description":format!("{name} version {phase}"),"inputSchema":{"type":"object"},
+            }));
+            json!({"tools":tools})
+        }
+        "resources/list" => {
+            json!({"resources":[{"uri":format!("fixture://refresh/{changing_name}"),"name":changing_name}]})
+        }
+        "resources/templates/list" => json!({"resourceTemplates":[]}),
+        "prompts/list" => json!({"prompts":[{"name":changing_name}]}),
+        method => panic!("unexpected refresh fixture method: {method}"),
+    };
+    Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+}
+
+#[tokio::test]
 async fn modern_resource_subscriptions_share_scoped_upstream_watches() {
     assert_shared_upstream_watch(false).await;
 }

@@ -92,7 +92,7 @@ impl CatalogSubscriptions {
         self.changed(visibility, team, owner);
     }
 
-    fn changed(&self, visibility: &str, team: Option<&str>, owner: Option<&str>) {
+    pub(crate) fn changed(&self, visibility: &str, team: Option<&str>, owner: Option<&str>) {
         let _ = self.changes.send(CatalogChange {
             visibility: visibility.to_owned(),
             team_id: team.map(str::to_owned),
