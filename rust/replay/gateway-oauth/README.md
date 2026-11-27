@@ -28,3 +28,11 @@ Queued registration deferred discovery until a user authorized. A queued
 description edit preserved the catalog and the existing grant. Changing
 the upstream destination or OAuth configuration invalidates stored user
 grants and pending authorization states.
+
+Dynamic client registration matched 13 normalized HTTP responses on SQLite
+and PostgreSQL. The provider received the same RFC 7591 payload as the
+pinned gateway. The fixture covered issuer metadata discovery under a
+tenant path, authorization-code exchange, reuse of the registered client,
+and global admin list, detail, and local deletion. Two workers sharing
+either database made one registration request for concurrent authorization
+attempts.

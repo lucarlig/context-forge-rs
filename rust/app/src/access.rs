@@ -550,6 +550,10 @@ impl IntoResponse for AuthError {
 }
 
 impl Principal {
+    pub(crate) fn is_admin(&self) -> bool {
+        self.is_admin
+    }
+
     pub(crate) fn is_global_admin(&self) -> bool {
         self.is_admin && self.visibility == TeamVisibility::Admin
     }

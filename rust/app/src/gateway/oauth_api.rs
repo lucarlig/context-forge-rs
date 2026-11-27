@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod clients;
 mod flow;
+mod registration;
 mod storage;
 mod token_access;
 
@@ -13,6 +15,7 @@ use jiff::Timestamp;
 use serde_json::Map;
 
 use super::{catalog_api::CatalogApiError, *};
+use crate::oauth_client::IssuerMetadataCache;
 
 const MAX_STATUS_GATEWAYS: usize = 100;
 
@@ -23,6 +26,37 @@ pub struct GatewayOAuthSettings {
     pub(crate) secure_cookies: bool,
     pub(crate) token_retrieval: bool,
     pub(crate) refresh_threshold: i64,
+    pub(crate) dcr: DcrSettings,
+    pub(crate) request_timeout: Duration,
+    pub(crate) issuer_metadata: IssuerMetadataCache,
+}
+
+pub struct DcrSettings {
+    pub(crate) enabled: bool,
+    pub(crate) auto_register: bool,
+    pub(crate) allowed_issuers: HashSet<String>,
+    pub(crate) default_scopes: Vec<String>,
+    pub(crate) auth_method: String,
+    pub(crate) application_type: String,
+    pub(crate) metadata_ttl: Duration,
+    pub(crate) client_name_template: String,
+    pub(crate) request_refresh_without_advertisement: bool,
+}
+
+impl Default for DcrSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_register: true,
+            allowed_issuers: HashSet::new(),
+            default_scopes: vec!["mcp:read".to_owned()],
+            auth_method: "client_secret_basic".to_owned(),
+            application_type: "auto".to_owned(),
+            metadata_ttl: Duration::from_secs(3600),
+            client_name_template: "ContextForge ({gateway_name})".to_owned(),
+            request_refresh_without_advertisement: false,
+        }
+    }
 }
 
 impl Default for GatewayOAuthSettings {
@@ -34,7 +68,26 @@ impl Default for GatewayOAuthSettings {
             secure_cookies: true,
             token_retrieval: false,
             refresh_threshold: 600,
+            dcr: DcrSettings::default(),
+            request_timeout: Duration::from_secs(30),
+            issuer_metadata: IssuerMetadataCache::default(),
         }
+    }
+}
+
+impl GatewayOAuthSettings {
+    pub(in crate::gateway) async fn discover_endpoints(
+        &self,
+        upstream: &UpstreamClient,
+        config: &mut OAuthConfig,
+    ) {
+        config
+            .discover_endpoints(
+                &upstream.with_timeout_cap(self.request_timeout),
+                &self.issuer_metadata,
+                self.dcr.metadata_ttl,
+            )
+            .await;
     }
 }
 
@@ -45,6 +98,11 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
         .route("/oauth/authorize/{id}", get(flow::authorize))
         .route("/oauth/token/{id}", get(token_access::token))
         .route("/oauth/fetch-tools/{id}", post(fetch_tools))
+        .route("/oauth/registered-clients", get(clients::list))
+        .route(
+            "/oauth/registered-clients/{id}",
+            get(clients::read).delete(clients::delete),
+        )
 }
 
 pub(super) fn callback_router() -> Router<Arc<GatewayService>> {

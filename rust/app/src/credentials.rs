@@ -156,6 +156,10 @@ impl AuthInput {
         self.oauth_config.as_ref()
     }
 
+    pub(crate) fn oauth_config_mut(&mut self) -> Option<&mut OAuthConfig> {
+        self.oauth_config.as_mut()
+    }
+
     pub(crate) fn is_one_time_marker(&self) -> bool {
         self.auth_type
             .as_deref()

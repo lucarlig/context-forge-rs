@@ -31,14 +31,8 @@ pub(super) async fn authorize(
     Path(id): Path<String>,
     Query(query): Query<AuthorizeQuery>,
 ) -> Result<Response, CatalogApiError> {
-    let gateway = visible_gateway(&service, &principal, &id).await?;
-    let config = code_config(&service, &gateway).await?;
-    if config.client_id().is_none() {
-        return Err(CatalogApiError::detail(
-            StatusCode::BAD_REQUEST,
-            "OAuth configuration missing client_id",
-        ));
-    }
+    let (gateway, config) =
+        super::registration::configured_client(&service, &principal, &id).await?;
     let verifier = Zeroizing::new(random_secret::<32>().ok_or_else(CatalogApiError::unavailable)?);
     let binding = Zeroizing::new(random_secret::<32>().ok_or_else(CatalogApiError::unavailable)?);
     let mut state = random_secret::<32>().ok_or_else(CatalogApiError::unavailable)?;
@@ -328,7 +322,7 @@ fn random_secret<const N: usize>() -> Option<String> {
     Some(URL_SAFE_NO_PAD.encode(random.as_ref()))
 }
 
-fn valid_redirect(url: &str) -> Option<url::Url> {
+pub(super) fn valid_redirect(url: &str) -> Option<url::Url> {
     url::Url::parse(url).ok().filter(|url| {
         matches!(url.scheme(), "http" | "https")
             && url.host().is_some()

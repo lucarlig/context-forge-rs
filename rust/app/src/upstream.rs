@@ -31,7 +31,7 @@ use rmcp::model::{
     ServerJsonRpcMessage, ServerNotification, ServerRequest, SubscriptionFilter,
     SubscriptionsListenRequest, SubscriptionsListenRequestParams,
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -1054,6 +1054,32 @@ impl UpstreamClient {
 
     pub(crate) fn check_endpoint(&self, endpoint: &str) -> Result<(), UpstreamError> {
         self.policy.validate_url(endpoint).map(|_| ())
+    }
+
+    pub(crate) async fn oauth_document<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        body: Option<&Value>,
+    ) -> Result<T, UpstreamError> {
+        timeout_at(self.deadline()?, async {
+            let (client, url) = self.pinned_client(endpoint, None, None).await?;
+            let request = match body {
+                Some(body) => client
+                    .post(url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body.to_string()),
+                None => client.get(url),
+            };
+            let response = request.header(ACCEPT, "application/json").send().await?;
+            let status = response.status().as_u16();
+            if status != 200 && (body.is_none() || status != 201) {
+                return Err(UpstreamError::Status(status));
+            }
+            let bytes = Zeroizing::new(read_json_body(response).await?);
+            serde_json::from_slice(&bytes).map_err(|_| UpstreamError::InvalidResponse)
+        })
+        .await
+        .map_err(|_| UpstreamError::Timeout)?
     }
 
     pub(crate) async fn exchange_oauth_token(

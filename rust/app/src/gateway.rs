@@ -77,7 +77,7 @@ use proxy::DirectTarget;
 pub use health::GatewayHealth;
 pub use lifecycle::GatewayLifecycle;
 pub use listeners::{GatewayListeners, ListenerElection};
-pub use oauth_api::GatewayOAuthSettings;
+pub use oauth_api::{DcrSettings, GatewayOAuthSettings};
 pub(crate) use proxy::GATEWAY_ID_HEADER;
 pub use resource_api::ResourceLimits;
 pub use roots::{RootSettings, RootSetupError};
@@ -1130,7 +1130,7 @@ async fn register(
     Extension(principal): Extension<Principal>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    Json(input): Json<RegisterGateway>,
+    Json(mut input): Json<RegisterGateway>,
 ) -> Result<Response, RegistrationResponse> {
     let name = input.name.trim();
     let slug = slugify(name);
@@ -1229,6 +1229,12 @@ async fn register(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Invalid passthrough header name",
         ));
+    }
+    if let Some(config) = input.auth.oauth_config_mut() {
+        service
+            .gateway_oauth
+            .discover_endpoints(&service.upstream, config)
+            .await;
     }
     let mut auth = input
         .auth

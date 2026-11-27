@@ -176,6 +176,12 @@ pub(crate) async fn update(
     let tls_changed = gateway.ca_certificate != previous.ca_certificate
         || gateway.client_cert != previous.client_cert
         || client_key.is_some();
+    if let Some(config) = auth.oauth_config_mut() {
+        service
+            .gateway_oauth
+            .discover_endpoints(&service.upstream, config)
+            .await;
+    }
     let auth_changed = if let Some(connection) = &mut connection {
         let changed = auth
             .apply_update(

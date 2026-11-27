@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod authorization_code;
+mod discovery;
 
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use crate::{
     upstream_tls::TlsMaterial,
 };
 pub(crate) use authorization_code::UserOAuthTokens;
+pub(crate) use discovery::{IssuerMetadata, IssuerMetadataCache, validate_endpoint};
 
 const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -63,6 +65,12 @@ pub(crate) struct OAuthConfig {
     registration_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     authorization_response_iss_parameter_supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jwks_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dcr_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoints_discovered: Option<bool>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

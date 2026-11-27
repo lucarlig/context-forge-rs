@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     gateway::{
-        CatalogRefresh, GatewayHealth, GatewayLifecycle, GatewayListeners, GatewayOAuthSettings,
-        ListenerElection, Pagination, ResourceLimits, RootSettings,
+        CatalogRefresh, DcrSettings, GatewayHealth, GatewayLifecycle, GatewayListeners,
+        GatewayOAuthSettings, ListenerElection, Pagination, ResourceLimits, RootSettings,
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     local_auth::{
@@ -299,6 +299,36 @@ impl Settings {
         if !(0..=3600).contains(&refresh_threshold) {
             return Err("invalid OAUTH_TOKEN_REFRESH_THRESHOLD_SECONDS".into());
         }
+        let auth_method = value("DCR_TOKEN_ENDPOINT_AUTH_METHOD", "client_secret_basic")?;
+        if !matches!(
+            auth_method.as_str(),
+            "client_secret_basic" | "client_secret_post" | "none"
+        ) {
+            return Err("invalid DCR_TOKEN_ENDPOINT_AUTH_METHOD".into());
+        }
+        let application_type = value("DCR_APPLICATION_TYPE", "auto")?;
+        if !matches!(application_type.as_str(), "auto" | "web" | "native") {
+            return Err("invalid DCR_APPLICATION_TYPE".into());
+        }
+        let default_scopes =
+            serde_json::from_str(&value("DCR_DEFAULT_SCOPES", r#"["mcp:read"]"#)?)?;
+        let dcr = DcrSettings {
+            enabled: flag("DCR_ENABLED")?.unwrap_or(true),
+            auto_register: flag("DCR_AUTO_REGISTER_ON_MISSING_CREDENTIALS")?.unwrap_or(true),
+            allowed_issuers: allowlist("DCR_ALLOWED_ISSUERS")?,
+            default_scopes,
+            auth_method,
+            application_type,
+            metadata_ttl: Duration::from_secs(parse("DCR_METADATA_CACHE_TTL", 3600)?),
+            client_name_template: value(
+                "DCR_CLIENT_NAME_TEMPLATE",
+                "ContextForge ({gateway_name})",
+            )?,
+            request_refresh_without_advertisement: flag(
+                "DCR_REQUEST_REFRESH_TOKEN_WHEN_UNSUPPORTED",
+            )?
+            .unwrap_or(false),
+        };
         Ok(GatewayOAuthSettings {
             redirect_uri: format!("{origin}{callback_path}"),
             callback_path,
@@ -307,6 +337,9 @@ impl Settings {
                 || value("ENVIRONMENT", "development")? == "production",
             token_retrieval: flag("OAUTH_TOKEN_RETRIEVAL_ENABLED")?.unwrap_or(false),
             refresh_threshold,
+            dcr,
+            request_timeout: positive_seconds("OAUTH_REQUEST_TIMEOUT", 30.0)?,
+            issuer_metadata: Default::default(),
         })
     }
 

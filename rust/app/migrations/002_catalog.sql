@@ -302,3 +302,32 @@ CREATE TABLE IF NOT EXISTS cf_oauth_refresh_claims (
     FOREIGN KEY (gateway_id,app_user_email)
         REFERENCES oauth_tokens(gateway_id,app_user_email) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS registered_oauth_clients (
+    id VARCHAR(36) PRIMARY KEY NOT NULL,
+    gateway_id VARCHAR(36) NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
+    issuer VARCHAR(500) NOT NULL,
+    client_id VARCHAR(500) NOT NULL,
+    client_secret_encrypted TEXT,
+    redirect_uris TEXT NOT NULL,
+    grant_types TEXT NOT NULL,
+    response_types TEXT,
+    scope VARCHAR(1000),
+    token_endpoint_auth_method VARCHAR(50) NOT NULL,
+    registration_client_uri VARCHAR(500),
+    registration_access_token_encrypted TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE INDEX IF NOT EXISTS ix_registered_oauth_clients_gateway_id
+    ON registered_oauth_clients(gateway_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_issuer ON registered_oauth_clients(gateway_id, issuer);
+
+CREATE TABLE IF NOT EXISTS cf_oauth_registration_claims (
+    gateway_id VARCHAR(36) PRIMARY KEY NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
+    gateway_version INTEGER NOT NULL,
+    claim VARCHAR(36) NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
