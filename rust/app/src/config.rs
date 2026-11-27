@@ -13,7 +13,7 @@ use crate::{
     },
     jwt::{JwtConfig, JwtIssuer, JwtVerifier},
     local_auth::{
-        AccountSettings, ResetSettings, TeamSettings,
+        AccountSettings, ResetSettings, SsoSettings, TeamSettings,
         mail::{MailSettings, MailTls, Mailer},
     },
     mcp::{
@@ -457,7 +457,25 @@ impl Settings {
             page_size,
             max_page_size,
             kdf: Self::secret_kdf()?,
+            sso: Self::sso()?,
         })
+    }
+
+    fn sso() -> Result<Option<SsoSettings>, Box<dyn Error + Send + Sync>> {
+        if !flag("SSO_ENABLED")?.unwrap_or(false) {
+            return Ok(None);
+        }
+        let kdf = Self::secret_kdf()?;
+        let vault = Self::auth_encryption_secret()?.map(|secret| {
+            let mut vault = crate::secret_envelope::SecretEnvelope::new(&secret);
+            vault.kdf = kdf;
+            vault
+        });
+        Ok(Some(SsoSettings {
+            upstream: Self::upstream_client()?,
+            vault,
+            allowed_issuers: allowlist("SSO_ISSUERS")?,
+        }))
     }
 
     fn account_teams() -> Result<TeamSettings, Box<dyn Error + Send + Sync>> {

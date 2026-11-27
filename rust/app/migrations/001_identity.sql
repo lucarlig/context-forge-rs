@@ -20,6 +20,31 @@ CREATE TABLE IF NOT EXISTS email_users (
     last_login TIMESTAMP WITH TIME ZONE
 );
 
+CREATE TABLE IF NOT EXISTS sso_providers (
+    id VARCHAR(50) PRIMARY KEY NOT NULL,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    display_name VARCHAR(100) NOT NULL,
+    provider_type VARCHAR(20) NOT NULL,
+    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    client_id VARCHAR(255) NOT NULL,
+    client_secret_encrypted TEXT NOT NULL,
+    authorization_url VARCHAR(500) NOT NULL,
+    token_url VARCHAR(500) NOT NULL,
+    userinfo_url VARCHAR(500) NOT NULL,
+    issuer VARCHAR(500),
+    jwks_uri VARCHAR(500),
+    ca_certificate TEXT,
+    trusted_for_api_auth BOOLEAN DEFAULT FALSE,
+    api_audience VARCHAR(500),
+    trusted_domains JSON NOT NULL,
+    scope VARCHAR(200) NOT NULL DEFAULT 'openid profile email',
+    auto_create_users BOOLEAN NOT NULL DEFAULT TRUE,
+    team_mapping JSON NOT NULL,
+    provider_metadata JSON NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS email_teams (
     id VARCHAR(36) PRIMARY KEY NOT NULL,
     name VARCHAR(255) NOT NULL,

@@ -4,6 +4,7 @@ pub(crate) mod mail;
 mod password_reset;
 mod passwords;
 mod rbac;
+mod sso;
 mod storage;
 mod teams;
 mod user_lifecycle;
@@ -36,6 +37,7 @@ use crate::{
 };
 
 pub(crate) use password_reset::ResetSettings;
+pub(crate) use sso::SsoSettings;
 pub(crate) use storage::{POSTGRES_MIGRATION, SQLITE_MIGRATION};
 pub(crate) use teams::TeamSettings;
 
@@ -78,6 +80,7 @@ pub struct AccountSettings {
     pub(crate) page_size: u32,
     pub(crate) max_page_size: u32,
     pub(crate) kdf: SecretKdf,
+    pub(crate) sso: Option<SsoSettings>,
 }
 
 struct Accounts {
@@ -208,12 +211,22 @@ pub async fn router(
             );
     }
     let protected = protected.merge(rbac::router()).merge(teams::router());
-    Ok(public
+    let mut router = public
         .with_state(state.clone())
         .merge(state.access.protect_api_with_message(
             protected.with_state(state.clone()),
             "Authentication required",
-        )))
+        ));
+    if state.settings.sso.is_some() {
+        let (sso_public, sso_admin) = sso::routers();
+        router = router.merge(sso_public.with_state(state.clone())).merge(
+            state.access.protect_api_with_message(
+                sso_admin.with_state(state.clone()),
+                "Authorization token required",
+            ),
+        );
+    }
+    Ok(router)
 }
 
 #[derive(Deserialize)]

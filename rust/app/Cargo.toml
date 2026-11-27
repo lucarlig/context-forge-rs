@@ -42,6 +42,8 @@ serde_json_path = "0.7.2"
 sha2 = "0.11"
 shell-words = "1.1"
 sqlx = { version = "0.9.1", default-features = false, features = ["derive", "postgres", "runtime-tokio", "sqlite-bundled", "tls-rustls-ring-native-roots"] }
+sqlx-postgres = { version = "0.9.1", default-features = false, features = ["json"] }
+sqlx-sqlite = { version = "0.9.1", default-features = false, features = ["json"] }
 thiserror = "2"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tokio-util = "0.7"
