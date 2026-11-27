@@ -15,12 +15,14 @@ use crate::{
     upstream::{DiscoveredMetadata, UpstreamTransport},
 };
 
+mod agents;
 mod entry_filters;
 mod metrics;
 mod prompts;
 mod resources;
 mod servers;
 mod tools;
+pub(crate) use agents::{AgentLookup, AgentRecord, AgentWriteError};
 pub(crate) use entry_filters::CatalogEntryFilters;
 pub(crate) use metrics::{ExecutionMetrics, MetricEntity};
 pub(crate) use prompts::{PromptRecord, PromptWriteError};
@@ -159,6 +161,7 @@ pub struct CatalogTool {
     pub(crate) needs_upstream_config: bool,
     pub(crate) rest: Option<RestTool>,
     pub(crate) grpc_service_id: Option<String>,
+    pub(crate) a2a_agent_id: Option<String>,
     pub(crate) response_filter: String,
     pub definition: ToolDefinition,
 }
@@ -414,6 +417,7 @@ struct ToolRow {
     annotations: Option<String>,
     integration_type: String,
     grpc_service_id: Option<String>,
+    a2a_agent_id: Option<String>,
     response_filter: String,
     #[sqlx(flatten)]
     rest: RestTool,
@@ -505,11 +509,14 @@ macro_rules! tool_query {
                 COALESCE(g.gateway_mode, '') AS gateway_mode, COALESCE(g.transport, '') AS gateway_transport,
                 t.request_type, t.integration_type,
                 CASE WHEN t.integration_type = 'gRPC' THEN t.grpc_service_id END AS grpc_service_id,
+                CASE WHEN t.integration_type = 'A2A' THEN aa.id END AS a2a_agent_id,
                 COALESCE(t.jsonpath_filter, '') AS response_filter,
                 (
                     ", gateway_policy!(), "
                     OR ((LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth')
                         OR COALESCE(t.auth_value, '') <> '')
+                        AND NOT (t.integration_type = 'A2A'
+                            AND LOWER(COALESCE(t.auth_type, '')) = LOWER(COALESCE(aa.auth_type, '')))
                         AND NOT (", configured_auth!(), "
                             AND LOWER(COALESCE(t.auth_type, '')) = LOWER(COALESCE(g.auth_type, ''))))
                     OR COALESCE(t.tool_validation_policy, '') <> ''
@@ -542,12 +549,15 @@ macro_rules! tool_query {
              FROM tools t
              LEFT JOIN gateways g ON g.id = t.gateway_id
              LEFT JOIN grpc_services gs ON gs.id = t.grpc_service_id
+             LEFT JOIN a2a_agents aa ON aa.tool_id = t.id AND t.integration_type = 'A2A'
              WHERE t.enabled = TRUE AND t.name IS NOT NULL
                 AND ((t.integration_type IN ('MCP', 'REST')
                     AND ((t.integration_type = 'REST' AND t.gateway_id IS NULL)
                         OR (g.enabled = TRUE AND g.status = 'active' AND ", visible!("g"), ")))
                     OR ($9 AND t.integration_type = 'gRPC' AND t.gateway_id IS NULL
-                        AND gs.enabled = TRUE AND ", visible!("gs"), "))
+                        AND gs.enabled = TRUE AND ", visible!("gs"), ")
+                    OR ($10 AND t.integration_type = 'A2A' AND t.gateway_id IS NULL
+                        AND aa.enabled = TRUE AND ", visible!("aa"), "))
                 AND (CAST($2 AS TEXT) IS NULL OR t.name = $2)
                 AND (CAST($3 AS TEXT) IS NULL OR t.id > $3)
                 AND ", visible!("t"), "
@@ -938,9 +948,9 @@ impl Database {
         server_id: Option<&str>,
         after_id: Option<&str>,
         limit: u32,
-        grpc_enabled: bool,
+        integrations: (bool, bool),
     ) -> Result<Vec<CatalogTool>, sqlx::Error> {
-        self.mcp_tools(scope, server_id, None, after_id, limit, grpc_enabled)
+        self.mcp_tools(scope, server_id, None, after_id, limit, integrations)
             .await
     }
 
@@ -1289,10 +1299,10 @@ impl Database {
         scope: CatalogScope<'_>,
         server_id: Option<&str>,
         name: &str,
-        grpc_enabled: bool,
+        integrations: (bool, bool),
     ) -> Result<Option<CatalogTool>, sqlx::Error> {
         let mut matches = self
-            .mcp_tools(scope, server_id, Some(name), None, 2, grpc_enabled)
+            .mcp_tools(scope, server_id, Some(name), None, 2, integrations)
             .await?;
         if matches.len() > 1 {
             return Err(sqlx::Error::Protocol(
@@ -1309,7 +1319,7 @@ impl Database {
         name: Option<&str>,
         after_id: Option<&str>,
         limit: u32,
-        grpc_enabled: bool,
+        (grpc_enabled, a2a_enabled): (bool, bool),
     ) -> Result<Vec<CatalogTool>, sqlx::Error> {
         let teams = match scope.visibility {
             TeamVisibility::Teams(teams) => teams.as_slice(),
@@ -1329,6 +1339,7 @@ impl Database {
                     .bind(team_ids)
                     .bind(i64::from(limit))
                     .bind(grpc_enabled)
+                    .bind(a2a_enabled)
                     .fetch_all($pool)
                     .await?
             };
@@ -1849,6 +1860,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         annotations,
         integration_type,
         grpc_service_id,
+        a2a_agent_id,
         response_filter,
         rest,
     } = row;
@@ -1867,6 +1879,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         deprecated,
         rest: (integration_type == "REST").then_some(rest),
         grpc_service_id,
+        a2a_agent_id,
         response_filter,
         needs_upstream_config,
         definition: ToolDefinition {
@@ -2063,14 +2076,14 @@ mod tests {
 
         assert_eq!(
             ids(database
-                .list_mcp_tools(public, None, None, 10, false)
+                .list_mcp_tools(public, None, None, 10, (false, false))
                 .await
                 .unwrap()),
             ["01"]
         );
         assert_eq!(
             ids(database
-                .list_mcp_tools(owner, None, Some("01"), 10, false)
+                .list_mcp_tools(owner, None, Some("01"), 10, (false, false))
                 .await
                 .unwrap()),
             ["02", "03"]
@@ -2086,35 +2099,35 @@ mod tests {
         assert!(!database.active_team("missing").await.unwrap());
         assert!(
             database
-                .list_mcp_tools(outsider, Some("fort-server"), None, 10, false)
+                .list_mcp_tools(outsider, Some("fort-server"), None, 10, (false, false))
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             database
-                .find_mcp_tool(outsider, Some("fort-server"), "public-echo", false)
+                .find_mcp_tool(outsider, Some("fort-server"), "public-echo", (false, false))
                 .await
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             ids(database
-                .list_mcp_tools(member, Some("fort-server"), Some("01"), 1, false)
+                .list_mcp_tools(member, Some("fort-server"), Some("01"), 1, (false, false))
                 .await
                 .unwrap()),
             ["02"]
         );
         assert!(
             database
-                .find_mcp_tool(member, Some("fort-server"), "own-echo", false)
+                .find_mcp_tool(member, Some("fort-server"), "own-echo", (false, false))
                 .await
                 .unwrap()
                 .is_none()
         );
 
         let tool = database
-            .find_mcp_tool(member, Some("fort-server"), "fort-echo", false)
+            .find_mcp_tool(member, Some("fort-server"), "fort-echo", (false, false))
             .await
             .unwrap()
             .unwrap();
@@ -2139,7 +2152,7 @@ mod tests {
             .unwrap();
         assert!(
             database
-                .find_mcp_tool(member, Some("fort-server"), "fort-echo", false)
+                .find_mcp_tool(member, Some("fort-server"), "fort-echo", (false, false))
                 .await
                 .unwrap()
                 .unwrap()
@@ -2151,7 +2164,7 @@ mod tests {
             .unwrap();
         assert!(
             database
-                .find_mcp_tool(member, Some("fort-server"), "fort-echo", false)
+                .find_mcp_tool(member, Some("fort-server"), "fort-echo", (false, false))
                 .await
                 .unwrap()
                 .is_none()
@@ -2207,7 +2220,7 @@ mod tests {
         };
         assert!(
             database
-                .find_mcp_tool(public, None, "fixture-echo", false)
+                .find_mcp_tool(public, None, "fixture-echo", (false, false))
                 .await
                 .unwrap()
                 .is_some()

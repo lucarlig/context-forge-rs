@@ -99,6 +99,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let gateway_listeners = settings.gateway_listeners()?;
     let (well_known, cache_max_age, allow_oauth_loopback) = Settings::server_oauth_metadata()?;
     let (rest_timeout, rest_response_text_limit) = Settings::rest_tool_limits()?;
+    let (a2a_enabled, a2a_timeout) = Settings::a2a_federation()?;
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
@@ -115,6 +116,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_response_filters(Settings::response_filters()?)
         .with_rest_tool_limits(rest_timeout, rest_response_text_limit)
         .with_grpc_settings(Settings::grpc_federation()?)
+        .with_a2a_settings(a2a_enabled, a2a_timeout)
         .with_schema_validation(Settings::schema_validation()?)
         .with_token_issuer(email_auth_enabled, issuer)
         .with_gateway_oauth(Settings::gateway_oauth()?)

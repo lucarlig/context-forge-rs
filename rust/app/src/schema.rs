@@ -14,13 +14,15 @@ const IDENTITY: &str = include_str!("../migrations/001_identity.sql");
 const CATALOG: &str = include_str!("../migrations/002_catalog.sql");
 const LEGACY_SSE: &str = include_str!("../migrations/003_legacy_sse.sql");
 const GRPC: &str = include_str!("../migrations/004_grpc.sql");
-const MIGRATIONS: [&str; 6] = [
+const A2A: &str = include_str!("../migrations/005_a2a.sql");
+const MIGRATIONS: [&str; 7] = [
     "identity",
     "catalog",
     "legacy_sse",
     "historical_catalog",
     "cel_response_filters",
     "grpc_services",
+    "a2a_agents",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -293,6 +295,9 @@ impl Database {
                         4 => response_filters::translate_filters!($transaction),
                         5 => {
                             sqlx::raw_sql(GRPC).execute(&mut *$transaction).await?;
+                        }
+                        6 => {
+                            sqlx::raw_sql(A2A).execute(&mut *$transaction).await?;
                         }
                         _ => unreachable!("unknown migration implementation"),
                     }

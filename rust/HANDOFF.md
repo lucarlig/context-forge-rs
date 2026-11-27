@@ -253,6 +253,25 @@ Register the service through `/admin/grpc` to expose its methods in MCP. The
 CLI replay checked reflection, shutdown on SIGINT, and the exit code and
 diagnostic for `--connect-grpc`.
 
+## A2A federation
+
+The gateway registers, lists, reads, and invokes agents through `/a2a` and
+`/v1/a2a`. It creates derived MCP tools in the agent registration
+transaction. Invocation supports HTTP/JSON and the A2A v0.3 and v1 JSON-RPC
+bindings. Outbound requests use the gateway's pinned URL policy and an
+agent-specific header allowlist.
+
+The replay matched the pinned gateway on SQLite and PostgreSQL. It checked
+name and ID lookup, both request formats, version conversion, upstream bearer
+credentials, and invocation through the generated MCP tool. Native tests check
+team scope, masked credentials, the feature flag, and outbound header filtering.
+Agents registered by the pinned release and their existing bearer credentials
+also work through both routes after Rust adopts the SQLite database.
+UAID routing and enforced plugin bindings reject invocation before dispatch.
+
+Agent updates, deletion, cards, OAuth, streaming, UAID routing, and task
+lifecycle remain open.
+
 ## Gateway management
 
 The gateway management and catalog milestone is verified. Standing upstream

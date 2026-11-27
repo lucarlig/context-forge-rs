@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod a2a_api;
 mod catalog_api;
 mod content;
 mod exchanged_tokens;
@@ -116,6 +117,8 @@ pub struct GatewayService {
     max_prompt_bytes: usize,
     tool_preview_enabled: bool,
     grpc: GrpcSettings,
+    a2a_enabled: bool,
+    a2a_timeout: Duration,
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
     gateway_oauth: GatewayOAuthSettings,
@@ -222,6 +225,8 @@ impl GatewayService {
             max_prompt_bytes: 10240,
             tool_preview_enabled: true,
             grpc: GrpcSettings::default(),
+            a2a_enabled: true,
+            a2a_timeout: Duration::from_secs(30),
             email_auth_enabled: true,
             token_issuer: None,
             gateway_oauth: GatewayOAuthSettings::default(),
@@ -275,6 +280,12 @@ impl GatewayService {
 
     pub fn with_grpc_settings(mut self, settings: GrpcSettings) -> Self {
         self.grpc = settings;
+        self
+    }
+
+    pub fn with_a2a_settings(mut self, enabled: bool, timeout: Duration) -> Self {
+        self.a2a_enabled = enabled;
+        self.a2a_timeout = timeout;
         self
     }
 
@@ -518,6 +529,7 @@ impl GatewayService {
         }
         self.access.protect_api(
             router
+                .merge(a2a_api::router())
                 .merge(oauth_api::router())
                 .merge(roots::router())
                 .merge(export_api::router())
@@ -627,7 +639,7 @@ impl GatewayService {
                 server_id,
                 continuation.as_ref().map(|cursor| cursor.after_id.as_str()),
                 size + 1,
-                self.grpc.enabled,
+                (self.grpc.enabled, self.a2a_enabled),
             )
             .await?;
 
@@ -750,6 +762,13 @@ impl GatewayService {
                         biased;
                         () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
                         result = grpc_api::invoke(self, &tool, service_id, &request, principal) => result,
+                    };
+                }
+                if let Some(agent_id) = &tool.a2a_agent_id {
+                    return tokio::select! {
+                        biased;
+                        () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
+                        result = a2a_api::call_tool(self, &tool, agent_id, &request, principal, context.request_headers) => result,
                     };
                 }
                 let transport = UpstreamTransport::from_name(&tool.gateway_transport);
@@ -1154,7 +1173,7 @@ impl GatewayService {
                 access::catalog_scope(principal),
                 server.map(|server| server.id.as_str()),
                 name,
-                self.grpc.enabled,
+                (self.grpc.enabled, self.a2a_enabled),
             )
             .await?)
     }

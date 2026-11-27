@@ -39,6 +39,8 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+#[path = "gateway/a2a_federation.rs"]
+mod a2a_federation;
 #[path = "gateway/catalog_configuration_import.rs"]
 mod catalog_configuration_import;
 #[path = "gateway/configuration_import.rs"]
