@@ -639,6 +639,10 @@ impl Settings {
         Ok(bytes)
     }
 
+    pub fn tool_preview_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
+        Ok(flag("MCPGATEWAY_TOOL_PREVIEW_ENABLED")?.unwrap_or(true))
+    }
+
     pub fn resource_limits() -> Result<ResourceLimits, Box<dyn Error + Send + Sync>> {
         let mut limits = ResourceLimits::default();
         limits.max_bytes = parse("CONTENT_MAX_RESOURCE_SIZE", limits.max_bytes)?;

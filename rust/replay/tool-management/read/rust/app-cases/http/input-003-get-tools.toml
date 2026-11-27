@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/tools/tool-fixture"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc2NzIyNTYwMCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJ0b29sLWFkbWluLWZpeHR1cmUtc3RhdGljIiwiaXNfYWRtaW4iOnRydWUsInRlYW1zIjpudWxsLCJ0b2tlbl91c2UiOiJhcGkiLCJ1c2VyIjp7ImVtYWlsIjoiYWRtaW5AZXhhbXBsZS5jb20iLCJpc19hZG1pbiI6dHJ1ZX19.A0wlvDQXXPPXwSHnQkG5FYWTP1aURp7UbkHefDFBxUw"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

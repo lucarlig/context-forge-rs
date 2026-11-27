@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/v1/tools/tool-private"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXJAZXhhbXBsZS5jb20iLCJpc3MiOiJtY3BnYXRld2F5IiwiYXVkIjoibWNwZ2F0ZXdheS1hcGkiLCJpYXQiOjE3NjcyMjU2MDAsImV4cCI6NDEwMjQ0NDgwMCwianRpIjoidG9vbC1hZG1pbi1maXh0dXJlLXN0YXRpYyIsImlzX2FkbWluIjpmYWxzZSwidGVhbXMiOltdLCJ0b2tlbl91c2UiOiJhcGkiLCJ1c2VyIjp7ImVtYWlsIjoidmlld2VyQGV4YW1wbGUuY29tIiwiaXNfYWRtaW4iOmZhbHNlfX0.T6dH1VCuUG1p0UdhxGuC0C251rHB6selTsxjc2ZYDbc"
+
+[response]
+status = 404
+
+[response.headers]
+content-type = "application/json"

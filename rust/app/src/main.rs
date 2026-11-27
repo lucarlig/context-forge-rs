@@ -60,6 +60,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_root_settings(Settings::root_settings()?, shutdown.clone())?
         .with_resource_limits(Settings::resource_limits()?)
         .with_max_prompt_bytes(Settings::max_prompt_bytes()?)
+        .with_tool_preview(Settings::tool_preview_enabled()?)
         .with_logging_filter(handle)
         .with_management_page_sizes(management_page_size, management_max_page_size)
         .with_credential_secret(Settings::auth_encryption_secret()?.as_deref())

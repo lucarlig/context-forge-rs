@@ -54,3 +54,7 @@ Prompt management supports transactional creation, partial updates, state change
 and deletion on both databases. The live checks covered template byte limits,
 argument order, revision metadata, and virtual-server scoping.
 [Prompt write verification](replay/prompt-management/write.md)
+
+Tool REST reads expose scoped metadata, mask headers for callers without edit
+access, and support JSONPath projection. Dry-run preview validates arguments and
+checks virtual-server membership. [Tool read verification](replay/tool-management/read/README.md)

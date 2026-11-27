@@ -14,6 +14,7 @@ pub(super) struct CatalogListQuery {
     pub(super) team_id: Option<String>,
     pub(super) gateway_id: Option<String>,
     pub(super) mcp_server_id: Option<String>,
+    pub(super) apijsonpath: Option<String>,
 }
 
 impl CatalogListQuery {

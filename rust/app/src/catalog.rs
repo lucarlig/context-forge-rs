@@ -18,9 +18,11 @@ use crate::{
 mod entry_filters;
 mod prompts;
 mod resources;
+mod tools;
 pub(crate) use entry_filters::CatalogEntryFilters;
 pub(crate) use prompts::{PromptRecord, PromptWriteError};
 pub(crate) use resources::{ResourceRecord, ResourceWriteError};
+pub(crate) use tools::ToolRecord;
 
 const MIGRATION: &str = include_str!("../migrations/002_catalog.sql");
 pub(crate) const CATALOG_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682067)";

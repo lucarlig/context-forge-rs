@@ -10,6 +10,7 @@ mod proxy;
 mod resource_api;
 mod roots;
 mod tags;
+mod tool_api;
 
 use std::{
     collections::HashSet,
@@ -86,6 +87,7 @@ pub struct GatewayService {
     lifecycle: Option<GatewayLifecycle>,
     roots: roots::RootRegistry,
     max_prompt_bytes: usize,
+    tool_preview_enabled: bool,
     resource_limits: ResourceLimits,
     resource_events: resource_api::ResourceEvents,
     active_refreshes: Mutex<HashSet<String>>,
@@ -163,6 +165,7 @@ impl GatewayService {
             lifecycle: None,
             roots: roots::RootRegistry::default(),
             max_prompt_bytes: 10240,
+            tool_preview_enabled: true,
             resource_limits: ResourceLimits::default(),
             resource_events: resource_api::ResourceEvents::new(
                 tokio_util::sync::CancellationToken::new(),
@@ -218,6 +221,11 @@ impl GatewayService {
 
     pub fn with_max_prompt_bytes(mut self, max_bytes: usize) -> Self {
         self.max_prompt_bytes = max_bytes;
+        self
+    }
+
+    pub fn with_tool_preview(mut self, enabled: bool) -> Self {
+        self.tool_preview_enabled = enabled;
         self
     }
 
@@ -352,6 +360,7 @@ impl GatewayService {
                 .merge(roots::router())
                 .merge(tags::router())
                 .merge(prompt_api::router(self.max_prompt_bytes))
+                .merge(tool_api::router())
                 .merge(resource_api::router(self.resource_limits.max_bytes))
                 .with_state(self.clone()),
         )
