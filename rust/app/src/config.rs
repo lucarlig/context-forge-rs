@@ -6,7 +6,7 @@ use jsonwebtoken::EncodingKey;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    gateway::{CatalogRefresh, GatewayHealth, GatewayLifecycle, Pagination},
+    gateway::{CatalogRefresh, GatewayHealth, GatewayLifecycle, Pagination, RootSettings},
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
@@ -617,6 +617,16 @@ impl Settings {
             lease: positive_seconds("GATEWAY_ASYNC_LIFECYCLE_LEASE_SECONDS", 90.0)?,
             concurrency: parse("MAX_CONCURRENT_HEALTH_CHECKS", 10usize)?.max(1),
         }))
+    }
+
+    pub fn root_settings() -> Result<RootSettings, Box<dyn Error + Send + Sync>> {
+        let defaults = value("DEFAULT_ROOTS", "[]")?;
+        Ok(RootSettings {
+            network_schemes: allowlist("ROOT_ALLOWED_SCHEMES")?,
+            file_enabled: flag("ROOT_ALLOW_FILE_SCHEME")?.unwrap_or(false),
+            file_prefixes: allowlist("ROOT_ALLOWED_FILE_PREFIXES")?,
+            defaults: serde_json::from_str(&defaults).map_err(|_| "invalid DEFAULT_ROOTS")?,
+        })
     }
 
     pub fn invalidate_sessions_on_password_change() -> Result<bool, Box<dyn Error + Send + Sync>> {

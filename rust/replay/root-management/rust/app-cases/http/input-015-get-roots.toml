@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/roots"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc2NzIyNTYwMCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJyb290LWFkbWluLWZpeHR1cmUtc3RhdGljIiwiaXNfYWRtaW4iOnRydWUsInRlYW1zIjpbXSwidG9rZW5fdXNlIjoiYXBpIiwidXNlciI6eyJlbWFpbCI6ImFkbWluQGV4YW1wbGUuY29tIiwiaXNfYWRtaW4iOnRydWV9fQ.kJGUKsAdnH59_ivn_Cl1W3lUoizqRB1yeO-h4LLVCj4"
+
+[response]
+status = 403
+
+[response.headers]
+content-type = "application/json"

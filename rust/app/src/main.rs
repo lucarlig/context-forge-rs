@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             catalog_refresh,
         )
         .with_gateway_lifecycle(Settings::gateway_lifecycle()?)
+        .with_root_settings(Settings::root_settings()?, shutdown.clone())?
         .with_logging_filter(handle)
         .with_management_page_sizes(management_page_size, management_max_page_size)
         .with_credential_secret(Settings::auth_encryption_secret()?.as_deref())

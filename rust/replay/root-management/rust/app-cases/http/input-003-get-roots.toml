@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/roots/https%3A%2F%2Fexample.invalid%2Fteam"
+
+[request.headers]
+Accept = "application/json"
+Authorization = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBleGFtcGxlLmNvbSIsImlzcyI6Im1jcGdhdGV3YXkiLCJhdWQiOiJtY3BnYXRld2F5LWFwaSIsImlhdCI6MTc2NzIyNTYwMCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJyb290LWFkbWluLWZpeHR1cmUtc3RhdGljIiwiaXNfYWRtaW4iOnRydWUsInRlYW1zIjpudWxsLCJ0b2tlbl91c2UiOiJhcGkiLCJ1c2VyIjp7ImVtYWlsIjoiYWRtaW5AZXhhbXBsZS5jb20iLCJpc19hZG1pbiI6dHJ1ZX19.zt3Gamc2T-zADDn34vAfH7Wjo50JodDB4AG7fMA2AAc"
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"

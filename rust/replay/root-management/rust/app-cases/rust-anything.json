@@ -1,0 +1,29 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "context-forge-rs",
+  "run": [
+    "/tmp/context-forge-port-tools/context-forge-reference-server"
+  ],
+  "normalize": [
+    "key-order"
+  ],
+  "timeout_secs": 30,
+  "http": {},
+  "recorded": [
+    "input-001-get-roots",
+    "input-002-post-v1",
+    "input-003-get-roots",
+    "input-004-post-roots",
+    "input-005-put-roots",
+    "input-006-get-v1",
+    "input-007-post-roots",
+    "input-008-post-roots",
+    "input-009-post-roots",
+    "input-010-post-roots",
+    "input-011-post-roots",
+    "input-012-post-roots",
+    "input-013-delete-roots",
+    "input-014-get-v1",
+    "input-015-get-roots"
+  ]
+}

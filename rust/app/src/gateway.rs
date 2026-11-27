@@ -5,6 +5,7 @@ mod health;
 mod lifecycle;
 mod management;
 mod proxy;
+mod roots;
 
 use std::{
     collections::HashSet,
@@ -67,6 +68,7 @@ use proxy::DirectTarget;
 pub use health::GatewayHealth;
 pub use lifecycle::GatewayLifecycle;
 pub(crate) use proxy::GATEWAY_ID_HEADER;
+pub use roots::{RootSettings, RootSetupError};
 
 pub struct GatewayService {
     pub(crate) access: Arc<Authorizer>,
@@ -77,6 +79,7 @@ pub struct GatewayService {
     management_max_page_size: u32,
     refresh: CatalogRefresh,
     lifecycle: Option<GatewayLifecycle>,
+    roots: roots::RootRegistry,
     active_refreshes: Mutex<HashSet<String>>,
     logging_filter: Option<reload::Handle<LevelFilter, Registry>>,
     subscriptions: CatalogSubscriptions,
@@ -150,6 +153,7 @@ impl GatewayService {
             management_max_page_size: 500,
             refresh,
             lifecycle: None,
+            roots: roots::RootRegistry::default(),
             active_refreshes: Mutex::default(),
             logging_filter: None,
             subscriptions: CatalogSubscriptions::new(ListenSettings::default()),
@@ -182,6 +186,15 @@ impl GatewayService {
     pub fn with_gateway_lifecycle(mut self, lifecycle: Option<GatewayLifecycle>) -> Self {
         self.lifecycle = lifecycle;
         self
+    }
+
+    pub fn with_root_settings(
+        mut self,
+        settings: RootSettings,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<Self, RootSetupError> {
+        self.roots = roots::RootRegistry::new(settings, shutdown)?;
+        Ok(self)
     }
 
     pub fn with_credential_secret(mut self, secret: Option<&str>) -> Self {
@@ -310,7 +323,8 @@ impl GatewayService {
                     post(management::set_state),
                 );
         }
-        self.access.protect_api(router.with_state(self.clone()))
+        self.access
+            .protect_api(router.merge(roots::router()).with_state(self.clone()))
     }
 
     pub fn mcp_router(self: &Arc<Self>, require_auth: bool, mode: ProtocolMode) -> Router {

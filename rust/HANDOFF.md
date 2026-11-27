@@ -37,3 +37,5 @@ Gateway metadata and endpoint updates preserve retained catalog IDs and roll bac
 Gateway health checks update reachability and refresh the catalog on recovery. The live pinned comparison covered offline invocation, error persistence, and recovery using stored upstream credentials. [Gateway health verification](replay/gateway-management/health.md)
 
 The opt-in asynchronous lifecycle accepts create, update, and delete operations and completes them in a database-backed worker. The live checks verified status transitions and recovery after a worker exited while holding a claim. [Gateway lifecycle verification](replay/gateway-management/lifecycle.md)
+
+The root management APIs support canonically identified network and file roots, configuration export, and an SSE changes stream. The HTTP recordings verify the URI policy and the unrestricted administrator requirement. [Root management verification](replay/root-management/README.md)
