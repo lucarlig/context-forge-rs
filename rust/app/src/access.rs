@@ -61,6 +61,7 @@ struct McpAccess {
     auth: Arc<Authorizer>,
     require_auth: bool,
     legacy_transport: bool,
+    oauth_base: Option<Arc<str>>,
 }
 
 impl Authorizer {
@@ -77,11 +78,21 @@ impl Authorizer {
     }
 
     pub fn protect_mcp(self: &Arc<Self>, router: Router, require_auth: bool) -> Router {
+        self.protect_mcp_with_oauth(router, require_auth, "http://localhost:4444")
+    }
+
+    pub(crate) fn protect_mcp_with_oauth(
+        self: &Arc<Self>,
+        router: Router,
+        require_auth: bool,
+        oauth_base: &str,
+    ) -> Router {
         router.route_layer(middleware::from_fn_with_state(
             McpAccess {
                 auth: self.clone(),
                 require_auth,
                 legacy_transport: false,
+                oauth_base: Some(oauth_base.into()),
             },
             authorize_mcp,
         ))
@@ -97,6 +108,7 @@ impl Authorizer {
                 auth: self.clone(),
                 require_auth,
                 legacy_transport: true,
+                oauth_base: None,
             },
             authorize_mcp,
         ))
@@ -455,7 +467,30 @@ async fn authorize_mcp(
     next: Next,
 ) -> Result<Response, AuthError> {
     let server_id = path.as_ref().and_then(|path| path.server_id.as_deref());
-    let principal = match bearer(request.headers())? {
+    let credential = bearer(request.headers())?;
+    let anonymous_server = if credential.is_none()
+        && let Some(base) = access.oauth_base.as_deref()
+        && let Some(id) = server_id
+    {
+        let server = access.auth.database.catalog_server(id).await?;
+        if server.as_ref().is_some_and(|server| server.oauth_enabled) {
+            let url =
+                crate::gateway::resource_metadata_url(base, request.headers(), request.uri(), id);
+            let challenge =
+                axum::http::HeaderValue::from_str(&format!("Bearer resource_metadata=\"{url}\""))
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("Bearer"));
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, challenge)],
+                Json(json!({"detail":"This server requires OAuth authentication"})),
+            )
+                .into_response());
+        }
+        Some(server)
+    } else {
+        None
+    };
+    let principal = match credential {
         None if access.require_auth => {
             return Err(if access.legacy_transport {
                 AuthError::ApiRequired
@@ -475,14 +510,13 @@ async fn authorize_mcp(
     let scope = catalog_scope(principal.as_ref());
     let server = match server_id {
         Some(id) => {
-            let server = access
-                .auth
-                .database
-                .catalog_server(id)
-                .await?
-                .ok_or_else(|| {
-                    AuthError::ServerMissing(access.legacy_transport.then(|| id.to_owned()))
-                })?;
+            let server = match anonymous_server {
+                Some(server) => server,
+                None => access.auth.database.catalog_server(id).await?,
+            }
+            .ok_or_else(|| {
+                AuthError::ServerMissing(access.legacy_transport.then(|| id.to_owned()))
+            })?;
             if server.oauth_enabled && principal.is_none() {
                 return Err(AuthError::Required);
             }

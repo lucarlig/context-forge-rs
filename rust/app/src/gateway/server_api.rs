@@ -5,8 +5,11 @@ use axum::extract::{Path, Query};
 use super::{catalog_api::*, *};
 use crate::catalog::{ExecutionMetrics, MetricEntity, ServerLinks, ServerRecord};
 
+mod handshake;
+pub(super) use handshake::HandshakeProbe;
 mod oauth;
 mod write;
+pub(crate) use oauth::resource_metadata_url;
 pub(super) use oauth::router as well_known_router;
 
 pub(super) fn router() -> Router<Arc<GatewayService>> {
@@ -24,6 +27,10 @@ pub(super) fn router() -> Router<Arc<GatewayService>> {
             .route(
                 &format!("{base}/{{id}}/oauth/approve"),
                 post(write::approve),
+            )
+            .route(
+                &format!("{base}/{{id}}/test-handshake"),
+                post(handshake::test),
             )
             .route(&format!("{base}/{{id}}/{{kind}}"), get(associated));
     }

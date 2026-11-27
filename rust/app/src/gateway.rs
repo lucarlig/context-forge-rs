@@ -78,6 +78,7 @@ pub use listeners::{GatewayListeners, ListenerElection};
 pub(crate) use proxy::GATEWAY_ID_HEADER;
 pub use resource_api::ResourceLimits;
 pub use roots::{RootSettings, RootSetupError};
+pub(crate) use server_api::resource_metadata_url;
 
 pub struct GatewayService {
     pub(crate) access: Arc<Authorizer>,
@@ -91,7 +92,7 @@ pub struct GatewayService {
     roots: roots::RootRegistry,
     max_prompt_bytes: usize,
     tool_preview_enabled: bool,
-    virtual_server_base: String,
+    pub(crate) virtual_server_base: String,
     well_known_enabled: bool,
     well_known_max_age: u32,
     allow_http_oauth_loopback: bool,
@@ -397,6 +398,18 @@ impl GatewayService {
                 .merge(resource_api::router(self.resource_limits.max_bytes))
                 .with_state(self.clone()),
         )
+    }
+
+    pub fn registration_router_with_probe(
+        self: &Arc<Self>,
+        mcp: Router,
+        timeout: Duration,
+    ) -> Router {
+        self.registration_router()
+            .layer(Extension(server_api::HandshakeProbe {
+                router: mcp,
+                timeout,
+            }))
     }
 
     pub fn mcp_router(self: &Arc<Self>, require_auth: bool, mode: ProtocolMode) -> Router {

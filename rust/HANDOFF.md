@@ -78,3 +78,8 @@ Virtual-server writes manage associations, interfaces, instructions, and
 OAuth approval transactionally. The pinned comparison covered a failed
 association, encrypted OAuth settings, and approval of a specific revision.
 [Virtual-server write verification](replay/server-management/write.md)
+
+The virtual-server management milestone is verified. The handshake route uses
+the running MCP transport and the caller's credentials. OAuth-enabled servers
+advertise the protected resource metadata URL in their authentication
+challenge. [Handshake verification](replay/server-management/handshake.md)

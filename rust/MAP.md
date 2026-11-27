@@ -18,7 +18,7 @@ Mark a milestone complete after testing it through its normal entry point. The R
 - [x] Legacy SSE, WebSocket, and stdio transports and translation
 - [x] Authenticated MCP upstreams, identity forwarding, and direct proxy mode
 - [x] Gateway update, delete, refresh, health lifecycle, and full catalog APIs
-- [ ] Virtual-server management and OAuth resource metadata
+- [x] Virtual-server management and OAuth resource metadata
 - [ ] API token issuance, usage limits, and lifecycle
 - [ ] User, team, role, and local login management
 - [ ] OAuth, SSO, dynamic registration, and external identities

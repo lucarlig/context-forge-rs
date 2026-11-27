@@ -73,7 +73,7 @@ async fn protected_resource(
             "OAuth authorization_server not configured for server: {id}"
         )));
     }
-    let base = request_base(&service, &headers, &uri);
+    let base = request_base(&service.virtual_server_base, &headers, &uri);
     let mut result = json!({
         "resource":format!("{base}/servers/{id}/mcp"),
         "authorization_servers":issuers,
@@ -119,9 +119,13 @@ async fn deprecated_path(
     {
         return Err(not_found("Server not found"));
     }
-    let base = request_base(&service, &headers, &uri);
-    let target = HeaderValue::from_str(&format!("{base}{WELL_KNOWN_PATH}/servers/{id}/mcp"))
-        .map_err(|_| CatalogApiError::detail(StatusCode::BAD_REQUEST, "Invalid server URL"))?;
+    let target = HeaderValue::from_str(&resource_metadata_url(
+        &service.virtual_server_base,
+        &headers,
+        &uri,
+        &id,
+    ))
+    .map_err(|_| CatalogApiError::detail(StatusCode::BAD_REQUEST, "Invalid server URL"))?;
     let mut response = (
         StatusCode::MOVED_PERMANENTLY,
         Json(json!({"detail":"Moved Permanently"})),
@@ -131,24 +135,48 @@ async fn deprecated_path(
     Ok(response)
 }
 
-fn request_base(service: &GatewayService, headers: &HeaderMap, uri: &Uri) -> String {
+pub(crate) fn resource_metadata_url(
+    base: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+    server: &str,
+) -> String {
+    let base = request_base(base, headers, uri);
+    format!("{base}{WELL_KNOWN_PATH}/servers/{server}/mcp")
+}
+
+fn request_base(configured_base: &str, headers: &HeaderMap, uri: &Uri) -> String {
     let authority = headers
         .get(header::HOST)
         .and_then(|host| host.to_str().ok())
-        .and_then(|host| host.parse::<Authority>().ok())
-        .filter(|host| !host.as_str().contains('@'));
-    let Some(authority) = authority.as_ref().or_else(|| uri.authority()) else {
-        return service.virtual_server_base.clone();
+        .and_then(|host| host.parse::<Authority>().ok());
+    let Some(authority) = authority
+        .as_ref()
+        .or_else(|| uri.authority())
+        .filter(|host| !host.as_str().contains('@'))
+    else {
+        return configured_base.to_owned();
     };
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|header| header.to_str().ok())
         .and_then(|header| header.split(',').next())
         .map(str::trim)
-        .filter(|value| matches!(*value, "http" | "https"))
-        .or_else(|| uri.scheme_str())
+        .and_then(|value| {
+            if value.eq_ignore_ascii_case("https") {
+                Some("https")
+            } else if value.eq_ignore_ascii_case("http") {
+                Some("http")
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            uri.scheme_str()
+                .filter(|scheme| matches!(*scheme, "http" | "https"))
+        })
         .unwrap_or("http");
-    let configured = reqwest::Url::parse(&service.virtual_server_base).ok();
+    let configured = reqwest::Url::parse(configured_base).ok();
     let prefix = configured
         .as_ref()
         .map_or("", |config| config.path().trim_end_matches('/'));

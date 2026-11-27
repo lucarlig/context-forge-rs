@@ -87,9 +87,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
     let legacy_sse = service.legacy_sse_router(require_api_auth, sse);
     let websocket = service.websocket_router(Settings::websocket_settings(shutdown.clone())?);
+    let transport = Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse).merge(websocket));
+    let management =
+        service.registration_router_with_probe(transport.clone(), health_settings.timeout);
     let app = probes::router(database, redis)
-        .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse).merge(websocket)))
-        .merge(service.registration_router())
+        .merge(transport)
+        .merge(management)
         .merge(service.server_oauth_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     let background = catalog_available.then(|| {
