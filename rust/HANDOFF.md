@@ -29,3 +29,5 @@ Gateway management now supports listing and detail reads at `/gateways`, `/v1/ga
 Gateway impact previews identify visible virtual servers associated with a gateway. Synchronous deletion removes the gateway, its cached catalog, and their associations in one transaction. Rust verified deletion with both native tables and the pinned gateway's SQLite schema. [Impact and deletion recordings](replay/gateway-management/delete/README.md)
 
 Manual gateway refresh updates the cached catalog while preserving IDs and associations for retained entries. The pinned comparison covered tools alone and a full refresh with resources and prompts. The Rust integration test verifies that a failed discovery preserves the cached tools. [Gateway refresh verification](replay/gateway-management/refresh/README.md)
+
+Gateway state changes update the gateway and its catalog together. Reactivation uses the gateway's stored credentials to discover a fresh catalog, and a failed discovery preserves cached entries. [Gateway activation verification](replay/gateway-management/state.md)

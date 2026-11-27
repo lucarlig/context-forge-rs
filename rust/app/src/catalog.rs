@@ -658,7 +658,7 @@ const CONNECTION_CONFIG: &str = concat!(
         CAST(g.oauth_config AS TEXT) AS oauth,
         CAST(g.passthrough_headers AS TEXT) AS passthrough, CAST(g.identity_propagation AS TEXT) AS identity,
         g.ca_certificate, g.client_cert, g.client_key FROM gateways g
-    WHERE g.id = $1 AND g.url = $2 AND g.enabled = TRUE AND g.status = 'active'
+    WHERE g.id = $1 AND g.url = $2 AND (g.enabled = TRUE OR $3) AND g.status = 'active'
         AND g.gateway_mode IN ('cache', 'direct_proxy') AND NOT ",
     gateway_policy!()
 );
@@ -1430,12 +1430,14 @@ impl Database {
         &self,
         id: &str,
         url: &str,
+        allow_disabled: bool,
     ) -> Result<Option<GatewayConnectionRow>, sqlx::Error> {
         macro_rules! fetch {
             ($pool:expr) => {
                 sqlx::query_as::<_, GatewayConnectionRow>(CONNECTION_CONFIG)
                     .bind(id)
                     .bind(url)
+                    .bind(allow_disabled)
                     .fetch_optional($pool)
                     .await
             };

@@ -23,6 +23,7 @@ pub(crate) struct CatalogRefreshInput<'a> {
     pub(crate) metadata: &'a DiscoveredMetadata,
     pub(crate) include_resources: bool,
     pub(crate) include_prompts: bool,
+    pub(crate) activating: bool,
 }
 
 #[derive(Default, Serialize)]
@@ -266,11 +267,7 @@ impl Database {
         macro_rules! sync {
             ($transaction:ident, $lock:literal, $exists:literal, $insert_tool:expr,
              $dialect:ident, $now:literal) => {{
-                let id = sqlx::query_scalar::<_, String>(locked_gateway_query!($lock))
-                    .bind(&gateway.id).bind(gateway.version).bind(&gateway.updated_at)
-                    .bind(&gateway.visibility).bind(gateway.owner_email.as_deref())
-                    .bind(gateway.team_id.as_deref())
-                    .fetch_optional(&mut *$transaction).await?;
+                let id = lock_gateway!($transaction, gateway, $lock);
                 if id.is_none() {
                     return Ok(None);
                 }
@@ -324,9 +321,14 @@ impl Database {
                 refresh_metadata!($transaction, $exists, $dialect, gateway, input, changes);
                 let now = Timestamp::now().to_string();
                 sqlx::query(concat!("UPDATE gateways SET capabilities = ", json_parameter!($dialect, "$2"),
-                    ", last_refresh_at = ", $now, ", updated_at = ", $now, " WHERE id = $1"))
-                    .bind(&gateway.id).bind(input.capabilities.to_string()).bind(now)
+                    ", last_refresh_at = CASE WHEN $4 THEN last_refresh_at ELSE ", $now, " END,
+                    last_seen = CASE WHEN $4 THEN ", $now, " ELSE last_seen END,
+                    updated_at = ", $now, " WHERE id = $1"))
+                    .bind(&gateway.id).bind(input.capabilities.to_string()).bind(&now).bind(input.activating)
                     .execute(&mut *$transaction).await?;
+                if input.activating {
+                    set_gateway_state!($transaction, &gateway.id, true, &now, $now);
+                }
                 $transaction.commit().await?;
                 Ok(Some(changes))
             }};

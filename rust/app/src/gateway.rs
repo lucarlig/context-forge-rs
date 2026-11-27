@@ -36,9 +36,9 @@ use crate::{
     access::{self, Authorizer, Principal, RoleContext},
     auth::TeamVisibility,
     catalog::{
-        CatalogList, CatalogServer, CatalogTool, ContentGateway, GatewayMode, GatewayRegistration,
-        RegisteredTls, RegisteredTool, RegistrationError, RegistrationOptions, ToolDefinition,
-        slugify,
+        CatalogList, CatalogServer, CatalogTool, ContentGateway, GatewayConnectionRow, GatewayMode,
+        GatewayRegistration, RegisteredTls, RegisteredTool, RegistrationError, RegistrationOptions,
+        ToolDefinition, slugify,
     },
     config::{HeaderForwarding, IdentityForwarding, ProxyCatalogSettings, SecretKdf},
     credentials::{
@@ -284,6 +284,14 @@ impl GatewayService {
                 .route(
                     &format!("{route}/{{key}}/tools/refresh"),
                     post(management::refresh),
+                )
+                .route(
+                    &format!("{route}/{{key}}/state"),
+                    post(management::set_state),
+                )
+                .route(
+                    &format!("{route}/{{key}}/toggle"),
+                    post(management::set_state),
                 );
         }
         self.access.protect_api(router.with_state(self.clone()))
@@ -559,9 +567,21 @@ impl GatewayService {
         }
         let connection = self
             .database
-            .gateway_connection(id, url)
+            .gateway_connection(id, url, false)
             .await?
             .ok_or(ToolError::Unavailable)?;
+        self.connection_credentials(id, url, connection, incoming, principal)
+            .await
+    }
+
+    async fn connection_credentials(
+        &self,
+        id: &str,
+        url: &str,
+        connection: GatewayConnectionRow,
+        incoming: Option<&HeaderMap>,
+        principal: Option<&Principal>,
+    ) -> Result<Option<UpstreamCredentials>, ToolError> {
         let kind = connection.kind.as_str();
         let cipher = self.credential_cipher.as_ref();
         let mut credentials = if matches!(kind, "" | "none" | "one_time_auth" | "oauth") {

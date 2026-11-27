@@ -168,10 +168,49 @@ macro_rules! locked_gateway_query {
         concat!(
             "SELECT id FROM gateways WHERE id = $1 AND version = $2
                AND CAST(updated_at AS TEXT) = $3 AND visibility = $4
-               AND owner_email IS NOT DISTINCT FROM $5 AND team_id IS NOT DISTINCT FROM $6",
+               AND owner_email IS NOT DISTINCT FROM $5 AND team_id IS NOT DISTINCT FROM $6
+               AND status = $7 AND enabled = $8 AND reachable = $9",
             $lock
         )
     };
+}
+
+macro_rules! lock_gateway {
+    ($transaction:ident, $expected:expr, $lock:literal) => {
+        sqlx::query_scalar::<_, String>(locked_gateway_query!($lock))
+            .bind(&$expected.id)
+            .bind($expected.version)
+            .bind(&$expected.updated_at)
+            .bind(&$expected.visibility)
+            .bind($expected.owner_email.as_deref())
+            .bind($expected.team_id.as_deref())
+            .bind(&$expected.status)
+            .bind($expected.enabled)
+            .bind($expected.reachable)
+            .fetch_optional(&mut *$transaction)
+            .await?
+    };
+}
+
+macro_rules! set_gateway_state {
+    ($transaction:ident, $id:expr, $enabled:expr, $now:expr, $date:literal) => {{
+        let statements = [
+            concat!("UPDATE gateways SET enabled = $2, reachable = TRUE, updated_at = ", $date, " WHERE id = $1"),
+            concat!("UPDATE tools SET enabled = ($2 AND validation_refusal IS NULL), reachable = TRUE,
+                updated_at = ", $date, " WHERE gateway_id = $1
+                AND (enabled <> ($2 AND validation_refusal IS NULL) OR reachable <> TRUE)"),
+            concat!("UPDATE resources SET enabled = $2, updated_at = ", $date, " WHERE gateway_id = $1 AND enabled IS DISTINCT FROM $2"),
+            concat!("UPDATE prompts SET enabled = $2, updated_at = ", $date, " WHERE gateway_id = $1 AND enabled IS DISTINCT FROM $2"),
+        ];
+        for statement in statements {
+            sqlx::query(statement)
+                .bind($id)
+                .bind($enabled)
+                .bind($now)
+                .execute(&mut *$transaction)
+                .await?;
+        }
+    }};
 }
 
 macro_rules! delete_catalog_rows {
@@ -315,15 +354,7 @@ impl Database {
     ) -> Result<bool, sqlx::Error> {
         macro_rules! delete {
             ($transaction:ident, $lock:literal, $table_exists:literal) => {{
-                let id = sqlx::query_scalar::<_, String>(locked_gateway_query!($lock))
-                    .bind(&expected.id)
-                    .bind(expected.version)
-                    .bind(&expected.updated_at)
-                    .bind(&expected.visibility)
-                    .bind(expected.owner_email.as_deref())
-                    .bind(expected.team_id.as_deref())
-                    .fetch_optional(&mut *$transaction)
-                    .await?;
+                let id = lock_gateway!($transaction, expected, $lock);
                 let Some(id) = id else {
                     return Ok(false);
                 };
@@ -354,6 +385,39 @@ impl Database {
                     transaction,
                     " FOR UPDATE",
                     "SELECT to_regclass(CAST($1 AS TEXT)) IS NOT NULL"
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn set_gateway_state(
+        &self,
+        expected: &GatewayRecord,
+        enabled: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let now = jiff::Timestamp::now().to_string();
+        macro_rules! change {
+            ($transaction:ident, $lock:literal, $date:literal) => {{
+                let Some(id) = lock_gateway!($transaction, expected, $lock) else {
+                    return Ok(false);
+                };
+                set_gateway_state!($transaction, &id, enabled, &now, $date);
+                $transaction.commit().await?;
+                Ok(true)
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+                change!(transaction, "", "$3")
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
+                change!(
+                    transaction,
+                    " FOR UPDATE",
+                    "CAST(CAST($3 AS TEXT) AS TIMESTAMPTZ)"
                 )
             }
         }

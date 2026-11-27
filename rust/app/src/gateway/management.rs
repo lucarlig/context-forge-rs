@@ -27,6 +27,11 @@ pub(super) struct RefreshParameters {
 }
 
 #[derive(Deserialize)]
+pub(super) struct StateParameters {
+    activate: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub(super) struct ListParameters {
     include_inactive: Option<String>,
     include_pagination: Option<String>,
@@ -278,6 +283,7 @@ pub(super) async fn refresh(
                 metadata: &metadata,
                 include_resources,
                 include_prompts,
+                activating: false,
             },
         )
         .await
@@ -295,6 +301,161 @@ pub(super) async fn refresh(
         );
     }
     Ok(refresh_response(&record.id, started, changes, None))
+}
+
+pub(super) async fn set_state(
+    State(service): State<Arc<GatewayService>>,
+    Extension(principal): Extension<Principal>,
+    Path(key): Path<String>,
+    Query(query): Query<StateParameters>,
+) -> Result<Json<Value>, ManagementError> {
+    let activate = query
+        .activate
+        .as_deref()
+        .map(|value| flag(Some(value)))
+        .transpose()?
+        .unwrap_or(true);
+    let ownership_error = if activate {
+        "Only the owner can activate the gateway"
+    } else {
+        "Only the owner can deactivate the gateway"
+    };
+    let mut record = manageable(
+        &service,
+        &principal,
+        key,
+        "gateways.update",
+        ownership_error,
+    )
+    .await?;
+    if record.status != "active" {
+        return Err(ManagementError::LifecycleInProgress);
+    }
+    if record.enabled != activate || !record.reachable {
+        let rediscovered = if activate {
+            activate_catalog(&service, &record).await?
+        } else {
+            false
+        };
+        if !rediscovered
+            && !service
+                .database
+                .set_gateway_state(&record, activate)
+                .await?
+        {
+            return Err(ManagementError::ConcurrentChange);
+        }
+        if activate {
+            service.subscriptions.changed(
+                &record.visibility,
+                record.team_id.as_deref(),
+                record.owner_email.as_deref(),
+            );
+        } else {
+            service.subscriptions.removed(
+                &record.id,
+                &record.visibility,
+                record.team_id.as_deref(),
+                record.owner_email.as_deref(),
+            );
+        }
+        record = lookup(&service, &principal, record.id).await?;
+    }
+    let Value::Object(fields) = response(&record, service.credential_cipher.as_ref()) else {
+        unreachable!("gateway response is an object");
+    };
+    let gateway = fields
+        .into_iter()
+        .map(|(field, value)| (snake_case(&field), value))
+        .collect::<serde_json::Map<_, _>>();
+    let action = if activate { "activated" } else { "deactivated" };
+    Ok(Json(json!({
+        "status":"success","message":format!("Gateway {} {action}",record.id),"gateway":gateway,
+    })))
+}
+
+async fn activate_catalog(
+    service: &GatewayService,
+    record: &GatewayRecord,
+) -> Result<bool, ManagementError> {
+    let Some(transport) = UpstreamTransport::from_name(&record.transport) else {
+        return Ok(false);
+    };
+    let Some(connection) = service
+        .database
+        .gateway_connection(&record.id, &record.url, true)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let credentials = match service
+        .connection_credentials(&record.id, &record.url, connection, None, None)
+        .await
+    {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            tracing::warn!(gateway = %record.id, %error, "could not load gateway activation credentials");
+            return Ok(false);
+        }
+    };
+    let (catalog, metadata) = match service
+        .upstream
+        .discover_catalog(UpstreamEndpoint {
+            url: &record.url,
+            transport,
+            credentials: credentials.as_ref(),
+        })
+        .await
+    {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            tracing::warn!(gateway = %record.id, %error, "gateway activation discovery failed");
+            return Ok(false);
+        }
+    };
+    let tools: Vec<ToolDefinition> = match catalog
+        .tools
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect()
+    {
+        Ok(tools) => tools,
+        Err(_) => return Ok(false),
+    };
+    match service
+        .database
+        .refresh_catalog(
+            record,
+            CatalogRefreshInput {
+                tools: &tools,
+                capabilities: &catalog.capabilities,
+                metadata: &metadata,
+                include_resources: true,
+                include_prompts: true,
+                activating: true,
+            },
+        )
+        .await
+    {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Err(ManagementError::ConcurrentChange),
+        Err(RegistrationError::Database(error)) => Err(error.into()),
+        Err(RegistrationError::ToolNameConflict) => Err(ManagementError::ToolNameConflict),
+        Err(_) => Ok(false),
+    }
+}
+
+fn snake_case(field: &str) -> String {
+    let mut result = String::with_capacity(field.len() + 4);
+    for character in field.chars() {
+        if character.is_ascii_uppercase() {
+            result.push('_');
+            result.push(character.to_ascii_lowercase());
+        } else {
+            result.push(character);
+        }
+    }
+    result
 }
 
 struct RefreshGuard<'a> {
@@ -578,6 +739,8 @@ pub(super) enum ManagementError {
     NotFound(String),
     Conflict(String),
     ConcurrentChange,
+    LifecycleInProgress,
+    ToolNameConflict,
     RefreshInProgress(String),
     Internal,
 }
@@ -603,6 +766,14 @@ impl IntoResponse for ManagementError {
             Self::ConcurrentChange => (
                 StatusCode::CONFLICT,
                 "Gateway changed during request".to_owned(),
+            ),
+            Self::LifecycleInProgress => (
+                StatusCode::CONFLICT,
+                "Gateway lifecycle operation is in progress".to_owned(),
+            ),
+            Self::ToolNameConflict => (
+                StatusCode::CONFLICT,
+                "Gateway tool name conflicts with an existing tool".to_owned(),
             ),
             Self::RefreshInProgress(name) => (
                 StatusCode::CONFLICT,
