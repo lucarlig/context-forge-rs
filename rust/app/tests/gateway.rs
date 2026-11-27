@@ -598,12 +598,22 @@ struct ResourceStreamFixture {
     opened: AtomicUsize,
     release: CancellationToken,
     closed: CancellationToken,
+    bearer: bool,
 }
 
 async fn modern_resource_fixture(
     State(fixture): State<Arc<ResourceStreamFixture>>,
+    headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Response {
+    if fixture.bearer
+        && headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer stored-subscription-fixture")
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let id = &request["id"];
     let mut result = match request["method"].as_str().unwrap() {
         "server/discover" => json!({
@@ -667,10 +677,22 @@ async fn modern_resource_fixture(
 
 #[tokio::test]
 async fn modern_resource_subscriptions_share_scoped_upstream_watches() {
+    assert_shared_upstream_watch(false).await;
+}
+
+#[tokio::test]
+async fn modern_resource_subscriptions_use_stored_upstream_headers() {
+    assert_shared_upstream_watch(true).await;
+}
+
+async fn assert_shared_upstream_watch(bearer: bool) {
     const METHOD: &str = "subscriptions/listen";
     const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let fixture = Arc::new(ResourceStreamFixture::default());
+    let fixture = Arc::new(ResourceStreamFixture {
+        bearer,
+        ..ResourceStreamFixture::default()
+    });
     let upstream = Running::start(
         Router::new()
             .route("/mcp", post(modern_resource_fixture))
@@ -685,19 +707,22 @@ async fn modern_resource_subscriptions_share_scoped_upstream_watches() {
         .execute(pool)
         .await
         .unwrap();
-    let service = Arc::new(GatewayService::new(
-        database.clone(),
-        authorizer(database),
-        UpstreamClient::new(
-            EgressPolicy {
-                allow_localhost: true,
-                ..EgressPolicy::default()
-            },
-            Duration::from_secs(5),
-        ),
-        Pagination::new(100, 900, None),
-        CatalogRefresh::default(),
-    ));
+    let service = Arc::new(
+        GatewayService::new(
+            database.clone(),
+            authorizer(database),
+            UpstreamClient::new(
+                EgressPolicy {
+                    allow_localhost: true,
+                    ..EgressPolicy::default()
+                },
+                Duration::from_secs(5),
+            ),
+            Pagination::new(100, 900, None),
+            CatalogRefresh::default(),
+        )
+        .with_credential_secret(Some("subscription-fixture-encryption-key")),
+    );
     let gateway = Running::start(
         service
             .registration_router()
@@ -710,9 +735,14 @@ async fn modern_resource_subscriptions_share_scoped_upstream_watches() {
         .build()
         .unwrap();
     let admin = token("admin", Value::Null, json!({}));
-    let (status, registration) = send(&client, gateway.url("/gateways"), json!({
+    let mut input = json!({
         "name":"resource-fixture","url":upstream.url("/mcp"),"visibility":"public","transport":"STREAMABLEHTTP"
-    }), Some(&admin)).await;
+    });
+    if bearer {
+        input["auth_type"] = "bearer".into();
+        input["auth_token"] = "stored-subscription-fixture".into();
+    }
+    let (status, registration) = send(&client, gateway.url("/gateways"), input, Some(&admin)).await;
     assert_eq!(status, StatusCode::OK, "{registration}");
     let listen = |path: &str, id| {
         client.post(gateway.url(path))

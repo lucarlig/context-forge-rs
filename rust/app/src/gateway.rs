@@ -200,7 +200,14 @@ impl GatewayService {
         server: Option<&CatalogServer>,
     ) -> Result<AcceptedSubscription, ErrorData> {
         self.subscriptions
-            .prepare(&self.database, &self.upstream, requested, principal, server)
+            .prepare(
+                &self.database,
+                &self.upstream,
+                self.credential_cipher.as_ref(),
+                requested,
+                principal,
+                server,
+            )
             .await
     }
 

@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     access::{self, Principal},
     catalog::{CatalogScope, CatalogServer, GatewayRegistration},
+    credentials::{CredentialCipher, UpstreamCredentials, decode_headers},
     database::Database,
     resource_relay::{ResourceRelay, ResourceWatches},
     upstream::UpstreamClient,
@@ -84,6 +85,7 @@ impl CatalogSubscriptions {
         &self,
         database: &Database,
         upstream: &UpstreamClient,
+        cipher: Option<&CredentialCipher>,
         requested: SubscriptionFilter,
         principal: Option<&Principal>,
         server: Option<&CatalogServer>,
@@ -157,6 +159,25 @@ impl CatalogSubscriptions {
                     ErrorData::internal_error("Internal server error", None)
                 })?
         };
+        let targets = targets
+            .into_iter()
+            .filter_map(|(target, stored)| {
+                let credentials = match stored {
+                    Some(encoded) => match decode_headers(cipher, &encoded) {
+                        Ok(headers) => Some(UpstreamCredentials {
+                            headers,
+                            ..UpstreamCredentials::default()
+                        }),
+                        Err(_) => {
+                            tracing::debug!(gateway = %target.gateway_id, "could not load upstream resource subscription credentials");
+                            return None;
+                        }
+                    },
+                    None => None,
+                };
+                Some((target, credentials))
+            })
+            .collect();
         let resources = self.resources.watch(targets, upstream);
         let accepted_uris: Vec<_> = wanted
             .into_iter()

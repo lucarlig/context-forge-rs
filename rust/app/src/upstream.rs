@@ -743,14 +743,12 @@ impl UpstreamClient {
 
     pub(crate) async fn listen_resource(
         &self,
-        endpoint: &str,
+        endpoint: UpstreamEndpoint<'_>,
         uri: &str,
         mut on_event: impl FnMut(ResourceListenEvent),
     ) -> Result<ResourceListenEnd, UpstreamError> {
         let deadline = self.deadline()?;
-        let session = self
-            .open_session(UpstreamEndpoint::streamable(endpoint), deadline)
-            .await?;
+        let session = self.open_session(endpoint, deadline).await?;
         let Some(version) = session
             .protocol_version
             .as_ref()

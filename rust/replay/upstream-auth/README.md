@@ -18,6 +18,8 @@ Gateway registration accepts a private CA and an optional client certificate and
 
 AWS SigV4 gateway registration encrypts the secret access key and temporary session token. The gateway signs the bytes it sends during discovery and invocation. [SigV4 recordings](sigv4/README.md)
 
+Modern resource subscriptions use stored Basic, bearer, or custom gateway headers on the standing upstream connection. The pinned and Rust gateways acknowledged the same resource, relayed its update to two downstream subscribers through a single upstream watch, and closed that watch after the last subscriber disconnected. The Rust integration test also covers virtual-server visibility and shared watches without credentials.
+
 For replay, register four public Streamable HTTP servers named `basic`, `bearer`, `headers`, and `query` in the fixture database. Each exposes an `echo` tool and prefixes its result with the gateway name. Use synthetic credentials that the upstream fixture requires and that the gateway stores using the configured encryption secret.
 
 ```sh

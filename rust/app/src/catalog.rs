@@ -532,11 +532,9 @@ type ResourceSubscriptionRow = (
     Option<String>,
     Option<String>,
     String,
+    String,
+    String,
     Option<String>,
-    Option<String>,
-    Option<String>,
-    bool,
-    bool,
 );
 
 macro_rules! catalog_metadata_query {
@@ -894,7 +892,7 @@ impl Database {
         scope: CatalogScope<'_>,
         server: Option<&str>,
         uris: &[&str],
-    ) -> Result<Vec<ResourceSubscriptionTarget>, sqlx::Error> {
+    ) -> Result<Vec<(ResourceSubscriptionTarget, Option<String>)>, sqlx::Error> {
         let teams = visible_team_ids(scope)?;
         let uris =
             serde_json::to_string(uris).map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
@@ -902,12 +900,21 @@ impl Database {
             ($pool:ident, $teams:literal, $uris:literal) => {{
                 let query = metadata_query!(
                     $teams,
-                    concat!("item.uri, ", content_gateway_columns!()),
+                    "item.uri, g.id, g.url,
+                    CASE WHEN LOWER(COALESCE(g.auth_type, '')) IN ('basic', 'bearer', 'authheaders')
+                        THEN COALESCE(CAST(g.auth_value AS TEXT), 'null') END",
                     "resources",
                     "server_resource_association",
                     "resource_id",
                     concat!(
-                        "UPPER(g.transport) = 'STREAMABLEHTTP' AND item.uri IN (",
+                        "UPPER(g.transport) = 'STREAMABLEHTTP'
+                        AND g.gateway_mode IN ('cache', 'direct_proxy')
+                        AND LOWER(COALESCE(g.auth_type, 'none')) IN ('', 'none', 'one_time_auth', 'basic', 'bearer', 'authheaders')
+                        AND COALESCE(g.ca_certificate, '') = ''
+                        AND COALESCE(g.client_cert, '') = ''
+                        AND COALESCE(g.client_key, '') = ''
+                        AND NOT ", gateway_policy!(), "
+                        AND item.uri IN (",
                         $uris,
                         ")"
                     )
@@ -939,20 +946,16 @@ impl Database {
         };
         Ok(rows
             .into_iter()
-            .filter_map(
-                |(_, _, _, _, uri, gateway_id, url, _, available, needs_auth)| match (
-                    gateway_id,
-                    url,
-                    available && !needs_auth,
-                ) {
-                    (Some(gateway_id), Some(url), true) => Some(ResourceSubscriptionTarget {
+            .map(|(_, _, _, _, uri, gateway_id, url, headers)| {
+                (
+                    ResourceSubscriptionTarget {
                         gateway_id,
                         uri,
                         url,
-                    }),
-                    _ => None,
-                },
-            )
+                    },
+                    headers,
+                )
+            })
             .collect())
     }
 

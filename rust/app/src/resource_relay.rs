@@ -16,14 +16,35 @@ use uuid::Uuid;
 
 use crate::{
     catalog::ResourceSubscriptionTarget,
-    upstream::{ResourceListenEnd, ResourceListenEvent, UpstreamClient, UpstreamError},
+    credentials::UpstreamCredentials,
+    upstream::{
+        ResourceListenEnd, ResourceListenEvent, UpstreamClient, UpstreamEndpoint, UpstreamError,
+        UpstreamTransport,
+    },
 };
 
 const MAX_WATCHES: usize = 256;
 const LEGACY_REPROBE: Duration = Duration::from_secs(3600);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
-type Target = Arc<ResourceSubscriptionTarget>;
+type Target = Arc<WatchTarget>;
+type GatewayScope = (String, String, Option<[u8; 32]>);
+
+#[derive(Eq, Hash, PartialEq)]
+struct WatchTarget {
+    resource: ResourceSubscriptionTarget,
+    credentials: Option<[u8; 32]>,
+}
+
+impl WatchTarget {
+    fn gateway_scope(&self) -> GatewayScope {
+        (
+            self.resource.gateway_id.clone(),
+            self.resource.url.clone(),
+            self.credentials,
+        )
+    }
+}
 
 pub(crate) struct ResourceRelay {
     state: Arc<Mutex<RelayState>>,
@@ -33,7 +54,7 @@ pub(crate) struct ResourceRelay {
 #[derive(Default)]
 struct RelayState {
     watches: HashMap<Target, Watch>,
-    legacy: HashMap<String, Instant>,
+    legacy: HashMap<GatewayScope, Instant>,
 }
 
 struct Watch {
@@ -51,7 +72,7 @@ impl ResourceRelay {
 
     pub(crate) fn watch(
         &self,
-        targets: Vec<ResourceSubscriptionTarget>,
+        targets: Vec<(ResourceSubscriptionTarget, Option<UpstreamCredentials>)>,
         upstream: &UpstreamClient,
     ) -> ResourceWatches {
         let mut active = ResourceWatches {
@@ -62,8 +83,20 @@ impl ResourceRelay {
         let mut state = self.state.lock().expect("resource watches");
         let now = Instant::now();
         state.legacy.retain(|_, until| *until > now);
-        for target in targets.into_iter().map(Arc::new) {
-            if state.legacy.contains_key(&target.gateway_id) || active.targets.contains(&target) {
+        for (resource, credentials) in targets {
+            let endpoint = UpstreamEndpoint {
+                url: &resource.url,
+                transport: UpstreamTransport::StreamableHttp,
+                credentials: credentials.as_ref(),
+            };
+            let fingerprint = endpoint.credential_fingerprint();
+            let target = Arc::new(WatchTarget {
+                resource,
+                credentials: fingerprint,
+            });
+            if state.legacy.contains_key(&target.gateway_scope())
+                || active.targets.contains(&target)
+            {
                 continue;
             }
             let full = state.watches.len() >= MAX_WATCHES;
@@ -73,6 +106,7 @@ impl ResourceRelay {
                     let task = tokio::spawn(relay_forever(
                         upstream.clone(),
                         target.clone(),
+                        credentials,
                         Arc::downgrade(&self.state),
                         self.updates.clone(),
                     ));
@@ -94,7 +128,7 @@ pub(crate) struct ResourceWatches {
 
 impl ResourceWatches {
     pub(crate) fn contains_uri(&self, uri: &str) -> bool {
-        self.targets.iter().any(|target| target.uri == uri)
+        self.targets.iter().any(|target| target.resource.uri == uri)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -113,7 +147,8 @@ impl ResourceWatches {
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             };
             if self.targets.contains(&target) {
-                sink.notify_resource_updated(target.uri.clone()).await?;
+                sink.notify_resource_updated(target.resource.uri.clone())
+                    .await?;
             }
         }
     }
@@ -136,15 +171,21 @@ impl Drop for ResourceWatches {
 async fn relay_forever(
     upstream: UpstreamClient,
     target: Target,
+    credentials: Option<UpstreamCredentials>,
     state: Weak<Mutex<RelayState>>,
     updates: broadcast::Sender<Target>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut relisten = false;
+    let endpoint = UpstreamEndpoint {
+        url: &target.resource.url,
+        transport: UpstreamTransport::StreamableHttp,
+        credentials: credentials.as_ref(),
+    };
     loop {
         let mut acknowledged = None;
         let result = upstream
-            .listen_resource(&target.url, &target.uri, |event| match event {
+            .listen_resource(endpoint, &target.resource.uri, |event| match event {
                 ResourceListenEvent::Acknowledged => {
                     acknowledged = Some(Instant::now());
                     if relisten {
@@ -163,7 +204,7 @@ async fn relay_forever(
                         .lock()
                         .expect("resource watches")
                         .legacy
-                        .insert(target.gateway_id.clone(), Instant::now() + LEGACY_REPROBE);
+                        .insert(target.gateway_scope(), Instant::now() + LEGACY_REPROBE);
                 }
                 return;
             }
@@ -171,7 +212,7 @@ async fn relay_forever(
             | Err(UpstreamError::BlockedDestination | UpstreamError::InvalidUrl) => return,
             Ok(ResourceListenEnd::Disconnected) => {}
             Err(error) => {
-                tracing::debug!(%error, gateway = %target.gateway_id, "upstream resource subscription disconnected");
+                tracing::debug!(%error, gateway = %target.resource.gateway_id, "upstream resource subscription disconnected");
             }
         }
         if acknowledged.is_some_and(|at| at.elapsed() >= MAX_BACKOFF) {
