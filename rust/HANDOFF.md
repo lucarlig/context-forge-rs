@@ -96,6 +96,18 @@ round-trip replay. It exported a filtered bundle, previewed an import,
 applied only the selected tool, and returned exit code 1 for a failed item
 or missing authentication. The Rust check also verified Unix output mode `0600`.
 
+## HTTP request boundary
+
+The gateway enables correlation IDs and request header limits by default.
+Eleven live Rust Anything cases match the pinned gateway for correlation ID
+generation, preservation, response headers, and HTTP 431 errors. They cover
+disabled middleware, duplicate request fields, and limits at the boundary.
+
+The Hyper HTTP/1 parser still rejects requests above 100 header fields before
+the middleware runs. A live request with 101 fields and `MAX_HEADER_COUNT=120`
+returns 431 in Rust and 200 in the pinned gateway. Outbound correlation ID
+propagation remains open.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

@@ -16,6 +16,7 @@ mod forward_identity;
 pub mod gateway;
 mod gateway_records;
 pub mod grpc;
+pub mod http_boundary;
 mod identity;
 pub mod jwt;
 mod legacy_sse;

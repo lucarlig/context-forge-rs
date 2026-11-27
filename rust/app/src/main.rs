@@ -7,6 +7,7 @@ use context_forge_rs::{
     config::Settings,
     database::Database,
     gateway::GatewayService,
+    http_boundary::HttpBoundary,
     local_auth,
     probes::{self, RedisProbe},
     schema,
@@ -49,6 +50,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .init();
 
     let settings = Settings::from_env()?;
+    let http_boundary = HttpBoundary::from_env()?;
     let database = Database::from_settings(&settings)?;
     let redis = settings.redis.as_ref().map(RedisProbe::new).transpose()?;
     let verifier = Settings::jwt_verifier()?;
@@ -158,6 +160,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .merge(accounts)
         .merge(service.gateway_oauth_callback())
         .merge(service.server_oauth_router());
+    let app = http_boundary.apply(app);
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     let background = catalog_available.then(|| {
         [
