@@ -19,6 +19,10 @@ use tracing_subscriber::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("rotate-credentials") {
+        return context_forge_rs::credential_rotation::cli(args).await;
+    }
     let (filter, handle) = reload::Layer::new(LevelFilter::INFO);
     tracing_subscriber::registry()
         .with(filter)

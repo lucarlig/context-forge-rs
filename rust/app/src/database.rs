@@ -18,6 +18,20 @@ pub enum Database {
 
 impl Database {
     pub fn from_settings(settings: &Settings) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Self::connect(settings, None)
+    }
+
+    pub(crate) fn for_credential_rotation(
+        settings: &Settings,
+        dry_run: bool,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Self::connect(settings, Some(dry_run))
+    }
+
+    fn connect(
+        settings: &Settings,
+        maintenance: Option<bool>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let url = settings.database_url.as_str();
         if url.starts_with("sqlite:") {
             let memory = matches!(url, "sqlite://" | "sqlite:///:memory:" | "sqlite::memory:");
@@ -28,10 +42,13 @@ impl Database {
                     .strip_prefix("sqlite:///")
                     .filter(|path| !path.is_empty())
                     .ok_or("invalid SQLite DATABASE_URL")?;
-                SqliteConnectOptions::new()
-                    .filename(path)
-                    .create_if_missing(true)
-                    .journal_mode(SqliteJournalMode::Wal)
+                let connect = SqliteConnectOptions::new().filename(path);
+                match maintenance {
+                    Some(read_only) => connect.read_only(read_only),
+                    None => connect
+                        .create_if_missing(true)
+                        .journal_mode(SqliteJournalMode::Wal),
+                }
             };
             let options = options
                 .busy_timeout(settings.sqlite_busy_timeout)
