@@ -22,7 +22,7 @@ use context_forge_rs::{
     access::Authorizer,
     config::{RedisSettings, Settings},
     database::Database,
-    gateway::{CatalogRefresh, GatewayService, Pagination},
+    gateway::{CatalogRefresh, GatewayHealth, GatewayService, Pagination},
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, ListenSettings, ProtocolMode, RedisSessionDirectory, SessionSettings,
@@ -924,6 +924,127 @@ async fn gateway_update_preserves_catalog_ids_and_rolls_back_a_failed_destinatio
     assert_eq!(current["name"], "New Name");
     assert_eq!(current["url"], moved);
     assert_eq!(current["version"], 2);
+}
+
+#[tokio::test]
+async fn gateway_health_preserves_enabled_state_and_recovers_the_catalog() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let phase = Arc::new(AtomicUsize::new(0));
+    let upstream = Running::start(
+        Router::new()
+            .route("/mcp", post(refresh_fixture))
+            .with_state(phase.clone()),
+    )
+    .await;
+    let database = database().await;
+    let service = Arc::new(GatewayService::new(
+        database.clone(),
+        authorizer(database),
+        UpstreamClient::new(
+            EgressPolicy {
+                allow_localhost: true,
+                ..EgressPolicy::default()
+            },
+            Duration::from_secs(2),
+        )
+        .with_connect_mode(ConnectMode::Legacy),
+        Pagination::new(100, 900, None),
+        CatalogRefresh::default(),
+    ));
+    let app = Running::start(
+        service
+            .registration_router()
+            .merge(service.mcp_router(false, ProtocolMode::Legacy)),
+    )
+    .await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let admin = token("admin", Value::Null, json!({}));
+    let (status, registered) = send(
+        &client,
+        app.url("/gateways"),
+        json!({"name":"health","url":upstream.url("/mcp"),"transport":"STREAMABLEHTTP"}),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let id = registered["id"].as_str().unwrap();
+    let endpoint = app.url(&format!("/v1/mcp-servers/{id}"));
+    let stop = CancellationToken::new();
+    let health = tokio::spawn(service.run_gateway_health(
+        GatewayHealth {
+            interval: Duration::from_millis(30),
+            timeout: Duration::from_secs(2),
+            failure_threshold: Some(2),
+            concurrency: 1,
+            auto_refresh: true,
+        },
+        stop.clone(),
+    ));
+    let observe = |reachable: bool| {
+        let (client, endpoint, admin) = (&client, &endpoint, &admin);
+        async move {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let bytes = client
+                        .get(endpoint)
+                        .bearer_auth(admin)
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap();
+                    let record: Value = serde_json::from_slice(&bytes).unwrap();
+                    if record["reachable"] == reachable && !record["lastRefreshAt"].is_null() {
+                        return record;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let initial = observe(true).await;
+    phase.store(2, Ordering::SeqCst);
+    let offline = observe(false).await;
+    assert_eq!(offline["enabled"], true);
+    assert_eq!(offline["lastError"], "server responded with HTTP 503");
+    let (status, call) = send(
+        &client, app.url("/mcp"),
+        json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"health-echo","arguments":{}}}),
+        Some(&admin),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(call["result"]["isError"], true);
+    assert_eq!(
+        call["result"]["content"][0]["text"],
+        "Unknown tool: health-echo"
+    );
+    phase.store(1, Ordering::SeqCst);
+    let recovered = observe(true).await;
+    assert_eq!(recovered["version"], initial["version"]);
+    assert_eq!(recovered["lastRefreshAt"], initial["lastRefreshAt"]);
+    assert!(recovered["lastError"].is_null());
+    let (status, listed) = send(
+        &client,
+        app.url("/mcp"),
+        json!({"jsonrpc":"2.0","id":13,"method":"tools/list","params":{}}),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: std::collections::BTreeSet<_> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["health-added", "health-echo"].into_iter().collect());
+    stop.cancel();
+    health.await.unwrap();
 }
 
 async fn refresh_fixture(

@@ -25,7 +25,15 @@ pub(crate) struct CatalogRefreshInput<'a> {
     pub(crate) metadata: &'a DiscoveredMetadata,
     pub(crate) include_resources: bool,
     pub(crate) include_prompts: bool,
-    pub(crate) activating: bool,
+    pub(crate) completion: CatalogRefreshCompletion,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogRefreshCompletion {
+    Refresh,
+    Automatic,
+    Activate,
+    Recover,
 }
 
 #[derive(Default, Serialize)]
@@ -528,14 +536,22 @@ impl Database {
                 }
                 refresh_metadata!($transaction, $exists, $dialect, gateway, input, changes);
                 let now = Timestamp::now().to_string();
+                let stamp_seen = updating || input.completion == CatalogRefreshCompletion::Activate;
+                let stamp_refresh = !updating && matches!(input.completion, CatalogRefreshCompletion::Refresh | CatalogRefreshCompletion::Automatic);
                 sqlx::query(concat!("UPDATE gateways SET capabilities = ", json_parameter!($dialect, "$2"),
-                    ", last_refresh_at = CASE WHEN $4 THEN last_refresh_at ELSE ", $now, " END,
+                    ", last_refresh_at = CASE WHEN $5 THEN ", $now, " ELSE last_refresh_at END,
                     last_seen = CASE WHEN $4 THEN ", $now, " ELSE last_seen END,
                     updated_at = ", $now, " WHERE id = $1"))
-                    .bind(&gateway.id).bind(input.capabilities.to_string()).bind(&now).bind(input.activating || updating)
+                    .bind(&gateway.id).bind(input.capabilities.to_string()).bind(&now).bind(stamp_seen)
+                    .bind(stamp_refresh)
                     .execute(&mut *$transaction).await?;
-                if input.activating {
-                    set_gateway_state!($transaction, &gateway.id, true, &now, $now);
+                match input.completion {
+                    CatalogRefreshCompletion::Activate => set_gateway_state!($transaction, &gateway.id, true, &now, $now),
+                    CatalogRefreshCompletion::Automatic | CatalogRefreshCompletion::Recover =>
+                        write_gateway_health!($transaction, &gateway.id, true, &now, None::<&str>, $now),
+                    CatalogRefreshCompletion::Refresh if updating =>
+                        write_gateway_health!($transaction, &gateway.id, true, &now, None::<&str>, $now),
+                    CatalogRefreshCompletion::Refresh => {}
                 }
                 $transaction.commit().await?;
                 Ok(Some(changes))

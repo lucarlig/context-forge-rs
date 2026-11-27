@@ -32,7 +32,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let require_api_auth = Settings::api_requires_auth()?;
     let shutdown = CancellationToken::new();
     let sse = settings.gateway_sse_settings(shutdown.clone())?;
-    if verifier.is_some() || !require_mcp_auth {
+    let catalog_available = verifier.is_some() || !require_mcp_auth;
+    if catalog_available {
         database.migrate_identity().await?;
         database.migrate_catalog().await?;
         if matches!(sse.backend, SseBackend::Database) {
@@ -45,13 +46,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Settings::invalidate_sessions_on_password_change()?,
     ));
     let (management_page_size, management_max_page_size) = Settings::management_page_sizes()?;
+    let catalog_refresh = Settings::catalog_refresh()?;
+    let health_settings = Settings::gateway_health(&catalog_refresh)?;
     let service = Arc::new(
         GatewayService::new(
             database.clone(),
             access,
             Settings::upstream_client()?,
             Settings::mcp_pagination()?,
-            Settings::catalog_refresh()?,
+            catalog_refresh,
         )
         .with_logging_filter(handle)
         .with_management_page_sizes(management_page_size, management_max_page_size)
@@ -79,16 +82,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .merge(Settings::mcp_ingress_policy()?.apply(mcp.merge(legacy_sse).merge(websocket)))
         .merge(service.registration_router());
     let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
+    let health = catalog_available
+        .then(|| tokio::spawn(service.run_gateway_health(health_settings, shutdown.clone())));
     tracing::info!(address = %listener.local_addr()?, "gateway listening");
-    axum::serve(
+    let stop = shutdown.clone();
+    let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
-        shutdown.cancel();
+        stop.cancel();
     })
-    .await?;
+    .await;
+    shutdown.cancel();
+    if let Some(health) = health {
+        health.await?;
+    }
+    result?;
     Ok(())
 }
 

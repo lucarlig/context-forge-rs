@@ -6,7 +6,7 @@ use jsonwebtoken::EncodingKey;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    gateway::{CatalogRefresh, Pagination},
+    gateway::{CatalogRefresh, GatewayHealth, Pagination},
     jwt::{JwtConfig, JwtVerifier},
     mcp::{
         HttpOptions, IngressPolicy, ListenSettings, ProtocolMode, RedisSessionDirectory,
@@ -587,6 +587,23 @@ impl Settings {
         Ok(CatalogRefresh {
             default_seconds,
             minimum_seconds,
+        })
+    }
+
+    pub fn gateway_health(
+        refresh: &CatalogRefresh,
+    ) -> Result<GatewayHealth, Box<dyn Error + Send + Sync>> {
+        let threshold = parse("UNHEALTHY_THRESHOLD", 3i32)?;
+        let concurrency = parse("MAX_CONCURRENT_HEALTH_CHECKS", 10usize)?;
+        if threshold < -1 || concurrency == 0 {
+            return Err("invalid gateway health threshold or concurrency".into());
+        }
+        Ok(GatewayHealth {
+            interval: Duration::from_secs(u64::try_from(refresh.minimum_seconds)?),
+            timeout: positive_seconds("GATEWAY_HEALTH_CHECK_TIMEOUT", 30.0)?,
+            failure_threshold: u32::try_from(threshold).ok(),
+            concurrency,
+            auto_refresh: flag("AUTO_REFRESH_SERVERS")?.unwrap_or(false),
         })
     }
 

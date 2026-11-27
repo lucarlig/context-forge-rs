@@ -33,3 +33,5 @@ Manual gateway refresh updates the cached catalog while preserving IDs and assoc
 Gateway state changes update the gateway and its catalog together. Reactivation uses the gateway's stored credentials to discover a fresh catalog, and a failed discovery preserves cached entries. [Gateway activation verification](replay/gateway-management/state.md)
 
 Gateway metadata and endpoint updates preserve retained catalog IDs and roll back changes when the new destination fails discovery. SQLite and PostgreSQL passed the live checks. [Gateway update verification](replay/gateway-management/update.md)
+
+Gateway health checks update reachability and refresh the catalog on recovery. The live pinned comparison covered offline invocation, error persistence, and recovery using stored upstream credentials. [Gateway health verification](replay/gateway-management/health.md)

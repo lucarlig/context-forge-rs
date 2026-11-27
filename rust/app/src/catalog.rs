@@ -109,6 +109,7 @@ pub struct CatalogTool {
     pub gateway_transport: String,
     pub request_type: String,
     pub requires_gateway_policy: bool,
+    pub(crate) reachable: bool,
     pub(crate) needs_upstream_config: bool,
     pub definition: ToolDefinition,
 }
@@ -316,24 +317,26 @@ type ServerRow = (
     String,
     Option<String>,
 );
-type ToolRow = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    bool,
-    bool,
-    String,
-    Option<String>,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-);
+#[derive(sqlx::FromRow)]
+struct ToolRow {
+    id: String,
+    original_name: String,
+    gateway_id: String,
+    gateway_name: String,
+    gateway_url: String,
+    gateway_mode: String,
+    gateway_transport: String,
+    request_type: String,
+    requires_gateway_policy: bool,
+    reachable: bool,
+    needs_upstream_config: bool,
+    name: String,
+    title: Option<String>,
+    description: String,
+    input_schema: String,
+    output_schema: Option<String>,
+    annotations: Option<String>,
+}
 
 macro_rules! visible {
     ($table:literal) => {
@@ -415,7 +418,8 @@ macro_rules! tool_query {
     ($team_ids:literal) => {
         concat!(
             "WITH visible_team_ids(id) AS (", $team_ids, ")
-             SELECT t.id, t.original_name, g.id, g.name, g.url, g.gateway_mode, g.transport, t.request_type,
+             SELECT t.id, t.original_name, g.id AS gateway_id, g.name AS gateway_name,
+                g.url AS gateway_url, g.gateway_mode, g.transport AS gateway_transport, t.request_type,
                 (
                     ", gateway_policy!(), "
                     OR ((LOWER(COALESCE(t.auth_type, 'none')) NOT IN ('', 'none', 'one_time_auth')
@@ -429,9 +433,11 @@ macro_rules! tool_query {
                     OR ", non_empty_json!("t.sigv4_config"), "
                     OR ", non_empty_json!("t.plugin_chain_pre"), "
                     OR ", non_empty_json!("t.plugin_chain_post"), "
-                ),
-                ", connection_configured!(), ", t.name, t.title, COALESCE(t.description, ''), CAST(t.input_schema AS TEXT),
-                CAST(t.output_schema AS TEXT), CAST(t.annotations AS TEXT)
+                ) AS requires_gateway_policy,
+                ", connection_configured!(), " AS needs_upstream_config,
+                (t.reachable AND g.reachable) AS reachable, t.name, t.title,
+                COALESCE(t.description, '') AS description, CAST(t.input_schema AS TEXT) AS input_schema,
+                CAST(t.output_schema AS TEXT) AS output_schema, CAST(t.annotations AS TEXT) AS annotations
              FROM tools t
              JOIN gateways g ON g.id = t.gateway_id
              WHERE t.enabled = TRUE AND t.integration_type = 'MCP' AND t.name IS NOT NULL
@@ -1650,7 +1656,7 @@ fn metadata_item(list: CatalogList, row: MetadataRow) -> Result<(String, Value),
 }
 
 fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
-    let (
+    let ToolRow {
         id,
         original_name,
         gateway_id,
@@ -1660,6 +1666,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         gateway_transport,
         request_type,
         requires_gateway_policy,
+        reachable,
         needs_upstream_config,
         name,
         title,
@@ -1667,7 +1674,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         input_schema,
         output_schema,
         annotations,
-    ) = row;
+    } = row;
     Ok(CatalogTool {
         id,
         original_name,
@@ -1678,6 +1685,7 @@ fn decode_tool(row: ToolRow) -> Result<CatalogTool, sqlx::Error> {
         gateway_transport,
         request_type,
         requires_gateway_policy,
+        reachable,
         needs_upstream_config,
         definition: ToolDefinition {
             name,

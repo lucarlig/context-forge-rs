@@ -148,6 +148,12 @@ const GATEWAY_LOOKUP_QUERY: &str = concat!(
       ORDER BY g.id"
 );
 
+const GATEWAY_HEALTH_QUERY: &str = concat!(
+    gateway_select!(),
+    " WHERE g.status = 'active' AND (CAST($1 AS TEXT) IS NULL OR g.id > $1)
+      ORDER BY g.id LIMIT $2"
+);
+
 const GATEWAY_IMPACT_QUERY: &str = "
     SELECT s.id, s.name, s.visibility, s.team_id, s.owner_email
     FROM servers s
@@ -213,6 +219,39 @@ macro_rules! set_gateway_state {
     }};
 }
 
+macro_rules! write_gateway_health {
+    ($transaction:ident, $id:expr, $reachable:expr, $now:expr, $error:expr, $date:literal) => {{
+        sqlx::query(concat!(
+            "UPDATE gateways SET
+            reachable = CASE WHEN enabled THEN $2 ELSE reachable END,
+            last_seen = CASE WHEN $2 THEN ",
+            $date,
+            " ELSE last_seen END,
+            updated_at = CASE WHEN enabled AND reachable <> $2 THEN ",
+            $date,
+            " ELSE updated_at END,
+            last_error = CASE WHEN enabled THEN $4 ELSE last_error END WHERE id = $1"
+        ))
+        .bind($id)
+        .bind($reachable)
+        .bind($now)
+        .bind($error)
+        .execute(&mut *$transaction)
+        .await?;
+        sqlx::query(concat!(
+            "UPDATE tools SET reachable = $2, updated_at = ",
+            $date,
+            " WHERE gateway_id = $1 AND reachable <> $2
+              AND EXISTS (SELECT 1 FROM gateways WHERE id = $1 AND enabled)"
+        ))
+        .bind($id)
+        .bind($reachable)
+        .bind($now)
+        .execute(&mut *$transaction)
+        .await?;
+    }};
+}
+
 macro_rules! delete_catalog_rows {
     ($transaction:ident, $value:expr, $table_exists:literal, $optional:expr, $required:expr) => {{
         for (table, statement) in $optional {
@@ -237,7 +276,7 @@ macro_rules! delete_catalog_rows {
 }
 
 mod refresh;
-pub(crate) use refresh::{CatalogChanges, CatalogRefreshInput};
+pub(crate) use refresh::{CatalogChanges, CatalogRefreshCompletion, CatalogRefreshInput};
 
 const OPTIONAL_GATEWAY_DELETES: &[(&str, &str)] = &[
     (
@@ -269,6 +308,60 @@ const GATEWAY_DELETES: &[&str] = &[
 ];
 
 impl Database {
+    pub(crate) async fn gateways_for_health(
+        &self,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<GatewayRecord>, sqlx::Error> {
+        macro_rules! select {
+            ($pool:ident) => {
+                sqlx::query_as::<_, GatewayRecord>(GATEWAY_HEALTH_QUERY)
+                    .bind(after_id)
+                    .bind(limit)
+                    .fetch_all($pool)
+                    .await
+            };
+        }
+        match self {
+            Self::Sqlite(pool) => select!(pool),
+            Self::Postgres(pool) => select!(pool),
+        }
+    }
+
+    pub(crate) async fn set_gateway_health(
+        &self,
+        expected: &GatewayRecord,
+        error: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let now = jiff::Timestamp::now().to_string();
+        let reachable = error.is_none();
+        macro_rules! change {
+            ($transaction:ident, $lock:literal, $date:literal) => {{
+                let Some(id) = lock_gateway!($transaction, expected, $lock) else {
+                    return Ok(false);
+                };
+                write_gateway_health!($transaction, &id, reachable, &now, error, $date);
+                $transaction.commit().await?;
+                Ok(true)
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+                change!(transaction, "", "$3")
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
+                change!(
+                    transaction,
+                    " FOR UPDATE",
+                    "CAST(CAST($3 AS TEXT) AS TIMESTAMPTZ)"
+                )
+            }
+        }
+    }
+
     pub(crate) async fn listed_gateways(
         &self,
         scope: CatalogScope<'_>,

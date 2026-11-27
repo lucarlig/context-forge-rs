@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use crate::{
     catalog::slugify,
     credentials::{CredentialCipher, decode_header_values},
-    gateway_records::{CatalogChanges, CatalogRefreshInput, GatewayList, GatewayRecord},
+    gateway_records::{
+        CatalogChanges, CatalogRefreshCompletion, CatalogRefreshInput, GatewayList, GatewayRecord,
+    },
 };
 
 use super::*;
@@ -220,17 +222,8 @@ pub(super) async fn refresh(
             None,
         ));
     }
-    if !service
-        .active_refreshes
-        .lock()
-        .expect("active gateway refreshes")
-        .insert(record.id.clone())
-    {
+    let Some(_refresh_guard) = service.try_catalog_refresh(&record.id) else {
         return Err(ManagementError::RefreshInProgress(record.name));
-    }
-    let _refresh_guard = RefreshGuard {
-        gateways: &service.active_refreshes,
-        id: &record.id,
     };
     let failure = |error: String| {
         refresh_response(&record.id, started, CatalogChanges::default(), Some(error))
@@ -286,7 +279,7 @@ pub(super) async fn refresh(
                 metadata: &metadata,
                 include_resources,
                 include_prompts,
-                activating: false,
+                completion: CatalogRefreshCompletion::Refresh,
             },
         )
         .await
@@ -435,7 +428,7 @@ async fn activate_catalog(
                 metadata: &metadata,
                 include_resources: true,
                 include_prompts: true,
-                activating: true,
+                completion: CatalogRefreshCompletion::Activate,
             },
         )
         .await
@@ -461,7 +454,20 @@ fn snake_case(field: &str) -> String {
     result
 }
 
-struct RefreshGuard<'a> {
+impl GatewayService {
+    pub(super) fn try_catalog_refresh<'a>(&'a self, id: &'a str) -> Option<RefreshGuard<'a>> {
+        self.active_refreshes
+            .lock()
+            .expect("active gateway refreshes")
+            .insert(id.to_owned())
+            .then(|| RefreshGuard {
+                gateways: &self.active_refreshes,
+                id,
+            })
+    }
+}
+
+pub(super) struct RefreshGuard<'a> {
     gateways: &'a Mutex<HashSet<String>>,
     id: &'a str,
 }

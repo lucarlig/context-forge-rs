@@ -215,7 +215,7 @@ pub(crate) async fn update(
                 metadata,
                 include_resources: true,
                 include_prompts: true,
-                activating: false,
+                completion: CatalogRefreshCompletion::Refresh,
             });
     match service
         .database

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod content;
+mod health;
 mod management;
 mod proxy;
 
@@ -59,6 +60,7 @@ use crate::{
 };
 use proxy::DirectTarget;
 
+pub use health::GatewayHealth;
 pub(crate) use proxy::GATEWAY_ID_HEADER;
 
 pub struct GatewayService {
@@ -485,6 +487,9 @@ impl GatewayService {
                     result = self.lookup_tool(principal, server, &request.name) => result?,
                 }
                 .ok_or(ToolError::NotFound)?;
+                if !tool.reachable {
+                    return tool_result_error(format!("Unknown tool: {}", request.name));
+                }
                 let transport = UpstreamTransport::from_name(&tool.gateway_transport);
                 let available = matches!(tool.gateway_mode.as_str(), "cache" | "direct_proxy")
                     && UpstreamTransport::from_name(&tool.request_type) == transport
