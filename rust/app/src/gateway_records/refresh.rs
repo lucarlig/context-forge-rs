@@ -248,7 +248,7 @@ macro_rules! json_parameter {
 }
 
 macro_rules! apply_gateway_metadata {
-    ($tx:ident, $dialect:ident, $before:ident, $after:ident, $cipher:ident) => {{
+    ($tx:ident, $dialect:ident, $before:ident, $after:ident, $cipher:ident, $client_key:ident) => {{
         let renamed = $before.slug != $after.slug;
         let scope_changed = $before.visibility != $after.visibility || $before.team_id != $after.team_id;
         if (renamed || scope_changed)
@@ -286,6 +286,8 @@ macro_rules! apply_gateway_metadata {
             ", auth_query_params = ", json_parameter!($dialect, "$20"),
             ", sigv4_config = ", json_parameter!($dialect, "$21"),
             ", oauth_config = ", json_parameter!($dialect, "$22"), ",
+            ca_certificate = $23, ca_certificate_sig = $24, signing_algorithm = $25,
+            client_cert = $26, client_key = CASE WHEN $27 THEN $28 ELSE client_key END,
             updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE id = $1"))
             .bind(&$after.id).bind(&$after.name).bind(&$after.slug).bind($after.description.as_deref())
             .bind(&$after.visibility).bind($after.team_id.as_deref()).bind(&$after.tags)
@@ -296,6 +298,9 @@ macro_rules! apply_gateway_metadata {
             .bind($after.auth_type.as_deref()).bind($after.auth_value.as_deref())
             .bind($after.auth_query_params.as_deref()).bind($after.sigv4_config.as_deref())
             .bind($after.oauth_config.as_deref())
+            .bind($after.ca_certificate.as_deref()).bind($after.ca_certificate_sig.as_deref())
+            .bind($after.signing_algorithm.as_deref()).bind($after.client_cert.as_deref())
+            .bind($client_key.is_some()).bind($client_key.flatten())
             .execute(&mut *$tx).await?;
         if renamed {
             for statement in RENAMED_CATALOG_ITEMS {
@@ -424,7 +429,7 @@ impl Database {
         gateway: &GatewayRecord,
         input: CatalogRefreshInput<'_>,
     ) -> Result<Option<CatalogChanges>, RegistrationError> {
-        self.write_gateway_catalog(gateway, gateway, Some(input), false, None)
+        self.write_gateway_catalog(gateway, gateway, Some(input), false, None, None)
             .await
     }
 
@@ -434,8 +439,9 @@ impl Database {
         gateway: &GatewayRecord,
         input: Option<CatalogRefreshInput<'_>>,
         cipher: Option<&CredentialCipher>,
+        client_key: Option<Option<&str>>,
     ) -> Result<Option<CatalogChanges>, RegistrationError> {
-        self.write_gateway_catalog(expected, gateway, input, true, cipher)
+        self.write_gateway_catalog(expected, gateway, input, true, cipher, client_key)
             .await
     }
 
@@ -446,6 +452,7 @@ impl Database {
         input: Option<CatalogRefreshInput<'_>>,
         updating: bool,
         cipher: Option<&CredentialCipher>,
+        client_key: Option<Option<&str>>,
     ) -> Result<Option<CatalogChanges>, RegistrationError> {
         let mut names = HashSet::new();
         for tool in input.as_ref().into_iter().flat_map(|input| input.tools) {
@@ -466,7 +473,7 @@ impl Database {
                     return Ok(None);
                 }
                 if updating {
-                    apply_gateway_metadata!($transaction, $dialect, expected, gateway, cipher);
+                    apply_gateway_metadata!($transaction, $dialect, expected, gateway, cipher, client_key);
                 }
                 let Some(input) = input else {
                     $transaction.commit().await?;

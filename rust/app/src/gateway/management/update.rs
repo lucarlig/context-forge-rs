@@ -38,7 +38,70 @@ pub(crate) struct GatewayUpdate {
     #[serde(flatten)]
     auth: AuthInput,
     #[serde(flatten)]
+    tls: TlsUpdate,
+    #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct TlsUpdate {
+    #[serde(alias = "caCertificate")]
+    ca_certificate: Option<String>,
+    #[serde(alias = "caCertificateSig")]
+    ca_certificate_sig: Option<String>,
+    #[serde(alias = "signingAlgorithm")]
+    signing_algorithm: Option<String>,
+    #[serde(alias = "clientCert")]
+    client_cert: Option<String>,
+    #[serde(alias = "clientKey")]
+    client_key: Option<String>,
+}
+
+impl TlsUpdate {
+    async fn apply(
+        self,
+        service: &GatewayService,
+        gateway: &mut GatewayRecord,
+        connection: Option<&mut GatewayConnectionRow>,
+    ) -> Result<Option<Option<String>>, UpdateError> {
+        if let Some(certificate) = self.ca_certificate {
+            gateway.ca_certificate = Some(certificate);
+        }
+        if let Some(signature) = self.ca_certificate_sig {
+            gateway.ca_certificate_sig = Some(signature);
+        }
+        if let Some(algorithm) = self.signing_algorithm {
+            gateway.signing_algorithm = Some(algorithm);
+        }
+        if let Some(certificate) = self.client_cert {
+            gateway.client_cert = Some(certificate);
+        }
+        let key = match self.client_key.map(Zeroizing::new) {
+            None => None,
+            Some(key) if key.as_str() == MASKED => None,
+            Some(key) if key.trim().is_empty() => Some(None),
+            Some(key) => {
+                let unavailable = || {
+                    UpdateError::message(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Gateway credential encryption unavailable",
+                    )
+                };
+                let vault = service.vault.as_ref().ok_or_else(unavailable)?;
+                Some(Some(vault.seal(key).await.map_err(|_| unavailable())?))
+            }
+        };
+        if let Some(connection) = connection {
+            connection
+                .ca_certificate
+                .clone_from(&gateway.ca_certificate);
+            connection.client_cert.clone_from(&gateway.client_cert);
+            if let Some(key) = &key {
+                connection.client_key.clone_from(key);
+            }
+        }
+        Ok(key)
+    }
 }
 
 fn nullable_field<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -69,7 +132,8 @@ pub(crate) async fn update(
         return Err(ManagementError::LifecycleInProgress.into());
     }
     let mut gateway = previous.clone();
-    let (mut auth, one_time_auth) = apply_fields(&service, &principal, &mut gateway, input).await?;
+    let (mut auth, one_time_auth, tls) =
+        apply_fields(&service, &principal, &mut gateway, input).await?;
     gateway.modified_by = Some(principal.email.clone());
     if let Some(Extension(ConnectInfo(address))) = peer {
         gateway.modified_from_ip = Some(address.ip().to_string());
@@ -94,13 +158,22 @@ pub(crate) async fn update(
         .gateway_connection(&previous.id, &previous.url, true, Some(previous.version))
         .await
         .map_err(ManagementError::from)?;
+    let client_key = tls
+        .apply(&service, &mut gateway, connection.as_mut())
+        .await?;
+    let tls_changed = gateway.ca_certificate != previous.ca_certificate
+        || gateway.client_cert != previous.client_cert
+        || client_key.is_some();
     let auth_changed = if let Some(connection) = &mut connection {
-        let changed = auth.apply_update(
-            connection,
-            service.credential_cipher.as_ref(),
-            service.query_auth_hosts.as_ref(),
-            &gateway.url,
-        )?;
+        let changed = auth
+            .apply_update(
+                connection,
+                service.credential_cipher.as_ref(),
+                service.vault.as_ref(),
+                service.query_auth_hosts.as_ref(),
+                &gateway.url,
+            )
+            .await?;
         if changed && !one_time_auth {
             gateway.auth_type = Some(connection.kind.clone());
             gateway.auth_value.clone_from(&connection.headers);
@@ -120,7 +193,7 @@ pub(crate) async fn update(
         &gateway,
         transport,
         connection,
-        destination_changed || auth_changed,
+        destination_changed || auth_changed || tls_changed,
     )
     .await?;
     if one_time_auth {
@@ -151,6 +224,7 @@ pub(crate) async fn update(
             &gateway,
             discovery,
             service.credential_cipher.as_ref(),
+            client_key.as_ref().map(|key| key.as_deref()),
         )
         .await
     {
@@ -181,6 +255,7 @@ pub(crate) async fn update(
     }
     if destination_changed
         || auth_changed
+        || tls_changed
         || previous.visibility != gateway.visibility
         || previous.team_id != gateway.team_id
     {
@@ -212,7 +287,7 @@ async fn apply_fields(
     principal: &Principal,
     gateway: &mut GatewayRecord,
     input: GatewayUpdate,
-) -> Result<(AuthInput, bool), UpdateError> {
+) -> Result<(AuthInput, bool, TlsUpdate), UpdateError> {
     let GatewayUpdate {
         name,
         description,
@@ -227,6 +302,7 @@ async fn apply_fields(
         gateway_mode,
         one_time_auth,
         auth,
+        tls,
         extra,
     } = input;
     if let Some(name) = name {
@@ -402,22 +478,15 @@ async fn apply_fields(
             .filter(|character| *character != '_')
             .collect::<String>()
             .to_ascii_lowercase();
-        matches!(
-            normalized.as_str(),
-            "cacertificate"
-                | "cacertificatesig"
-                | "signingalgorithm"
-                | "clientcert"
-                | "clientkey"
-                | "toolvalidationpolicy"
-        ) || normalized == "authvalue" && !value.is_null() && value.as_str() != Some("*****")
+        normalized == "toolvalidationpolicy"
+            || normalized == "authvalue" && !value.is_null() && value.as_str() != Some("*****")
     }) {
         return Err(UpdateError::message(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Unsupported gateway configuration update",
         ));
     }
-    Ok((auth, one_time_auth.unwrap_or(false)))
+    Ok((auth, one_time_auth.unwrap_or(false), tls))
 }
 
 async fn discover_updated_gateway(
@@ -443,6 +512,7 @@ async fn discover_updated_gateway(
         }
         return Ok(None);
     };
+    let oauth = connection.kind == "oauth";
     let Ok(credentials) = service
         .connection_credentials(&gateway.id, &gateway.url, connection, None, None)
         .await
@@ -450,7 +520,11 @@ async fn discover_updated_gateway(
         if connection_changed {
             return Err(UpdateError::message(
                 StatusCode::BAD_GATEWAY,
-                "Could not load upstream authentication",
+                if oauth {
+                    "OAuth authentication failed"
+                } else {
+                    "Could not load upstream authentication or TLS material"
+                },
             ));
         }
         return Ok(None);
@@ -486,29 +560,47 @@ async fn discover_updated_gateway(
                 "Gateway URL is invalid or disallowed",
             ))
         }
+        Err(UpstreamError::Status(status @ (401 | 403)))
+            if connection_changed
+                && credentials
+                    .as_ref()
+                    .is_some_and(|credentials| credentials.sigv4.is_some()) =>
+        {
+            Err(failed_endpoint(
+                gateway,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "upstream rejected the SigV4 credentials (HTTP {status}). Verify the access key, secret, region and service."
+                ),
+            ))
+        }
         Err(error) if connection_changed => {
-            let endpoint = url::Url::parse(&gateway.url)
-                .ok()
-                .map(|mut url| {
-                    url.set_query(None);
-                    url.set_fragment(None);
-                    url.to_string()
-                })
-                .unwrap_or_default();
             let detail = match error {
                 UpstreamError::Status(status) => format!("server responded with HTTP {status}"),
                 error => error.to_string(),
             };
-            Err(UpdateError::message(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to initialize gateway at {endpoint}: {detail}"),
-            ))
+            Err(failed_endpoint(gateway, StatusCode::BAD_GATEWAY, detail))
         }
         Err(error) => {
             tracing::warn!(gateway = %gateway.id, %error, "gateway update discovery failed");
             Ok(None)
         }
     }
+}
+
+fn failed_endpoint(gateway: &GatewayRecord, status: StatusCode, detail: String) -> UpdateError {
+    let endpoint = url::Url::parse(&gateway.url)
+        .ok()
+        .map(|mut url| {
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_default();
+    UpdateError::message(
+        status,
+        format!("Failed to initialize gateway at {endpoint}: {detail}"),
+    )
 }
 
 pub(crate) struct UpdateError(StatusCode, Value);

@@ -40,6 +40,36 @@ impl Drop for SigV4Config {
 }
 
 impl SigV4Config {
+    pub(crate) fn resolve_masks(
+        &mut self,
+        cipher: &CredentialCipher,
+        stored: Option<&str>,
+    ) -> Result<(), CredentialError> {
+        let keep_secret = self.secret_access_key == "*****";
+        let keep_token = self.session_token.as_deref() == Some("*****");
+        if !keep_secret && !keep_token {
+            return Ok(());
+        }
+        let stored: Option<Self> = stored
+            .map(|value| serde_json::from_str(value).map_err(|_| CredentialError))
+            .transpose()?;
+        if keep_secret {
+            let existing = stored.as_ref().ok_or(CredentialError)?;
+            self.secret_access_key =
+                open_field(cipher, SECRET_KEY, &existing.secret_access_key)?.to_string();
+        }
+        if keep_token {
+            self.session_token = stored
+                .as_ref()
+                .and_then(|config| config.session_token.as_deref())
+                .map(|token| {
+                    open_field(cipher, SESSION_TOKEN, token).map(|token| token.to_string())
+                })
+                .transpose()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare(
         &self,
         cipher: &CredentialCipher,

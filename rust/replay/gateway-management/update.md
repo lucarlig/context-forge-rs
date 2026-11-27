@@ -21,3 +21,7 @@ Rust passed bearer, Basic, header, and query checks on SQLite and PostgreSQL, an
 ```sh
 cargo test --locked --test gateway registration_encrypts_bearer_credentials_and_uses_them_for_mcp_requests
 ```
+
+The TLS fixture retained a masked client key and rotated to a second certificate and key signed by the private CA. Invalid material and removing the required CA returned HTTP 502 and preserved the working configuration. The rotated key was encrypted at rest and the next MCP invocation used the new certificate.
+
+SigV4 updates retained a masked session token while rotating the signing key. Both gateways used the new key for discovery and invocation and returned HTTP 422 for a rejected key. Both gateways rotated client-credentials OAuth secrets, kept masked values, and preserved the previous configuration when the token endpoint rejected the new secret. Rust requires a fresh credential when the OAuth token endpoint changes origin and reports connection errors without including query parameters. The TLS, SigV4, and OAuth rotation fixtures passed on SQLite and PostgreSQL.

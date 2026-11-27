@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::secret_envelope::SecretEnvelope;
 
 const MASK: &str = "*****";
 
@@ -25,10 +26,11 @@ impl AuthInput {
             || self.sigv4_config.is_some()
     }
 
-    pub(crate) fn apply_update(
+    pub(crate) async fn apply_update(
         &mut self,
         current: &mut GatewayConnectionRow,
         cipher: Option<&CredentialCipher>,
+        vault: Option<&SecretEnvelope>,
         query_hosts: Option<&HashSet<String>>,
         url: &str,
     ) -> Result<bool, UpdateAuthError> {
@@ -52,12 +54,22 @@ impl AuthInput {
             .to_ascii_lowercase();
         let query_update = kind == "query_param"
             && (self.auth_query_param_key.is_some() || self.auth_query_param_value.is_some());
-        if self.oauth_config.is_some() || self.sigv4_config.is_some() {
+        if self.oauth_config.is_some() && kind != "oauth" {
             return Err(UpdateAuthError::Validation(
-                "Unsupported gateway authentication configuration update",
+                "oauth_config requires auth_type 'oauth'",
             ));
         }
-        if explicit_kind.is_none() && self.auth_headers.is_none() && !query_update {
+        if self.sigv4_config.is_some() && kind != "sigv4" {
+            return Err(UpdateAuthError::Validation(
+                "sigv4_config requires auth_type 'sigv4'",
+            ));
+        }
+        if explicit_kind.is_none()
+            && self.auth_headers.is_none()
+            && !query_update
+            && self.oauth_config.is_none()
+            && self.sigv4_config.is_none()
+        {
             return Ok(false);
         }
         if matches!(kind.as_str(), "" | "none" | "one_time_auth") {
@@ -68,15 +80,46 @@ impl AuthInput {
             };
             return Ok(current.replace_auth(marker, None));
         }
-        if matches!(kind.as_str(), "oauth" | "sigv4") {
-            return if kind == current.kind {
-                Ok(false)
-            } else {
-                Err(AuthError::Invalid.into())
-            };
-        }
         let same_kind = kind == current.kind;
+        let mut stored_oauth = None;
         match kind.as_str() {
+            "sigv4" => {
+                let Some(config) = self.sigv4_config.as_mut() else {
+                    return keep_existing_config(same_kind, current.sigv4.as_deref());
+                };
+                config
+                    .resolve_masks(
+                        cipher.ok_or(AuthError::from(CredentialError))?,
+                        current.sigv4.as_deref().filter(|_| same_kind),
+                    )
+                    .map_err(|_| AuthError::Invalid)?;
+            }
+            "oauth" => {
+                let Some(config) = self.oauth_config.as_mut() else {
+                    return keep_existing_config(same_kind, current.oauth.as_deref());
+                };
+                let vault = vault.ok_or(AuthError::from(CredentialError))?;
+                let existing = match current.oauth.as_deref().filter(|_| same_kind) {
+                    Some(encoded) => OAuthConfig::load(vault, encoded).await.ok(),
+                    None => None,
+                };
+                config
+                    .resolve_masks(existing.as_ref())
+                    .map_err(|_| AuthError::Invalid)?;
+                if existing.as_ref() == Some(config) {
+                    return Ok(false);
+                }
+                if !config.valid() {
+                    return Err(AuthError::Invalid.into());
+                }
+                stored_oauth = Some(
+                    config
+                        .store(vault)
+                        .await
+                        .map_err(|_| AuthError::from(CredentialError))?
+                        .0,
+                );
+            }
             "basic" => {
                 if self.auth_password.as_deref() == Some(MASK) {
                     let headers = stored_header_values(current, cipher, same_kind)?;
@@ -157,21 +200,37 @@ impl AuthInput {
             _ => return Err(AuthError::Unsupported.into()),
         }
         self.auth_type = Some(kind);
-        let prepared = self
+        let mut prepared = self
             .prepare(cipher, query_hosts, url)?
             .ok_or(AuthError::Invalid)?;
-        if same_kind
-            && prepared.matches_stored(
+        let unchanged = if let Some(signer) = &prepared.credentials.sigv4 {
+            cipher
+                .zip(current.sigv4.as_deref())
+                .is_some_and(|(cipher, stored)| {
+                    SigV4Config::load(cipher, stored)
+                        .is_ok_and(|existing| signer.fingerprint() == existing.fingerprint())
+                })
+        } else {
+            prepared.matches_stored(
                 current.headers.as_deref(),
                 current.query.as_deref(),
                 current.sigv4.as_deref(),
                 current.oauth.as_deref(),
             )
-        {
+        };
+        if same_kind && unchanged {
             return Ok(false);
         }
+        prepared.encoded_oauth = stored_oauth;
         Ok(current.replace_auth(prepared.kind, Some(prepared)))
     }
+}
+
+fn keep_existing_config(same_kind: bool, stored: Option<&str>) -> Result<bool, UpdateAuthError> {
+    if same_kind && stored.is_some_and(|value| !matches!(value.trim(), "" | "null" | "{}")) {
+        return Ok(false);
+    }
+    Err(AuthError::Invalid.into())
 }
 
 impl GatewayConnectionRow {

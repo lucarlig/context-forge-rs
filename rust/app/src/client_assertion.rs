@@ -14,7 +14,7 @@ use crate::upstream::UpstreamError;
 
 const LIFETIME_SECONDS: i64 = 300;
 
-#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub(crate) enum AssertionAlgorithm {
     #[default]

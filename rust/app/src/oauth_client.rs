@@ -25,7 +25,7 @@ const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
 const MASKED: &str = "*****";
 const ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OAuthConfig {
     token_url: String,
@@ -59,7 +59,7 @@ enum ClientAuth {
     PrivateKeyJwt,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 enum OAuthValues {
     One(String),
@@ -74,6 +74,26 @@ impl Drop for OAuthConfig {
 }
 
 impl OAuthConfig {
+    pub(crate) fn resolve_masks(&mut self, stored: Option<&Self>) -> Result<(), EnvelopeError> {
+        let keep_secret = self.client_secret.as_deref() == Some(MASKED);
+        let keep_key = self.private_key.as_deref() == Some(MASKED);
+        if !keep_secret && !keep_key {
+            return Ok(());
+        }
+        let stored = stored.ok_or(EnvelopeError)?;
+        let origin = |url| url::Url::parse(url).ok().map(|url| url.origin());
+        if origin(&self.token_url) != origin(&stored.token_url) {
+            return Err(EnvelopeError);
+        }
+        if keep_secret {
+            self.client_secret = Some(stored.client_secret.clone().ok_or(EnvelopeError)?);
+        }
+        if keep_key {
+            self.private_key = Some(stored.private_key.clone().ok_or(EnvelopeError)?);
+        }
+        Ok(())
+    }
+
     fn client_auth(&self) -> Option<ClientAuth> {
         let value = self
             .token_endpoint_auth_method
