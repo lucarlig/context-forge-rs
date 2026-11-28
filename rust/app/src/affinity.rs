@@ -34,6 +34,7 @@ use crate::{
     forward_headers::{hop_header_name, nominated_hop_header},
     gateway::GATEWAY_ID_HEADER,
     mcp::MAX_REQUEST_BODY_BYTES,
+    observability::{TraceContext, baggage, current_trace, with_trace},
     redis_sessions::RedisSessionDirectory,
 };
 
@@ -44,7 +45,8 @@ const MAX_CHUNK: usize = 64 * 1024;
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ACTIVE_FORWARDS: usize = 8192;
 fn forwardable_header(name: &str) -> bool {
-    !hop_header_name(name) && !matches!(name, "host" | "content-length" | "expect")
+    !hop_header_name(name)
+        && !matches!(name, "host" | "content-length" | "expect" | baggage::HEADER)
 }
 
 const CORE_HEADERS: &[&str] = &[
@@ -76,6 +78,8 @@ struct WireRequest {
     headers: Vec<(String, String)>,
     peer: Option<SocketAddr>,
     body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trace: Option<Box<TraceContext>>,
 }
 
 impl WireRequest {
@@ -119,6 +123,9 @@ impl WireRequest {
         }
         if let Some(peer) = self.peer {
             request.extensions_mut().insert(ConnectInfo(peer));
+        }
+        if let Some(trace) = self.trace {
+            request.extensions_mut().insert(*trace);
         }
         request.extensions_mut().insert(Forwarded);
         Some(request)
@@ -223,6 +230,9 @@ async fn exchange(
             .get::<ConnectInfo<SocketAddr>>()
             .map(|peer| peer.0),
         body,
+        trace: current_trace()
+            .and_then(TraceContext::for_affinity)
+            .map(Box::new),
     };
     let id = Uuid::new_v4().simple().to_string();
     let mut subscription = directory
@@ -542,11 +552,14 @@ async fn dispatch(
     mut credit: mpsc::Receiver<()>,
 ) -> io::Result<()> {
     let response = match request.into_request() {
-        Some(request) => match timeout(wait, router.oneshot(request)).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => match error {},
-            Err(_) => relay_error(StatusCode::GATEWAY_TIMEOUT, "Session worker timed out"),
-        },
+        Some(request) => {
+            let trace = request.extensions().get::<TraceContext>().cloned();
+            match timeout(wait, with_trace(trace, router.oneshot(request))).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => match error {},
+                Err(_) => relay_error(StatusCode::GATEWAY_TIMEOUT, "Session worker timed out"),
+            }
+        }
         None => relay_error(StatusCode::BAD_REQUEST, "Invalid forwarded MCP request"),
     };
     send_frame(

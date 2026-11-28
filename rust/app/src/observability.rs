@@ -20,6 +20,7 @@ use crate::{
     database::Database,
 };
 
+pub(crate) mod baggage;
 pub(crate) mod framework;
 mod operation;
 pub(crate) mod query;

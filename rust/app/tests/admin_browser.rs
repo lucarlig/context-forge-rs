@@ -2550,6 +2550,15 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
         ("OTEL_ENABLE_OBSERVABILITY", "true"),
         ("OTEL_HTTPX_INSTRUMENTATION_ENABLED", "true"),
         ("OTEL_SQLALCHEMY_INSTRUMENTATION_ENABLED", "true"),
+        ("OTEL_BAGGAGE_ENABLED", "true"),
+        ("OTEL_BAGGAGE_PROPAGATE_TO_EXTERNAL", "true"),
+        (
+            "OTEL_BAGGAGE_HEADER_MAPPINGS",
+            r#"[{"header_name":"X-Fixture-Zone","baggage_key":"fixture.zone"},{"header_name":"X-Fixture-Region","baggage_key":"fixture.region"}]"#,
+        ),
+        ("ENABLE_HEADER_PASSTHROUGH", "true"),
+        ("PASSTHROUGH_HEADERS_SOURCE", "env"),
+        ("DEFAULT_PASSTHROUGH_HEADERS", r#"["baggage"]"#),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
         ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
         ("OTEL_EXPORTER_OTLP_HEADERS", "x-fixture-export=collector"),
@@ -2644,7 +2653,11 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
             format!("00-{request_trace}-{remote_span}-{flags}"),
         )
         .header("tracestate", "fixture=keep")
-        .header("baggage", "private=otlp-baggage-sentinel")
+        .header("X-Fixture-Zone", "test zone")
+        .header(
+            "baggage",
+            "fixture.zone=overridden,fixture.region=Bearer%09otlp-baggage-sentinel,private=otlp-baggage-sentinel",
+        )
         .send()
         .await
         .unwrap()
@@ -2661,7 +2674,7 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
         assert_eq!(parts[1], request_trace);
         assert_ne!(parts[2], remote_span);
         assert_eq!(parts[3], flags);
-        assert!(!headers.contains_key("baggage"));
+        assert_eq!(headers["baggage"], "fixture.zone=test%20zone");
         if flags == "01" {
             assert_eq!(headers["tracestate"], "fixture=keep");
             sampled_outbound = Some(u64::from_str_radix(parts[2], 16).unwrap().to_be_bytes());
@@ -2751,6 +2764,24 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
                 .iter()
                 .all(|field| field.key != "fixture.unrelated")
         );
+        let baggage: Vec<_> = span
+            .attributes
+            .iter()
+            .filter(|field| field.key.starts_with("baggage."))
+            .collect();
+        if span.trace_id == tool_trace_id {
+            assert_eq!(baggage.len(), 1, "{}", span.name);
+            assert_eq!(baggage[0].key, "baggage.fixture.zone");
+            assert_eq!(
+                baggage[0]
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.value.as_ref()),
+                Some(&Attribute::StringValue("test zone".to_owned()))
+            );
+        } else {
+            assert!(baggage.is_empty(), "{}", span.name);
+        }
     }
     let root = spans
         .iter()

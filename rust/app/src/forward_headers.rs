@@ -158,6 +158,7 @@ fn blocked(name: &HeaderName, incoming: &HeaderMap) -> bool {
                 | "content-length"
                 | "host"
                 | "expect"
+                | crate::observability::baggage::HEADER
                 | EXPLICIT_AUTH
                 | GATEWAY_ID_HEADER
         )
@@ -181,7 +182,7 @@ pub(crate) fn nominated_hop_header(incoming: &HeaderMap, name: &str) -> bool {
         .any(|listed| listed.trim().eq_ignore_ascii_case(name))
 }
 
-fn sensitive(name: &HeaderName) -> bool {
+pub(crate) fn sensitive(name: &HeaderName) -> bool {
     static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
         r"^(?:authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-(?:auth|api|access|refresh|client|bearer|session|security)[-_]?(?:token|secret|key)|x-amz-(?:security-token|signature|credential))$"

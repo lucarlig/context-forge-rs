@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use super::{ExportSpan, SemanticConventions};
-use crate::observability::{bounded, current_trace, with_trace};
+use crate::observability::{baggage, bounded, current_trace, with_trace};
 use opentelemetry::{
     KeyValue,
     trace::{Span, SpanKind, Status},
@@ -12,9 +12,16 @@ use reqwest::{Client, Method, Request, Response, Url, Version};
 
 pub(crate) struct HttpClientSpan(Option<Box<(ExportSpan, SemanticConventions)>>);
 
+const PROPAGATION_HEADERS: &[&str] = &["traceparent", "tracestate", baggage::HEADER];
+
 impl HttpClientSpan {
     pub(crate) fn start(request: &mut Request) -> Self {
-        let Some(trace) = current_trace() else {
+        let trace = current_trace();
+        if !signature_owns_headers(request.url(), &[baggage::HEADER]) {
+            let approved = trace.as_ref().and_then(|trace| trace.baggage.as_deref());
+            baggage::inject(request.headers_mut(), approved);
+        }
+        let Some(trace) = trace else {
             return Self(None);
         };
         let Some(parent) = trace.exported else {
@@ -23,12 +30,12 @@ impl HttpClientSpan {
         if let Some(mode) = trace.http_clients {
             let name = http_method(request.method());
             let span = parent.start_span(name, SpanKind::Client, request_attributes(request, mode));
-            if !signature_owns_trace_headers(request.url()) {
+            if !signature_owns_headers(request.url(), PROPAGATION_HEADERS) {
                 span.context().inject(request.headers_mut());
             }
             Self(Some(Box::new((span, mode))))
         } else {
-            if trace.mcp_call && !signature_owns_trace_headers(request.url()) {
+            if trace.mcp_call && !signature_owns_headers(request.url(), PROPAGATION_HEADERS) {
                 parent.inject(request.headers_mut());
             }
             Self(None)
@@ -134,11 +141,11 @@ pub(crate) async fn mcp_call<T, E>(
     result
 }
 
-fn signature_owns_trace_headers(url: &Url) -> bool {
+fn signature_owns_headers(url: &Url, headers: &[&str]) -> bool {
     url.query_pairs().any(|(key, value)| {
         key.eq_ignore_ascii_case("x-amz-signedheaders")
             && value.split(';').any(|name| {
-                ["traceparent", "tracestate", "baggage"]
+                headers
                     .iter()
                     .any(|header| name.eq_ignore_ascii_case(header))
             })

@@ -23,6 +23,7 @@ pub(super) fn mapped_header_name(name: &str) -> Option<HeaderName> {
         && !normalized.starts_with("mcp-")
         && !normalized.starts_with("x-mcp-")
         && !normalized.starts_with("x-forwarded-user")
+        && normalized != crate::observability::baggage::HEADER
         && normalized != "x-upstream-authorization")
         .then_some(name)
 }

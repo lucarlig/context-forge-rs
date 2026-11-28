@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{future::Future, time::Instant};
+use std::{future::Future, sync::Arc, time::Instant};
 
 use jiff::Timestamp;
 use opentelemetry::{
@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
+    baggage::Baggage,
     bounded,
     telemetry::{
         ExportContext, ExportSpan, SemanticConventions, langfuse, redis_client::RedisConventions,
@@ -31,6 +32,8 @@ pub(crate) struct TraceContext {
     pub(super) redis_commands: Option<RedisConventions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) sql_queries: Option<SemanticConventions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) baggage: Option<Arc<Baggage>>,
     #[serde(skip)]
     pub(super) mcp_session: Option<String>,
     #[serde(skip)]
@@ -46,6 +49,12 @@ pub(super) struct StoredTrace {
 }
 
 impl TraceContext {
+    pub(crate) fn for_affinity(mut self) -> Option<Self> {
+        self.exported.as_ref()?;
+        self.stored = None;
+        Some(self)
+    }
+
     pub(crate) fn set_mcp_session(&mut self, session_id: &str) {
         if self.exported.is_some() {
             self.mcp_session = Some(session_id.to_owned());
@@ -62,6 +71,10 @@ tokio::task_local! { static TRACE: TraceContext; }
 
 pub(crate) fn current_trace() -> Option<TraceContext> {
     TRACE.try_with(Clone::clone).ok()
+}
+
+pub(super) fn current_baggage() -> Option<Arc<Baggage>> {
+    TRACE.try_with(|trace| trace.baggage.clone()).ok().flatten()
 }
 
 pub(super) fn sql_trace() -> Option<(SemanticConventions, ExportContext)> {

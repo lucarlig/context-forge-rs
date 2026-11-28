@@ -46,7 +46,7 @@ use tonic::{metadata::MetadataMap, transport::ClientTlsConfig};
 use url::Url;
 use uuid::Uuid;
 
-use super::{QueryRedaction, TraceContext, bounded, framework, with_trace};
+use super::{QueryRedaction, TraceContext, baggage, bounded, framework, with_trace};
 use crate::{
     config::{flag, parse, value},
     http_boundary::CorrelationId,
@@ -97,6 +97,7 @@ pub(crate) struct Telemetry {
     tracer: SdkTracer,
     framework_tracer: SdkTracer,
     redaction: QueryRedaction,
+    baggage: Option<baggage::Policy>,
     host: String,
     port: u16,
     http_clients: Option<SemanticConventions>,
@@ -161,12 +162,24 @@ impl Telemetry {
         } else {
             builder
         };
+        let redaction = QueryRedaction::from_env()?;
+        let baggage = match baggage::Policy::from_env(&redaction) {
+            Ok(policy) => policy,
+            Err(_) => {
+                tracing::warn!("Could not configure OpenTelemetry baggage");
+                None
+            }
+        };
+        let builder = if baggage.is_some() {
+            builder.with_span_processor(baggage::Processor)
+        } else {
+            builder
+        };
         let provider = builder
             .with_resource(Resource::builder().with_attributes(attributes).build())
             .build();
         let tracer = provider.tracer_with_scope(scope());
         let framework_tracer = provider.tracer_with_scope(framework::scope());
-        let redaction = QueryRedaction::from_env()?;
         let host = value("HOST", "127.0.0.1")?;
         let http_clients = flag("OTEL_HTTPX_INSTRUMENTATION_ENABLED")?
             .unwrap_or(false)
@@ -187,6 +200,7 @@ impl Telemetry {
             tracer,
             framework_tracer,
             redaction,
+            baggage,
             host,
             port,
             http_clients,
@@ -443,6 +457,10 @@ async fn observe(
         .get::<MatchedPath>()
         .map(MatchedPath::as_str);
     let parent = TraceContextPropagator::new().extract(&Headers(request.headers()));
+    let baggage = telemetry
+        .baggage
+        .as_ref()
+        .and_then(|policy| policy.read(request.headers()));
     let remote = parent.span().span_context().clone();
     if remote.is_valid() && !remote.is_sampled() {
         return observe_request(
@@ -450,10 +468,15 @@ async fn observe(
             next,
             ExportContext::child_context(&remote),
             None,
+            baggage,
             &telemetry,
         )
         .await;
     }
+    let parent = match &baggage {
+        Some(baggage) => parent.with_value(baggage.clone()),
+        None => parent,
+    };
     let method = request.method().as_str();
     let path = bounded(path, 2000);
     let protocol = match request.version() {
@@ -540,6 +563,7 @@ async fn observe(
         next,
         ExportContext::from_span(root.span_context()),
         Some(request_trace),
+        baggage,
         &telemetry,
     )
     .await;
@@ -579,6 +603,7 @@ async fn observe_request(
     next: Next,
     exported: ExportContext,
     framework: Option<Box<framework::RequestTrace>>,
+    baggage: Option<Arc<baggage::Baggage>>,
     telemetry: &Telemetry,
 ) -> Response {
     let context = TraceContext {
@@ -587,6 +612,7 @@ async fn observe_request(
         redis_commands: telemetry.redis_commands,
         sql_queries: telemetry.sql_queries,
         framework,
+        baggage,
         ..TraceContext::default()
     };
     request.extensions_mut().insert(context.clone());
@@ -696,7 +722,7 @@ impl ExportContext {
     }
 
     pub(super) fn inject(&self, headers: &mut HeaderMap) {
-        for name in ["traceparent", "tracestate", "baggage"] {
+        for name in ["traceparent", "tracestate"] {
             headers.remove(name);
         }
         if let Ok(value) = HeaderValue::from_str(&self.traceparent) {

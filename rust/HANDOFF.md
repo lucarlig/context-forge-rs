@@ -649,8 +649,27 @@ Eight Rust Anything cases verify these phases, statuses, and parent links.
 The comparison maps Python instrumentation scopes and function names to
 their Rust equivalents. When the gateway generates a trace ID, Axum and
 the transport share that trace. The pinned gateway generates two traces.
-Additional endpoint phases, background spans, and baggage propagation remain
-open.
+Additional endpoint phases and background spans remain open.
+
+Set `OTEL_BAGGAGE_ENABLED=true` to attach approved request baggage to
+OpenTelemetry spans as `baggage.<key>`. Configure the allowlist with
+`OTEL_BAGGAGE_HEADER_MAPPINGS`, a JSON array of `header_name` and
+`baggage_key` pairs. A mapped header takes precedence over the same
+incoming W3C key. The gateway rejects credential mappings and applies the
+configured item and byte limits.
+
+Set `OTEL_BAGGAGE_PROPAGATE_TO_EXTERNAL=true` to send approved baggage on
+upstream HTTP requests. Forwarding works with client spans disabled and for
+unsampled requests. Redis session affinity and the legacy SSE queue carry
+approved baggage with its request. [W3C Baggage](https://www.w3.org/TR/baggage/)
+
+Four Rust Anything cases verify the documented baggage policy. The pinned
+HTTPX instrumentation forwards unknown entries and sends baggage with the
+opt-in disabled. The replay projects those captures to the documented
+allowlist and forwarding settings. Rust tests verify span enrichment,
+encoded size limits, and outbound filtering. Checks against two gateway
+processes verify Redis-affined MCP and legacy SSE delivery. Plugin-based
+span attribute customization remains open.
 
 Set `OTEL_COPY_RESOURCE_ATTRS_TO_SPANS=true` to copy `arize.project.name`
 and `model_id` from the OpenTelemetry resource to recorded spans. Other
