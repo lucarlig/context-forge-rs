@@ -380,16 +380,19 @@ impl Drop for RedisListener {
 }
 
 pub(crate) fn session_key(id: &HeaderValue) -> Result<String, SessionError> {
-    let bytes = id.as_bytes();
-    if bytes.len() != 32
-        || !bytes
-            .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-    {
-        return Err(SessionError::NotFound);
-    }
-    let id = id.to_str().map_err(|_| SessionError::NotFound)?;
+    let id = id
+        .to_str()
+        .ok()
+        .filter(|id| valid_session_id(id))
+        .ok_or(SessionError::NotFound)?;
     Ok(format!("{SESSION_KEY_PREFIX}{id}"))
+}
+
+pub(crate) fn valid_session_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub(crate) fn ttl_millis(ttl: Duration) -> i64 {

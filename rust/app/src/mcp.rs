@@ -20,6 +20,7 @@ use axum::{
     routing::{any, post},
 };
 use futures_util::{Stream, StreamExt, stream};
+use opentelemetry::{KeyValue, trace::Span as _};
 use rmcp::model::{
     CallToolRequestParams, CancelledNotificationParam, CompleteRequestParams, ErrorData,
     GetPromptRequestParams, GetPromptResponse, Implementation, InitializeRequestParams,
@@ -44,7 +45,7 @@ use crate::{
     events::{Journal, parse_cursor},
     gateway::{GatewayService, ToolError},
     modern::Modern,
-    observability::framework,
+    observability::{framework, scoped::ScopedSpan, with_trace},
     sessions::{
         PendingError, PendingRequest, Session, SessionAccess, SessionError, Sessions,
         new_session_id,
@@ -53,7 +54,7 @@ use crate::{
 };
 
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
-const SESSION_HEADER: &str = "mcp-session-id";
+pub(crate) const SESSION_HEADER: &str = "mcp-session-id";
 const LAST_EVENT_ID: &str = "last-event-id";
 const RUNTIME_HEADER: &str = "x-contextforge-mcp-runtime";
 const LEGACY_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
@@ -353,9 +354,12 @@ pub(crate) async fn forward_remote(
     let Ok(Some(id)) = session_header(request.headers()) else {
         return Ok(request);
     };
-    if sessions.local_exists(id) {
-        return Ok(request);
-    }
+    let mut check = ScopedSpan::start("mcp.affinity.check", || {
+        json!({
+            "mcp.session_id": id.to_str().ok().and_then(affinity::trace_session_prefix),
+            "mcp.affinity.worker_id": redis.worker_id(),
+        })
+    });
     let owner = request
         .extensions()
         .get::<Principal>()
@@ -364,10 +368,30 @@ pub(crate) async fn forward_remote(
         .extensions()
         .get::<CatalogServer>()
         .map(|server| server.id.as_str());
-    let worker = match redis
-        .locate(id, owner, server, *request.method() == Method::POST)
-        .await
-    {
+    let is_post = *request.method() == Method::POST;
+    let location = with_trace(check.context(), async {
+        if sessions.local_exists(id) {
+            return Ok(());
+        }
+        redis.locate(id, owner, server, is_post).await
+    })
+    .await;
+    if let Some(span) = check.recording() {
+        let (owner, decision) = match &location {
+            Ok(()) => (redis.worker_id().to_owned(), "local"),
+            Err(SessionError::Remote(worker)) => (worker.simple().to_string(), "forward"),
+            _ => ("none".to_owned(), "local"),
+        };
+        span.set_attributes([
+            KeyValue::new("mcp.affinity.owner", owner),
+            KeyValue::new("mcp.affinity.decision", decision),
+        ]);
+    }
+    check.finish(
+        matches!(&location, Err(SessionError::Unavailable))
+            .then_some("MCP affinity owner lookup failed"),
+    );
+    let worker = match location {
         Err(SessionError::Remote(worker)) => worker,
         // The local route applies endpoint-specific validation and error formatting.
         _ => return Ok(request),

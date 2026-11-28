@@ -3119,6 +3119,242 @@ async fn traces_background_probes_and_mcp_tool_errors_without_upstream_credentia
 }
 
 #[tokio::test]
+#[ignore = "requires a disposable Redis or Valkey database in REDIS_URL"]
+async fn affinity_spans_link_sender_and_owner_for_http_and_rpc() {
+    use axum::{
+        Json, Router,
+        body::Bytes,
+        extract::Path,
+        routing::{get, post},
+    };
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value::Value as Attribute,
+    };
+    use prost::Message;
+    use serde_json::{Value, json};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = format!("http://{}", listener.local_addr().unwrap());
+    let (exports, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mock = tokio::spawn(async move {
+        let router = Router::new()
+            .route(
+                "/upstream",
+                get(|| async { Json(json!({"fixture":"affinity-trace-tool"})) }),
+            )
+            .route(
+                "/v1/traces/{worker}",
+                post(move |Path(worker): Path<String>, body: Bytes| {
+                    let exports = exports.clone();
+                    async move {
+                        let _ = exports
+                            .send((worker, ExportTraceServiceRequest::decode(body).unwrap()));
+                        ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
+                    }
+                }),
+            );
+        axum::serve(listener, router).await.unwrap();
+    });
+    let directory =
+        FixtureDirectory(std::env::temp_dir().join(Uuid::new_v4().simple().to_string()));
+    std::fs::create_dir(&directory.0).unwrap();
+    let database = format!("sqlite:///{}/gateway.db", directory.0.display());
+    let redis = std::env::var("REDIS_URL").unwrap();
+    let key = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let settings = [
+        ("DATABASE_URL", database.as_str()),
+        ("CACHE_TYPE", "redis"),
+        ("REDIS_URL", redis.as_str()),
+        ("JWT_SECRET_KEY", key.as_str()),
+        ("AUTH_ENCRYPTION_SECRET", key.as_str()),
+        ("USE_STATEFUL_SESSIONS", "true"),
+        ("MCPGATEWAY_SESSION_AFFINITY_ENABLED", "true"),
+        ("JSON_RESPONSE_ENABLED", "true"),
+        ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
+        ("OTEL_BSP_SCHEDULE_DELAY", "25"),
+    ];
+    let mut first = settings.to_vec();
+    let owner_endpoint = format!("{peer}/v1/traces/owner");
+    first.push(("OTEL_EXPORTER_OTLP_ENDPOINT", &owner_endpoint));
+    let mut second = settings.to_vec();
+    let relay_endpoint = format!("{peer}/v1/traces/relay");
+    second.push(("OTEL_EXPORTER_OTLP_ENDPOINT", &relay_endpoint));
+    let mut owner = gateway_with_env(&first).await;
+    let mut relay = gateway_with_env(&second).await;
+    let post_json = |gateway: &BrowserGateway, path: &str, data: Value| {
+        gateway
+            .client
+            .post(format!("{}{path}", gateway.origin))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(data.to_string())
+    };
+    let login = post_json(
+        &owner,
+        "/auth/email/login",
+        json!({"email": EMAIL, "password": owner.password}),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap();
+    let login: Value = serde_json::from_slice(&login).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    post_json(
+        &owner,
+        "/tools",
+        json!({
+            "tool":{"name":"affinity-trace","url":format!("{peer}/upstream"),"request_type":"GET",
+                "integration_type":"REST","input_schema":{"type":"object"}},
+            "visibility":"public"
+        }),
+    )
+    .bearer_auth(token)
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let version = "2025-11-25";
+    let begin = post_json(&owner, "/mcp", json!({
+        "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+        }
+    })).bearer_auth(token).header("mcp-protocol-version", version)
+        .send().await.unwrap().error_for_status().unwrap();
+    let session = begin.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    begin.bytes().await.unwrap();
+    assert_eq!(
+        post_json(
+            &owner,
+            "/mcp",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .bearer_auth(token)
+        .header("mcp-protocol-version", version)
+        .header("mcp-session-id", &session)
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::ACCEPTED
+    );
+
+    for (route, kind, method, trace_id) in [
+        (
+            "/mcp",
+            "http",
+            "POST",
+            0xa810762ba9864f1199a6e35d84e6c031u128,
+        ),
+        (
+            "/rpc",
+            "rpc",
+            "tools/call",
+            0xa810762ba9864f1199a6e35d84e6c032u128,
+        ),
+    ] {
+        let tool = post_json(
+            &relay,
+            route,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"affinity-trace","arguments":{}}}),
+        )
+        .bearer_auth(token)
+        .header("mcp-protocol-version", version)
+        .header("mcp-session-id", &session)
+        .header(
+            "traceparent",
+            format!("00-{trace_id:032x}-25d5fe7d414e5cee-01"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+        assert!(tool.contains("affinity-trace-tool"), "{tool}");
+        let forward_name = format!("mcp.affinity.forward_{kind}");
+        let mut spans = Vec::new();
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let (worker, batch) = received.recv().await.unwrap();
+                assert!(!format!("{batch:?}").contains(&session));
+                spans.extend(
+                    batch
+                        .resource_spans
+                        .into_iter()
+                        .flat_map(|resource| resource.scope_spans)
+                        .flat_map(|scope| scope.spans)
+                        .filter(|span| span.trace_id == trace_id.to_be_bytes())
+                        .map(|span| (worker.clone(), span)),
+                );
+                let find = |name| spans.iter().find(|(_, span)| span.name == name);
+                let [
+                    Some((check_worker, check)),
+                    Some((forward_worker, forward)),
+                    Some((execute_worker, execute)),
+                    Some((tool_worker, tool)),
+                ] = [
+                    "mcp.affinity.check",
+                    forward_name.as_str(),
+                    "mcp.affinity.execute_forwarded",
+                    "tool.invoke",
+                ]
+                .map(find)
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    (check_worker.as_str(), forward_worker.as_str()),
+                    ("relay", "relay")
+                );
+                assert_eq!(
+                    (execute_worker.as_str(), tool_worker.as_str()),
+                    ("owner", "owner")
+                );
+                assert_eq!(forward.parent_span_id, check.parent_span_id);
+                assert_eq!(execute.parent_span_id, forward.span_id);
+                assert_eq!(tool.parent_span_id, execute.span_id);
+                for (span, key, expected) in [
+                    (check, "mcp.affinity.decision", "forward"),
+                    (execute, "mcp.affinity.forward_type", kind),
+                    (execute, "mcp.method", method),
+                    (execute, "mcp.session_id", &session[..8]),
+                ] {
+                    assert!(
+                        span.attributes.iter().any(|field| field.key == key
+                            && field.value.as_ref().and_then(|value| value.value.as_ref())
+                                == Some(&Attribute::StringValue(expected.to_owned()))),
+                        "{key}"
+                    );
+                }
+                assert!(
+                    [check, forward, execute]
+                        .iter()
+                        .all(|span| span.status.as_ref().unwrap().code == 1)
+                );
+                break;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    relay.process.kill().await.unwrap();
+    owner.process.kill().await.unwrap();
+    mock.abort();
+}
+
+#[tokio::test]
 async fn zipkin_posts_batched_json_with_trace_ancestry_and_redacted_tags() {
     use axum::{Json, Router, http::HeaderMap, routing::post};
     use serde_json::{Value, json};

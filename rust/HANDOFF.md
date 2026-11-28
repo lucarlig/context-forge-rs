@@ -579,8 +579,20 @@ for standard database and network attributes.
 Four Rust Anything replays match the pinned session registry span across
 legacy and standard attributes, disabled instrumentation, and unsampled
 requests. Live Rust checks cover Redis-backed SSE queue writes and a Redis
-rate-limit command failure that falls back to memory. All eight tests that
+rate-limit command failure that falls back to memory. All nine tests that
 require external Redis or PostgreSQL pass with disposable instances.
+
+Redis-affined MCP requests trace the ownership check, forwarding, and owner
+dispatch. The owner dispatch inherits the forwarding span across the Redis
+handoff. Forwarding and dispatch record status when response headers are
+ready. Affinity spans use the first eight hexadecimal characters of a
+validated session ID.
+
+Four Rust Anything cases cover local ownership, forwarded HTTP, forwarded
+RPC, and unsampled propagation. For `/rpc`, Rust adds sender spans and nests
+the owner dispatch under `mcp.affinity.forward_rpc`. The pinned gateway
+attaches the owner span to the incoming context. A live Rust test checks
+the span parents and verifies which worker exported each span.
 
 Set `OTEL_SQLALCHEMY_INSTRUMENTATION_ENABLED=true` to export SQLx client
 spans for application queries on sampled requests. This covers pooled

@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{StreamExt, stream};
+use opentelemetry::{KeyValue, trace::Span as _};
 use redis::aio::PubSubStream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -33,9 +34,9 @@ use uuid::Uuid;
 use crate::{
     forward_headers::{hop_header_name, nominated_hop_header},
     gateway::GATEWAY_ID_HEADER,
-    mcp::MAX_REQUEST_BODY_BYTES,
-    observability::{TraceContext, baggage, current_trace, with_trace},
-    redis_sessions::RedisSessionDirectory,
+    mcp::{MAX_REQUEST_BODY_BYTES, SESSION_HEADER, session_header},
+    observability::{TraceContext, baggage, current_trace, scoped::ScopedSpan, with_trace},
+    redis_sessions::{RedisSessionDirectory, valid_session_id},
 };
 
 const HEADERS: u8 = 1;
@@ -55,7 +56,7 @@ const CORE_HEADERS: &[&str] = &[
     "content-type",
     "last-event-id",
     "mcp-protocol-version",
-    "mcp-session-id",
+    SESSION_HEADER,
     "x-upstream-authorization",
     GATEWAY_ID_HEADER,
 ];
@@ -97,7 +98,46 @@ impl WireRequest {
         }
         self.headers
             .iter()
-            .find_map(|(name, value)| (name == "mcp-session-id").then_some(value.as_str()))
+            .find_map(|(name, value)| (name == SESSION_HEADER).then_some(value.as_str()))
+    }
+
+    fn span_attributes(&self) -> serde_json::Value {
+        let session = self
+            .headers
+            .iter()
+            .find_map(|(name, value)| (name == SESSION_HEADER).then_some(value.as_str()));
+        let method = if is_rpc(&self.path) {
+            #[derive(Deserialize)]
+            struct RpcMethod {
+                method: String,
+            }
+
+            serde_json::from_str::<RpcMethod>(&self.body)
+                .ok()
+                .map(|request| match request.method.as_str() {
+                    "ping"
+                    | "tools/call"
+                    | "tools/list"
+                    | "resources/list"
+                    | "resources/read"
+                    | "resources/templates/list"
+                    | "prompts/list"
+                    | "prompts/get"
+                    | "completion/complete"
+                    | "logging/setLevel" => request.method,
+                    _ => "other".to_owned(),
+                })
+        } else {
+            match self.method.as_str() {
+                method @ ("GET" | "POST" | "DELETE") => Some(method.to_owned()),
+                _ => None,
+            }
+        };
+        json!({
+            "mcp.session_id": session.and_then(trace_session_prefix),
+            "mcp.affinity.forward_type": if is_rpc(&self.path) {"rpc"} else {"http"},
+            "mcp.method": method,
+        })
     }
 
     fn into_request(self) -> Option<Request> {
@@ -130,6 +170,14 @@ impl WireRequest {
         request.extensions_mut().insert(Forwarded);
         Some(request)
     }
+}
+
+fn is_rpc(path: &str) -> bool {
+    matches!(path, "/rpc" | "/rpc/")
+}
+
+pub(crate) fn trace_session_prefix(id: &str) -> Option<&str> {
+    valid_session_id(id).then(|| &id[..8])
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,7 +230,24 @@ pub(crate) async fn forward(
     wait: Duration,
     client_headers: bool,
 ) -> Response {
-    match exchange(directory, worker, request, wait, client_headers).await {
+    let name = if is_rpc(request.uri().path()) {
+        "mcp.affinity.forward_rpc"
+    } else {
+        "mcp.affinity.forward_http"
+    };
+    let mut span = ScopedSpan::start(name, || {
+        json!({
+            "mcp.session_id": session_header(request.headers()).ok().flatten()
+                .and_then(|id| id.to_str().ok()).and_then(trace_session_prefix),
+            "mcp.affinity.owner": worker.simple().to_string(),
+        })
+    });
+    let response = match with_trace(
+        span.context(),
+        exchange(directory, worker, request, wait, client_headers),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(%error, "MCP affinity forwarding failed");
@@ -191,7 +256,19 @@ pub(crate) async fn forward(
                 "Session worker unavailable",
             )
         }
+    };
+    finish_relay_span(&mut span, &response, "MCP affinity forwarding failed");
+    response
+}
+
+fn finish_relay_span(span: &mut ScopedSpan, response: &Response, failure: &'static str) {
+    if let Some(recording) = span.recording() {
+        recording.set_attribute(KeyValue::new(
+            "http.response.status_code",
+            i64::from(response.status().as_u16()),
+        ));
     }
+    span.finish((!response.status().is_success()).then_some(failure));
 }
 
 async fn exchange(
@@ -551,17 +628,25 @@ async fn dispatch(
     wait: Duration,
     mut credit: mpsc::Receiver<()>,
 ) -> io::Result<()> {
-    let response = match request.into_request() {
-        Some(request) => {
-            let trace = request.extensions().get::<TraceContext>().cloned();
-            match timeout(wait, with_trace(trace, router.oneshot(request))).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => match error {},
-                Err(_) => relay_error(StatusCode::GATEWAY_TIMEOUT, "Session worker timed out"),
+    let trace = request.trace.as_deref().cloned();
+    let response = with_trace(trace, async {
+        let mut span = ScopedSpan::start("mcp.affinity.execute_forwarded", || {
+            request.span_attributes()
+        });
+        let response = match request.into_request() {
+            Some(request) => {
+                match timeout(wait, with_trace(span.context(), router.oneshot(request))).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => match error {},
+                    Err(_) => relay_error(StatusCode::GATEWAY_TIMEOUT, "Session worker timed out"),
+                }
             }
-        }
-        None => relay_error(StatusCode::BAD_REQUEST, "Invalid forwarded MCP request"),
-    };
+            None => relay_error(StatusCode::BAD_REQUEST, "Invalid forwarded MCP request"),
+        };
+        finish_relay_span(&mut span, &response, "MCP affinity worker dispatch failed");
+        response
+    })
+    .await;
     send_frame(
         directory,
         reply,
