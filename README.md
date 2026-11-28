@@ -22,9 +22,10 @@ Use `--fd 3` when a supervisor passes a TCP or Unix stream socket as descriptor 
 
 ### Containers
 
-The image contains the gateway and `context-forge-translate`. It runs as UID 10001 and checks `/ready` over TCP on `PORT`. Put a strong `PLATFORM_ADMIN_PASSWORD` and independent random values for `JWT_SECRET_KEY` and `AUTH_ENCRYPTION_SECRET` in a private `.env` file.
+The image contains the gateway and `context-forge-translate`. It runs as UID 10001 and checks `/ready` over TCP on `PORT`. For a fresh deployment, generate the gateway secrets in `.env`.
 
 ```sh
+cargo run --locked -- init-secrets --patch-env .env
 docker build -f Containerfile -t context-forge-rs:local .
 docker run --rm --env-file .env -p 127.0.0.1:4444:4444 \
   -e DATABASE_URL=sqlite:////var/lib/context-forge/mcp.db \
@@ -46,6 +47,8 @@ docker compose up --build -d --wait
 Compose runs `context-forge-rs migrate` before starting the gateway. PostgreSQL and Redis use named volumes and private service addresses. Set `CONTEXT_FORGE_PORT` to change the host port.
 
 ### Database and configuration commands
+
+`context-forge-rs init-secrets` writes `.env.secrets` by default. Use `--output` to choose another file, `--force` to overwrite it, or `--stdout` to print the generated values. On Unix, files written by this command have mode `0600`.
 
 Run `context-forge-rs migrate` to prepare the native database schema before starting the gateway. Set `MCPGATEWAY_SKIP_MIGRATIONS=true` on gateway workers to require a current native schema at startup.
 

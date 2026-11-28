@@ -32,6 +32,7 @@ pub(crate) use inherited::InheritedListener;
   migrate              Upgrade the native database schema
   export               Export gateway configuration
   import               Import gateway configuration
+  init-secrets         Generate deployment secrets
   rotate-credentials   Rotate stored credentials")]
 pub(crate) struct ServerArgs {
     /// TCP address. Defaults to HOST or MCG_HOST, then 127.0.0.1.

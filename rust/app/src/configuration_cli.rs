@@ -3,8 +3,7 @@
 use std::{
     collections::BTreeMap,
     error::Error,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -12,10 +11,12 @@ use std::{
 use clap::{Parser, ValueEnum};
 use reqwest::{Client, Method, RequestBuilder, Url, header};
 use serde_json::{Value, json};
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::config::{Settings, flag, value};
+use crate::{
+    config::{Settings, flag, value},
+    private_file,
+};
 
 type CliError = Box<dyn Error + Send + Sync>;
 
@@ -214,28 +215,8 @@ async fn export(args: ExportArgs) -> Result<(), CliError> {
 }
 
 fn write_export(destination: &Path, contents: &[u8]) -> Result<(), CliError> {
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".context-forge-export-{}.tmp", Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    let result = file.write_all(contents).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = result.and_then(|()| fs::rename(&temporary, destination)) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    Ok(())
+    fs::create_dir_all(private_file::parent(destination))?;
+    Ok(private_file::write(destination, contents, true)?)
 }
 
 async fn import(args: ImportArgs) -> Result<(), CliError> {

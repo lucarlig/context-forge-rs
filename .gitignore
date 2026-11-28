@@ -2,4 +2,5 @@
 /mcp.db
 /mcp.db-*
 /.env
+/.env.secrets
 **/app-cases/replay-report.md

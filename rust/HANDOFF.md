@@ -147,6 +147,24 @@ rejection of closed descriptors, regular files, datagrams, connected
 streams, and unnamed Unix sockets. A Rust test checks descriptor flags.
 A Linux arm64 container check verifies both inherited transports.
 
+## Deployment secrets
+
+`context-forge-rs init-secrets` generates two keys and three passwords
+from OS randomness. It supports a separate secrets file, stdout output,
+interactive and forced replacement, and weak-value patching in `.env`.
+File writes stage private content and replace the destination atomically.
+
+Patch mode checks the configured key length and entropy. It preserves
+strong keys, dotenv references, comments, and unrelated assignments.
+A weak shell override cannot replace an existing encryption key in the
+file. Shell-only password settings stay out of the file.
+
+Sixteen Rust Anything cases compare the command with the pinned release.
+They cover generation, file permissions, overwrite choices, symlink
+rejection, quoted values, reference expansion, the key length floor,
+and the encryption key guard. A Linux arm64 container check starts the
+gateway and authenticates with the generated settings.
+
 ## HTTP request boundary
 
 The gateway enables correlation IDs and request header limits by default.

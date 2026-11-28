@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some("migrate") => run(Startup::Migrate),
         Some("export") => run(Startup::Configuration("export")),
         Some("import") => run(Startup::Configuration("import")),
+        Some("init-secrets") => context_forge_rs::init_secrets::run(),
         _ => {
             let arguments = ServerArgs::parse();
             #[cfg(unix)]
