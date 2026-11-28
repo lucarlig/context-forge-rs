@@ -61,7 +61,7 @@ pub(super) async fn panel(
     let query = query.unwrap_or_default();
     let matched = normalize_query(query).map_err(panel_error)?;
     let rows = registry
-        .search(&matched, usize::MAX)
+        .search(principal, &matched, usize::MAX)
         .into_iter()
         .map(Row::from)
         .collect();
@@ -104,7 +104,7 @@ async fn read(
                 let q = normalize_query(&q)?;
                 let limit = service.root_search_limit(limit)?;
                 let roots = registry
-                    .search(&q, limit)
+                    .search(&principal, &q, limit)
                     .into_iter()
                     .map(|root| {
                         let name = if root.name.is_empty() {

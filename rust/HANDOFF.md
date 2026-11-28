@@ -593,6 +593,20 @@ The cases cover Redis snapshot continuations, empty pages, invalid cursors,
 and unsampled requests. A live Rust test checks SQL span ancestry and
 cursor redaction in collector exports.
 
+Management catalog APIs trace tool, prompt, resource, and resource-template
+listings. Root listings trace REST, JSON-RPC, Admin UI searches, and
+configuration exports. The root span records the registry count.
+Resource metadata lookups trace missing and inactive records as errors.
+The span includes the resource ID when it parses as a UUID.
+
+Six Rust Anything cases compare pagination, legacy virtual-server tool
+listing, root exports and Admin UI searches, resource lookup status,
+and unsampled requests. A live Rust test checks request and SQL span
+ancestry. Resource lookup spans use a fixed error description.
+Identity capture uses the existing opt-in policy. With identity capture
+enabled, Rust includes the admin team scope on management catalog spans.
+The reference omits this attribute on several admin listings.
+
 Set `OTEL_REDIS_INSTRUMENTATION_ENABLED=true` to export Redis client spans
 for request-scoped commands. This covers session affinity, legacy SSE queues,
 shared catalog and token caches, and Redis rate limiting. Command spans carry

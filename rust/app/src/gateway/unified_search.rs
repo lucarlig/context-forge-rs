@@ -347,7 +347,7 @@ async fn supplementary_items(
         }
         "roots" if service.can_administer_roots(principal).await? => service
             .roots
-            .search(filter.text, filter.limit as usize)
+            .search(principal, filter.text, filter.limit as usize)
             .into_iter()
             .map(|root| {
                 let name = if root.name.is_empty() {

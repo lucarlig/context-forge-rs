@@ -343,7 +343,7 @@ async fn dispatch(
             if !call.principal.is_global_admin() || call.principal.server_limit.is_some() {
                 return Err(RpcFault::access_denied(call.method));
             }
-            Ok(json!({"roots": service.roots.export_configuration(None)}))
+            Ok(json!({"roots": service.roots.export_configuration(call.principal, None)}))
         }
         "resources/list" | "resources/templates/list" | "prompts/list" => {
             let list = match call.method {

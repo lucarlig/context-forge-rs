@@ -49,17 +49,25 @@ async fn list(
 ) -> Result<Json<Value>, CatalogApiError> {
     require_catalog_permission(&service, &principal, "prompts.read", true).await?;
     let page = CatalogPage::prepare(&service, &principal, &query, "rest/prompts")?;
-    let rows = service
-        .database
-        .managed_prompts(access::catalog_scope(Some(&principal)), page.filters())
-        .await?;
-    Ok(Json(page.envelope(
-        &service,
-        rows,
-        "prompts",
-        |row| (&row.created_at, &row.id),
-        |row| metadata(row, true),
-    )?))
+    page.span("prompt.list", &principal, &query)
+        .run(
+            async {
+                let rows = service
+                    .database
+                    .managed_prompts(access::catalog_scope(Some(&principal)), page.filters())
+                    .await?;
+                page.envelope(
+                    &service,
+                    rows,
+                    "prompts",
+                    |row| (&row.created_at, &row.id),
+                    |row| metadata(row, true),
+                )
+                .map(Json)
+            },
+            "Prompt listing failed",
+        )
+        .await
 }
 
 async fn read(

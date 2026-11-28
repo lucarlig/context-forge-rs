@@ -258,7 +258,7 @@ async fn configuration(
             json!(
                 service
                     .roots
-                    .export_configuration(request.selection_for("roots"))
+                    .export_configuration(principal, request.selection_for("roots"))
             ),
         );
     }

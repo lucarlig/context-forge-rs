@@ -7,11 +7,14 @@ use tokio_util::sync::CancellationToken;
 use super::{
     catalog_api::{
         CatalogApiError as ResourceError, CatalogListQuery, CatalogPage, alias_metadata, flag,
-        http_server_id, require_catalog_permission,
+        http_server_id, require_catalog_permission, trace_visibility,
     },
     *,
 };
-use crate::catalog::{CatalogEntryFilters, MetricEntity, ResourceContentRecord, ResourceRecord};
+use crate::{
+    catalog::{CatalogEntryFilters, MetricEntity, ResourceContentRecord, ResourceRecord},
+    observability::scoped::ScopedSpan,
+};
 
 mod events;
 mod write;
@@ -50,21 +53,29 @@ async fn list(
 ) -> Result<Json<Value>, ResourceError> {
     require_catalog_permission(&service, &principal, "resources.read", true).await?;
     let page = CatalogPage::prepare(&service, &principal, &query, "rest/resources")?;
-    let rows = service
-        .database
-        .managed_resources(
-            access::catalog_scope(Some(&principal)),
-            page.filters(),
-            Some(false),
+    page.span("resource.list", &principal, &query)
+        .run(
+            async {
+                let rows = service
+                    .database
+                    .managed_resources(
+                        access::catalog_scope(Some(&principal)),
+                        page.filters(),
+                        Some(false),
+                    )
+                    .await?;
+                page.envelope(
+                    &service,
+                    rows,
+                    "resources",
+                    |row| (&row.created_at, &row.id),
+                    |row| metadata(row, true),
+                )
+                .map(Json)
+            },
+            "Resource listing failed",
         )
-        .await?;
-    Ok(Json(page.envelope(
-        &service,
-        rows,
-        "resources",
-        |row| (&row.created_at, &row.id),
-        |row| metadata(row, true),
-    )?))
+        .await
 }
 
 async fn templates(
@@ -73,22 +84,32 @@ async fn templates(
     Query(query): Query<CatalogListQuery>,
 ) -> Result<Json<Value>, ResourceError> {
     require_catalog_permission(&service, &principal, "resources.read", true).await?;
+    let include_inactive = flag(query.include_inactive.as_deref())?;
     let tags = query.tags();
-    let records = service
-        .database
-        .managed_resources(
-            access::catalog_scope(Some(&principal)),
-            CatalogEntryFilters {
-                include_inactive: flag(query.include_inactive.as_deref())?,
-                visibility: query.visibility.as_deref(),
-                team: None,
-                gateway: None,
-                after: None,
-                limit: i64::MAX,
-                offset: 0,
-                tags: &tags,
-            },
-            Some(true),
+    let span = ScopedSpan::authenticated("resource_template.list", &principal, || {
+        json!({
+            "include_inactive": include_inactive,
+            "tags.count": query.tag_values().count(),
+            "visibility": trace_visibility(query.visibility.as_deref()),
+        })
+    });
+    let records = span
+        .run(
+            service.database.managed_resources(
+                access::catalog_scope(Some(&principal)),
+                CatalogEntryFilters {
+                    include_inactive,
+                    visibility: query.visibility.as_deref(),
+                    team: None,
+                    gateway: None,
+                    after: None,
+                    limit: i64::MAX,
+                    offset: 0,
+                    tags: &tags,
+                },
+                Some(true),
+            ),
+            "Resource template listing failed",
         )
         .await?;
     let templates = records.into_iter().map(|resource| json!({
@@ -107,14 +128,21 @@ async fn info(
     Query(query): Query<CatalogListQuery>,
 ) -> Result<Json<Value>, ResourceError> {
     require_catalog_permission(&service, &principal, "resources.read", true).await?;
-    let resource = find_visible(
-        &service,
-        &principal,
-        &id,
-        flag(query.include_inactive.as_deref())?,
+    let include_inactive = flag(query.include_inactive.as_deref())?;
+    ScopedSpan::authenticated("resource.get", &principal, || {
+        json!({
+            "resource.id": Uuid::try_parse(&id).ok().map(|_| &id),
+            "include_inactive": include_inactive,
+        })
+    })
+    .run(
+        async {
+            let resource = find_visible(&service, &principal, &id, include_inactive).await?;
+            Ok(Json(metadata(&resource, true)))
+        },
+        "Resource lookup failed",
     )
-    .await?;
-    Ok(Json(metadata(&resource, true)))
+    .await
 }
 
 async fn read(

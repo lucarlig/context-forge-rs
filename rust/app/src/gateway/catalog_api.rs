@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::catalog::{CatalogEntryFilters, slugify};
+use crate::{
+    catalog::{CatalogEntryFilters, slugify},
+    observability::scoped::ScopedSpan,
+};
 
 #[derive(Default, Deserialize)]
 pub(super) struct CatalogListQuery {
@@ -35,18 +38,19 @@ impl CatalogListQuery {
     }
 
     pub(super) fn tags(&self) -> Vec<String> {
-        let mut tags = self
-            .tags
+        let mut tags = self.tag_values().map(str::to_owned).collect::<Vec<_>>();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+
+    pub(super) fn tag_values(&self) -> impl Iterator<Item = &str> {
+        self.tags
             .as_deref()
             .unwrap_or_default()
             .split(',')
             .map(str::trim)
             .filter(|tag| !tag.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        tags.sort_unstable();
-        tags.dedup();
-        tags
     }
 }
 
@@ -144,6 +148,24 @@ impl<'a> CatalogPage<'a> {
         }
     }
 
+    pub(super) fn span(
+        &self,
+        name: &'static str,
+        principal: &Principal,
+        query: &CatalogListQuery,
+    ) -> ScopedSpan {
+        ScopedSpan::authenticated(name, principal, || {
+            json!({
+                "include_inactive": self.include_inactive,
+                "tags.count": query.tag_values().count(),
+                "gateway_id": self.gateway.filter(|id| trace_identifier(id)),
+                "team.filter": self.team.filter(|id| trace_identifier(id)),
+                "visibility": trace_visibility(self.visibility),
+                "limit": query.limit,
+            })
+        })
+    }
+
     pub(super) fn envelope<T>(
         &self,
         service: &GatewayService,
@@ -179,6 +201,18 @@ impl<'a> CatalogPage<'a> {
             json!(entries)
         })
     }
+}
+
+fn trace_identifier(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 100
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub(super) fn trace_visibility(visibility: Option<&str>) -> Option<&str> {
+    visibility.filter(|value| matches!(*value, "private" | "team" | "public"))
 }
 
 pub(crate) fn flag(input: Option<&str>) -> Result<bool, CatalogApiError> {

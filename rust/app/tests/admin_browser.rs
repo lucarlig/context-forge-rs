@@ -2695,13 +2695,57 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     missing.bytes().await.unwrap();
 
+    let management_requests = [
+        (
+            "/v1/prompts?include_pagination=true&limit=2&visibility=public",
+            "prompt.list",
+            StatusCode::OK,
+            0x182cf4c06e0e4efa8e5369b811a358b0_u128,
+        ),
+        (
+            "/resources/00000000000000000000000000000000/info",
+            "resource.get",
+            StatusCode::NOT_FOUND,
+            0x182cf4c06e0e4efa8e5369b811a358b1,
+        ),
+        (
+            "/roots",
+            "root.list",
+            StatusCode::OK,
+            0x182cf4c06e0e4efa8e5369b811a358b2,
+        ),
+    ];
+    for (path, _, status, request_trace) in management_requests {
+        let response = client
+            .get(format!("{origin}{path}"))
+            .bearer_auth(admin)
+            .header(
+                "traceparent",
+                format!("00-{request_trace:032x}-{remote_span}-01"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{path}");
+        response.bytes().await.unwrap();
+    }
+
     let is_sql = |span: &Span| span.attributes.iter().any(|field| field.key == "db.system");
     let id = |trace| u128::from_str_radix(trace, 16).unwrap().to_be_bytes();
     let (trace_id, tool_trace_id, ignored_trace) = (id(trace), id(tool_trace), id(unsampled_trace));
     let missing_trace_id = id(missing_trace);
     let (mut statements, mut spans, mut phases) = (Vec::new(), Vec::new(), Vec::new());
+    let mut management: Vec<Span> = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while spans.len() < 8 || statements.is_empty() || phases.len() < 9 {
+        while spans.len() < 8
+            || statements.is_empty()
+            || phases.len() < 9
+            || !management_requests.iter().all(|(_, name, _, id)| {
+                management
+                    .iter()
+                    .any(|span| span.trace_id == id.to_be_bytes() && span.name == *name)
+            })
+        {
             let (headers, request) = batches.recv().await.unwrap();
             assert_eq!(headers["x-fixture-export"], "collector");
             let dump = format!("{request:?}");
@@ -2718,6 +2762,13 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
                 let framework = scope.scope.is_some_and(|scope| scope.name == "axum");
                 for span in scope.spans {
                     assert_ne!(span.trace_id, ignored_trace);
+                    if management_requests
+                        .iter()
+                        .any(|(_, _, _, id)| span.trace_id == id.to_be_bytes())
+                    {
+                        management.push(span);
+                        continue;
+                    }
                     if ![trace_id, tool_trace_id, missing_trace_id]
                         .iter()
                         .any(|id| span.trace_id == *id)
@@ -2875,6 +2926,45 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
     assert_eq!(outbound.parent_span_id, gateway_call.span_id);
     assert_eq!(outbound.span_id, sampled_outbound.unwrap());
     assert_eq!(outbound.trace_id, tool_trace_id);
+    for (_, name, status, id) in management_requests {
+        let trace_id = id.to_be_bytes();
+        let operation = management.iter().find(|span| span.name == name).unwrap();
+        assert_eq!(operation.trace_id, trace_id);
+        assert_eq!(
+            operation.status.as_ref().unwrap().code,
+            if status.is_success() { 1 } else { 2 }
+        );
+        assert!(management.iter().any(|span| {
+            span.trace_id == trace_id && span.kind == 2 && span.span_id == operation.parent_span_id
+        }));
+        let attribute = |key| {
+            operation
+                .attributes
+                .iter()
+                .find(|field| field.key == key)
+                .and_then(|field| field.value.as_ref()?.value.as_ref())
+        };
+        assert_eq!(
+            attribute("auth.method"),
+            Some(&Attribute::StringValue("jwt".into()))
+        );
+        if name == "root.list" {
+            assert_eq!(attribute("root.count"), Some(&Attribute::IntValue(0)));
+        } else {
+            assert!(
+                management
+                    .iter()
+                    .any(|span| is_sql(span) && span.parent_span_id == operation.span_id)
+            );
+        }
+        if name == "prompt.list" {
+            assert_eq!(attribute("limit"), Some(&Attribute::IntValue(2)));
+            assert_eq!(
+                attribute("visibility"),
+                Some(&Attribute::StringValue("public".into()))
+            );
+        }
+    }
     gateway.process.kill().await.unwrap();
     collector_task.abort();
 }

@@ -6,7 +6,9 @@ use axum::extract::{Path, Query};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use super::{catalog_api::*, *};
-use crate::{catalog::ToolRecord, credentials::decode_header_values};
+use crate::{
+    catalog::ToolRecord, credentials::decode_header_values, observability::scoped::ScopedSpan,
+};
 
 const MASK: &str = "*****";
 pub(super) const SECRET_HEADER: &str = "_mcpgateway_encrypted_header_value_v1";
@@ -87,48 +89,65 @@ async fn list_payload(
 ) -> Result<Value, CatalogApiError> {
     let projection = JsonProjection::parse(query.apijsonpath.as_deref())?;
     let page = CatalogPage::prepare(service, principal, query, "rest/tools")?;
-    let scope = access::catalog_scope(Some(principal));
-    let tools = if let Some(server) = server {
-        service
-            .database
-            .managed_server_tools(scope, &server.id, false)
-            .await?
+    let span = if let Some(server) = server {
+        ScopedSpan::authenticated("tool.list", principal, || {
+            json!({
+                "server_id": server.id,
+                "include_inactive": false,
+                "include_metrics": false,
+            })
+        })
     } else {
-        service
-            .database
-            .managed_tools(scope, page.filters())
-            .await?
+        page.span("tool.list", principal, query)
     };
-    let teams = header_team_owners(service, principal, &tools).await?;
-    let mut response = page.envelope(
-        service,
-        tools.iter().collect(),
-        "tools",
-        |tool| (&tool.created_at, &tool.id),
-        |tool| {
-            let team_owner = tool
-                .team_id
-                .as_deref()
-                .and_then(|team| teams.get(team))
-                .copied()
-                .unwrap_or(false);
-            metadata(
+    span.run(
+        async {
+            let scope = access::catalog_scope(Some(principal));
+            let tools = if let Some(server) = server {
+                service
+                    .database
+                    .managed_server_tools(scope, &server.id, false)
+                    .await?
+            } else {
+                service
+                    .database
+                    .managed_tools(scope, page.filters())
+                    .await?
+            };
+            let teams = header_team_owners(service, principal, &tools).await?;
+            let mut response = page.envelope(
                 service,
-                tool,
-                true,
-                false,
-                can_view_headers(principal, tool, team_owner),
-            )
+                tools.iter().collect(),
+                "tools",
+                |tool| (&tool.created_at, &tool.id),
+                |tool| {
+                    let team_owner = tool
+                        .team_id
+                        .as_deref()
+                        .and_then(|team| teams.get(team))
+                        .copied()
+                        .unwrap_or(false);
+                    metadata(
+                        service,
+                        tool,
+                        true,
+                        false,
+                        can_view_headers(principal, tool, team_owner),
+                    )
+                },
+            )?;
+            if let Some(projection) = projection {
+                if response.is_array() {
+                    response = projection.apply(&response);
+                } else {
+                    response["tools"] = projection.apply(&response["tools"]);
+                }
+            }
+            Ok(response)
         },
-    )?;
-    if let Some(projection) = projection {
-        if response.is_array() {
-            response = projection.apply(&response);
-        } else {
-            response["tools"] = projection.apply(&response["tools"]);
-        }
-    }
-    Ok(response)
+        "Tool listing failed",
+    )
+    .await
 }
 
 async fn detail(

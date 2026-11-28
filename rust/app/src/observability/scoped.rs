@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use opentelemetry::{
+    KeyValue,
     global::BoxedSpan,
     trace::{Span as _, Status},
 };
 use serde_json::Value;
 
+use crate::access::Principal;
+
 use super::{
     TraceContext, current_trace,
     telemetry::{ExportSpan, exported_attributes, langfuse},
+    with_trace,
 };
 
 #[derive(Default)]
@@ -44,6 +48,32 @@ impl ScopedSpan {
 
     pub(crate) fn context(&self) -> Option<TraceContext> {
         self.context.clone()
+    }
+
+    pub(crate) fn authenticated(
+        name: &'static str,
+        principal: &Principal,
+        attributes: impl FnOnce() -> Value,
+    ) -> Self {
+        let mut span = Self::start(name, attributes);
+        if let Some(recording) = span.recording() {
+            if let Some(policy) = langfuse::policy() {
+                policy.identify(principal, recording);
+            } else {
+                recording.set_attribute(KeyValue::new("auth.method", "jwt"));
+            }
+        }
+        span
+    }
+
+    pub(crate) async fn run<T, E>(
+        mut self,
+        operation: impl Future<Output = Result<T, E>>,
+        failure: &'static str,
+    ) -> Result<T, E> {
+        let result = with_trace(self.context(), operation).await;
+        self.finish(result.is_err().then_some(failure));
+        result
     }
 
     pub(crate) fn recording(&mut self) -> Option<&mut BoxedSpan> {

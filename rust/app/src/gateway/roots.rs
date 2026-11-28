@@ -12,6 +12,8 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use url::{ParseError, Url};
 
+use crate::observability::scoped::ScopedSpan;
+
 use super::*;
 use super::{
     catalog_api::CatalogApiError,
@@ -112,12 +114,31 @@ impl RootRegistry {
         self.roots.lock().expect("root catalog")
     }
 
-    pub(super) fn export_configuration(&self, selected: Option<&[String]>) -> Vec<Value> {
-        self.items()
-            .iter()
-            .filter(|root| selected.is_none_or(|uris| uris.contains(&root.uri)))
-            .map(|root| json!({"uri":root.uri,"name":root.name}))
-            .collect()
+    fn list_with<T>(&self, principal: &Principal, read: impl FnOnce(&[Root]) -> T) -> T {
+        let roots = self.items();
+        let mut span = ScopedSpan::authenticated(
+            "root.list",
+            principal,
+            || json!({"root.count": roots.len()}),
+        );
+        let result = read(&roots);
+        drop(roots);
+        span.finish(None);
+        result
+    }
+
+    pub(super) fn export_configuration(
+        &self,
+        principal: &Principal,
+        selected: Option<&[String]>,
+    ) -> Vec<Value> {
+        self.list_with(principal, |roots| {
+            roots
+                .iter()
+                .filter(|root| selected.is_none_or(|uris| uris.contains(&root.uri)))
+                .map(|root| json!({"uri":root.uri,"name":root.name}))
+                .collect()
+        })
     }
 
     fn canonical(&self, uri: &str) -> Result<String, RootError> {
@@ -168,17 +189,19 @@ impl RootRegistry {
             .ok_or_else(|| not_found(uri))
     }
 
-    pub(crate) fn search(&self, query: &str, limit: usize) -> Vec<Root> {
-        self.items()
-            .iter()
-            .filter(|root| {
-                query.is_empty()
-                    || root.name.to_lowercase().contains(query)
-                    || root.uri.to_lowercase().contains(query)
-            })
-            .take(limit)
-            .cloned()
-            .collect()
+    pub(crate) fn search(&self, principal: &Principal, query: &str, limit: usize) -> Vec<Root> {
+        self.list_with(principal, |roots| {
+            roots
+                .iter()
+                .filter(|root| {
+                    query.is_empty()
+                        || root.name.to_lowercase().contains(query)
+                        || root.uri.to_lowercase().contains(query)
+                })
+                .take(limit)
+                .cloned()
+                .collect()
+        })
     }
 
     pub(crate) fn add(&self, uri: &str, name: Option<String>) -> Result<Root, RootError> {
@@ -314,7 +337,7 @@ async fn list(
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<Root>>, RootError> {
     require_admin(&service, &principal).await?;
-    Ok(Json(service.roots.items().clone()))
+    Ok(Json(service.roots.list_with(&principal, <[Root]>::to_vec)))
 }
 
 #[derive(Deserialize)]
