@@ -4,11 +4,13 @@ use axum::{
     extract::{Path, Query},
     http::HeaderValue,
 };
+use opentelemetry::{KeyValue, trace::Span as _};
 use serde_json::Map;
 use sqlx::types::Json as DbJson;
 
 use super::{catalog_api::*, *};
 use crate::catalog::{AgentInteraction, AgentLookup, AgentRecord, AgentWriteError};
+use crate::observability::{scoped::ScopedSpan, with_trace};
 use crate::schema_validation::Target;
 use crate::uaid::{self, UaidInput};
 use crate::upstream::RestResponse;
@@ -302,35 +304,53 @@ async fn register_agent(
     if let Some(uaid) = uaid {
         record.set_uaid(uaid);
     }
-    let agent = app
-        .database
-        .insert_agent(
-            &record,
-            encoded_query.as_ref(),
-            &cards::stored_rows(cards.as_ref()),
-        )
-        .await
-        .map_err(|error| match error {
-            AgentWriteError::Duplicate { id, enabled } => {
-                let inactive = if enabled { "" } else { " (inactive)" };
-                CatalogApiError::detail(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "A2A agent with name '{}' already exists{inactive} (ID: {id})",
-                        record.slug
-                    ),
-                )
-            }
-            AgentWriteError::Changed | AgentWriteError::ToolConflict => {
-                lifecycle::write_error(error, &record)
-            }
-            AgentWriteError::Database(error) => error.into(),
-        })?;
-    app.subscriptions.changed(
-        &agent.visibility,
-        agent.team_id.as_deref(),
-        agent.owner_email.as_deref(),
+    let mut span = ScopedSpan::authenticated("a2a.register", principal, || {
+        json!({
+            "a2a.agent.name": record.name,
+            "a2a.agent.type": record.agent_type,
+            "team_id": record.team_id,
+            "visibility": record.visibility,
+        })
+    });
+    let stored_cards = cards::stored_rows(cards.as_ref());
+    let result = with_trace(span.context(), async {
+        let agent = app
+            .database
+            .insert_agent(&record, encoded_query.as_ref(), &stored_cards)
+            .await?;
+        app.subscriptions.changed(
+            &agent.visibility,
+            agent.team_id.as_deref(),
+            agent.owner_email.as_deref(),
+        );
+        Ok::<_, AgentWriteError>(agent)
+    })
+    .await;
+    if let (Ok(agent), Some(recording)) = (&result, span.recording()) {
+        recording.set_attribute(KeyValue::new("a2a.agent.id", agent.id.clone()));
+    }
+    lifecycle::finish_span(
+        &mut span,
+        result.is_err().then_some("A2A agent registration failed"),
+        matches!(result, Err(AgentWriteError::Duplicate { .. }))
+            .then_some("A2AAgentNameConflictError"),
     );
+    let agent = result.map_err(|error| match error {
+        AgentWriteError::Duplicate { id, enabled } => {
+            let inactive = if enabled { "" } else { " (inactive)" };
+            CatalogApiError::detail(
+                StatusCode::CONFLICT,
+                format!(
+                    "A2A agent with name '{}' already exists{inactive} (ID: {id})",
+                    record.slug
+                ),
+            )
+        }
+        AgentWriteError::Changed | AgentWriteError::ToolConflict => {
+            lifecycle::write_error(error, &record)
+        }
+        AgentWriteError::Database(error) => error.into(),
+    })?;
     Ok(read_agent(&agent))
 }
 

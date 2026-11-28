@@ -302,15 +302,32 @@ pub(super) async fn set_agent_state(
     } else {
         "deactivate the Agent"
     };
-    let previous = editable(app, principal, id, "a2a.update", action, admin).await?;
-    let result = app
-        .database
-        .set_agent_state(&previous, enabled)
-        .await
-        .map_err(|error| write_error(error, &previous))?;
-    changed(app, &result);
-    tracing::info!(actor = %principal.email, agent_id = %id, enabled, "A2A agent state set");
-    Ok(read_agent(&result))
+    let permission = "a2a.update";
+    require_edit(app, principal, permission, admin).await?;
+    let mut span = ScopedSpan::authenticated("a2a.state_change", principal, || {
+        json!({
+            "a2a.agent.id": Uuid::try_parse(id).ok().map(|_| id),
+            "a2a.agent.activate": enabled,
+        })
+    });
+    let result = with_trace(span.context(), async {
+        let previous = editable_agent(app, principal, id, permission, action, admin).await?;
+        let result = app
+            .database
+            .set_agent_state(&previous, enabled)
+            .await
+            .map_err(|error| write_error(error, &previous))?;
+        changed(app, &result);
+        tracing::info!(actor = %principal.email, agent_id = %id, enabled, "A2A agent state set");
+        Ok(read_agent(&result))
+    })
+    .await;
+    finish_span(
+        &mut span,
+        result.is_err().then_some("A2A agent state change failed"),
+        mutation_error_type(&result),
+    );
+    result
 }
 
 #[derive(Deserialize)]
@@ -338,14 +355,59 @@ pub(super) async fn remove_agent(
     purge_metrics: bool,
     admin: bool,
 ) -> Result<(), CatalogApiError> {
-    let previous = editable(app, principal, id, "a2a.delete", "delete this agent", admin).await?;
-    app.database
-        .delete_agent(&previous, purge_metrics)
-        .await
-        .map_err(|error| write_error(error, &previous))?;
-    changed(app, &previous);
-    tracing::info!(actor = %principal.email, agent_id = %id, purge_metrics, "A2A agent deleted");
-    Ok(())
+    let permission = "a2a.delete";
+    require_edit(app, principal, permission, admin).await?;
+    let mut span = ScopedSpan::authenticated("a2a.delete", principal, || {
+        json!({
+            "a2a.agent.id": Uuid::try_parse(id).ok().map(|_| id),
+            "purge_metrics": purge_metrics,
+        })
+    });
+    let result = with_trace(span.context(), async {
+        let previous =
+            editable_agent(app, principal, id, permission, "delete this agent", admin).await?;
+        app.database
+            .delete_agent(&previous, purge_metrics)
+            .await
+            .map_err(|error| write_error(error, &previous))?;
+        changed(app, &previous);
+        tracing::info!(actor = %principal.email, agent_id = %id, purge_metrics, "A2A agent deleted");
+        Ok(())
+    })
+    .await;
+    finish_span(
+        &mut span,
+        result.is_err().then_some("A2A agent deletion failed"),
+        mutation_error_type(&result),
+    );
+    result
+}
+
+fn mutation_error_type<T>(result: &Result<T, CatalogApiError>) -> Option<&'static str> {
+    match result.as_ref().err()?.0 {
+        StatusCode::NOT_FOUND => Some("A2AAgentNotFoundError"),
+        StatusCode::FORBIDDEN => Some("PermissionError"),
+        _ => None,
+    }
+}
+
+pub(super) fn finish_span(
+    span: &mut ScopedSpan,
+    failure: Option<&'static str>,
+    error_type: Option<&'static str>,
+) {
+    if let Some(recording) = span.recording() {
+        let outcome = if failure.is_some() {
+            "error"
+        } else {
+            "success"
+        };
+        recording.set_attribute(KeyValue::new(outcome, true));
+        if let Some(error_type) = error_type {
+            recording.set_attribute(KeyValue::new("error.type", error_type));
+        }
+    }
+    span.finish(failure);
 }
 
 pub(super) async fn editable(
@@ -356,8 +418,28 @@ pub(super) async fn editable(
     action: &str,
     admin: bool,
 ) -> Result<AgentRecord, CatalogApiError> {
+    require_edit(app, principal, permission, admin).await?;
+    editable_agent(app, principal, id, permission, action, admin).await
+}
+
+async fn require_edit(
+    app: &GatewayService,
+    principal: &Principal,
+    permission: &str,
+    admin: bool,
+) -> Result<(), CatalogApiError> {
     require_enabled(app)?;
-    require_catalog_permission(app, principal, permission, !admin).await?;
+    require_catalog_permission(app, principal, permission, !admin).await
+}
+
+async fn editable_agent(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    permission: &str,
+    action: &str,
+    admin: bool,
+) -> Result<AgentRecord, CatalogApiError> {
     let agent = find(app, Some(principal), AgentLookup::Id(id)).await?;
     let role = agent
         .team_id

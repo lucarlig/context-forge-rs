@@ -607,6 +607,18 @@ Identity capture uses the existing opt-in policy. With identity capture
 enabled, Rust includes the admin team scope on management catalog spans.
 The reference omits this attribute on several admin listings.
 
+A2A registration, activation, deactivation, and deletion export lifecycle
+spans through the API and Admin UI. Registration traces the durable write
+after Agent Card discovery. State and deletion spans trace the authorized
+lookup and write. Spans record outcomes, duplicate or missing agent errors,
+and the requested metrics purge. Registration uses the opt-in identity
+policy for the actor email. The reference also exports a `created_by` field.
+
+Five Rust Anything cases compare REST and Admin UI lifecycle traces on
+both SQLite and PostgreSQL. They cover missing agents, conflicts, failed
+card discovery, disabled routes, and unsampled requests. A live Rust test
+checks SQL and request ancestry and verifies that spans omit credentials.
+
 Set `OTEL_REDIS_INSTRUMENTATION_ENABLED=true` to export Redis client spans
 for request-scoped commands. This covers session affinity, legacy SSE queues,
 shared catalog and token caches, and Redis rate limiting. Command spans carry

@@ -2970,6 +2970,179 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
 }
 
 #[tokio::test]
+async fn a2a_lifecycle_traces_storage_results_without_credentials() {
+    use axum::{Router, body::Bytes, routing::post};
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value::Value as Attribute,
+    };
+    use prost::Message;
+    use reqwest::Method;
+    use serde_json::{Value, json};
+
+    const SECRET: &str = "fixture-a2a-registration-credential";
+    let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = format!("http://{}", collector.local_addr().unwrap());
+    let endpoint = format!("{peer}/v1/traces");
+    let (exports, mut batches) = tokio::sync::mpsc::unbounded_channel();
+    let collector_task = tokio::spawn(async move {
+        let routes = Router::new().route(
+            "/v1/traces",
+            post(move |body: Bytes| {
+                let exports = exports.clone();
+                async move {
+                    exports
+                        .send(ExportTraceServiceRequest::decode(body).unwrap())
+                        .unwrap();
+                    ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
+                }
+            }),
+        );
+        axum::serve(collector, routes).await.unwrap();
+    });
+    let mut gateway = gateway_with_env(&[
+        ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_SQLALCHEMY_INSTRUMENTATION_ENABLED", "true"),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+        ("OTEL_BSP_SCHEDULE_DELAY", "30"),
+    ])
+    .await;
+    let (client, origin) = (&gateway.client, &gateway.origin);
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"email":EMAIL,"password":gateway.password}).to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let login: Value = serde_json::from_slice(&login).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    let trace = |step| 0x67a38a88935544f0a918c3bf5b50d2a0_u128 + step;
+    let request = |method, path: &str, step| {
+        client
+            .request(method, format!("{origin}{path}"))
+            .bearer_auth(token)
+            .header(
+                "traceparent",
+                format!("00-{:032x}-22449223b0c04ed6-01", trace(step)),
+            )
+    };
+    let registration = json!({"visibility":"public","agent":{
+        "name":"Traced Agent", "endpoint_url":format!("{peer}/agent?token={SECRET}"),
+        "auth_type":"bearer", "auth_token":SECRET
+    }});
+    let create = |step| {
+        request(Method::POST, "/a2a", step)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(registration.to_string())
+            .send()
+    };
+    let created = create(1).await.unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(&created.bytes().await.unwrap()).unwrap();
+    let id = created["id"].as_str().unwrap();
+    let duplicate = create(2).await.unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    let state = format!("/a2a/{id}/state?activate=false");
+    let state = request(Method::POST, &state, 3).send().await.unwrap();
+    assert_eq!(state.status(), StatusCode::OK);
+    let state: Value = serde_json::from_slice(&state.bytes().await.unwrap()).unwrap();
+    assert_eq!(state["enabled"], false);
+    let deletion = format!("/a2a/{id}?purge_metrics=true");
+    let deleted = request(Method::DELETE, &deletion, 4).send().await.unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let missing = request(Method::DELETE, &deletion, 5).send().await.unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let expected = [
+        "a2a.register",
+        "a2a.register",
+        "a2a.state_change",
+        "a2a.delete",
+        "a2a.delete",
+    ];
+    let is_sql = |span: &opentelemetry_proto::tonic::trace::v1::Span| {
+        span.attributes.iter().any(|field| field.key == "db.system")
+    };
+    let mut spans = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let batch = batches.recv().await.unwrap();
+            assert!(!format!("{batch:?}").contains(SECRET));
+            spans.extend(
+                batch
+                    .resource_spans
+                    .into_iter()
+                    .flat_map(|resource| resource.scope_spans)
+                    .flat_map(|scope| scope.spans),
+            );
+            if expected.iter().enumerate().all(|(index, name)| {
+                let trace_id = trace(index as u128 + 1).to_be_bytes();
+                spans.iter().any(|span| {
+                    span.trace_id == trace_id
+                        && span.name == *name
+                        && spans
+                            .iter()
+                            .any(|child| is_sql(child) && child.parent_span_id == span.span_id)
+                        && spans
+                            .iter()
+                            .any(|parent| parent.kind == 2 && parent.span_id == span.parent_span_id)
+                })
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    for (index, name) in expected.iter().enumerate() {
+        let trace_id = trace(index as u128 + 1).to_be_bytes();
+        let span = spans
+            .iter()
+            .find(|span| span.trace_id == trace_id && span.name == *name)
+            .unwrap();
+        let attribute = |key| {
+            span.attributes
+                .iter()
+                .find(|field| field.key == key)
+                .and_then(|field| field.value.as_ref()?.value.as_ref())
+        };
+        let error_type = match index {
+            1 => Some("A2AAgentNameConflictError"),
+            4 => Some("A2AAgentNotFoundError"),
+            _ => None,
+        };
+        assert_eq!(
+            span.status.as_ref().unwrap().code,
+            if error_type.is_some() { 2 } else { 1 }
+        );
+        assert_eq!(
+            attribute("error.type").cloned(),
+            error_type.map(|name| Attribute::StringValue(name.into()))
+        );
+        let agent = (index != 1).then(|| Attribute::StringValue(id.into()));
+        assert_eq!(attribute("a2a.agent.id"), agent.as_ref());
+        assert_eq!(
+            attribute(if error_type.is_some() {
+                "error"
+            } else {
+                "success"
+            }),
+            Some(&Attribute::BoolValue(true))
+        );
+        assert!(attribute("created_by").is_none());
+        assert!(attribute("user.email").is_none());
+    }
+    gateway.process.kill().await.unwrap();
+    collector_task.abort();
+}
+
+#[tokio::test]
 async fn traces_background_probes_and_mcp_tool_errors_without_upstream_credentials() {
     use std::sync::{
         Arc,
