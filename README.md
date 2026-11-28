@@ -18,6 +18,8 @@ The binary listens on `127.0.0.1:4444` and uses `sqlite:///./mcp.db` by default.
 
 `--host` and `--port` override the listener environment variables. The gateway uses `MCG_HOST` and `MCG_PORT` when their canonical variables are unset. Use `--port 0` to select an available port. On Unix, `--uds /path/to/gateway.sock` binds a filesystem socket with permissions set by the process umask.
 
+Use `--fd 3` when a supervisor passes a TCP or Unix stream socket as descriptor 3. The inherited socket takes precedence over the bind options. The supervisor retains ownership of any Unix socket path.
+
 ### Containers
 
 The image contains the gateway and `context-forge-translate`. It runs as UID 10001 and checks `/ready` over TCP on `PORT`. Put a strong `PLATFORM_ADMIN_PASSWORD` and independent random values for `JWT_SECRET_KEY` and `AUTH_ENCRYPTION_SECRET` in a private `.env` file.

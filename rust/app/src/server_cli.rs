@@ -17,6 +17,11 @@ use std::{
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
+#[cfg(unix)]
+mod inherited;
+#[cfg(unix)]
+pub(crate) use inherited::InheritedListener;
+
 #[derive(Parser)]
 #[command(
     name = "context-forge-rs",
@@ -41,19 +46,37 @@ pub(crate) struct ServerArgs {
     #[cfg(unix)]
     #[arg(long, value_name = "PATH")]
     pub(crate) uds: Option<PathBuf>,
+
+    /// Accept connections from a stream socket passed by the launcher.
+    #[cfg(unix)]
+    #[arg(long, value_name = "FD", value_parser = clap::value_parser!(i32).range(0..))]
+    pub(crate) fd: Option<std::os::fd::RawFd>,
 }
 
 pub(crate) enum ServerListener {
     Tcp(TcpListener, SocketAddr),
     #[cfg(unix)]
-    Unix(UnixListener, SocketFile),
+    Unix(UnixListener, Option<SocketFile>),
 }
 
 impl ServerListener {
     pub(crate) async fn bind(
         settings: &Settings,
         #[cfg(unix)] path: Option<PathBuf>,
+        #[cfg(unix)] inherited: Option<InheritedListener>,
     ) -> io::Result<Self> {
+        #[cfg(unix)]
+        if let Some(listener) = inherited {
+            return match listener {
+                InheritedListener::Tcp(listener) => {
+                    let address = listener.local_addr()?;
+                    Ok(Self::Tcp(TcpListener::from_std(listener)?, address))
+                }
+                InheritedListener::Unix(listener) => {
+                    Ok(Self::Unix(UnixListener::from_std(listener)?, None))
+                }
+            };
+        }
         #[cfg(unix)]
         if let Some(path) = path {
             let listener = UnixListener::bind(&path)?;
@@ -63,11 +86,11 @@ impl ServerListener {
             }
             return Ok(Self::Unix(
                 listener,
-                SocketFile {
+                Some(SocketFile {
                     path,
                     device: metadata.dev(),
                     inode: metadata.ino(),
-                },
+                }),
             ));
         }
 
@@ -104,7 +127,7 @@ impl ServerListener {
             }
             #[cfg(unix)]
             Self::Unix(listener, socket) => {
-                tracing::info!(path = %socket.path.display(), "gateway listening");
+                tracing::info!(address = ?listener.local_addr(), "gateway listening");
                 let result = boundary
                     .serve_unix(listener, router, shutdown, background)
                     .await;
@@ -151,18 +174,18 @@ mod tests {
 
         fs::write(&path, "keep").unwrap();
         assert!(
-            ServerListener::bind(&settings, Some(path.clone()))
+            ServerListener::bind(&settings, Some(path.clone()), None)
                 .await
                 .is_err()
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "keep");
         fs::remove_file(&path).unwrap();
 
-        let listener = ServerListener::bind(&settings, Some(path.clone()))
+        let listener = ServerListener::bind(&settings, Some(path.clone()), None)
             .await
             .unwrap();
         assert!(
-            ServerListener::bind(&settings, Some(path.clone()))
+            ServerListener::bind(&settings, Some(path.clone()), None)
                 .await
                 .is_err()
         );

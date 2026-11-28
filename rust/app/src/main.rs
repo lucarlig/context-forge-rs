@@ -22,7 +22,20 @@ use tracing_subscriber::{
 
 mod server_cli;
 
+#[cfg(unix)]
+use server_cli::InheritedListener;
 use server_cli::{ServerArgs, ServerListener};
+
+enum Startup {
+    RotateCredentials,
+    Migrate,
+    Configuration(&'static str),
+    Server {
+        arguments: ServerArgs,
+        #[cfg(unix)]
+        inherited: Option<InheritedListener>,
+    },
+}
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let command = std::env::args_os().nth(1);
@@ -33,36 +46,69 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some(context_forge_rs::schema_validation::WORKER_ARG) => {
             context_forge_rs::schema_validation::worker().map_err(Into::into)
         }
-        _ => run(),
+        Some("rotate-credentials") => run(Startup::RotateCredentials),
+        Some("migrate") => run(Startup::Migrate),
+        Some("export") => run(Startup::Configuration("export")),
+        Some("import") => run(Startup::Configuration("import")),
+        _ => {
+            let arguments = ServerArgs::parse();
+            #[cfg(unix)]
+            let inherited = arguments
+                .fd
+                .map(|fd| {
+                    // SAFETY: --fd transfers an inherited listener before the runtime starts.
+                    unsafe { InheritedListener::adopt(fd) }
+                        .map_err(|error| format!("invalid --fd {fd}: {error}"))
+                })
+                .transpose()?;
+            run(Startup::Server {
+                arguments,
+                #[cfg(unix)]
+                inherited,
+            })
+        }
     }
 }
 
 #[tokio::main]
-async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let command = std::env::args_os().nth(1);
-    let args = std::env::args().skip(2);
-    match command.as_deref().and_then(|argument| argument.to_str()) {
-        Some("rotate-credentials") => {
-            return context_forge_rs::credential_rotation::cli(args).await;
+async fn run(startup: Startup) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let arguments;
+    #[cfg(unix)]
+    let inherited;
+    let remaining_args = std::env::args().skip(2);
+    match startup {
+        Startup::RotateCredentials => {
+            return context_forge_rs::credential_rotation::cli(remaining_args).await;
         }
-        Some("migrate") => return schema::cli(args).await,
-        Some(command @ ("export" | "import")) => {
-            return context_forge_rs::configuration_cli::run(command, args).await;
+        Startup::Migrate => return schema::cli(remaining_args).await,
+        Startup::Configuration(command) => {
+            return context_forge_rs::configuration_cli::run(command, remaining_args).await;
         }
-        _ => {}
+        Startup::Server {
+            arguments: options,
+            #[cfg(unix)]
+                inherited: socket,
+        } => {
+            arguments = options;
+            #[cfg(unix)]
+            {
+                inherited = socket;
+            }
+        }
     }
-    let options = ServerArgs::parse();
     let (filter, handle) = reload::Layer::new(LevelFilter::INFO);
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    let mut settings = Settings::from_env_with_listener(options.host, options.port)?;
+    let mut settings = Settings::from_env_with_listener(arguments.host, arguments.port)?;
     let listener = ServerListener::bind(
         &settings,
         #[cfg(unix)]
-        options.uds,
+        arguments.uds,
+        #[cfg(unix)]
+        inherited,
     )
     .await?;
     settings.port = listener.port().unwrap_or(settings.port);

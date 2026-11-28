@@ -135,6 +135,18 @@ enables forwarded client addresses.
 A Linux arm64 container check verifies Unix socket readiness and removal
 after graceful shutdown.
 
+`--fd` adopts an inherited TCP or Unix stream socket before the Tokio
+runtime starts. The gateway sets close-on-exec and nonblocking mode and
+uses the normal HTTP boundary. Inherited TCP sockets supply the active
+port. Filesystem Unix socket paths remain with the launcher.
+
+Thirteen Rust Anything cases cover IPv4, IPv6, and Unix sockets, including
+already listening sockets, bound sockets, unbound TCP sockets, and file
+descriptor zero. The cases also verify bind-option precedence and
+rejection of closed descriptors, regular files, datagrams, connected
+streams, and unnamed Unix sockets. A Rust test checks descriptor flags.
+A Linux arm64 container check verifies both inherited transports.
+
 ## HTTP request boundary
 
 The gateway enables correlation IDs and request header limits by default.
