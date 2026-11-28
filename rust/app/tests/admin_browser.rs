@@ -2509,7 +2509,8 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
         routing::{get, post},
     };
     use opentelemetry_proto::tonic::{
-        collector::trace::v1::ExportTraceServiceRequest, trace::v1::Span,
+        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value::Value as Attribute,
+        trace::v1::Span,
     };
     use prost::Message;
     use serde_json::{Value, json};
@@ -2552,6 +2553,11 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
         ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
         ("OTEL_EXPORTER_OTLP_HEADERS", "x-fixture-export=collector"),
+        ("OTEL_COPY_RESOURCE_ATTRS_TO_SPANS", "true"),
+        (
+            "OTEL_RESOURCE_ATTRIBUTES",
+            "arize.project.name=fixture-project,model_id=fixture-model,fixture.unrelated=resource-only",
+        ),
         ("OTEL_BSP_SCHEDULE_DELAY", "30"),
     ])
     .await;
@@ -2697,6 +2703,27 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
             .is_err()
     );
     assert_eq!(spans.len(), 5);
+    for span in spans.iter().chain(&statements) {
+        for (key, expected) in [
+            ("arize.project.name", "fixture-project"),
+            ("model_id", "fixture-model"),
+        ] {
+            let attribute = span
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key == key)
+                .and_then(|attribute| attribute.value.as_ref()?.value.as_ref());
+            assert_eq!(
+                attribute,
+                Some(&Attribute::StringValue(expected.to_owned()))
+            );
+        }
+        assert!(
+            span.attributes
+                .iter()
+                .all(|field| field.key != "fixture.unrelated")
+        );
+    }
     let trace_id = u128::from_str_radix(trace, 16).unwrap().to_be_bytes();
     let root = spans
         .iter()

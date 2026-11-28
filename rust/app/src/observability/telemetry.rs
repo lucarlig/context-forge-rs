@@ -20,7 +20,7 @@ use axum::{
 };
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use opentelemetry::{
-    InstrumentationScope, KeyValue,
+    Context, InstrumentationScope, Key, KeyValue,
     global::{self, BoxedSpan},
     propagation::{Extractor, TextMapPropagator},
     trace::{
@@ -33,9 +33,11 @@ use opentelemetry_otlp::{
 };
 use opentelemetry_sdk::{
     Resource,
+    error::OTelSdkResult,
     propagation::TraceContextPropagator,
     trace::{
         BatchConfigBuilder, BatchSpanProcessor, SdkTracer, SdkTracerProvider, Span as SdkSpan,
+        SpanData, SpanProcessor,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -157,6 +159,11 @@ impl Telemetry {
             settings_pairs(&value("OTEL_RESOURCE_ATTRIBUTES", "")?)
                 .map(|(key, value)| KeyValue::new(key.to_owned(), value.to_owned())),
         );
+        let builder = if flag("OTEL_COPY_RESOURCE_ATTRS_TO_SPANS")?.unwrap_or(false) {
+            builder.with_span_processor(ResourceSpanAttributes::default())
+        } else {
+            builder
+        };
         let provider = builder
             .with_resource(Resource::builder().with_attributes(attributes).build())
             .build();
@@ -199,6 +206,35 @@ impl Telemetry {
         if !matches!(shutdown, Ok(Ok(()))) {
             tracing::warn!("OpenTelemetry shutdown could not flush all spans");
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResourceSpanAttributes {
+    attributes: Vec<KeyValue>,
+}
+
+impl SpanProcessor for ResourceSpanAttributes {
+    fn set_resource(&mut self, resource: &Resource) {
+        self.attributes = ["arize.project.name", "model_id"]
+            .into_iter()
+            .map(Key::from_static_str)
+            .filter_map(|key| resource.get(&key).map(|value| KeyValue::new(key, value)))
+            .collect();
+    }
+
+    fn on_start(&self, span: &mut SdkSpan, _: &Context) {
+        span.set_attributes(self.attributes.iter().cloned());
+    }
+
+    fn on_end(&self, _: SpanData) {}
+
+    fn force_flush(&self) -> OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(&self, _: Duration) -> OTelSdkResult {
+        Ok(())
     }
 }
 

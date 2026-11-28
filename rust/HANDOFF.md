@@ -603,6 +603,15 @@ A live Rust collector test checks the validated authorization against a
 signal-specific header override. Framework spans, Jaeger and Zipkin export,
 and Langfuse prompt version and session metadata remain open.
 
+Set `OTEL_COPY_RESOURCE_ATTRS_TO_SPANS=true` to copy `arize.project.name`
+and `model_id` from the OpenTelemetry resource to recorded spans. Other
+attributes stay on the resource. The setting defaults to off.
+
+The pinned gateway raises a span processor callback error with the setting
+enabled and OpenTelemetry SDK 1.45.2. The disabled case matches in Rust
+Anything. Native collector checks verify the selected attributes on HTTP,
+operation, outbound, and SQL spans and preserve unsampled requests.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.
