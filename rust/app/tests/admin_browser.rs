@@ -1706,6 +1706,99 @@ async fn roots_dashboard_shares_the_registry_and_requires_unrestricted_admin() {
 }
 
 #[tokio::test]
+async fn unified_search_keeps_owned_tools_inside_the_token_team() {
+    use serde_json::{Value, json};
+
+    let mut gateway = gateway().await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let post = |path, token: Option<&str>, body: Value| {
+        let request = client
+            .post(format!("{origin}{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        let request = match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert!(status.is_success(), "{status} {body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        }
+    };
+    let login = post(
+        "/auth/email/login",
+        None,
+        json!({"email":EMAIL,"password":password}),
+    )
+    .await;
+    let admin = login["access_token"].as_str().unwrap();
+    let mut teams = Vec::new();
+    for (team, tool) in [
+        ("Search Alpha", "alpha-owned"),
+        ("Search Beta", "beta-owned"),
+    ] {
+        let team = post(
+            "/teams",
+            Some(admin),
+            json!({"name":team,"visibility":"private"}),
+        )
+        .await;
+        post(
+            "/tools",
+            Some(admin),
+            json!({"tool":{"name":tool,"url":"https://example.test/search","integration_type":"REST",
+                           "request_type":"GET","input_schema":{"type":"object"},"visibility":"private"},
+                   "team_id":team["id"]}),
+        )
+        .await;
+        teams.push(team);
+    }
+    post(
+        "/servers",
+        Some(admin),
+        json!({"server":{"name":"search-owned-server"},"visibility":"public"}),
+    )
+    .await;
+    let issued = post(
+        "/tokens",
+        Some(admin),
+        json!({"name":"search-team-token","team_id":teams[0]["id"],"expires_in_days":1,
+               "scope":{"permissions":["tools.read"]}}),
+    )
+    .await;
+    let token = issued["access_token"].as_str().unwrap();
+    let endpoint = format!("{origin}/v1/search?q=owned&entity_types=tools,servers");
+    let search = |url, token: &str| client.get(url).bearer_auth(token).send();
+    let baseline = search(endpoint.clone(), admin).await.unwrap();
+    let baseline: Value = serde_json::from_str(&baseline.text().await.unwrap()).unwrap();
+    assert_eq!(baseline["count"], 3);
+    let scoped = search(endpoint.clone(), token).await.unwrap();
+    assert_eq!(scoped.status(), StatusCode::OK);
+    let scoped: Value = serde_json::from_str(&scoped.text().await.unwrap()).unwrap();
+    assert_eq!(scoped["count"], 1);
+    assert_eq!(scoped["items"][0]["name"], "alpha-owned");
+    assert_eq!(scoped["results"]["servers"], json!([]));
+    let other_team = format!("{endpoint}&team_id={}", teams[1]["id"].as_str().unwrap());
+    let scoped = search(other_team, token).await.unwrap();
+    assert_eq!(scoped.status(), StatusCode::OK);
+    let scoped: Value = serde_json::from_str(&scoped.text().await.unwrap()).unwrap();
+    assert_eq!(scoped["count"], 0);
+    let forbidden = search(format!("{origin}/v1/admin/search?q=owned"), token)
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    gateway.process.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn disabling_legacy_api_preserves_versioned_browser_forms_and_server_sse() {
     let mut gateway = gateway_with_env(&[
         ("LEGACY_API_ENABLED", "false"),

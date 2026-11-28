@@ -22,6 +22,7 @@ mod entry_filters;
 mod metrics;
 mod prompts;
 mod resources;
+mod search;
 mod servers;
 mod tools;
 pub(crate) use agent_push_configs::{PushConfig, PushConfigInput, PushConfigWriteError};
@@ -33,6 +34,7 @@ pub(crate) use entry_filters::{CatalogEntryFilters, ManagedCatalog, managed_visi
 pub(crate) use metrics::{ExecutionMetrics, MetricEntity};
 pub(crate) use prompts::{PromptRecord, PromptWriteError};
 pub(crate) use resources::{ResourceRecord, ResourceWriteError};
+pub(crate) use search::{SearchFilters, SearchKind, escape_like, parse_tag_groups};
 pub(crate) use servers::{
     ServerInterfaceInput, ServerLinkUpdate, ServerLinks, ServerRecord, ServerWriteError,
 };
@@ -867,9 +869,10 @@ macro_rules! insert_tool {
             "INSERT INTO tools (
                 id, gateway_id, name, original_name, custom_name_slug, custom_name, description, original_description,
                 title, input_schema, output_schema, annotations, url, enabled, reachable, created_at, updated_at,
+                display_name,
                 jsonpath_filter, integration_type, request_type, created_by, owner_email, team_id, visibility, tags
             ) VALUES ($1, $2, $3, $4, $5, $4, $6, $6, $7, ", $input_schema, ", ", $output_schema, ", ", $annotations, ",
-                $11, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '', 'MCP', $15, $12, $12, $13, $14, '[]')"
+                $11, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $16, '', 'MCP', $15, $12, $12, $13, $14, '[]')"
         )
     };
 }
@@ -1495,6 +1498,7 @@ impl Database {
                         .bind(gateway.team_id)
                         .bind(gateway.visibility)
                         .bind(gateway.transport.name())
+                        .bind(display_name(&definition.name))
                         .execute(&mut *$tx)
                         .await?;
                 }
@@ -1767,6 +1771,24 @@ pub(crate) fn prompt_argument_schema(prompt: &rmcp::model::Prompt) -> Value {
         }
     }
     json!({"type":"object","properties":properties,"required":required})
+}
+
+pub(crate) fn display_name(name: &str) -> String {
+    name.split(|character: char| character.is_whitespace() || matches!(character, '_' | '-' | '.'))
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let initial = characters.next().expect("nonempty name component");
+            initial
+                .to_uppercase()
+                .chain(characters.flat_map(char::to_lowercase))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(255)
+        .collect()
 }
 
 pub(crate) fn slugify(value: &str) -> String {

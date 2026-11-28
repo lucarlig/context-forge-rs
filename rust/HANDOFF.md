@@ -350,6 +350,27 @@ Six Rust Anything scenarios match on SQLite and PostgreSQL. A separate case
 checks the Redis version and redaction with an authenticated Redis server.
 Chromium verifies sign-in, the Version info link, and the partial HTML.
 
+## Unified search
+
+`/v1/search` and its legacy alias return grouped and flattened results.
+The admin endpoints and Search section use the same query. Search enforces
+entity permissions and token team scope before ranking and limiting rows.
+It supports literal text, grouped tags, inactive entries, and gateway filters.
+
+Opt in to the `catalog` entity type to search open entries in the bundled
+or operator-configured YAML catalog. The native decoder is serde-saphyr.
+It reads bounded files with no file inclusion and uses no Python dependency.
+[serde-saphyr documentation](https://docs.rs/serde-saphyr/2.2.0/serde_saphyr/)
+
+Six Rust Anything scenarios match on SQLite and PostgreSQL. They cover query
+validation, result grouping, tag and gateway filters, team-scoped tokens,
+browser-session authentication, and the admin feature flag. Chromium verifies
+the dashboard search. The live Rust test verifies that a team-scoped token
+cannot see a private tool owned by the same account in a different team.
+
+New MCP and A2A registrations save display names for their tools. Refresh an
+existing MCP gateway or edit an existing A2A agent to populate missing names.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

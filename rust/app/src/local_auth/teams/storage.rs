@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::catalog::{SearchFilters, escape_like};
 
 #[derive(sqlx::FromRow)]
 pub(super) struct Team {
@@ -216,6 +217,35 @@ macro_rules! team_transaction {
 }
 
 impl Database {
+    pub(crate) async fn search_team_items(
+        &self,
+        filter: &SearchFilters<'_>,
+    ) -> Result<Vec<Value>, sqlx::Error> {
+        let text = format!("%{}%", escape_like(filter.text));
+        let teams = json!(filter.team_ids).to_string();
+        macro_rules! query {
+            ($pool:expr, $team_index:literal) => {
+                sqlx::query_as::<_, Team>(concat!(
+                    "WITH visible_teams(id) AS (", $team_index, ") SELECT ", team_fields!(),
+                    " FROM email_teams t WHERE (t.is_active OR $1)
+                       AND (($2 AND (NOT t.is_personal OR t.created_by=$3))
+                           OR (NOT $2 AND t.id IN (SELECT id FROM visible_teams)))
+                       AND (LOWER(t.name) LIKE $5 ESCAPE '\\' OR LOWER(t.slug) LIKE $5 ESCAPE '\\'
+                            OR LOWER(t.description) LIKE $5 ESCAPE '\\')
+                       ORDER BY t.created_at DESC,t.id DESC LIMIT $6"
+                )).bind(filter.include_inactive).bind(filter.unrestricted).bind(filter.email)
+                    .bind(&teams).bind(&text).bind(filter.limit).fetch_all($pool).await?
+            };
+        }
+        let teams = match self {
+            Self::Sqlite(pool) => query!(pool, "SELECT value FROM json_each($4)"),
+            Self::Postgres(pool) => {
+                query!(pool, "SELECT json_array_elements_text(CAST($4 AS JSON))")
+            }
+        };
+        Ok(teams.iter().map(Team::directory_metadata).collect())
+    }
+
     pub(super) async fn team_directory(
         &self,
         actor: TeamActor<'_>,

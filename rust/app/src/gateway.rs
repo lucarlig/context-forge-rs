@@ -30,6 +30,8 @@ mod tags;
 mod token_api;
 pub(crate) use token_api::{AdminTokenPage, AdminTokenQuery};
 mod tool_api;
+mod unified_search;
+pub use unified_search::SearchSettings;
 
 use std::{
     collections::HashSet,
@@ -124,6 +126,7 @@ pub struct GatewayService {
     max_prompt_bytes: usize,
     tool_preview_enabled: bool,
     grpc: GrpcSettings,
+    search: SearchSettings,
     a2a_enabled: bool,
     a2a_timeout: Duration,
     a2a_card_timeout: Duration,
@@ -251,6 +254,7 @@ impl GatewayService {
             max_prompt_bytes: 10240,
             tool_preview_enabled: true,
             grpc: GrpcSettings::default(),
+            search: SearchSettings::default(),
             a2a_enabled: true,
             a2a_timeout: Duration::from_secs(30),
             a2a_card_timeout: Duration::from_secs(120),
@@ -309,6 +313,11 @@ impl GatewayService {
 
     pub fn with_grpc_settings(mut self, settings: GrpcSettings) -> Self {
         self.grpc = settings;
+        self
+    }
+
+    pub fn with_search_settings(mut self, settings: SearchSettings) -> Self {
+        self.search = settings;
         self
     }
 
@@ -584,6 +593,9 @@ impl GatewayService {
             oauth_api::browser_router().with_state(self.clone()),
             Some(format!("{}/admin/login", self.gateway_oauth.admin_root)),
         );
+        let search = self
+            .access
+            .protect_browser_api(unified_search::router(self), None);
         self.access
             .protect_api(
                 router
@@ -600,6 +612,7 @@ impl GatewayService {
                     .with_state(self.clone()),
             )
             .merge(grpc_admin)
+            .merge(search)
             .merge(oauth_browser)
     }
 

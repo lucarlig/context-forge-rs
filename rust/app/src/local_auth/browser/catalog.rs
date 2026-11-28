@@ -377,6 +377,7 @@ fn read_query(uri: &Uri) -> Result<AdminListQuery, CatalogApiError> {
 #[derive(Serialize)]
 pub(super) struct Dashboard {
     navigation: Vec<Link>,
+    search: Option<Value>,
     sections: Vec<Section>,
     include_inactive: bool,
     team: Option<String>,
@@ -523,6 +524,7 @@ pub(super) async fn dashboard(
                 || (*name == "a2a" && a2a_visible)
                 || (*name == "grpc" && grpc_visible)
                 || (*name == "roots" && roots_visible)
+                || *name == "search"
                 || permitted.iter().any(|kind| kind.name() == *name)
         });
     if selected.is_none() {
@@ -530,7 +532,7 @@ pub(super) async fn dashboard(
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
-    let mut navigation = Vec::with_capacity(permitted.len() + 8);
+    let mut navigation = Vec::with_capacity(permitted.len() + 9);
     if !permitted.is_empty()
         || tokens_visible
         || users_visible
@@ -546,6 +548,16 @@ pub(super) async fn dashboard(
             selected: selected.is_none(),
         });
     }
+    navigation.push(Link {
+        label: "Search",
+        href: href(Some("search"), None),
+        selected: selected == Some("search"),
+    });
+    let search = if selected == Some("search") {
+        Some(service.dashboard_search(principal, uri).await?)
+    } else {
+        None
+    };
     for kind in &permitted {
         navigation.push(Link {
             label: label(*kind),
@@ -689,6 +701,7 @@ pub(super) async fn dashboard(
     .await?;
     Ok(Dashboard {
         navigation,
+        search,
         sections,
         include_inactive,
         team: team.map(str::to_owned),

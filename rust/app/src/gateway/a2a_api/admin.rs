@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::catalog::AdminAgentFilters;
+use crate::catalog::{AdminAgentFilters, parse_tag_groups};
 
 #[derive(Default, Deserialize)]
 pub(crate) struct AdminA2aQuery {
@@ -44,21 +44,7 @@ impl AdminA2aQuery {
 
     fn parsed_tags(&self) -> (&str, Vec<Vec<String>>) {
         let expression = self.tags.as_deref().unwrap_or_default().trim();
-        let groups = expression
-            .split(',')
-            .filter_map(|group| {
-                let terms: Vec<_> = group
-                    .split('+')
-                    .map(str::trim)
-                    .filter(|term| !term.is_empty())
-                    .take(10)
-                    .map(str::to_owned)
-                    .collect();
-                (!terms.is_empty()).then_some(terms)
-            })
-            .take(20)
-            .collect();
-        (expression, groups)
+        (expression, parse_tag_groups(expression))
     }
 }
 

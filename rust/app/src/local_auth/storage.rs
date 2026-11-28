@@ -175,6 +175,31 @@ pub(super) struct LocalEvent {
 }
 
 impl Database {
+    pub(crate) async fn search_user_items(
+        &self,
+        search: &str,
+        limit: i64,
+    ) -> Result<Vec<Value>, sqlx::Error> {
+        if search.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefix = format!("{}%", crate::catalog::escape_like(search));
+        let users = self.user_directory(Some(&prefix), limit, 0).await?;
+        Ok(users
+            .iter()
+            .map(|user| {
+                let full_name = user.full_name.as_deref().unwrap_or_default();
+                let name = if full_name.is_empty() {
+                    &user.email
+                } else {
+                    full_name
+                };
+                json!({"id":user.email,"name":name,"email":user.email,"full_name":full_name,
+                "is_admin":user.is_admin,"is_active":user.is_active})
+            })
+            .collect())
+    }
+
     pub(super) async fn user_directory_counts(
         &self,
         prefix: Option<&str>,

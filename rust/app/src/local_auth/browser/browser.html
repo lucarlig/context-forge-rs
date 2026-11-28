@@ -303,6 +303,10 @@
         {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}
         {% if catalog.selected %}<input type="hidden" name="section" value="{{ catalog.selected }}">{% endif %}
         {% if catalog.tokens %}<label>Search tokens <input type="search" name="q" maxlength="500" value="{{ catalog.tokens.search|default('', true) }}"></label>{% endif %}
+        {% if catalog.search %}
+        <label>Search catalogs <input type="search" name="q" maxlength="500" value="{{ catalog.search.query }}"></label>
+        <label>Tags <input name="tags" maxlength="500" value="{{ catalog.search.tags }}"></label>
+        {% endif %}
         {% if catalog.selected == "a2a" %}
         <label>Search agents <input type="search" name="q" maxlength="500" value="{{ catalog.a2a.q|default('', true) }}"></label>
         <label>Tags <input name="tags" value="{{ catalog.a2a.tags|default('', true) }}"></label>
@@ -322,6 +326,20 @@
         <button type="submit">Apply</button>
       </form>
     </div>
+    {% if catalog.search %}
+    <section aria-labelledby="search-results-heading">
+      <h2 id="search-results-heading">Search results</h2>
+      {% for group in catalog.search.groups if group.count %}
+      <h3>{{ group.entity_type|capitalize }}</h3>
+      <ul>
+        {% for item in group.items %}
+        <li>{{ item.display_name or item.name }}{% if item.description %} · {{ item.description }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% endfor %}
+      {% if not catalog.search.count and (catalog.search.query or catalog.search.tags) %}<p>No matching entries.</p>{% endif %}
+    </section>
+    {% endif %}
     {% if catalog.tokens %}
       {% set tokens = catalog.tokens %}
       {% include "tokens.html" %}

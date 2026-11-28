@@ -306,26 +306,7 @@ pub(super) async fn search(
                 "Invalid user search limit",
             ));
         }
-        let items = if let Some(prefix) = match_prefix(&search) {
-            accounts
-                .database
-                .user_directory(Some(&prefix), limit, 0)
-                .await?
-        } else {
-            Vec::new()
-        }
-        .iter()
-        .map(|user| {
-            let full_name = user.full_name.as_deref().unwrap_or_default();
-            let name = user
-                .full_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&user.email);
-            json!({"id": user.email, "name": name, "email": user.email,
-                   "full_name": full_name, "is_admin": user.is_admin, "is_active": user.is_active})
-        })
-        .collect::<Vec<_>>();
+        let items = accounts.database.search_user_items(&search, limit).await?;
         Ok(Json(json!({
             "users": items, "items": items, "count": items.len(),
             "entity_type": "users", "query": search,

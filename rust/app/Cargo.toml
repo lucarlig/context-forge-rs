@@ -69,6 +69,7 @@ zeroize = "1.9"
 lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 subtle = { version = "2.6", default-features = false }
 sysinfo = { version = "0.38.4", default-features = false, features = ["system", "disk"] }
+serde-saphyr = { version = "2.2.0", default-features = false, features = ["deserialize"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"

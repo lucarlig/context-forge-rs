@@ -8,7 +8,7 @@ use context_forge_rs::{
     config::Settings,
     database::Database,
     diagnostics::Diagnostics,
-    gateway::GatewayService,
+    gateway::{GatewayService, SearchSettings},
     http_boundary::HttpBoundary,
     local_auth,
     probes::{self, RedisProbe},
@@ -107,6 +107,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_response_filters(Settings::response_filters()?)
         .with_rest_tool_limits(rest_timeout, rest_response_text_limit)
         .with_grpc_settings(Settings::grpc_federation()?)
+        .with_search_settings(SearchSettings::from_env()?)
         .with_a2a_settings(a2a_enabled, a2a_timeout)
         .with_a2a_card_timeout(Settings::a2a_card_timeout()?)
         .with_a2a_metrics(Settings::a2a_metrics()?)

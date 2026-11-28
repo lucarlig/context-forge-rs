@@ -281,21 +281,3 @@ impl Database {
         agent_transaction!(self, delete)
     }
 }
-
-fn display_name(name: &str) -> String {
-    name.split(|character: char| character.is_whitespace() || matches!(character, '_' | '-' | '.'))
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut characters = part.chars();
-            let initial = characters.next().expect("nonempty name component");
-            initial
-                .to_uppercase()
-                .chain(characters.flat_map(char::to_lowercase))
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(255)
-        .collect()
-}

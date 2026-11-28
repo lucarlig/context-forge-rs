@@ -171,9 +171,9 @@ const INSERT_TOOL: &str = "
     INSERT INTO tools (id, name, original_name, custom_name_slug, custom_name, url,
         description, original_description, integration_type, request_type, input_schema,
         annotations, tags, enabled, reachable, deprecated, expose_passthrough, jsonpath_filter,
-        created_at, updated_at, created_by, created_via, version, team_id, owner_email, visibility)
+        created_at, updated_at, created_by, created_via, version, team_id, owner_email, visibility, display_name)
     VALUES ($1,$2,$3,$2,$3,$4,$5,$5,'A2A','POST',$6,$7,$8,TRUE,TRUE,FALSE,TRUE,'',
-        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,$9,$12,1,$10,$9,$11)";
+        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,$9,$12,1,$10,$9,$11,$13)";
 
 impl Database {
     pub(crate) async fn local_uaid_agents(
@@ -323,6 +323,7 @@ impl Database {
                         .bind(&agent.team_id)
                         .bind(&agent.visibility)
                         .bind(agent.created_via.as_deref().unwrap_or("api"))
+                        .bind(display_name(&agent.name))
                         .execute(&mut *$tx)
                         .await?;
                 }

@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     catalog::{
         INSERT_RESOURCE, POSTGRES_TOOL_INSERT, RegistrationError, SQLITE_TOOL_INSERT,
-        ToolDefinition, prompt_argument_schema, resource_registrations, slugify,
+        ToolDefinition, display_name, prompt_argument_schema, resource_registrations, slugify,
     },
     credentials::{CredentialCipher, decode_headers, decode_query},
     oauth_client::OAuthConfig,
@@ -74,6 +74,7 @@ struct StoredTool {
     id: String,
     original_name: String,
     original_description: Option<String>,
+    display_name: Option<String>,
     title: Option<String>,
     input_schema: String,
     output_schema: Option<String>,
@@ -102,7 +103,7 @@ struct StoredPrompt {
 }
 
 const STORED_TOOLS: &str = "
-    SELECT id, original_name, original_description, title,
+    SELECT id, original_name, original_description, display_name, title,
         CAST(input_schema AS TEXT) AS input_schema, CAST(output_schema AS TEXT) AS output_schema,
         CAST(annotations AS TEXT) AS annotations
     FROM tools WHERE gateway_id = $1 AND integration_type = 'MCP'";
@@ -518,7 +519,8 @@ impl Database {
                     let annotations = tool.annotations.clone().unwrap_or_else(|| json!({}));
                     if let Some(previous) = stored_tools.remove(&tool.name) {
                         let description = (!tool.description.is_empty()).then_some(tool.description.as_str());
-                        if previous.original_description.as_deref().filter(|text| !text.is_empty()) != description
+                        if previous.display_name.is_none()
+                            || previous.original_description.as_deref().filter(|text| !text.is_empty()) != description
                             || previous.title != tool.title
                             || stored_json(Some(&previous.input_schema)).as_ref() != Some(&tool.input_schema)
                             || stored_json(previous.output_schema.as_deref()) != tool.output_schema
@@ -528,10 +530,12 @@ impl Database {
                                 description = CASE WHEN COALESCE(description, '') = COALESCE(original_description, '') THEN $2 ELSE description END,
                                 original_description = $2, title = $3, input_schema = ", json_parameter!($dialect, "$4"), ",
                                 output_schema = ", json_parameter!($dialect, "$5"), ", annotations = ", json_parameter!($dialect, "$6"), ",
+                                display_name = COALESCE(display_name, $7),
                                 updated_at = CURRENT_TIMESTAMP WHERE id = $1"))
                                 .bind(previous.id).bind(&tool.description).bind(&tool.title)
                                 .bind(tool.input_schema.to_string()).bind(tool.output_schema.as_ref().map(Value::to_string))
-                                .bind(annotations.to_string()).execute(&mut *$transaction).await?;
+                                .bind(annotations.to_string()).bind(display_name(&tool.name))
+                                .execute(&mut *$transaction).await?;
                             changes.tools_updated += 1;
                         }
                     } else {
@@ -549,6 +553,7 @@ impl Database {
                             .bind(tool.input_schema.to_string()).bind(tool.output_schema.as_ref().map(Value::to_string))
                             .bind(annotations.to_string()).bind(&gateway.url).bind(gateway.owner_email.as_deref())
                             .bind(gateway.team_id.as_deref()).bind(&gateway.visibility).bind(&gateway.transport)
+                            .bind(display_name(&tool.name))
                             .execute(&mut *$transaction).await?;
                         changes.tools_added += 1;
                     }
