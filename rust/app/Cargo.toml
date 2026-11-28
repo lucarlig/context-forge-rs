@@ -10,6 +10,7 @@ default-run = "context-forge-rs"
 [dependencies]
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash", "zeroize"] }
 async-compression = { version = "0.4.54", default-features = false, features = ["tokio", "brotli", "deflate", "gzip", "zlib", "zstd"] }
+async-trait = "0.1"
 aws-credential-types = "1.2.14"
 aws-sigv4 = "1.4.5"
 axum = { version = "0.8", features = ["multipart", "ws"] }
@@ -32,6 +33,7 @@ jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 mime_guess = "2"
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "fuel", "macros", "multi_template", "serde"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-http = { version = "0.33.1", default-features = false }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["grpc-tonic", "http-proto", "internal-logs", "reqwest-blocking-client", "tls-ring", "tls-roots", "trace"] }
 opentelemetry-stdout = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }

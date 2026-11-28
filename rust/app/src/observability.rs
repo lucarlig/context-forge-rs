@@ -95,17 +95,18 @@ impl QueryRedaction {
         Ok(Self(Arc::new(keys)))
     }
 
+    fn sensitive_key(&self, key: &str) -> bool {
+        self.0.contains(&normalized_key(key))
+    }
+
     fn query(&self, raw: &str) -> String {
         let decoded = url::form_urlencoded::parse(raw.as_bytes());
-        if !decoded
-            .clone()
-            .any(|(key, _)| self.0.contains(&normalized_key(&key)))
-        {
+        if !decoded.clone().any(|(key, _)| self.sensitive_key(&key)) {
             return raw.to_owned();
         }
         url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(decoded.map(|(key, value)| {
-                let value = if self.0.contains(&normalized_key(&key)) {
+                let value = if self.sensitive_key(&key) {
                     "***".into()
                 } else {
                     value

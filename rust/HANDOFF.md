@@ -580,7 +580,28 @@ with the flag enabled. Native assertions verify query spans, request parent
 links, and sanitized failure spans on both databases. The live Rust
 collector test also verifies SQL spans with database trace storage disabled.
 
-Framework spans and vendor-specific exporters remain open.
+`LANGFUSE_OTEL_ENDPOINT` takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`.
+Langfuse endpoints use HTTP with Basic authentication. The exporter selects
+`Authorization` from `OTEL_EXPORTER_OTLP_HEADERS`, `LANGFUSE_OTEL_AUTH`, or
+the Langfuse project keys in that order. Invalid credentials fail startup.
+The exporter appends `/v1/traces` to a Langfuse base URL and supplies the
+default ingestion version `4`. The pinned gateway sends a supplied base URL
+as-is. [Langfuse OpenTelemetry documentation](https://langfuse.com/integrations/native/opentelemetry)
+
+Langfuse operation names, tags, and levels default to enabled for Langfuse
+destinations. Set `OTEL_EMIT_LANGFUSE_ATTRIBUTES` and
+`OTEL_CAPTURE_IDENTITY_ATTRIBUTES` to control these labels and verified user
+attributes. `OTEL_CAPTURE_INPUT_SPANS` and `OTEL_CAPTURE_OUTPUT_SPANS` take
+comma-separated span names. Capture covers tool calls, prompt renders,
+resource reads with text results, and A2A invocation. It applies credential
+redaction and `OTEL_MAX_TRACE_PAYLOAD_SIZE` before export. Payload capture
+defaults to off.
+
+Nine Rust Anything cases verify credential selection, startup rejection,
+endpoint handling, metadata controls, and opt-in redacted prompt payloads.
+A live Rust collector test checks the validated authorization against a
+signal-specific header override. Framework spans, Jaeger and Zipkin export,
+and Langfuse prompt version and session metadata remain open.
 
 ## Gateway and protocol verification
 

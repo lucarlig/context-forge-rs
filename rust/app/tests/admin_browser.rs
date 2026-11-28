@@ -2747,6 +2747,78 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
 }
 
 #[tokio::test]
+async fn langfuse_exports_to_the_vendor_endpoint_with_validated_credentials() {
+    use axum::{Router, http::HeaderMap, routing::post};
+    use base64::{Engine as _, prelude::BASE64_STANDARD};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/api/public/otel", listener.local_addr().unwrap());
+    let (exports, mut batches) = tokio::sync::mpsc::unbounded_channel();
+    let collector = tokio::spawn(async move {
+        let router = Router::new().route(
+            "/api/public/otel/v1/traces",
+            post(move |headers: HeaderMap| {
+                let exports = exports.clone();
+                async move {
+                    exports.send(headers).unwrap();
+                    ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
+                }
+            }),
+        );
+        axum::serve(listener, router).await.unwrap();
+    });
+    let encoded = BASE64_STANDARD.encode(format!("fixture:{}", Uuid::new_v4()));
+    let authorization = format!("Basic {encoded}");
+    let common = format!("aUtHoRiZaTiOn={authorization},x-fixture=preserved");
+    let mut gateway = gateway_with_env(&[
+        ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+        ("LANGFUSE_OTEL_ENDPOINT", &endpoint),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1"),
+        ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://127.0.0.1:1"),
+        ("OTEL_EXPORTER_OTLP_HEADERS", &common),
+        (
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "authorization=Bearer overridden",
+        ),
+        ("OTEL_BSP_SCHEDULE_DELAY", "30"),
+    ])
+    .await;
+    let login = gateway
+        .client
+        .post(format!("{}/auth/email/login", gateway.origin))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL,"password":gateway.password}).to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let login: serde_json::Value = serde_json::from_slice(&login.bytes().await.unwrap()).unwrap();
+    let response = gateway
+        .client
+        .post(format!("{}/rpc", gateway.origin))
+        .bearer_auth(login["access_token"].as_str().unwrap())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(response.text().await.unwrap().contains("\"result\""));
+    let headers = tokio::time::timeout(Duration::from_secs(5), batches.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(headers[header::AUTHORIZATION], authorization);
+    assert_eq!(headers["x-fixture"], "preserved");
+    assert_eq!(headers["x-langfuse-ingestion-version"], "4");
+    gateway.process.kill().await.unwrap();
+    collector.abort();
+}
+
+#[tokio::test]
 async fn registry_registration_requires_browser_proof_and_serializes_oauth_duplicates() {
     use serde_json::{Value, json};
 

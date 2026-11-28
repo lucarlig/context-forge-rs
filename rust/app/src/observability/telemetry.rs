@@ -53,6 +53,7 @@ use crate::{
 type SettingsError = Box<dyn Error + Send + Sync>;
 
 pub(crate) mod client;
+pub(super) mod langfuse;
 pub(crate) mod redis_client;
 pub(crate) mod sql_client;
 use redis_client::RedisConventions;
@@ -104,6 +105,8 @@ impl Telemetry {
             return Ok(None);
         }
         let exporter = value("OTEL_TRACES_EXPORTER", "otlp")?.to_ascii_lowercase();
+        let endpoint = langfuse::configured_endpoint()?;
+        let is_langfuse = langfuse::matches_endpoint(&endpoint);
         let builder = SdkTracerProvider::builder();
         let builder = match exporter.as_str() {
             "none" => return Ok(None),
@@ -112,11 +115,15 @@ impl Telemetry {
                 return Ok(None);
             }
             "otlp" => {
-                let endpoint = value("OTEL_EXPORTER_OTLP_ENDPOINT", "")?;
                 if endpoint.is_empty() {
                     return Ok(None);
                 }
-                let Ok(exporter) = otlp_exporter(&endpoint) else {
+                let configured_headers = value("OTEL_EXPORTER_OTLP_HEADERS", "")?;
+                let authorization = is_langfuse
+                    .then(|| langfuse::authorization(&configured_headers))
+                    .transpose()?;
+                let Ok(exporter) = otlp_exporter(&endpoint, &configured_headers, authorization)
+                else {
                     tracing::warn!("Could not configure the OTLP trace exporter");
                     return Ok(None);
                 };
@@ -140,13 +147,11 @@ impl Telemetry {
             }
             _ => builder.with_simple_exporter(opentelemetry_stdout::SpanExporter::default()),
         };
+        let environment = value("DEPLOYMENT_ENV", &value("ENVIRONMENT", "development")?)?;
         let mut attributes = vec![
             KeyValue::new("service.name", value("OTEL_SERVICE_NAME", SERVICE)?),
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-            KeyValue::new(
-                "deployment.environment",
-                value("DEPLOYMENT_ENV", &value("ENVIRONMENT", "development")?)?,
-            ),
+            KeyValue::new("deployment.environment", environment.clone()),
         ];
         attributes.extend(
             settings_pairs(&value("OTEL_RESOURCE_ATTRIBUTES", "")?)
@@ -170,6 +175,7 @@ impl Telemetry {
             .unwrap_or(false)
             .then(|| SemanticConventions::from_env("database"))
             .transpose()?;
+        langfuse::configure_policy(is_langfuse, environment, redaction.clone())?;
         global::set_tracer_provider(provider.clone());
         Ok(Some(Self {
             provider,
@@ -213,7 +219,11 @@ fn settings_pairs(input: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-fn otlp_exporter(raw_endpoint: &str) -> Result<SpanExporter, SettingsError> {
+fn otlp_exporter(
+    raw_endpoint: &str,
+    configured_headers: &str,
+    authorization: Option<HeaderValue>,
+) -> Result<SpanExporter, SettingsError> {
     let protocol = value("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")?.to_ascii_lowercase();
     let insecure = flag("OTEL_EXPORTER_OTLP_INSECURE")?;
     let raw_endpoint = raw_endpoint.trim();
@@ -235,14 +245,13 @@ fn otlp_exporter(raw_endpoint: &str) -> Result<SpanExporter, SettingsError> {
         return Err("invalid OTLP endpoint".into());
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let configured_headers = value("OTEL_EXPORTER_OTLP_HEADERS", "")?;
     let exporter = SpanExporter::builder();
-    if protocol == "grpc" {
+    if protocol == "grpc" && authorization.is_none() {
         if insecure == Some(false) && endpoint.scheme() != "https" {
             return Err("secure OTLP gRPC requires an HTTPS endpoint".into());
         }
         let mut metadata = HeaderMap::new();
-        for (name, value) in settings_pairs(&configured_headers) {
+        for (name, value) in settings_pairs(configured_headers) {
             let mut value = HeaderValue::from_str(value)?;
             value.set_sensitive(true);
             metadata.insert(HeaderName::from_bytes(name.as_bytes())?, value);
@@ -256,7 +265,9 @@ fn otlp_exporter(raw_endpoint: &str) -> Result<SpanExporter, SettingsError> {
         }
         return exporter.build().map_err(Into::into);
     }
-    if endpoint.port() == Some(4317) {
+    if authorization.is_some() {
+        langfuse::set_traces_path(&mut endpoint);
+    } else if endpoint.port() == Some(4317) {
         let _ = endpoint.set_port(Some(4318));
         endpoint.set_path(&format!(
             "{}/v1/traces",
@@ -276,17 +287,21 @@ fn otlp_exporter(raw_endpoint: &str) -> Result<SpanExporter, SettingsError> {
         })?
         .join()
         .map_err(|_| "could not create the OTLP HTTP client")??;
-    let headers = settings_pairs(&configured_headers)
+    let headers = settings_pairs(configured_headers)
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
-    exporter
+    let exporter = exporter
         .with_http()
         .with_protocol(Protocol::HttpBinary)
         .with_endpoint(endpoint.as_str())
-        .with_headers(headers)
-        .with_http_client(http)
-        .build()
-        .map_err(Into::into)
+        .with_headers(headers);
+    let exporter = match authorization {
+        Some(authorization) => {
+            exporter.with_http_client(langfuse::AuthenticatedClient::new(http, authorization))
+        }
+        None => exporter.with_http_client(http),
+    };
+    exporter.build().map_err(Into::into)
 }
 
 fn traces_path(path: &str) -> bool {

@@ -132,6 +132,7 @@ pub(super) async fn test_agent(
             parameters,
             interaction_type: interaction_type.into(),
         },
+        principal,
         headers,
     )
     .await

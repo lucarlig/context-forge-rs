@@ -137,8 +137,13 @@ async fn read(
     let uri = record.uri.clone();
     let resolved_id = record.id.clone();
     let started = std::time::Instant::now();
-    let span = service.resource_span(&uri, Some(&principal), server).await;
+    let mut span = service.resource_span(&uri, Some(&principal), server).await;
     let result = resource_content(&service, &principal, record, uri, &headers, false).await;
+    if let Ok(value) = &result
+        && let Some(text) = value["text"].as_str()
+    {
+        span.capture_output(&json!({"content":text}));
+    }
     service
         .record_rest_execution(
             (MetricEntity::Resource, &resolved_id),
@@ -170,8 +175,13 @@ async fn test_uri(
         .ok_or_else(|| missing_resource(&uri))?;
     let resolved_id = record.id.clone();
     let started = std::time::Instant::now();
-    let span = service.resource_span(&uri, Some(&principal), None).await;
+    let mut span = service.resource_span(&uri, Some(&principal), None).await;
     let result = resource_content(&service, &principal, record, uri, &headers, true).await;
+    if let Ok(value) = &result
+        && let Some(text) = value["text"].as_str()
+    {
+        span.capture_output(&json!({"content":text}));
+    }
     service
         .record_rest_execution(
             (MetricEntity::Resource, &resolved_id),

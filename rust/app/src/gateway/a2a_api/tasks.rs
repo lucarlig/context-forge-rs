@@ -208,6 +208,7 @@ pub(super) async fn continue_task(
             ]),
             interaction_type: query_interaction(),
         },
+        Some(&principal),
         Some(&headers),
         InvocationSource::Api,
     )

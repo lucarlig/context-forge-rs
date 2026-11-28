@@ -850,6 +850,11 @@ impl GatewayService {
             Err(ToolError::InvalidArguments(_)) => Outcome::Error("Invalid tool arguments"),
             Err(_) => Outcome::Error("Tool execution failed"),
         };
+        if matches!(outcome, Outcome::Ok)
+            && let Ok(value) = &result
+        {
+            execution.span.capture_output(value);
+        }
         if !matches!(&result, Ok(value) if value["resultType"] == "input_required") {
             let succeeded = matches!(&result, Ok(value) if value["isError"] != true && value["is_error"] != true);
             self.record_target(execution.metric, server, started, succeeded)
@@ -863,11 +868,12 @@ impl GatewayService {
         &self,
         request: &CallToolRequestParams,
         context: &ToolContext<'_>,
+        principal: Option<&Principal>,
         id: Option<&str>,
         gateway: Option<&str>,
         integration: &'static str,
     ) -> OperationSpan {
-        OperationSpan::start(
+        let mut span = OperationSpan::start(
             &self.database,
             "tool.invoke",
             "client",
@@ -877,7 +883,10 @@ impl GatewayService {
                 "arguments_count":request.arguments.as_ref().map_or(0, serde_json::Map::len),
                 "has_headers":context.request_headers.is_some_and(|headers| !headers.is_empty()),
             }),
-        ).await
+        ).await;
+        span.identify(principal);
+        span.capture_input(request.arguments.as_ref().unwrap_or(&Default::default()));
+        span
     }
 
     async fn call_tool_inner(
@@ -903,7 +912,14 @@ impl GatewayService {
             } => {
                 execution.metric = Some(metrics::ExecutionTarget::Forwarded);
                 execution.span = self
-                    .tool_span(&request, &context, None, Some(&gateway.id), "MCP")
+                    .tool_span(
+                        &request,
+                        &context,
+                        principal,
+                        None,
+                        Some(&gateway.id),
+                        "MCP",
+                    )
                     .await;
                 (gateway, Some(timeout), String::new())
             }
@@ -934,6 +950,7 @@ impl GatewayService {
                     .tool_span(
                         &request,
                         &context,
+                        principal,
                         Some(&tool.id),
                         Some(tool.gateway_id.as_str()).filter(|id| !id.is_empty()),
                         integration,

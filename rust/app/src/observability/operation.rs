@@ -13,9 +13,11 @@ use uuid::Uuid;
 
 use super::{
     bounded,
-    telemetry::{ExportContext, ExportSpan, SemanticConventions, redis_client::RedisConventions},
+    telemetry::{
+        ExportContext, ExportSpan, SemanticConventions, langfuse, redis_client::RedisConventions,
+    },
 };
-use crate::database::Database;
+use crate::{access::Principal, database::Database};
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(crate) struct TraceContext {
@@ -127,7 +129,7 @@ pub(crate) struct OperationSpan {
 struct ExportedOperation {
     span: ExportSpan,
     started: Instant,
-    tool: bool,
+    name: &'static str,
 }
 
 impl ExportedOperation {
@@ -135,7 +137,7 @@ impl ExportedOperation {
         let ExportSpan::Recording(mut span) = self.span else {
             return;
         };
-        if self.tool {
+        if self.name == "tool.invoke" {
             span.set_attributes([
                 KeyValue::new("success", matches!(outcome, Outcome::Ok)),
                 KeyValue::new("cancelled", matches!(outcome, Outcome::Cancelled)),
@@ -144,6 +146,11 @@ impl ExportedOperation {
         }
         if matches!(outcome, Outcome::InputRequired) {
             span.set_attribute(KeyValue::new("input_required", true));
+        }
+        if matches!(outcome, Outcome::Error(_) | Outcome::Cancelled)
+            && let Some(policy) = langfuse::policy()
+        {
+            policy.failure(&mut span);
         }
         span.set_status(match outcome {
             Outcome::Error(message) => Status::error(message),
@@ -181,10 +188,16 @@ impl OperationSpan {
         }
         let started = Instant::now();
         let exported = context.exported.map(|parent| {
+            let mut span = parent.start_operation(name, &attributes);
+            if let ExportSpan::Recording(span) = &mut span
+                && let Some(policy) = langfuse::policy()
+            {
+                policy.label(name, &attributes, span);
+            }
             Box::new(ExportedOperation {
-                span: parent.start_operation(name, &attributes),
+                span,
                 started,
-                tool,
+                name,
             })
         });
         let mut result = Self {
@@ -236,6 +249,33 @@ impl OperationSpan {
     pub(crate) fn inject_trace_context(&self, headers: &mut axum::http::HeaderMap) {
         if let Some(exported) = &self.exported {
             exported.span.context().inject(headers);
+        }
+    }
+
+    pub(crate) fn identify(&mut self, principal: Option<&Principal>) {
+        if let Some(principal) = principal
+            && let Some(policy) = langfuse::policy()
+            && let Some(exported) = &mut self.exported
+            && let ExportSpan::Recording(span) = &mut exported.span
+        {
+            policy.identify(principal, span);
+        }
+    }
+
+    pub(crate) fn capture_input<T: Serialize + ?Sized>(&mut self, value: &T) {
+        self.capture(true, value);
+    }
+
+    pub(crate) fn capture_output<T: Serialize + ?Sized>(&mut self, value: &T) {
+        self.capture(false, value);
+    }
+
+    fn capture<T: Serialize + ?Sized>(&mut self, input: bool, value: &T) {
+        if let Some(policy) = langfuse::policy()
+            && let Some(exported) = &mut self.exported
+            && let ExportSpan::Recording(span) = &mut exported.span
+        {
+            policy.capture(exported.name, input, value, span);
         }
     }
 

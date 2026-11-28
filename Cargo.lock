@@ -797,6 +797,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "async-compression",
+ "async-trait",
  "aws-credential-types",
  "aws-sigv4",
  "axum",
@@ -821,6 +822,7 @@ dependencies = [
  "mime_guess",
  "minijinja",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry-stdout",

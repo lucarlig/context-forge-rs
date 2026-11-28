@@ -144,8 +144,8 @@ async fn retrieve(
     };
     let resolved_id = record.id.clone();
     let started = std::time::Instant::now();
-    let span = service
-        .prompt_span(id, arguments.len(), Some(principal), server)
+    let mut span = service
+        .prompt_span(id, Some(&arguments), Some(principal), server)
         .await;
     let result = async {
         let mut result = if let Some(gateway) = record.gateway.as_ref()
@@ -211,6 +211,9 @@ async fn retrieve(
     .await;
     let pending = matches!(&result, Ok(Json(value)) if value["resultType"] == "input_required");
     if !pending {
+        if let Ok(Json(value)) = &result {
+            span.capture_output(value);
+        }
         service
             .record_rest_execution(
                 (MetricEntity::Prompt, &resolved_id),

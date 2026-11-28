@@ -41,7 +41,7 @@ impl GatewayService {
         let started = std::time::Instant::now();
         self.check_mcp_permission(principal, server, "resources.read")
             .await?;
-        let span = self
+        let mut span = self
             .resource_span(
                 &params.uri,
                 principal,
@@ -60,6 +60,12 @@ impl GatewayService {
             )))
             .await;
         let pending = matches!(result, Ok(ReadResourceResponse::InputRequired(_)));
+        if let Ok(ReadResourceResponse::Complete(response)) = &result
+            && let [ResourceContents::TextResourceContents { text, .. }] =
+                response.contents.as_slice()
+        {
+            span.capture_output(&json!({"content":text}));
+        }
         if !pending {
             self.record_target(target, server, started, result.is_ok())
                 .await;
@@ -191,10 +197,10 @@ impl GatewayService {
         }
         self.check_mcp_permission(principal, server, "prompts.read")
             .await?;
-        let span = self
+        let mut span = self
             .prompt_span(
                 &params.name,
-                params.arguments.as_ref().map_or(0, JsonObject::len),
+                params.arguments.as_ref(),
                 principal,
                 server.map(|server| server.id.as_str()),
             )
@@ -211,6 +217,9 @@ impl GatewayService {
             )))
             .await;
         let pending = matches!(result, Ok(GetPromptResponse::InputRequired(_)));
+        if let Ok(GetPromptResponse::Complete(response)) = &result {
+            span.capture_output(response);
+        }
         if !pending {
             self.record_target(target, server, started, result.is_ok())
                 .await;
@@ -283,7 +292,7 @@ impl GatewayService {
         principal: Option<&Principal>,
         server: Option<&str>,
     ) -> OperationSpan {
-        OperationSpan::start(&self.database,"resource.read","internal",None,|| {
+        let mut span = OperationSpan::start(&self.database,"resource.read","internal",None,|| {
             let safe_uri = resource_trace_uri(uri);
             let http_url = safe_uri.starts_with("http").then_some(&safe_uri);
             json!({
@@ -292,23 +301,29 @@ impl GatewayService {
                 "http.url":http_url, "user":principal.map_or("anonymous", |principal| principal.email.as_str()),
                 "server_id":server, "request_id":request_id(),
             })
-        }).await
+        }).await;
+        span.identify(principal);
+        span.capture_input(&json!({"uri":resource_trace_uri(uri)}));
+        span
     }
 
     pub(super) async fn prompt_span(
         &self,
         name: &str,
-        arguments: usize,
+        arguments: Option<&JsonObject>,
         principal: Option<&Principal>,
         server: Option<&str>,
     ) -> OperationSpan {
-        OperationSpan::start(&self.database,"prompt.render","internal",None,|| {
+        let mut span = OperationSpan::start(&self.database,"prompt.render","internal",None,|| {
             json!({
-                "prompt.id":name.chars().take(255).collect::<String>(), "arguments_count":arguments,
+                "prompt.id":name.chars().take(255).collect::<String>(), "arguments_count":arguments.map_or(0, JsonObject::len),
                 "user":principal.map_or("anonymous", |principal| principal.email.as_str()),
                 "server_id":server, "tenant_id":null, "request_id":request_id().as_deref().unwrap_or("none"),
             })
-        }).await
+        }).await;
+        span.identify(principal);
+        span.capture_input(arguments.unwrap_or(&Default::default()));
+        span
     }
 
     pub(crate) async fn complete(

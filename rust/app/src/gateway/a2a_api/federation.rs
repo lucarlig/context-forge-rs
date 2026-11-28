@@ -35,7 +35,7 @@ pub(super) async fn dispatch(
     } else {
         find(app, Some(principal), lookup).await?
     };
-    invoke_recorded(app, &agent, invocation, headers).await
+    invoke_recorded(app, &agent, invocation, principal, headers).await
 }
 
 pub(super) fn check_hops(
@@ -93,17 +93,22 @@ async fn forward(
     *request.body_mut() = Some(json!({
         "agent_id":identifier, "parameters":invocation.parameters, "interaction_type":invocation.interaction_type,
     }).to_string().into());
-    let span = OperationSpan::start(
+    let mut span = OperationSpan::start(
         &app.database,"a2a.invoke","client",
         Some(SpanResource {kind:"agent",name:"federated agent",id:None}),
         || json!({"a2a.federation":true,"a2a.hop":hops+1,
             "a2a.interaction_type":invocation.interaction_type.chars().take(50).collect::<String>()}),
     ).await;
+    span.identify(Some(principal));
+    span.capture_input(&invocation.parameters);
     span.inject_trace_context(request.headers_mut());
     let result = span
         .scope(Box::pin(forward_request(app, principal, request, hops)))
         .await;
     let success = matches!(&result, Ok(value) if !protocol::has_rpc_error(value));
+    if success && let Ok(value) = &result {
+        span.capture_output(value);
+    }
     span.finish(Outcome::completed(success, "A2A federation request failed"))
         .await;
     result

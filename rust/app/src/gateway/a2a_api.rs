@@ -509,9 +509,18 @@ async fn invoke_recorded(
     app: &GatewayService,
     agent: &AgentRecord,
     input: Invocation,
+    principal: &Principal,
     headers: &HeaderMap,
 ) -> Result<Value, CatalogApiError> {
-    let result = invoke(app, agent, input, Some(headers), InvocationSource::Api).await?;
+    let result = invoke(
+        app,
+        agent,
+        input,
+        Some(principal),
+        Some(headers),
+        InvocationSource::Api,
+    )
+    .await?;
     tasks::record(app, &agent.id, &result, None).await;
     Ok(result)
 }
@@ -609,6 +618,7 @@ async fn invoke(
     app: &GatewayService,
     agent: &AgentRecord,
     input: Invocation,
+    principal: Option<&Principal>,
     incoming: Option<&HeaderMap>,
     source: InvocationSource,
 ) -> Result<Value, CatalogApiError> {
@@ -708,7 +718,7 @@ async fn invoke(
         id.write_header(&mut headers);
     }
     uaid::stamp(&mut headers, hops);
-    let payload = if jsonrpc {
+    if jsonrpc {
         headers.insert(
             "a2a-version",
             HeaderValue::from_str(&protocol::version_header(&agent.protocol_version))
@@ -719,14 +729,8 @@ async fn invoke(
             .or_insert(HeaderValue::from_static(
                 "application/json, text/event-stream",
             ));
-        protocol::rpc_request(input.parameters, &agent.protocol_version)
-    } else {
-        json!({"interaction_type":input.interaction_type,"parameters":input.parameters,"protocol_version":agent.protocol_version})
-    };
-    let mut request = reqwest::Request::new(reqwest::Method::POST, url);
-    *request.headers_mut() = headers;
-    *request.body_mut() = Some(payload.to_string().into());
-    let span = OperationSpan::start(
+    }
+    let mut span = OperationSpan::start(
         &app.database,"a2a.invoke","client",
         Some(SpanResource {kind:"agent",name:&agent.name,id:Some(&agent.id)}),
         || json!({
@@ -734,6 +738,16 @@ async fn invoke(
             "a2a.interaction_type":input.interaction_type.chars().take(50).collect::<String>(),
         }),
     ).await;
+    span.identify(principal);
+    span.capture_input(&input.parameters);
+    let payload = if jsonrpc {
+        protocol::rpc_request(input.parameters, &agent.protocol_version)
+    } else {
+        json!({"interaction_type":input.interaction_type,"parameters":input.parameters,"protocol_version":agent.protocol_version})
+    };
+    let mut request = reqwest::Request::new(reqwest::Method::POST, url);
+    *request.headers_mut() = headers;
+    *request.body_mut() = Some(payload.to_string().into());
     span.inject_trace_context(request.headers_mut());
     let started = std::time::Instant::now();
     let result = span.scope(Box::pin(dispatch_upstream(app, request))).await;
@@ -743,6 +757,11 @@ async fn invoke(
         Ok(_) => None,
     };
     let outcome = failure.map_or(Outcome::Ok, Outcome::Error);
+    if failure.is_none()
+        && let Ok(body) = &result
+    {
+        span.capture_output(body);
+    }
     if matches!(source, InvocationSource::Tool) {
         span.finish(outcome).await;
         return result;
@@ -839,6 +858,7 @@ pub(super) async fn call_tool(
             parameters: arguments,
             interaction_type,
         },
+        principal,
         headers,
         InvocationSource::Tool,
     )
