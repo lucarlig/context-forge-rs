@@ -9,14 +9,18 @@ use crate::env_file::EnvFile;
 type FileValues = HashMap<String, Zeroizing<String>>;
 static FILE_ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
 
-struct Environment {
+pub(crate) struct Environment {
     process_names: HashMap<String, String>,
     file_values: FileValues,
     listener_values: FileValues,
 }
 
 impl Environment {
-    fn read(explicit: Option<&Path>) -> io::Result<Self> {
+    pub(crate) fn from_file(path: &Path) -> io::Result<Self> {
+        Self::read(path, None)
+    }
+
+    fn read(default_path: &Path, explicit: Option<&Path>) -> io::Result<Self> {
         let mut process_names = HashMap::new();
         for (name, _) in env::vars_os() {
             if let Ok(name) = name.into_string() {
@@ -29,19 +33,7 @@ impl Environment {
             }
         }
 
-        let default_path = Path::new(".env");
-        let default_contents = match fs::read_to_string(default_path) {
-            Ok(contents) => Zeroizing::new(contents),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::IsADirectory
-                ) =>
-            {
-                Zeroizing::new(String::new())
-            }
-            Err(error) => return Err(file_error(default_path, error)),
-        };
+        let default_contents = optional_contents(default_path)?;
         let defaults =
             EnvFile::parse(&default_contents).map_err(|error| file_error(default_path, error))?;
         let listener_values = defaults
@@ -80,10 +72,34 @@ impl Environment {
     fn process_value(&self, name: &str) -> Option<OsString> {
         self.process_names.get(name).and_then(env::var_os)
     }
+
+    pub(crate) fn var_os(&self, name: &str) -> Option<OsString> {
+        self.process_value(name).or_else(|| {
+            self.file_values
+                .get(name)
+                .map(|value| value.as_str().into())
+        })
+    }
+
+    pub(crate) fn overridden_file_value(&self, name: &str) -> Option<&str> {
+        self.process_names.get(name)?;
+        self.file_values.get(name).map(|value| value.as_str())
+    }
+
+    pub(crate) fn listener(&self, primary: &str, legacy: &str) -> Option<OsString> {
+        self.process_value(primary)
+            .or_else(|| self.process_value(legacy))
+            .or_else(|| {
+                self.listener_values
+                    .get(primary)
+                    .or_else(|| self.listener_values.get(legacy))
+                    .map(|value| value.as_str().into())
+            })
+    }
 }
 
 pub fn load(explicit: Option<&Path>) -> io::Result<()> {
-    let environment = Environment::read(explicit)?;
+    let environment = Environment::read(Path::new(".env"), explicit)?;
     FILE_ENVIRONMENT
         .set(environment)
         .map_err(|_| io::Error::other("configuration files already loaded"))
@@ -91,12 +107,7 @@ pub fn load(explicit: Option<&Path>) -> io::Result<()> {
 
 pub(crate) fn var_os(name: &str) -> Option<OsString> {
     match FILE_ENVIRONMENT.get() {
-        Some(environment) => environment.process_value(name).or_else(|| {
-            environment
-                .file_values
-                .get(name)
-                .map(|value| value.as_str().into())
-        }),
+        Some(environment) => environment.var_os(name),
         None => env::var_os(name),
     }
 }
@@ -110,21 +121,23 @@ pub(crate) fn var(name: &str) -> Result<String, env::VarError> {
 
 pub(crate) fn listener(primary: &str, legacy: &str) -> Result<Option<String>, env::VarError> {
     let selected = match FILE_ENVIRONMENT.get() {
-        Some(environment) => environment
-            .process_value(primary)
-            .or_else(|| environment.process_value(legacy))
-            .or_else(|| {
-                environment
-                    .listener_values
-                    .get(primary)
-                    .or_else(|| environment.listener_values.get(legacy))
-                    .map(|value| value.as_str().into())
-            }),
+        Some(environment) => environment.listener(primary, legacy),
         None => env::var_os(primary).or_else(|| env::var_os(legacy)),
     };
     selected
         .map(|value| value.into_string().map_err(env::VarError::NotUnicode))
         .transpose()
+}
+
+fn optional_contents(path: &Path) -> io::Result<Zeroizing<String>> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => fs::read_to_string(path)
+            .map(Zeroizing::new)
+            .map_err(|error| file_error(path, error)),
+        Ok(_) => Ok(Zeroizing::new(String::new())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Zeroizing::new(String::new())),
+        Err(error) => Err(file_error(path, error)),
+    }
 }
 
 fn collected<'a>(assignments: impl Iterator<Item = (&'a str, &'a str)>) -> FileValues {

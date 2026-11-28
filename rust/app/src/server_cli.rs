@@ -31,6 +31,7 @@ pub(crate) use inherited::InheritedListener;
   migrate              Upgrade the native database schema
   export               Export gateway configuration
   import               Import gateway configuration
+  --validate-config    Validate an environment file (default: .env)
   --config-schema      Print the configuration JSON Schema or write it to a file
   init-secrets         Generate deployment secrets
   rotate-credentials   Rotate stored credentials")]

@@ -42,7 +42,7 @@ mod proxy;
 mod rate_limit;
 mod response_policy;
 
-pub(crate) use proxy::public_scheme;
+pub(crate) use proxy::{ProxyHeaders, public_scheme};
 pub(crate) use response_policy::allowed_origins;
 
 #[derive(Clone, Copy)]

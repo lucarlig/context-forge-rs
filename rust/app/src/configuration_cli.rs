@@ -19,6 +19,9 @@ use crate::{
     environment, private_file,
 };
 
+mod validate;
+pub use validate::run as validate_settings_file;
+
 type CliError = Box<dyn Error + Send + Sync>;
 const SETTINGS_SCHEMA: &str = include_str!("config/settings-v1.1.2.json");
 

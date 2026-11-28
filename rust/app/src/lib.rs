@@ -44,6 +44,7 @@ pub mod response_filter;
 pub mod schema;
 pub mod schema_validation;
 mod secret_envelope;
+mod secret_policy;
 mod sessions;
 mod sigv4;
 mod subscriptions;

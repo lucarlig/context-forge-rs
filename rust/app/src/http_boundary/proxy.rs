@@ -19,7 +19,7 @@ use crate::config::value;
 
 use super::UnixPeer;
 
-pub(super) struct ProxyHeaders {
+pub(crate) struct ProxyHeaders {
     networks: Vec<IpNet>,
     trust_all: bool,
 }
@@ -29,7 +29,7 @@ impl ProxyHeaders {
         Self::parse(&value("FORWARDED_ALLOW_IPS", "127.0.0.1,::1")?)
     }
 
-    pub(super) fn parse(raw: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         if raw.trim() == "*" {
             return Ok(Self {
                 networks: Vec::new(),

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::HashMap,
     env,
     error::Error,
     fmt::Write as _,
@@ -15,7 +14,7 @@ use clap::Parser;
 use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::Zeroizing;
 
-use crate::{env_file::EnvFile, private_file};
+use crate::{env_file::EnvFile, private_file, secret_policy};
 
 type CliError = Box<dyn Error + Send + Sync>;
 const KEY_BYTES: usize = 32;
@@ -132,7 +131,8 @@ fn patch(path: &Path) -> Result<(), CliError> {
             .or(stored)
             .unwrap_or_default();
         let key = bytes == KEY_BYTES;
-        if !weak(current, key, configured_minimum) {
+        let minimum = if key { configured_minimum } else { 0 };
+        if secret_policy::problem(current, minimum, key).is_none() {
             continue;
         }
         if environment.is_some() {
@@ -170,46 +170,10 @@ fn secret_minimum(file: Option<&str>) -> Result<usize, CliError> {
         .trim()
         .parse::<usize>()
         .map_err(|_| "MIN_SECRET_LENGTH must be a whole number")?;
-    if minimum < KEY_BYTES {
+    if minimum < secret_policy::MIN_SECRET_LENGTH {
         return Err("MIN_SECRET_LENGTH must be at least 32".into());
     }
     Ok(minimum)
-}
-
-fn weak(value: &str, key: bool, minimum: usize) -> bool {
-    let lower = Zeroizing::new(value.to_ascii_lowercase());
-    value.trim().is_empty()
-        || lower.starts_with("__replace_me__")
-        || lower.starts_with("replaceme")
-        || matches!(
-            lower.as_str(),
-            "my-test-key"
-                | "my-test-key-but-now-longer-than-32-bytes"
-                | "my-test-salt"
-                | "changeme"
-                | "secret"
-                | "password"
-                | "test-secret"
-                | "my-secret"
-                | "12345678"
-        )
-        || (key && (value.chars().count() < minimum || entropy(value) < 3.5))
-}
-
-fn entropy(value: &str) -> f64 {
-    let mut counts = HashMap::new();
-    let mut length = 0;
-    for ch in value.chars() {
-        *counts.entry(ch).or_insert(0) += 1;
-        length += 1;
-    }
-    -counts
-        .into_values()
-        .map(|count| {
-            let proportion = f64::from(count) / f64::from(length);
-            proportion * proportion.log2()
-        })
-        .sum::<f64>()
 }
 
 fn environment(name: &str) -> Result<Option<Zeroizing<String>>, CliError> {

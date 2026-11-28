@@ -194,6 +194,18 @@ release. Seven Rust Anything cases compare the exported bytes and cover
 stdout, file creation and replacement, environment overrides, and
 invalid destinations.
 
+`--validate-config [PATH]` checks the selected dotenv file and process
+overrides against the same schema. It also checks cross-field conditions
+and shares the secret strength policy with `init-secrets`. Errors report
+field paths and omit configured values. Numeric settings require finite values.
+
+Thirty-four Rust Anything cases compare success messages, exit codes, and
+invalid field names. They cover listener aliases, process overrides, variable
+references, scalar constraints, list decoding, and secret and password checks.
+Both implementations validate the pinned deployment template after secret
+generation. The Linux arm64 image validates its generated `.env`, honors
+the container port override, and rejects an invalid port without an override.
+
 ## HTTP request boundary
 
 The gateway enables correlation IDs and request header limits by default.
