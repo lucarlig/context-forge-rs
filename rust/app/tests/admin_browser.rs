@@ -1880,6 +1880,116 @@ async fn registry_selects_gateways_after_enforcing_team_scope() {
 }
 
 #[tokio::test]
+async fn registry_registration_requires_browser_proof_and_serializes_oauth_duplicates() {
+    use serde_json::{Value, json};
+
+    let directory =
+        FixtureDirectory(std::env::temp_dir().join(Uuid::new_v4().simple().to_string()));
+    std::fs::create_dir(&directory.0).unwrap();
+    let path = directory.0.join("catalog.yml");
+    std::fs::write(
+        &path,
+        r#"{"catalog_servers":[{"id":"staged","name":"OAuth Fixture","description":"Fixture",
+            "url":"https://example.test/mcp","auth_type":"OAuth2.1","transport":"STREAMABLEHTTP"}]}"#,
+    )
+    .unwrap();
+    let mut gateway =
+        gateway_with_env(&[("MCPGATEWAY_CATALOG_FILE", path.to_str().unwrap())]).await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        fixture,
+        ..
+    } = &gateway;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"email":EMAIL,"password":password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    let denied = client
+        .post(format!("{origin}/v1/admin/mcp-registry/staged/register"))
+        .header(header::COOKIE, format!("jwt_token={token}"))
+        .header(header::ACCEPT, "text/html")
+        .header(header::ORIGIN, origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(
+        denied
+            .text()
+            .await
+            .unwrap()
+            .contains("CSRF validation failed")
+    );
+
+    let canary = Uuid::new_v4().to_string();
+    let register = |name: &str| {
+        client
+            .post(format!("{origin}/v1/catalog/staged/register"))
+            .bearer_auth(token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "name":name,
+                    "oauth_credentials":{"client_id":name,"client_secret":canary},
+                })
+                .to_string(),
+            )
+            .send()
+    };
+    let (first, second) = tokio::join!(register("First fixture"), register("Second fixture"));
+    let mut successes = 0;
+    let mut conflicts = 0;
+    for response in [first.unwrap(), second.unwrap()] {
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(!body.contains(&canary));
+        let data: Value = serde_json::from_str(&body).unwrap();
+        match status {
+            StatusCode::OK => {
+                successes += 1;
+                assert_eq!(data["success"], true);
+                assert_eq!(data["oauth_required"], true);
+            }
+            StatusCode::CONFLICT => {
+                conflicts += 1;
+                assert_eq!(data["detail"], "Server already registered");
+            }
+            _ => panic!("unexpected registration status {status}"),
+        }
+    }
+    assert_eq!((successes, conflicts), (1, 1));
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", fixture.0.join("mcp.db").display()))
+            .await
+            .unwrap();
+    let rows = sqlx::query_as::<_, (bool, String, String, String)>(
+        "SELECT enabled,auth_type,created_via,CAST(oauth_config AS TEXT) FROM gateways WHERE url=$1"
+    ).bind("https://example.test/mcp").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let (enabled, auth, created_via, stored) = &rows[0];
+    assert!(!enabled);
+    assert_eq!(auth, "oauth");
+    assert_eq!(created_via, "catalog");
+    let data: Value = serde_json::from_str(stored).unwrap();
+    assert!(
+        data["client_secret"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(!stored.contains(&canary));
+    pool.close().await;
+    gateway.process.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn disabling_legacy_api_preserves_versioned_browser_forms_and_server_sse() {
     let mut gateway = gateway_with_env(&[
         ("LEGACY_API_ENABLED", "false"),

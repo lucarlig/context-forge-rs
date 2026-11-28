@@ -113,7 +113,7 @@ pub(crate) struct UpstreamCredentials {
     pub(crate) sigv4: Option<std::sync::Arc<SigV4>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub(crate) struct AuthInput {
     #[serde(alias = "authType")]
     auth_type: Option<String>,
@@ -210,16 +210,7 @@ impl AuthInput {
                 if !self.oauth_config.as_ref().is_some_and(OAuthConfig::valid) {
                     return Err(AuthError::Invalid);
                 }
-                return Ok(Some(PreparedAuth {
-                    kind: "oauth",
-                    encoded_headers: None,
-                    encoded_query: None,
-                    encoded_sigv4: None,
-                    encoded_oauth: None,
-                    credentials: UpstreamCredentials::default(),
-                    masked: json!({"authType": "oauth"}),
-                    cipher: cipher.ok_or(CredentialError)?,
-                }));
+                return Self::prepare_oauth(cipher).map(Some);
             }
             "sigv4" => {
                 let config = self.sigv4_config.as_ref().ok_or(AuthError::Invalid)?;
@@ -339,6 +330,34 @@ impl AuthInput {
             masked,
             cipher,
         }))
+    }
+
+    pub(crate) fn prepare_staged_oauth<'a>(
+        &self,
+        cipher: Option<&'a CredentialCipher>,
+    ) -> Result<Option<PreparedAuth<'a>>, AuthError> {
+        if self.auth_type.as_deref() != Some("oauth")
+            || !self
+                .oauth_config
+                .as_ref()
+                .is_some_and(OAuthConfig::valid_staged_authorization_code)
+        {
+            return Err(AuthError::Invalid);
+        }
+        Self::prepare_oauth(cipher).map(Some)
+    }
+
+    fn prepare_oauth(cipher: Option<&CredentialCipher>) -> Result<PreparedAuth<'_>, AuthError> {
+        Ok(PreparedAuth {
+            kind: "oauth",
+            encoded_headers: None,
+            encoded_query: None,
+            encoded_sigv4: None,
+            encoded_oauth: None,
+            credentials: UpstreamCredentials::default(),
+            masked: json!({"authType": "oauth"}),
+            cipher: cipher.ok_or(CredentialError)?,
+        })
     }
 }
 

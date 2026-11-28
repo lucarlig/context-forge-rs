@@ -176,9 +176,13 @@ async fn fetch_tools(
         super::management::RefreshParameters {
             include_resources: Some("true".to_owned()),
             include_prompts: Some("true".to_owned()),
+            ..Default::default()
         }
     } else {
-        super::management::RefreshParameters::default()
+        super::management::RefreshParameters {
+            fetch_authorized_catalog: true,
+            ..Default::default()
+        }
     };
     let response =
         super::management::refresh_catalog(&service, &principal, id.clone(), query, &headers).await;

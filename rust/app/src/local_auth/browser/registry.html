@@ -1,8 +1,25 @@
 <section aria-labelledby="registry-heading">
+  {% macro scope_fields(public_only, team) %}
+  <label>Visibility
+    <select name="visibility" aria-label="Visibility">
+      {% if not public_only %}<option value="private">Private</option><option value="team">Team</option>{% endif %}
+      <option value="public">Public</option>
+    </select>
+  </label>
+  {% if not public_only %}<label>Team ID <input name="team_id" value="{{ team|default('', true) }}" maxlength="36"></label>{% endif %}
+  {% endmacro %}
   <h2 id="registry-heading">MCP registry</h2>
   {% if registry.data.servers %}
+  {% if registry.can_register %}
+  <form id="registry-bulk" method="post" action="{{ root }}/admin/mcp-registry/bulk-register/form">
+    <input type="hidden" name="csrf_token" value="{{ proof }}">
+    {{ scope_fields(registry.public_only, catalog.team) }}
+    <label><input type="checkbox" name="skip_errors" value="true" checked> Continue on error</label>
+    <button type="submit">Register selected</button>
+  </form>
+  {% endif %}
   <table aria-labelledby="registry-heading">
-    <thead><tr><th scope="col">Server</th><th scope="col">Category</th><th scope="col">Authentication</th><th scope="col">Status</th></tr></thead>
+    <thead><tr><th scope="col">Server</th><th scope="col">Category</th><th scope="col">Authentication</th><th scope="col">Status</th>{% if registry.can_register %}<th scope="col">Actions</th>{% endif %}</tr></thead>
     <tbody>
     {% for entry in registry.data.servers %}
       <tr>
@@ -10,8 +27,43 @@
         <td>{{ entry.category }}</td>
         <td>{{ entry.auth_type }}</td>
         <td>{% if entry.requires_oauth_config %}OAuth setup required{% elif entry.is_registered %}Registered{% elif entry.is_available %}Available{% else %}Unavailable{% endif %}</td>
+        {% if registry.can_register %}
+        <td>
+          {% if entry.requires_oauth_config %}
+          <a href="{{ oauth_root }}/oauth/authorize/{{ entry.gateway_id }}">Authorize</a>
+          {% elif not entry.is_registered %}
+          <label><input type="checkbox" form="registry-bulk" name="server_ids" value="{{ entry.id }}" aria-label="Select {{ entry.name }}"> Select</label>
+          <details>
+            <summary>Register {{ entry.name }}</summary>
+            <form method="post" action="{{ root }}/admin/mcp-registry/{{ registry.form_ids[entry.id] }}/register/form">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <label>Gateway name <input name="name" placeholder="{{ entry.name }}" maxlength="255"></label>
+              {{ scope_fields(registry.public_only, catalog.team) }}
+              {% if entry.requires_api_key or entry.auth_type in ["API Key", "API", "OAuth2.1 & API Key"] %}
+              <label>API key <input name="api_key" type="password" autocomplete="off" maxlength="4096"></label>
+              {% endif %}
+              {% if entry.auth_type in ["OAuth2.1", "OAuth", "OAuth2.1 & API Key"] %}
+              <fieldset>
+                <legend>OAuth overrides</legend>
+                <label>Client ID <input name="client_id" autocomplete="off"></label>
+                <label>Client secret <input name="client_secret" type="password" autocomplete="off"></label>
+                <label>Issuer <input name="issuer" type="url"></label>
+                <label>Authorization URL <input name="authorization_url" type="url"></label>
+                <label>Token URL <input name="token_url" type="url"></label>
+                <label>Scopes <input name="scopes"></label>
+                <label>Redirect URI <input name="redirect_uri" type="url"></label>
+                <label>Audience <input name="audience"></label>
+                <label>Resource <input name="resource"></label>
+              </fieldset>
+              {% endif %}
+              <button type="submit">Register server</button>
+            </form>
+          </details>
+          {% endif %}
+        </td>
+        {% endif %}
       </tr>
-      {% if entry.description %}<tr><td colspan="4">{{ entry.description }}</td></tr>{% endif %}
+      {% if entry.description %}<tr><td colspan="{{ 5 if registry.can_register else 4 }}">{{ entry.description }}</td></tr>{% endif %}
     {% endfor %}
     </tbody>
   </table>

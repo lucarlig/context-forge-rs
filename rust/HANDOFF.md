@@ -390,6 +390,25 @@ verifies the dashboard filters. The live Rust test checks that a team-scoped
 token selects a visible gateway when a private gateway in another team shares
 its catalog URL.
 
+`POST /v1/catalog/{id}/register` registers a curated server through the
+gateway discovery and credential storage pipeline. Both admin prefixes
+provide single and bulk registration. The dashboard supports both operations.
+Registration checks both server and gateway creation permissions, and
+validates the requested team before discovery. Duplicate checks use scoped
+gateway records and run inside the write transaction.
+
+OAuth entries without an API key are saved disabled for authorization.
+The dashboard links to the existing OAuth flow. After authorization,
+Fetch Tools imports the catalog and leaves activation to the operator.
+The credential vault encrypts submitted client secrets and bearer keys.
+Browser form and HTMX writes require CSRF proof.
+
+Seven Rust Anything write scenarios match on SQLite and PostgreSQL. They
+cover single and bulk registration, team permissions, API keys, encrypted
+OAuth overrides, HTMX feedback, and tool discovery after authorization.
+Chromium verifies single and bulk registration. A live Rust test checks
+browser CSRF denial and concurrent attempts to register the same OAuth entry.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

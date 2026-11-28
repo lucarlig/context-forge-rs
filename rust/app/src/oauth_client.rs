@@ -185,6 +185,14 @@ impl OAuthConfig {
     }
 
     pub(crate) fn valid(&self) -> bool {
+        self.valid_config(false)
+    }
+
+    pub(crate) fn valid_staged_authorization_code(&self) -> bool {
+        self.is_authorization_code() && self.valid_config(true)
+    }
+
+    fn valid_config(&self, staged_authorization_code: bool) -> bool {
         let Some(method) = self.client_auth() else {
             return false;
         };
@@ -194,13 +202,14 @@ impl OAuthConfig {
             .as_ref()
             .is_some_and(|issuer| !issuer.is_empty());
         let endpoints = if self.is_authorization_code() {
-            (client || issuer)
-                && (issuer
-                    || (!self.token_url.is_empty()
-                        && self
-                            .authorization_url
-                            .as_ref()
-                            .is_some_and(|url| !url.is_empty())))
+            staged_authorization_code
+                || (client || issuer)
+                    && (issuer
+                        || (!self.token_url.is_empty()
+                            && self
+                                .authorization_url
+                                .as_ref()
+                                .is_some_and(|url| !url.is_empty())))
         } else if self.is_token_exchange() {
             self.valid_exchange()
         } else {

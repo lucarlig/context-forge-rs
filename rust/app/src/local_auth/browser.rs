@@ -6,6 +6,7 @@ mod forms;
 mod grpc;
 mod keycloak;
 mod recovery;
+mod registry;
 mod roots;
 mod sessions;
 mod team;
@@ -29,6 +30,21 @@ use super::*;
 pub(crate) fn registry_partial(registry: Value) -> Response {
     forms::render_template("registry.html", minijinja::context! { registry })
         .unwrap_or_else(IntoResponse::into_response)
+}
+pub(crate) fn registry_registration_fragment(id: &str, root: &str, result: Value) -> Response {
+    let id = percent_encoding::utf8_percent_encode(id, percent_encoding::NON_ALPHANUMERIC);
+    let action = format!("{root}/admin/mcp-registry/{id}/register");
+    let success = result["success"].as_bool() == Some(true);
+    let mut response =
+        forms::render_template("registry_registration.html", context! { action, result })
+            .unwrap_or_else(IntoResponse::into_response);
+    if success {
+        response.headers_mut().insert(
+            HeaderName::from_static("hx-trigger-after-swap"),
+            HeaderValue::from_static(r#"{"catalogRegistrationSuccess":{"delayMs":1500}}"#),
+        );
+    }
+    response
 }
 use crate::{
     access::{auth_cookie, browser_request, cookie},
@@ -167,6 +183,7 @@ pub(super) fn router(
         router = a2a::routes(router, path);
         router = grpc::routes(router, path);
         router = roots::routes(router, path);
+        router = registry::routes(router, path);
         for kind in ManagedCatalog::ALL {
             let base = format!("{path}/{}", kind.name());
             router = router

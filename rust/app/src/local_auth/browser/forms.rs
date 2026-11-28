@@ -247,6 +247,12 @@ pub(super) fn render_template(
                 .add_template("registry.html", include_str!("registry.html"))
                 .expect("valid MCP registry template");
             environment
+                .add_template(
+                    "registry_registration.html",
+                    include_str!("registry_registration.html"),
+                )
+                .expect("valid MCP registry registration template");
+            environment
         });
     let html = TEMPLATES
         .get_template(template)

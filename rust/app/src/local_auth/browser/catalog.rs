@@ -748,6 +748,7 @@ pub(super) async fn dashboard(
             Some("gateway_delete_pending") => Some("MCP server deletion is pending."),
             Some("gateway_write_pending") => Some("MCP server initialization is pending."),
             Some("gateway_refreshed") => Some("MCP server tools refreshed."),
+            Some("registry_registered") => Some("MCP server registered."),
             _ => None,
         },
     })

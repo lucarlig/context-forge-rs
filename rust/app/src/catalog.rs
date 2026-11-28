@@ -12,6 +12,7 @@ use crate::{
     auth::TeamVisibility,
     credentials::PreparedAuth,
     database::Database,
+    gateway_records::{REGISTRY_POSTGRES, REGISTRY_SQLITE, RegistryGateway},
     upstream::{DiscoveredMetadata, UpstreamTransport},
 };
 
@@ -313,6 +314,8 @@ pub(crate) struct RegistrationOptions<'a> {
     pub(crate) mode: GatewayMode,
     pub(crate) one_time_auth: bool,
     pub(crate) pending: bool,
+    pub(crate) inactive: bool,
+    pub(crate) registry_scope: Option<&'a TeamVisibility>,
     pub(crate) refresh_interval_seconds: Option<i32>,
     pub(crate) tls: RegisteredTls<'a>,
     pub(crate) created_from_ip: Option<&'a str>,
@@ -853,8 +856,8 @@ macro_rules! insert_gateway {
                 created_from_ip, created_via, created_user_agent, import_batch_id,
                 auth_type, auth_value, auth_query_params, passthrough_headers, identity_propagation,
                 ca_certificate, ca_certificate_sig, signing_algorithm, client_cert, client_key, sigv4_config, oauth_config
-            ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, TRUE,
-                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CASE WHEN $27 THEN NULL ELSE CURRENT_TIMESTAMP END,
+            ) VALUES ($1, $2, $3, $4, $5, ", $capabilities, ", ", $tags, ", $11, NOT $31,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CASE WHEN $27 OR $31 THEN NULL ELSE CURRENT_TIMESTAMP END,
                 NOT $27, $8, $8, $9, $10, $17, CASE WHEN $27 THEN 'pending' ELSE 'active' END,
                 CASE WHEN $27 THEN 'Gateway registration accepted and pending initialization' END, $28,
                 $25, COALESCE($29, 'api'), $26, $30,
@@ -1403,14 +1406,38 @@ impl Database {
 
         // The duplicate check and all inserts share a write transaction, including on SQLite.
         macro_rules! register {
-            ($tx:ident, $tool_conflicts:expr, $gateway_insert:expr, $tool_insert:expr, $schema:literal) => {{
+            ($tx:ident, $tool_conflicts:expr, $gateway_insert:expr, $tool_insert:expr, $schema:literal, $registry:ident) => {{
+                if let Some(visibility) = options.registry_scope {
+                    let teams = visible_team_ids(CatalogScope { email: Some(gateway.owner_email), visibility })?;
+                    let found = sqlx::query_as::<_, RegistryGateway>($registry)
+                        .bind(gateway.owner_email)
+                        .bind(*visibility == TeamVisibility::Admin)
+                        .bind(teams)
+                        .bind(json!([gateway.url]).to_string())
+                        .fetch_optional(&mut *$tx).await?;
+                    // A scoped token can retry an unassigned private registration without learning its ID.
+                    let unassigned_retry = matches!(visibility, TeamVisibility::Teams(_))
+                        && gateway.visibility == "private"
+                        && gateway.team_id.is_none()
+                        && sqlx::query_scalar::<_, bool>(
+                            "SELECT EXISTS (SELECT 1 FROM gateways
+                             WHERE url=$1 AND owner_email=$2 AND visibility='private' AND team_id IS NULL)"
+                        )
+                        .bind(gateway.url)
+                        .bind(gateway.owner_email)
+                        .fetch_one(&mut *$tx)
+                        .await?;
+                    if found.is_some() || unassigned_retry {
+                        return Err(RegistrationError::UrlConflict);
+                    }
+                }
                 let conflict = sqlx::query_scalar::<_, Option<String>>(CONFLICT_QUERY)
                     .bind(gateway.slug)
                     .bind(gateway.url)
                     .bind(gateway.visibility)
                     .bind(gateway.team_id)
                     .bind(gateway.owner_email)
-                    .bind(auth.is_none() && !options.one_time_auth)
+                    .bind(options.registry_scope.is_none() && auth.is_none() && !options.one_time_auth)
                     .fetch_one(&mut *$tx)
                     .await?;
                 match conflict.as_deref() {
@@ -1418,7 +1445,7 @@ impl Database {
                     Some("url") => return Err(RegistrationError::UrlConflict),
                     _ => {}
                 }
-                if let Some(auth) = auth {
+                if let Some(auth) = auth && options.registry_scope.is_none() {
                     let existing = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, Option<String>)>(AUTH_CONFLICT_QUERY)
                         .bind(gateway.url)
                         .bind(gateway.visibility)
@@ -1473,6 +1500,7 @@ impl Database {
                     .bind(options.refresh_interval_seconds)
                     .bind(options.created_via)
                     .bind(options.import_batch_id)
+                    .bind(options.inactive)
                     .execute(&mut *$tx)
                     .await?;
                 for tool in tools {
@@ -1557,7 +1585,8 @@ impl Database {
                         "json($24)"
                     ),
                     SQLITE_TOOL_INSERT,
-                    "json($7)"
+                    "json($7)",
+                    REGISTRY_SQLITE
                 );
             }
             Self::Postgres(pool) => {
@@ -1577,7 +1606,8 @@ impl Database {
                         "CAST($24 AS JSON)"
                     ),
                     POSTGRES_TOOL_INSERT,
-                    "CAST($7 AS JSON)"
+                    "CAST($7 AS JSON)",
+                    REGISTRY_POSTGRES
                 );
             }
         }

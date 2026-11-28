@@ -96,6 +96,17 @@
     </form>
     <p><a href="{{ root }}/admin/roots/export?uri={{ entry.encoded_uri }}">Download JSON</a></p>
     <p><a href="{{ root }}/admin/?section=roots#roots">Back to roots</a></p>
+    {% elif page == "registry-result" %}
+    <h1>MCP registry registration</h1>
+    {% if result.error %}
+    <p role="alert">{{ result.error }}</p>
+    {% else %}
+    <p>Registered {{ result.total_successful }} of {{ result.total_attempted }} selected servers.</p>
+    {% if result.failed %}
+    <ul>{% for entry in result.failed %}<li>{{ entry.server_id }} · {{ entry.error }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% endif %}
+    <p><a href="{{ back }}">Back to MCP registry</a></p>
     {% elif page == "grpc-edit" %}
     {% include "grpc_edit.html" %}
     {% elif page == "grpc-methods" %}

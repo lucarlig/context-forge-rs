@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod registration;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::ErrorKind,
@@ -21,15 +23,22 @@ pub(super) struct CatalogRegistry {
     file: String,
     ttl: Duration,
     page_size: i64,
+    allow_public_team: bool,
     cache: Mutex<Option<(Instant, Arc<[Entry]>)>>,
 }
 
 impl CatalogRegistry {
-    pub(super) fn new(file: String, ttl: Duration, page_size: i64) -> Self {
+    pub(super) fn new(
+        file: String,
+        ttl: Duration,
+        page_size: i64,
+        allow_public_team: bool,
+    ) -> Self {
         Self {
             file,
             ttl,
             page_size,
+            allow_public_team,
             cache: Mutex::new(None),
         }
     }
@@ -269,7 +278,7 @@ impl Filters {
 }
 
 pub(super) fn router() -> Router<Arc<GatewayService>> {
-    Router::new().route("/v1/catalog", get(list))
+    registration::routes(Router::new().route("/v1/catalog", get(list)))
 }
 
 pub(super) fn admin_router() -> Router<Arc<GatewayService>> {
@@ -279,6 +288,7 @@ pub(super) fn admin_router() -> Router<Arc<GatewayService>> {
             .route(&format!("{base}/servers"), get(admin_list))
             .route(&format!("{base}/{{id}}/status"), get(status))
             .route(&format!("{base}/partial"), get(partial));
+        router = registration::admin_routes(router, base);
     }
     router
 }
@@ -469,6 +479,17 @@ impl GatewayService {
         filters.offset = (page - 1).saturating_mul(filters.limit);
         let data = build_list(&entries, &matches, &filters);
         let pages = 1 + (data.total as i64).saturating_sub(1) / filters.limit;
+        let can_register = section && registration::can_register(self, principal, None).await?;
+        let form_ids: BTreeMap<_, _> = data
+            .servers
+            .iter()
+            .map(|row| {
+                let id = row.entry.id.as_str();
+                let encoded =
+                    percent_encoding::utf8_percent_encode(id, percent_encoding::NON_ALPHANUMERIC);
+                (id, encoded.to_string())
+            })
+            .collect();
         let link = |page: i64| {
             let mut query = url::form_urlencoded::Serializer::new(String::new());
             if section {
@@ -487,7 +508,8 @@ impl GatewayService {
             format!("{base}?{}", query.finish())
         };
         Ok(json!({
-            "data":data, "page":page, "pages":pages,
+            "data":data, "page":page, "pages":pages, "can_register":can_register, "form_ids":form_ids,
+            "public_only":principal.visibility == TeamVisibility::Public,
             "category":filters.category, "auth_type":filters.auth_type, "search":filters.search,
             "previous":(page > 1).then(|| link(page - 1)),
             "next":(page < pages).then(|| link(page + 1))

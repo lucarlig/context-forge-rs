@@ -23,6 +23,7 @@ impl SearchSettings {
                 value("MCPGATEWAY_CATALOG_FILE", "mcp-catalog.yml")?,
                 Duration::from_secs(parse("MCPGATEWAY_CATALOG_CACHE_TTL", 3600)?),
                 parse::<i64>("MCPGATEWAY_CATALOG_PAGE_SIZE", 100)?.max(1),
+                flag("ALLOW_PUBLIC_VISIBILITY")?.unwrap_or(true),
             ))
         } else {
             None

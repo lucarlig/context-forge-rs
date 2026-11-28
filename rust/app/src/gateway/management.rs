@@ -29,6 +29,8 @@ const MASKED: &str = "*****";
 pub(super) struct RefreshParameters {
     pub(super) include_resources: Option<String>,
     pub(super) include_prompts: Option<String>,
+    #[serde(skip)]
+    pub(super) fetch_authorized_catalog: bool,
 }
 
 #[derive(Deserialize)]
@@ -275,7 +277,12 @@ pub(super) async fn refresh_catalog(
     {
         return Err(ManagementError::Denied);
     }
-    if !record.enabled || !record.reachable || record.status != "active" {
+    let fetch_authorized_catalog = query.fetch_authorized_catalog
+        && record.created_via.as_deref() == Some("catalog")
+        && record.auth_type.as_deref() == Some("oauth");
+    if ((!record.enabled || !record.reachable) && !fetch_authorized_catalog)
+        || record.status != "active"
+    {
         return Ok(refresh_response(
             &record.id,
             started,
@@ -283,6 +290,8 @@ pub(super) async fn refresh_catalog(
             None,
         ));
     }
+    let include_resources = include_resources || fetch_authorized_catalog;
+    let include_prompts = include_prompts || fetch_authorized_catalog;
     let Some(_refresh_guard) = service.try_catalog_refresh(&record.id) else {
         return Err(ManagementError::RefreshInProgress(record.name));
     };
@@ -292,11 +301,24 @@ pub(super) async fn refresh_catalog(
     let Some(transport) = UpstreamTransport::from_name(&record.transport) else {
         return Ok(failure("Unsupported gateway transport".to_owned()));
     };
-    let credentials = match service
-        .configured_upstream(
+    let Some(connection) = service
+        .database
+        .gateway_connection(
             &record.id,
             &record.url,
-            true,
+            fetch_authorized_catalog,
+            Some(record.version),
+            None,
+        )
+        .await?
+    else {
+        return Ok(failure("Could not load upstream authentication".to_owned()));
+    };
+    let credentials = match service
+        .connection_credentials(
+            &record.id,
+            &record.url,
+            connection,
             Some(headers),
             Some(principal),
             UpstreamUse::Discovery,

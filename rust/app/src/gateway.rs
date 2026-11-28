@@ -1402,7 +1402,7 @@ fn list_fingerprint(method: &str, principal: Option<&Principal>, server: Option<
     Sha256::digest(value.as_bytes()).into()
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegisterGateway {
     name: String,
@@ -1469,6 +1469,10 @@ enum GatewayRegistrationSource<'a> {
         via: &'static str,
     },
     Import(&'a import_api::ImportScope<'a>),
+    Registry {
+        visibility: &'static str,
+        team: Option<&'a str>,
+    },
 }
 
 async fn register_gateway(
@@ -1509,6 +1513,7 @@ async fn register_gateway(
         }
     };
 
+    let registry_request = matches!(source, GatewayRegistrationSource::Registry { .. });
     let (visibility, team, created_via, batch_id, address, agent) = match source {
         GatewayRegistrationSource::Request {
             address,
@@ -1568,6 +1573,14 @@ async fn register_gateway(
                 None,
             )
         }
+        GatewayRegistrationSource::Registry { visibility, team } => (
+            visibility,
+            team.map(str::to_owned),
+            "catalog",
+            None,
+            None,
+            None,
+        ),
     };
 
     let url = input.url.trim();
@@ -1575,7 +1588,7 @@ async fn register_gateway(
     let lifecycle = service
         .lifecycle
         .as_ref()
-        .filter(|_| !one_time_auth && created_via != "import");
+        .filter(|_| !one_time_auth && created_via != "import" && !registry_request);
     service.upstream.check_endpoint(url).map_err(|_| {
         RegistrationResponse::new(
             StatusCode::BAD_REQUEST,
@@ -1632,14 +1645,26 @@ async fn register_gateway(
                     "OAuth token endpoint is invalid or disallowed",
                 )
             })?;
-        service
+        let discovery = service
             .gateway_oauth
-            .discover_endpoints(&service.upstream, config)
-            .await;
+            .discover_endpoints(&service.upstream, config);
+        if registry_request {
+            let _ = tokio::time::timeout(Duration::from_secs(5), discovery).await;
+        } else {
+            discovery.await;
+        }
     }
-    let mut auth = input
-        .auth
-        .prepare(service.credential_cipher.as_ref(), service.query_auth_hosts.as_ref(), url)
+    let staged_oauth = registry_request
+        && input
+            .auth
+            .oauth_config()
+            .is_some_and(OAuthConfig::is_authorization_code);
+    let cipher = service.credential_cipher.as_ref();
+    let mut auth = if staged_oauth {
+        input.auth.prepare_staged_oauth(cipher)
+    } else {
+        input.auth.prepare(cipher, service.query_auth_hosts.as_ref(), url)
+    }
         .map_err(|error| match error {
             AuthError::Invalid => RegistrationResponse::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1693,6 +1718,7 @@ async fn register_gateway(
         .auth
         .oauth_config()
         .is_some_and(OAuthConfig::defers_discovery);
+    let inactive = staged_oauth;
     if let Some(config) = input.auth.oauth_config()
         && let Some(auth) = &mut auth
     {
@@ -1763,6 +1789,30 @@ async fn register_gateway(
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "upstream gateway discovery failed");
+                if registry_request {
+                    let message = match error {
+                        UpstreamError::Transport | UpstreamError::Resolve => {
+                            "Server is offline or unreachable"
+                        }
+                        UpstreamError::Timeout => {
+                            "Server took too long to respond - it may be slow or unavailable"
+                        }
+                        UpstreamError::Status(401) => {
+                            "Authentication failed - check API key or OAuth credentials"
+                        }
+                        UpstreamError::Status(403) => {
+                            "Access forbidden - check permissions and API key"
+                        }
+                        UpstreamError::Status(404) => {
+                            "Server endpoint not found - check URL is correct"
+                        }
+                        UpstreamError::Status(500..=599) => {
+                            "Remote server error - the MCP server is experiencing issues"
+                        }
+                        _ => "Registration failed",
+                    };
+                    return RegistrationResponse::new(StatusCode::BAD_GATEWAY, message);
+                }
                 match error {
                     UpstreamError::Status(401 | 403) if discovery_credentials.sigv4.is_some() => {
                         RegistrationResponse::new(
@@ -1837,6 +1887,8 @@ async fn register_gateway(
                 mode,
                 one_time_auth,
                 pending: lifecycle.is_some(),
+                inactive,
+                registry_scope: registry_request.then_some(&principal.visibility),
                 refresh_interval_seconds: input.refresh_interval_seconds,
                 tls: RegisteredTls {
                     ca_certificate: input.ca_certificate.as_deref(),
@@ -1891,8 +1943,14 @@ async fn register_gateway(
             service.credential_cipher.as_ref(),
         )));
     }
-    service.subscriptions.registered(&registration);
+    if !inactive {
+        service.subscriptions.registered(&registration);
+    }
     let mut response = registration_response(&registration, address, agent);
+    if registry_request {
+        response["toolCount"] = tools.len().into();
+        response["enabled"] = (!inactive).into();
+    }
     response["createdVia"] = json!(created_via);
     response["importBatchId"] = json!(batch_id);
     response["gatewayMode"] = mode.name().into();
