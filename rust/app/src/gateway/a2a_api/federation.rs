@@ -99,6 +99,7 @@ async fn forward(
         || json!({"a2a.federation":true,"a2a.hop":hops+1,
             "a2a.interaction_type":invocation.interaction_type.chars().take(50).collect::<String>()}),
     ).await;
+    span.inject_trace_context(request.headers_mut());
     let result = forward_request(app, principal, request, hops).await;
     let success = matches!(&result, Ok(value) if !protocol::has_rpc_error(value));
     span.finish(Outcome::completed(success, "A2A federation request failed"))

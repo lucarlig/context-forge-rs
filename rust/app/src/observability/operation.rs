@@ -3,22 +3,36 @@
 use std::{future::Future, time::Instant};
 
 use jiff::Timestamp;
+use opentelemetry::{
+    KeyValue,
+    global::BoxedSpan,
+    trace::{Span, Status},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::bounded;
+use super::{bounded, telemetry::ExportContext};
 use crate::database::Database;
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub(crate) struct TraceContext {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub(super) stored: Option<StoredTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) exported: Option<ExportContext>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct StoredTrace {
     pub(super) trace_id: String,
     pub(super) span_id: String,
 }
 
 impl TraceContext {
-    pub(super) fn root(trace_id: String, span_id: String) -> Self {
-        Self { trace_id, span_id }
+    pub(super) fn with_stored(mut self, trace_id: String, span_id: String) -> Self {
+        self.stored = Some(StoredTrace { trace_id, span_id });
+        self
     }
 }
 
@@ -75,7 +89,7 @@ impl Outcome {
 
 pub(super) struct Operation {
     database: Database,
-    pub(super) parent: TraceContext,
+    pub(super) parent: StoredTrace,
     pub(super) id: String,
     pub(super) name: &'static str,
     pub(super) kind: &'static str,
@@ -90,6 +104,35 @@ pub(super) struct Operation {
 #[derive(Default)]
 pub(crate) struct OperationSpan {
     active: Option<Operation>,
+    exported: Option<ExportedOperation>,
+}
+
+struct ExportedOperation {
+    span: BoxedSpan,
+    started: Instant,
+    tool: bool,
+}
+
+impl ExportedOperation {
+    fn finish(mut self, outcome: Outcome) {
+        if self.tool {
+            self.span.set_attributes([
+                KeyValue::new("success", matches!(outcome, Outcome::Ok)),
+                KeyValue::new("cancelled", matches!(outcome, Outcome::Cancelled)),
+                KeyValue::new("duration.ms", self.started.elapsed().as_secs_f64() * 1000.0),
+            ]);
+        }
+        if matches!(outcome, Outcome::InputRequired) {
+            self.span
+                .set_attribute(KeyValue::new("input_required", true));
+        }
+        self.span.set_status(match outcome {
+            Outcome::Error(message) => Status::error(message),
+            Outcome::Cancelled => Status::error("Operation cancelled"),
+            Outcome::Ok | Outcome::InputRequired => Status::Ok,
+        });
+        self.span.end();
+    }
 }
 
 impl OperationSpan {
@@ -100,7 +143,7 @@ impl OperationSpan {
         resource: Option<SpanResource<'_>>,
         attrs: impl FnOnce() -> Value,
     ) -> Self {
-        let Some(parent) = current_trace() else {
+        let Some(context) = current_trace() else {
             return Self::default();
         };
         let mut attributes = attrs();
@@ -112,10 +155,24 @@ impl OperationSpan {
             .as_ref()
             .and_then(|resource| resource.id)
             .map(|id| bounded(id, 36));
-        if name == "tool.invoke" {
+        let tool = name == "tool.invoke";
+        if tool {
             attributes["tool.name"] = json!(resource_name);
             attributes["tool.id"] = json!(resource_id);
         }
+        let started = Instant::now();
+        let exported = context.exported.map(|parent| ExportedOperation {
+            span: parent.start_operation(name, &attributes),
+            started,
+            tool,
+        });
+        let mut result = Self {
+            active: None,
+            exported,
+        };
+        let Some(parent) = context.stored else {
+            return result;
+        };
         let operation = Operation {
             database: database.clone(),
             parent,
@@ -126,30 +183,45 @@ impl OperationSpan {
             resource_name,
             resource_id,
             started_at: Timestamp::now(),
-            started: Instant::now(),
+            started,
             attributes,
         };
         match Box::pin(database.start_operation(&operation, &operation.attributes)).await {
-            Ok(true) => Self {
-                active: Some(operation),
-            },
-            Ok(false) => Self::default(),
+            Ok(true) => result.active = Some(operation),
+            Ok(false) => {}
             Err(error) => {
                 tracing::warn!(%error, operation=name,"Operation span could not start");
-                Self::default()
             }
         }
+        result
     }
 
     pub(crate) async fn scope<T>(&self, operation: impl Future<Output = T>) -> T {
-        let child = self.active.as_ref().map(|span| TraceContext {
-            trace_id: span.parent.trace_id.clone(),
-            span_id: span.id.clone(),
+        let child = current_trace().map(|mut context| {
+            if let Some(span) = &self.active {
+                context.stored = Some(StoredTrace {
+                    trace_id: span.parent.trace_id.clone(),
+                    span_id: span.id.clone(),
+                });
+            }
+            if let Some(span) = &self.exported {
+                context.exported = Some(ExportContext::from_span(span.span.span_context()));
+            }
+            context
         });
         with_trace(child, operation).await
     }
 
+    pub(crate) fn inject_trace_context(&self, headers: &mut axum::http::HeaderMap) {
+        if let Some(exported) = &self.exported {
+            ExportContext::from_span(exported.span.span_context()).inject(headers);
+        }
+    }
+
     pub(crate) async fn finish(mut self, outcome: Outcome) {
+        if let Some(span) = self.exported.take() {
+            span.finish(outcome);
+        }
         if let Some(span) = &self.active {
             span.finish(outcome).await;
         }
@@ -159,6 +231,9 @@ impl OperationSpan {
 
 impl Drop for OperationSpan {
     fn drop(&mut self) {
+        if let Some(span) = self.exported.take() {
+            span.finish(Outcome::Cancelled);
+        }
         if let Some(span) = self.active.take()
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {

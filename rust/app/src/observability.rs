@@ -23,6 +23,7 @@ use crate::{
 mod operation;
 pub(crate) mod query;
 mod store;
+pub(crate) mod telemetry;
 pub(crate) use operation::{
     OperationSpan, Outcome, SpanResource, TraceContext, current_trace, with_trace,
 };
@@ -36,7 +37,7 @@ pub(crate) struct TraceLayer {
     include: Vec<Regex>,
     exclude: Vec<Regex>,
     sample_rate: f64,
-    redact_keys: std::collections::HashSet<String>,
+    redaction: QueryRedaction,
 }
 
 pub(crate) fn enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
@@ -54,19 +55,12 @@ impl TraceLayer {
         if !(0.0..=1.0).contains(&sample_rate) {
             return Err("invalid OBSERVABILITY_SAMPLE_RATE".into());
         }
-        let custom = value("OTEL_REDACT_FIELDS", "")?;
-        let redact_keys = SECRET_KEYS
-            .split(',')
-            .chain(custom.split(','))
-            .map(normalized_key)
-            .filter(|key| !key.is_empty())
-            .collect();
         Ok(Some(Self {
             database,
             include: path_patterns("OBSERVABILITY_INCLUDE_PATHS", INCLUDE)?,
             exclude: path_patterns("OBSERVABILITY_EXCLUDE_PATHS", EXCLUDE)?,
             sample_rate,
-            redact_keys,
+            redaction: QueryRedaction::from_env()?,
         }))
     }
 
@@ -84,18 +78,34 @@ impl TraceLayer {
             && (self.include.is_empty()
                 || self.include.iter().any(|pattern| pattern.is_match(path)))
     }
+}
+
+#[derive(Clone)]
+struct QueryRedaction(Arc<std::collections::HashSet<String>>);
+
+impl QueryRedaction {
+    fn from_env() -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let custom = value("OTEL_REDACT_FIELDS", "")?;
+        let keys = SECRET_KEYS
+            .split(',')
+            .chain(custom.split(','))
+            .map(normalized_key)
+            .filter(|key| !key.is_empty())
+            .collect();
+        Ok(Self(Arc::new(keys)))
+    }
 
     fn query(&self, raw: &str) -> String {
         let decoded = url::form_urlencoded::parse(raw.as_bytes());
         if !decoded
             .clone()
-            .any(|(key, _)| self.redact_keys.contains(&normalized_key(&key)))
+            .any(|(key, _)| self.0.contains(&normalized_key(&key)))
         {
             return raw.to_owned();
         }
         url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(decoded.map(|(key, value)| {
-                let value = if self.redact_keys.contains(&normalized_key(&key)) {
+                let value = if self.0.contains(&normalized_key(&key)) {
                     "***".into()
                 } else {
                     value
@@ -158,14 +168,16 @@ async fn observe(
     {
         return next.run(request).await;
     }
+    let inherited = current_trace();
     let context = request
         .headers()
         .get("traceparent")
-        .and_then(|value| traceparent(value.to_str().ok()?));
+        .and_then(|value| traceparent(value.to_str().ok()?))
+        .or_else(|| traceparent(&inherited.as_ref()?.exported.as_ref()?.traceparent));
     let query = request
         .uri()
         .query()
-        .map(|query| bounded(&layer.query(query), 2000));
+        .map(|query| bounded(&layer.redaction.query(query), 2000));
     let method = request.method().as_str();
     // The proxy middleware rewrites the request scheme for trusted forwarded traffic.
     let scheme = request.uri().scheme_str().unwrap_or("http");
@@ -225,7 +237,9 @@ async fn observe(
             return next.run(request).await;
         }
     };
-    let context = TraceContext::root(trace.id.clone(), trace.span.clone());
+    let context = inherited
+        .unwrap_or_default()
+        .with_stored(trace.id.clone(), trace.span.clone());
     request.extensions_mut().insert(context.clone());
     let response = with_trace(Some(context), next.run(request)).await;
     let code = response.status().as_u16();

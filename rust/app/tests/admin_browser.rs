@@ -2501,6 +2501,146 @@ async fn operation_traces_follow_mcp_workers_and_redact_resource_queries() {
 }
 
 #[tokio::test]
+async fn otlp_exports_request_and_operation_spans_with_database_tracing_disabled() {
+    use axum::{Router, body::Bytes, http::HeaderMap, routing::post};
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use prost::Message;
+    use serde_json::{Value, json};
+
+    let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/traces", collector.local_addr().unwrap());
+    let (exports, mut batches) = tokio::sync::mpsc::unbounded_channel();
+    let collector_task = tokio::spawn(async move {
+        let router = Router::new().route(
+            "/v1/traces",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let exports = exports.clone();
+                async move {
+                    let _ =
+                        exports.send((headers, ExportTraceServiceRequest::decode(body).unwrap()));
+                    ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
+                }
+            }),
+        );
+        axum::serve(collector, router).await.unwrap();
+    });
+    let mut gateway = gateway_with_env(&[
+        ("OBSERVABILITY_ENABLED", "false"),
+        ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+        ("OTEL_EXPORTER_OTLP_HEADERS", "x-fixture-export=collector"),
+        ("OTEL_BSP_SCHEDULE_DELAY", "30"),
+    ])
+    .await;
+    let (client, origin) = (&gateway.client, &gateway.origin);
+    let post_json = |path: &str, body: Value| {
+        client
+            .post(format!("{origin}{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+    };
+    let login = post_json(
+        "/auth/email/login",
+        json!({"email":EMAIL,"password":gateway.password}),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let login: Value = serde_json::from_slice(&login.bytes().await.unwrap()).unwrap();
+    let admin = login["access_token"].as_str().unwrap();
+    let uri = "file:///otlp-resource";
+    post_json(
+        "/resources",
+        json!({"resource":{"name":"otlp-resource","uri":uri,"content":"otlp-payload-sentinel"}}),
+    )
+    .bearer_auth(admin)
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+
+    let trace = "1e5b53ee2d60348d927b2cc4249d20f9";
+    let remote_span = "438b9406bbdabb20";
+    let sampled = post_json(
+        "/rpc?token=otlp-query-sentinel",
+        json!({"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":uri}}),
+    )
+    .bearer_auth(admin)
+    .header("traceparent", format!("00-{trace}-{remote_span}-01"))
+    .header("tracestate", "fixture=keep")
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    assert!(
+        sampled
+            .text()
+            .await
+            .unwrap()
+            .contains("otlp-payload-sentinel")
+    );
+    post_json("/rpc", json!({"jsonrpc":"2.0","id":2,"method":"ping"}))
+        .bearer_auth(admin)
+        .header("traceparent", format!("00-{trace}-{remote_span}-00"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    let mut spans = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while spans.len() < 2 {
+            let (headers, request) = batches.recv().await.unwrap();
+            assert_eq!(headers["x-fixture-export"], "collector");
+            let dump = format!("{request:?}");
+            assert!(!dump.contains("otlp-query-sentinel"));
+            assert!(!dump.contains("otlp-payload-sentinel"));
+            assert!(!dump.contains(EMAIL));
+            spans.extend(
+                request
+                    .resource_spans
+                    .into_iter()
+                    .flat_map(|resource| resource.scope_spans)
+                    .flat_map(|scope| scope.spans),
+            );
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), batches.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(spans.len(), 2);
+    let root = spans.iter().find(|span| span.name == "POST /rpc").unwrap();
+    let child = spans
+        .iter()
+        .find(|span| span.name == "resource.read")
+        .unwrap();
+    let trace_id = u128::from_str_radix(trace, 16).unwrap().to_be_bytes();
+    assert_eq!(root.trace_id, trace_id);
+    assert_eq!(child.trace_id, trace_id);
+    assert_eq!(
+        root.parent_span_id,
+        u64::from_str_radix(remote_span, 16).unwrap().to_be_bytes()
+    );
+    assert_eq!(child.parent_span_id, root.span_id);
+    assert_eq!(child.trace_state, "fixture=keep");
+    gateway.process.kill().await.unwrap();
+    collector_task.abort();
+}
+
+#[tokio::test]
 async fn registry_registration_requires_browser_proof_and_serializes_oauth_duplicates() {
     use serde_json::{Value, json};
 

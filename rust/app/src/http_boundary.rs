@@ -26,7 +26,7 @@ use crate::{
     access::Authorizer,
     config::{flag, parse, value},
     database::Database,
-    observability::TraceLayer,
+    observability::{TraceLayer, telemetry::Telemetry},
 };
 
 mod compression;
@@ -51,6 +51,7 @@ pub struct HttpBoundary {
     csrf: Option<csrf::Csrf>,
     legacy_api: legacy_api::LegacyApi,
     traces: Option<Arc<TraceLayer>>,
+    telemetry: Option<Arc<Telemetry>>,
 }
 
 impl HttpBoundary {
@@ -85,6 +86,7 @@ impl HttpBoundary {
             responses: response_policy::ResponsePolicy::from_env(port)?,
             csrf: csrf::Csrf::from_env(auth.clone())?,
             traces: TraceLayer::from_env(database.clone())?.map(Arc::new),
+            telemetry: Telemetry::from_env(port)?.map(Arc::new),
             rate_limiter: rate_limit::RateLimiter::from_env(auth, database)?,
             legacy_api: legacy_api::LegacyApi::from_env()?,
         })
@@ -106,6 +108,7 @@ impl HttpBoundary {
         });
         let mut http = http1::Builder::new();
         http.max_headers(count).timer(TokioTimer::new());
+        let telemetry = self.telemetry.clone();
         let app = self.apply(router);
         let connections = TaskTracker::new();
         loop {
@@ -138,6 +141,9 @@ impl HttpBoundary {
         drop(listener);
         connections.close();
         connections.wait().await;
+        if let Some(telemetry) = telemetry {
+            telemetry.shutdown().await;
+        }
     }
 
     fn apply(self, mut router: Router) -> Router {
@@ -151,6 +157,9 @@ impl HttpBoundary {
         }
         if let Some(traces) = self.traces {
             router = traces.apply(router);
+        }
+        if let Some(telemetry) = self.telemetry {
+            router = telemetry.apply(router);
         }
         router = self.proxies.apply(router);
         if let Some(correlation) = self.correlation {
@@ -339,6 +348,7 @@ mod tests {
             csrf: None,
             legacy_api: legacy_api::LegacyApi::Enabled(None),
             traces: None,
+            telemetry: None,
         };
         let router = Router::new().route(
             "/",
@@ -389,6 +399,7 @@ mod tests {
             csrf: None,
             legacy_api: legacy_api::LegacyApi::Enabled(None),
             traces: None,
+            telemetry: None,
         }
         .apply(Router::new().route("/", get(|| async { StatusCode::UNAUTHORIZED })));
         let request = || {

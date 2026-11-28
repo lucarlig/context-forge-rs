@@ -516,7 +516,31 @@ Seven Rust Anything cases match the pinned reference on SQLite and PostgreSQL.
 The comparison checks span names, outcomes, and safe metadata. Native checks
 verify parent links for queued SSE, WebSocket upgrades, and A2A tool calls. A
 live Rust test checks parent links and resource redaction across three MCP
-transports. External OpenTelemetry export remains open.
+transports.
+
+## OpenTelemetry export
+
+Set `OTEL_ENABLE_OBSERVABILITY=true` to enable OpenTelemetry independently of
+database trace recording. The default exporter uses OTLP over gRPC. Set
+`OTEL_EXPORTER_OTLP_ENDPOINT` to the collector endpoint. For HTTP, set
+`OTEL_EXPORTER_OTLP_PROTOCOL=http` and provide the collector's traces URL.
+`OTEL_TRACES_EXPORTER=console` prints spans for local inspection.
+`OTEL_TRACES_EXPORTER=none` disables export.
+
+The SDK batches spans and flushes on graceful shutdown. The gateway supports
+collector headers, batch limits, service names, and resource attributes.
+Gateway request and operation spans preserve W3C trace IDs, trace state, and
+sampling. A2A requests carry the invocation span as their parent. When both
+trace stores are enabled, they share the generated trace ID. Exported spans
+omit payloads, identity fields, and credential values in query parameters.
+
+Ten HTTP cases and three gRPC cases match the pinned reference's gateway
+spans in Rust Anything. The cases cover parent links, operation spans,
+stateful MCP, sampling, redaction, and disabled export. Native checks verify
+the shared trace ID, queued SSE propagation, and shutdown flushing. The
+live Rust test decodes OTLP exports with database tracing disabled.
+Framework spans, optional database, Redis and outbound HTTP instrumentation,
+and vendor-specific exporters remain open.
 
 ## Gateway and protocol verification
 

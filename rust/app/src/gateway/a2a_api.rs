@@ -734,6 +734,7 @@ async fn invoke(
             "a2a.interaction_type":input.interaction_type.chars().take(50).collect::<String>(),
         }),
     ).await;
+    span.inject_trace_context(request.headers_mut());
     let started = std::time::Instant::now();
     let result = dispatch_upstream(app, request).await;
     let failure = match &result {
