@@ -384,6 +384,7 @@ pub(super) struct Dashboard {
     pub(super) tokens: Option<super::token::Panel>,
     pub(super) users: Option<super::users::Panel>,
     pub(super) teams: Option<super::team::Panel>,
+    pub(super) a2a: Option<super::a2a::Panel>,
     error: Option<&'static str>,
     message: Option<&'static str>,
 }
@@ -505,6 +506,7 @@ pub(super) async fn dashboard(
     let tokens_visible = super::token::visible(accounts, principal, team).await?;
     let users_visible = super::users::visible(accounts, principal).await?;
     let teams_visible = super::team::visible(accounts, principal).await?;
+    let a2a_visible = super::a2a::visible(accounts, service, principal, team).await?;
     let parameters = forms::query(uri);
     let selected = parameters
         .get("section")
@@ -513,6 +515,7 @@ pub(super) async fn dashboard(
             (*name == "tokens" && tokens_visible)
                 || (*name == "users" && users_visible)
                 || (*name == "teams" && teams_visible)
+                || (*name == "a2a" && a2a_visible)
                 || permitted.iter().any(|kind| kind.name() == *name)
         });
     if selected.is_none() {
@@ -520,8 +523,8 @@ pub(super) async fn dashboard(
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
-    let mut navigation = Vec::with_capacity(permitted.len() + 4);
-    if !permitted.is_empty() || tokens_visible || users_visible || teams_visible {
+    let mut navigation = Vec::with_capacity(permitted.len() + 5);
+    if !permitted.is_empty() || tokens_visible || users_visible || teams_visible || a2a_visible {
         navigation.push(Link {
             label: "All sections",
             href: href(None, None),
@@ -556,6 +559,13 @@ pub(super) async fn dashboard(
             selected: selected == Some("teams"),
         });
     }
+    if a2a_visible {
+        navigation.push(Link {
+            label: "A2A Agents",
+            href: href(Some("a2a"), None),
+            selected: selected == Some("a2a"),
+        });
+    }
     let tokens = if selected == Some("tokens") {
         Some(super::token::panel(accounts, service, principal, uri).await?)
     } else {
@@ -569,6 +579,22 @@ pub(super) async fn dashboard(
     let teams = if selected == Some("teams") || selected.is_none() && teams_visible {
         let team_query = (selected == Some("teams")).then_some(uri);
         Some(super::team::panel(accounts, service, principal, team_query, include_inactive).await?)
+    } else {
+        None
+    };
+    let a2a = if selected == Some("a2a") || selected.is_none() && a2a_visible {
+        let a2a_query = (selected == Some("a2a")).then_some(uri);
+        Some(
+            super::a2a::panel(
+                accounts,
+                service,
+                principal,
+                a2a_query,
+                team,
+                include_inactive,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -616,12 +642,14 @@ pub(super) async fn dashboard(
         tokens,
         users,
         teams,
+        a2a,
         error: match parameters.get("error").map(String::as_str) {
             Some("conflict") => Some("This entry changed. Check its current state and try again."),
             Some("delete_failed") => Some("Could not delete the entry."),
             Some("name_conflict") => Some("A tool name conflicts with an existing tool."),
             Some("permission_denied") => Some("You don’t have permission to change this entry."),
             Some("state_change_failed") => Some("Could not change the state of the entry."),
+            Some("not_found") => Some("The selected entry is unavailable."),
             Some("gateway_refresh_failed") => Some("Could not refresh the MCP server tools."),
             _ => None,
         },

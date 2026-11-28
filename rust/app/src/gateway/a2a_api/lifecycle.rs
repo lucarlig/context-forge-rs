@@ -43,12 +43,30 @@ pub(super) async fn update(
     Path(id): Path<String>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    Json(mut patch): Json<AgentPatch>,
+    Json(patch): Json<AgentPatch>,
 ) -> Result<Json<Value>, CatalogApiError> {
-    let previous = editable(&app, &principal, &id, "a2a.update", "update this agent").await?;
+    let origin = WriteOrigin {
+        address: client_address(peer),
+        agent: user_agent(&headers),
+        via: None,
+    };
+    update_agent(&app, &principal, &id, patch, origin, false)
+        .await
+        .map(Json)
+}
+
+pub(super) async fn update_agent(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    mut patch: AgentPatch,
+    origin: WriteOrigin,
+    admin: bool,
+) -> Result<Value, CatalogApiError> {
+    let previous = editable(app, principal, id, "a2a.update", "update this agent", admin).await?;
     let mut agent = previous.clone();
     patch.apply_metadata(&mut agent)?;
-    validate_scope(&app, &principal, &previous, &agent).await?;
+    validate_scope(app, principal, &previous, &agent, admin).await?;
     if (agent.name != previous.name || agent.team_id != previous.team_id)
         && app.database.agent_has_enforced_binding(&previous).await?
         && !app.database.agent_has_enforced_binding(&agent).await?
@@ -83,7 +101,7 @@ pub(super) async fn update(
         agent.set_uaid(uaid);
     }
     if let Some(config) = patch.auth.oauth_config() {
-        oauth::validate_config(&app, config, previous.oauth_config.as_ref())?;
+        oauth::validate_config(app, config, previous.oauth_config.as_ref())?;
     }
     let mut auth = GatewayConnectionRow {
         kind: agent.auth_type.clone().unwrap_or_default(),
@@ -120,19 +138,20 @@ pub(super) async fn update(
             .map(DbJson);
     }
     agent.modified_by = Some(principal.email.clone());
-    agent.modified_from_ip = client_address(peer).or(agent.modified_from_ip);
-    agent.modified_user_agent = user_agent(&headers).or(agent.modified_user_agent);
+    agent.modified_from_ip = origin.address.or(agent.modified_from_ip);
+    agent.modified_user_agent = origin.agent.or(agent.modified_user_agent);
+    agent.modified_via = Some(origin.via.unwrap_or("api").to_owned());
     let result = app
         .database
         .update_agent(&previous, &agent)
         .await
         .map_err(|error| write_error(error, &agent))?;
     if previous.visibility != result.visibility || previous.team_id != result.team_id {
-        changed(&app, &previous);
+        changed(app, &previous);
     }
-    changed(&app, &result);
+    changed(app, &result);
     tracing::info!(actor = %principal.email, agent_id = %id, version = result.version, "A2A agent updated");
-    Ok(Json(read_agent(&result)))
+    Ok(read_agent(&result))
 }
 
 impl AgentPatch {
@@ -211,6 +230,7 @@ async fn validate_scope(
     principal: &Principal,
     previous: &AgentRecord,
     next: &AgentRecord,
+    admin: bool,
 ) -> Result<(), CatalogApiError> {
     if previous.visibility == next.visibility && previous.team_id == next.team_id {
         return Ok(());
@@ -240,7 +260,7 @@ async fn validate_scope(
     let role = team.map_or(RoleContext::AnyTeam, RoleContext::Team);
     if !app
         .access
-        .allows(principal, "a2a.update", role, true)
+        .allows(principal, "a2a.update", role, !admin)
         .await?
     {
         return Err(denied_team());
@@ -265,20 +285,32 @@ pub(super) async fn set_state(
         .map(|value| flag(Some(value)))
         .transpose()?
         .unwrap_or(true);
+    set_agent_state(&app, &principal, &id, enabled, false)
+        .await
+        .map(Json)
+}
+
+pub(super) async fn set_agent_state(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    enabled: bool,
+    admin: bool,
+) -> Result<Value, CatalogApiError> {
     let action = if enabled {
         "activate the Agent"
     } else {
         "deactivate the Agent"
     };
-    let previous = editable(&app, &principal, &id, "a2a.update", action).await?;
+    let previous = editable(app, principal, id, "a2a.update", action, admin).await?;
     let result = app
         .database
         .set_agent_state(&previous, enabled)
         .await
         .map_err(|error| write_error(error, &previous))?;
-    changed(&app, &result);
+    changed(app, &result);
     tracing::info!(actor = %principal.email, agent_id = %id, enabled, "A2A agent state set");
-    Ok(Json(read_agent(&result)))
+    Ok(read_agent(&result))
 }
 
 #[derive(Deserialize)]
@@ -293,32 +325,49 @@ pub(super) async fn remove(
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
     let purge_metrics = flag(query.purge_metrics.as_deref())?;
-    let previous = editable(&app, &principal, &id, "a2a.delete", "delete this agent").await?;
-    app.database
-        .delete_agent(&previous, purge_metrics)
-        .await
-        .map_err(|error| write_error(error, &previous))?;
-    changed(&app, &previous);
-    tracing::info!(actor = %principal.email, agent_id = %id, purge_metrics, "A2A agent deleted");
+    remove_agent(&app, &principal, &id, purge_metrics, false).await?;
     Ok(Json(
         json!({"status":"success","message":format!("A2A Agent {id} deleted successfully")}),
     ))
 }
 
-async fn editable(
+pub(super) async fn remove_agent(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    purge_metrics: bool,
+    admin: bool,
+) -> Result<(), CatalogApiError> {
+    let previous = editable(app, principal, id, "a2a.delete", "delete this agent", admin).await?;
+    app.database
+        .delete_agent(&previous, purge_metrics)
+        .await
+        .map_err(|error| write_error(error, &previous))?;
+    changed(app, &previous);
+    tracing::info!(actor = %principal.email, agent_id = %id, purge_metrics, "A2A agent deleted");
+    Ok(())
+}
+
+pub(super) async fn editable(
     app: &GatewayService,
     principal: &Principal,
     id: &str,
     permission: &str,
     action: &str,
+    admin: bool,
 ) -> Result<AgentRecord, CatalogApiError> {
-    require(app, principal, permission).await?;
+    require_enabled(app)?;
+    require_catalog_permission(app, principal, permission, !admin).await?;
     let agent = find(app, Some(principal), AgentLookup::Id(id)).await?;
     let role = agent
         .team_id
         .as_deref()
         .map_or(RoleContext::AnyTeam, RoleContext::Team);
-    if !app.access.allows(principal, permission, role, true).await? {
+    if !app
+        .access
+        .allows(principal, permission, role, !admin)
+        .await?
+    {
         return Err(denied_team());
     }
     if !owns_agent(app, principal, &agent).await? {

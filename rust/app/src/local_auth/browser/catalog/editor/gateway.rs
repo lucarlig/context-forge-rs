@@ -13,15 +13,8 @@ pub(super) fn fields(form: &Form, fields: &mut Map<String, Value>) -> Result<(),
             ("tool_validation_policy", "tool_validation_policy"),
         ],
     );
+    credential_fields(form, fields)?;
     for name in [
-        "auth_type",
-        "auth_username",
-        "auth_password",
-        "auth_token",
-        "auth_header_key",
-        "auth_header_value",
-        "auth_query_param_key",
-        "auth_query_param_value",
         "ca_certificate",
         "ca_certificate_sig",
         "client_cert",
@@ -32,12 +25,7 @@ pub(super) fn fields(form: &Form, fields: &mut Map<String, Value>) -> Result<(),
             fields.insert(name.to_owned(), value.into());
         }
     }
-    for name in [
-        "auth_headers",
-        "identity_propagation",
-        "sigv4_config",
-        "oauth_config",
-    ] {
+    for name in ["identity_propagation", "sigv4_config"] {
         json_field(form, fields, name)?;
     }
     if let Some(value) = nonempty(form, "one_time_auth") {
@@ -60,6 +48,29 @@ pub(super) fn fields(form: &Form, fields: &mut Map<String, Value>) -> Result<(),
             .unwrap_or_else(|_| json!(comma_separated(headers).collect::<Vec<_>>()));
         fields.insert("passthrough_headers".to_owned(), headers);
     }
+    Ok(())
+}
+
+pub(in crate::local_auth::browser) fn credential_fields(
+    form: &Form,
+    fields: &mut Map<String, Value>,
+) -> Result<(), CatalogApiError> {
+    for name in [
+        "auth_type",
+        "auth_username",
+        "auth_password",
+        "auth_token",
+        "auth_header_key",
+        "auth_header_value",
+        "auth_query_param_key",
+        "auth_query_param_value",
+    ] {
+        if let Some(value) = nonempty(form, name) {
+            fields.insert(name.to_owned(), value.into());
+        }
+    }
+    json_field(form, fields, "auth_headers")?;
+    json_field(form, fields, "oauth_config")?;
     if !fields.contains_key("oauth_config")
         && let Some(oauth) = oauth_fields(form)
     {

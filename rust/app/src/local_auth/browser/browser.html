@@ -86,6 +86,17 @@
     </form>
     {% endif %}
     <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
+    {% elif page == "a2a-edit" %}
+    {% include "a2a_edit.html" %}
+    {% elif page == "a2a-test" %}
+    <h1>A2A agent test</h1>
+    <p>{{ agent }}</p>
+    <pre>{{ result }}</pre>
+    <p><a href="{{ root }}/admin/?section=a2a#a2a-agents">Back to A2A agents</a></p>
+    {% elif page == "a2a-error" %}
+    <h1>A2A request failed</h1>
+    <p role="alert">{{ error }}</p>
+    <p><a href="{{ root }}/admin/?section=a2a#a2a-agents">Back to A2A agents</a></p>
     {% elif page == "team-edit" %}
     <h1>Edit team</h1>
     <form method="post" action="{{ root }}/admin/teams/{{ team.id }}/update{% if from_directory %}?directory=1{% endif %}">
@@ -258,6 +269,10 @@
         {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}
         {% if catalog.selected %}<input type="hidden" name="section" value="{{ catalog.selected }}">{% endif %}
         {% if catalog.tokens %}<label>Search tokens <input type="search" name="q" maxlength="500" value="{{ catalog.tokens.search|default('', true) }}"></label>{% endif %}
+        {% if catalog.selected == "a2a" %}
+        <label>Search agents <input type="search" name="q" maxlength="500" value="{{ catalog.a2a.q|default('', true) }}"></label>
+        <label>Tags <input name="tags" value="{{ catalog.a2a.tags|default('', true) }}"></label>
+        {% endif %}
         {% if catalog.users %}
         <label>Search users <input type="search" name="q" maxlength="500" value="{{ catalog.users.query }}"></label>
         {% else %}
@@ -282,6 +297,10 @@
     {% if catalog.teams %}
       {% set teams = catalog.teams %}
       {% include "teams.html" %}
+    {% endif %}
+    {% if catalog.a2a %}
+      {% set agents = catalog.a2a %}
+      {% include "a2a.html" %}
     {% endif %}
     {% for part in catalog.sections %}
     <section id="{{ part.fragment }}" aria-labelledby="heading-{{ part.name }}">

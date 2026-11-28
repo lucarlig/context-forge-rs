@@ -294,6 +294,19 @@ feature gating, and the versioned routes. Chromium verifies the workflow
 from public discovery through review. A Rust integration test verifies that
 concurrent approval and cancellation settle the request only once.
 
+## A2A agents dashboard
+
+The A2A Agents section lists agents by visibility and scope. It supports
+pagination, literal text search, grouped tag filters, and inactive agents.
+The editor shares registration and lifecycle logic with the A2A API.
+Edits preserve stored credentials when the user keeps the authentication
+method. Authorized users can run a diagnostic query with live credentials.
+
+Five Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+the directory, versioned routes, tag filtering, the agent lifecycle, and
+the A2A feature flag. Chromium exercises the dashboard workflow. A Rust
+test covers stored credential redaction and read-only token enforcement.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

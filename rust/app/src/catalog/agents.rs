@@ -5,8 +5,10 @@ use super::*;
 use crate::uaid::GeneratedUaid;
 use sqlx::types::Json as DbJson;
 
+mod admin;
 mod lifecycle;
 mod metrics;
+pub(crate) use admin::AdminAgentFilters;
 pub(crate) use cards::NewAgentCard;
 pub(crate) use metrics::AgentInteraction;
 
@@ -137,6 +139,7 @@ macro_rules! projection {
          LEFT JOIN email_teams t ON t.id = r.team_id AND t.is_active = TRUE"
     };
 }
+use projection;
 const BY_ID: &str = concat!(projection!(), " WHERE r.id = $1");
 const BY_UAID: &str = concat!(projection!(), " WHERE r.id = $1 OR r.uaid = $1 LIMIT 2");
 const BY_NAME: &str = concat!(
@@ -161,7 +164,7 @@ const INSERT_AGENT: &str = "
         created_at, updated_at, created_by, created_from_ip, created_via, created_user_agent, version,
         tool_id, oauth_config, uaid, uaid_registry, uaid_proto, uaid_native_id)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $18, $20, 'api', $21, 1, $22, $23,
+            $19, TRUE, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $18, $20, $28, $21, 1, $22, $23,
             $24, $25, $26, $27)";
 
 const INSERT_TOOL: &str = "
@@ -170,7 +173,7 @@ const INSERT_TOOL: &str = "
         annotations, tags, enabled, reachable, deprecated, expose_passthrough, jsonpath_filter,
         created_at, updated_at, created_by, created_via, version, team_id, owner_email, visibility)
     VALUES ($1,$2,$3,$2,$3,$4,$5,$5,'A2A','POST',$6,$7,$8,TRUE,TRUE,FALSE,TRUE,'',
-        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,$9,'api',1,$10,$9,$11)";
+        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,$9,$12,1,$10,$9,$11)";
 
 impl Database {
     pub(crate) async fn local_uaid_agents(
@@ -319,6 +322,7 @@ impl Database {
                         .bind(&agent.owner_email)
                         .bind(&agent.team_id)
                         .bind(&agent.visibility)
+                        .bind(agent.created_via.as_deref().unwrap_or("api"))
                         .execute(&mut *$tx)
                         .await?;
                 }
@@ -350,6 +354,7 @@ impl Database {
                     .bind(&agent.uaid_registry)
                     .bind(&agent.uaid_proto)
                     .bind(&agent.uaid_native_id)
+                    .bind(agent.created_via.as_deref().unwrap_or("api"))
                     .execute(&mut *$tx)
                     .await?;
                 cards::insert_cards!($tx, &agent.id, cards);

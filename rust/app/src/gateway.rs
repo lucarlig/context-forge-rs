@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod a2a_api;
+pub(crate) use a2a_api::{AdminA2aQuery, AdminAgentAction, a2a_agent_metadata};
 mod admin_catalog;
 mod catalog_api;
 pub(crate) use admin_catalog::{AdminListQuery, CatalogListing, CatalogMutation};

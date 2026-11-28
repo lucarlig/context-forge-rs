@@ -1213,3 +1213,161 @@ async fn team_join_requests_keep_scope_and_serialize_cancel_and_approval() {
     database.close().await;
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn admin_a2a_editor_preserves_credentials_and_honors_token_permissions() {
+    let mut gateway = gateway().await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL,"password":password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    let login: serde_json::Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let owner = login["access_token"].as_str().unwrap();
+    let secret = format!("agent-fixture-{}", Uuid::new_v4().simple());
+    let form = |fields: &[(&str, &str)]| {
+        let mut body = url::form_urlencoded::Serializer::new(String::new());
+        body.extend_pairs(fields.iter().copied());
+        body.finish()
+    };
+    let dir = format!("{origin}/admin/a2a");
+    let created = client
+        .post(&dir)
+        .bearer_auth(owner)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(form(&[
+            ("name", "Agent Fixture"),
+            ("endpoint_url", "http://127.0.0.1:1/a2a"),
+            ("visibility", "public"),
+            ("auth_type", "bearer"),
+            ("auth_token", &secret),
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let listing = client.get(&dir).bearer_auth(owner).send().await.unwrap();
+    assert_eq!(listing.status(), StatusCode::OK);
+    let listing = listing.text().await.unwrap();
+    assert!(!listing.contains(&secret));
+    let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    let id = listing["data"][0]["id"].as_str().unwrap();
+    let agent_team = listing["data"][0]["teamId"].as_str().unwrap();
+    let compact_team = Uuid::parse_str(agent_team).unwrap().simple().to_string();
+    let selected = client
+        .get(format!("{dir}?team_id={compact_team}"))
+        .bearer_auth(owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::OK);
+    let selected: serde_json::Value =
+        serde_json::from_str(&selected.text().await.unwrap()).unwrap();
+    assert_eq!(selected["data"][0]["id"], id);
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        gateway.fixture.0.join("mcp.db").display()
+    ))
+    .await
+    .unwrap();
+    let read_credential = || {
+        sqlx::query_scalar::<_, String>("SELECT auth_value FROM a2a_agents WHERE id=?")
+            .bind(id)
+            .fetch_one(&database)
+    };
+    let original = read_credential().await.unwrap();
+    assert!(!original.contains(&secret));
+    let editor = format!("{dir}/{id}/edit");
+    let page = client.get(&editor).bearer_auth(owner).send().await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = page.text().await.unwrap();
+    assert!(body.contains("Agent Fixture"));
+    assert!(!body.contains(&secret));
+
+    let other_team = client
+        .post(format!("{origin}/teams"))
+        .bearer_auth(owner)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"Other Agent Team","visibility":"private"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_team.status(), StatusCode::CREATED);
+    let other_team: serde_json::Value =
+        serde_json::from_str(&other_team.text().await.unwrap()).unwrap();
+    let issued = client
+        .post(format!("{origin}/tokens"))
+        .bearer_auth(owner)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::json!({
+                "name":"agent-read","expires_in_days":1,"team_id":other_team["id"],
+                "scope":{"permissions":["admin.dashboard","a2a.read"]},
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued: serde_json::Value = serde_json::from_str(&issued.text().await.unwrap()).unwrap();
+    let reader = issued["access_token"].as_str().unwrap();
+    let filtered = client
+        .get(format!("{dir}?team_id={agent_team}"))
+        .bearer_auth(reader)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered: serde_json::Value =
+        serde_json::from_str(&filtered.text().await.unwrap()).unwrap();
+    assert_eq!(filtered["pagination"]["total_items"], 0);
+    let update = |credential: &str| {
+        client
+            .post(&editor)
+            .bearer_auth(credential)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form(&[
+                ("_dashboard", "true"),
+                ("name", "Updated Agent"),
+                ("visibility", "public"),
+                ("team_id", agent_team),
+            ]))
+    };
+    assert_eq!(
+        update(reader).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        update(owner).send().await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+    assert!(original == read_credential().await.unwrap());
+    let detail = client
+        .get(format!("{dir}/{id}"))
+        .bearer_auth(reader)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail = detail.text().await.unwrap();
+    assert!(detail.contains("Updated Agent"));
+    assert!(!detail.contains(&secret));
+    let denied = client
+        .post(format!("{dir}/{id}/test"))
+        .bearer_auth(reader)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    database.close().await;
+    gateway.process.kill().await.unwrap();
+}

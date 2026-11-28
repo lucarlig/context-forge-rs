@@ -48,10 +48,25 @@ pub(super) async fn test(
     let query = input
         .and_then(|Json(input)| input)
         .and_then(|input| input.query);
-    if query
-        .as_ref()
-        .is_some_and(|query| query.chars().count() > 4096)
-    {
+    test_agent(&app, &principal, &id, &headers, query.as_deref(), false)
+        .await
+        .map(Json)
+}
+
+pub(super) async fn test_agent(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    admin: bool,
+) -> Result<Value, CatalogApiError> {
+    let (default_query, interaction_type) = if admin {
+        ("Hello from ContextForge Admin UI test!", "admin_test")
+    } else {
+        (DEFAULT_TEST_QUERY, "test")
+    };
+    if query.is_some_and(|query| query.chars().count() > 4096) {
         return Err(CatalogApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"detail":[{"type":"string_too_long","loc":["body","query"],
@@ -63,10 +78,10 @@ pub(super) async fn test(
             StatusCode::NOT_FOUND,
             "not_found",
             "A2A agent not found",
-            &id,
+            id,
         )
     };
-    let agent = find(&app, Some(&principal), AgentLookup::Id(&id))
+    let agent = find(app, Some(principal), AgentLookup::Id(id))
         .await
         .map_err(|error| {
             if error.0 == StatusCode::NOT_FOUND {
@@ -75,18 +90,33 @@ pub(super) async fn test(
                 error
             }
         })?;
+    if admin
+        && !app
+            .access
+            .allows(
+                principal,
+                "a2a.invoke",
+                agent
+                    .team_id
+                    .as_deref()
+                    .map_or(RoleContext::AnyTeam, RoleContext::Team),
+                false,
+            )
+            .await?
+    {
+        return Err(missing());
+    }
     if !agent.enabled {
         return Err(failure(
             StatusCode::BAD_GATEWAY,
             "agent_disabled",
             "A2A agent is disabled",
-            &id,
+            id,
         ));
     }
     let query = query
-        .as_deref()
         .filter(|query| !query.is_empty())
-        .unwrap_or(DEFAULT_TEST_QUERY);
+        .unwrap_or(default_query);
     let mut parameters = Map::from_iter([("query".into(), json!(query))]);
     if !matches!(agent.agent_type.as_str(), "generic" | "jsonrpc")
         && !agent.endpoint_url.ends_with('/')
@@ -96,13 +126,13 @@ pub(super) async fn test(
         parameters.insert("timestamp".into(), json!(Timestamp::now().as_second()));
     }
     let result = invoke_recorded(
-        &app,
+        app,
         &agent,
         Invocation {
             parameters,
-            interaction_type: "test".into(),
+            interaction_type: interaction_type.into(),
         },
-        &headers,
+        headers,
     )
     .await
     .map_err(|error| {
@@ -113,16 +143,16 @@ pub(super) async fn test(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "A2A agent test failed",
-                &id,
+                id,
             )
         } else {
-            failure(StatusCode::BAD_GATEWAY, "agent_error", FAILURE, &id)
+            failure(StatusCode::BAD_GATEWAY, "agent_error", FAILURE, id)
         }
     })?;
-    Ok(Json(
+    Ok(
         json!({"success":true,"result":result,"agent_name":agent.name,
         "test_timestamp":Timestamp::now().as_millisecond() as f64 / 1000.0}),
-    ))
+    )
 }
 
 fn failure(status: StatusCode, kind: &str, message: &str, id: &str) -> CatalogApiError {

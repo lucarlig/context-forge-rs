@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod gateway;
+pub(in crate::local_auth::browser) use gateway::credential_fields;
 
 use serde_json::Map;
 
@@ -401,7 +402,11 @@ fn fields(
     Ok(fields)
 }
 
-fn copy(form: &Form, fields: &mut Map<String, Value>, names: &[(&str, &str)]) {
+pub(in crate::local_auth::browser) fn copy(
+    form: &Form,
+    fields: &mut Map<String, Value>,
+    names: &[(&str, &str)],
+) {
     for (input, output) in names {
         if let Some(value) = form.value(input) {
             fields.insert((*output).to_owned(), value.into());
@@ -409,18 +414,18 @@ fn copy(form: &Form, fields: &mut Map<String, Value>, names: &[(&str, &str)]) {
     }
 }
 
-fn nonempty<'a>(form: &'a Form, name: &str) -> Option<&'a str> {
+pub(in crate::local_auth::browser) fn nonempty<'a>(form: &'a Form, name: &str) -> Option<&'a str> {
     form.value(name).filter(|value| !value.trim().is_empty())
 }
 
-fn comma_separated(value: &str) -> impl Iterator<Item = &str> {
+pub(in crate::local_auth::browser) fn comma_separated(value: &str) -> impl Iterator<Item = &str> {
     value
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }
 
-fn json_field(
+pub(in crate::local_auth::browser) fn json_field(
     form: &Form,
     fields: &mut Map<String, Value>,
     name: &str,

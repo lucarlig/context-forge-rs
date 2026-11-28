@@ -229,6 +229,12 @@ pub(super) fn render_template(
                 .add_template("team_requests.html", include_str!("team_requests.html"))
                 .expect("valid team join requests template");
             environment
+                .add_template("a2a.html", include_str!("a2a.html"))
+                .expect("valid A2A catalog template");
+            environment
+                .add_template("a2a_edit.html", include_str!("a2a_edit.html"))
+                .expect("valid A2A editor template");
+            environment
         });
     let html = TEMPLATES
         .get_template(template)

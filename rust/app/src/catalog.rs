@@ -27,7 +27,7 @@ mod tools;
 pub(crate) use agent_push_configs::{PushConfig, PushConfigInput, PushConfigWriteError};
 pub(crate) use agent_tasks::{AgentTask, AgentTaskCursor, TaskContinuation, terminal_task_state};
 pub(crate) use agents::{
-    AgentInteraction, AgentLookup, AgentRecord, AgentWriteError, NewAgentCard,
+    AdminAgentFilters, AgentInteraction, AgentLookup, AgentRecord, AgentWriteError, NewAgentCard,
 };
 pub(crate) use entry_filters::{CatalogEntryFilters, ManagedCatalog, managed_visibility};
 pub(crate) use metrics::{ExecutionMetrics, MetricEntity};

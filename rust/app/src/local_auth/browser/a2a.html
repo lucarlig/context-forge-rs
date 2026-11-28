@@ -1,0 +1,73 @@
+{% if mode == "selector" %}
+<ul aria-label="A2A agents">
+  {% for row in agents.rows %}
+    <li><a href="{{ root }}/admin/a2a/{{ row.data.id }}">{{ row.data.name }}</a></li>
+  {% else %}<li>No agents found.</li>{% endfor %}
+</ul>
+{% elif mode != "controls" %}
+<section id="a2a-agents" aria-labelledby="a2a-heading">
+  <h2 id="a2a-heading">A2A Agents</h2>
+  {% set query = "?include_inactive=" ~ ("true" if agents.include_inactive else "false") ~ ("&team_id=" ~ agents.team if agents.team else "") %}
+  {% if agents.add %}<p><a href="{{ root }}/admin/a2a/new{{ query }}">Add agent</a></p>{% endif %}
+  {% if agents.rows %}
+  <div class="table-scroll">
+    <table aria-labelledby="a2a-heading">
+      <thead><tr><th scope="col">Agent</th><th scope="col">Endpoint</th><th scope="col">Visibility</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+      <tbody>
+      {% for row in agents.rows %}
+        {% set agent = row.data %}
+        <tr>
+          <th scope="row">{{ agent.name }}</th>
+          <td>{{ agent.endpointUrl }}</td>
+          <td>{{ agent.visibility|capitalize }}</td>
+          <td>{% if agent.enabled %}Active{% else %}Inactive{% endif %}</td>
+          <td class="actions">
+            {% if row.edit %}
+            <a href="{{ root }}/admin/a2a/{{ agent.id }}/edit{{ query }}">Edit</a>
+            <form method="post" action="{{ root }}/admin/a2a/{{ agent.id }}/state">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <input type="hidden" name="_dashboard" value="true">
+              {% if agents.team %}<input type="hidden" name="team_id" value="{{ agents.team }}">{% endif %}
+              {% if agents.include_inactive %}<input type="hidden" name="is_inactive_checked" value="true">{% endif %}
+              <input type="hidden" name="activate" value="{{ 'false' if agent.enabled else 'true' }}">
+              <button type="submit">{{ 'Deactivate' if agent.enabled else 'Activate' }}</button>
+            </form>
+            {% endif %}
+            {% if row.test %}
+            <details><summary>Test</summary>
+              <form method="post" action="{{ root }}/admin/a2a/{{ agent.id }}/test">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <input type="hidden" name="_dashboard" value="true">
+                <label>Test query <input name="query" maxlength="4096"></label>
+                <button type="submit">Run test</button>
+              </form>
+            </details>
+            {% endif %}
+            {% if row.delete %}
+            <details><summary>Delete</summary>
+              <form method="post" action="{{ root }}/admin/a2a/{{ agent.id }}/delete">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <input type="hidden" name="_dashboard" value="true">
+                {% if agents.team %}<input type="hidden" name="team_id" value="{{ agents.team }}">{% endif %}
+                {% if agents.include_inactive %}<input type="hidden" name="is_inactive_checked" value="true">{% endif %}
+                <label><input type="checkbox" name="purge_metrics" value="true"> Purge metrics</label>
+                <button type="submit">Confirm delete</button>
+              </form>
+            </details>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p>No A2A agents found.</p>{% endif %}
+{% endif %}
+{% if agents.pagination.total_items %}
+  <nav class="page-links" aria-label="A2A agent pages">
+    {% if agents.previous %}<a href="{{ agents.previous }}">Previous</a>{% endif %}
+    <span>Page {{ agents.pagination.page }} of {{ agents.pagination.total_pages }}</span>
+    {% if agents.next %}<a href="{{ agents.next }}">Next</a>{% endif %}
+  </nav>
+{% endif %}
+{% if mode != "controls" and mode != "selector" %}</section>{% endif %}

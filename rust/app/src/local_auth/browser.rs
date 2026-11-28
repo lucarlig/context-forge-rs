@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod a2a;
 mod catalog;
 mod forms;
 mod keycloak;
@@ -154,6 +155,7 @@ pub(super) fn router(
             .route(&format!("{path}/tokens/{{id}}/usage"), get(token::usage));
         router = users::routes(router, path);
         router = team::routes(router, path);
+        router = a2a::routes(router, path);
         for kind in ManagedCatalog::ALL {
             let base = format!("{path}/{}", kind.name());
             router = router

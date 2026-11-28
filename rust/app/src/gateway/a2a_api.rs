@@ -12,6 +12,8 @@ use crate::catalog::{AgentInteraction, AgentLookup, AgentRecord, AgentWriteError
 use crate::schema_validation::Target;
 use crate::uaid::{self, UaidInput};
 
+mod admin;
+pub(crate) use admin::{AdminA2aQuery, AdminAgentAction, a2a_agent_metadata};
 mod cards;
 mod diagnostics;
 mod federation;
@@ -77,13 +79,18 @@ async fn require(
     principal: &Principal,
     permission: &str,
 ) -> Result<(), CatalogApiError> {
+    require_enabled(app)?;
+    require_catalog_permission(app, principal, permission, true).await
+}
+
+fn require_enabled(app: &GatewayService) -> Result<(), CatalogApiError> {
     if !app.a2a_enabled {
         return Err(CatalogApiError(
             StatusCode::NOT_FOUND,
             json!({"detail":{"error":"a2a_disabled","message":"A2A is disabled on this gateway"}}),
         ));
     }
-    require_catalog_permission(app, principal, permission, true).await
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -141,6 +148,22 @@ async fn register(
     Json(registration): Json<Registration>,
 ) -> Result<(StatusCode, Json<Value>), CatalogApiError> {
     require(&app, &principal, "a2a.create").await?;
+    let origin = WriteOrigin {
+        address: client_address(peer),
+        agent: user_agent(&headers),
+        via: None,
+    };
+    let result = register_agent(&app, &principal, registration, origin, false).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn register_agent(
+    app: &GatewayService,
+    principal: &Principal,
+    registration: Registration,
+    origin: WriteOrigin,
+    admin: bool,
+) -> Result<Value, CatalogApiError> {
     let input = registration.agent;
     let name = input.name.trim();
     let endpoint = input.endpoint_url.trim();
@@ -162,8 +185,8 @@ async fn register(
         ));
     }
     let team = registration_team(
-        &app,
-        &principal,
+        app,
+        principal,
         &registration.visibility,
         registration.team_id.as_deref(),
     )
@@ -172,11 +195,11 @@ async fn register(
     if !app
         .access
         .allows(
-            &principal,
+            principal,
             "a2a.create",
             team.as_deref()
                 .map_or(RoleContext::AnyTeam, RoleContext::Team),
-            true,
+            !admin,
         )
         .await?
     {
@@ -220,11 +243,11 @@ async fn register(
         .transpose()
         .map_err(|_| CatalogApiError::unavailable())?;
     let oauth_config = match input.auth.oauth_config() {
-        Some(config) => Some(oauth::store(&app, config).await?),
+        Some(config) => Some(oauth::store(app, config).await?),
         None => None,
     };
     let cards = cards::registration(
-        &app,
+        app,
         input.card_url.as_deref(),
         endpoint,
         auth.as_ref().map(|auth| &auth.credentials.headers),
@@ -256,9 +279,9 @@ async fn register(
         created_at: String::new(),
         updated_at: String::new(),
         created_by: None,
-        created_from_ip: client_address(peer),
-        created_via: None,
-        created_user_agent: user_agent(&headers),
+        created_from_ip: origin.address,
+        created_via: origin.via.map(str::to_owned),
+        created_user_agent: origin.agent,
         modified_by: None,
         modified_from_ip: None,
         modified_via: None,
@@ -307,7 +330,7 @@ async fn register(
         agent.team_id.as_deref(),
         agent.owner_email.as_deref(),
     );
-    Ok((StatusCode::CREATED, Json(read_agent(&agent))))
+    Ok(read_agent(&agent))
 }
 
 fn agent_slug(name: &str) -> Result<String, CatalogApiError> {

@@ -1,0 +1,67 @@
+<h1>{{ title }}</h1>
+<form method="post" action="{{ root }}/admin/a2a{% if id %}/{{ id }}/edit{% endif %}">
+  <input type="hidden" name="csrf_token" value="{{ proof }}">
+  <input type="hidden" name="_dashboard" value="true">
+  {% if include_inactive %}<input type="hidden" name="is_inactive_checked" value="true">{% endif %}
+  <label>Name <input name="name" required maxlength="255" value="{{ agent.name|default('', true) }}"></label>
+  <label>Endpoint URL <input name="endpoint_url" type="url" required maxlength="767" value="{{ agent.endpointUrl|default('', true) }}"></label>
+  <label>Description <textarea name="description">{{ agent.description|default('', true) }}</textarea></label>
+  <label>Tags <input name="tags" value="{{ tags }}"></label>
+  <label>Visibility
+    <select name="visibility">
+      <option value="private"{% if agent.visibility == "private" %} selected{% endif %}>Private</option>
+      <option value="team"{% if agent.visibility == "team" %} selected{% endif %}>Team</option>
+      <option value="public"{% if agent.visibility == "public" %} selected{% endif %}>Public</option>
+    </select>
+  </label>
+  <label>Team ID <input name="team_id" value="{{ team|default('', true) }}"></label>
+  <details>
+    <summary>Protocol and metadata</summary>
+    <label>Agent type <input name="agent_type" maxlength="50" value="{{ agent.agentType|default('generic', true) }}"></label>
+    <label>Protocol version <input name="protocol_version" maxlength="10" value="{{ agent.protocolVersion|default('1.0', true) }}"></label>
+    <label>Protocol binding
+      <select name="protocol_binding">
+        <option value="">Automatic</option>
+        <option value="jsonrpc"{% if agent.protocolBinding == "jsonrpc" %} selected{% endif %}>JSON-RPC</option>
+        <option value="http_json"{% if agent.protocolBinding == "http_json" %} selected{% endif %}>HTTP JSON</option>
+      </select>
+    </label>
+    {% if not id %}<label>Agent card URL <input name="card_url" type="url"></label>{% endif %}
+    <label>Capabilities JSON <textarea name="capabilities">{{ capabilities|default('', true) }}</textarea></label>
+    <label>Skills JSON <textarea name="skills">{{ skills|default('', true) }}</textarea></label>
+    <label>Configuration JSON <textarea name="config">{{ config|default('', true) }}</textarea></label>
+    <label>Passthrough headers <textarea name="passthrough_headers">{{ passthrough|default('', true) }}</textarea></label>
+    {% if not agent.uaid %}
+    <label><input type="checkbox" name="generate_uaid" value="true"> Generate UAID</label>
+    <label>Registry <input name="uaid_registry"></label>
+    <label>UAID protocol <input name="uaid_protocol"></label>
+    <label>Native ID override <input name="uaid_native_id_override"></label>
+    {% endif %}
+  </details>
+  <details>
+    <summary>Authentication</summary>
+    {% if agent.authType %}<p>Current method {{ agent.authType }}</p>{% endif %}
+    <label>Authentication method
+      <select name="auth_type">
+        {% if id %}<option value="">Keep current</option>{% endif %}
+        <option value="none">None</option>
+        <option value="basic">Basic</option>
+        <option value="bearer">Bearer</option>
+        <option value="authheaders">Custom headers</option>
+        <option value="query_param">Query parameter</option>
+        <option value="oauth">OAuth</option>
+      </select>
+    </label>
+    <label>Username <input name="auth_username" autocomplete="off"></label>
+    <label>Password <input name="auth_password" type="password" autocomplete="new-password"></label>
+    <label>Bearer token <input name="auth_token" type="password" autocomplete="new-password"></label>
+    <label>Header name <input name="auth_header_key"></label>
+    <label>Header value <input name="auth_header_value" type="password" autocomplete="new-password"></label>
+    <label>Headers JSON <textarea name="auth_headers" spellcheck="false"></textarea></label>
+    <label>Query parameter name <input name="auth_query_param_key"></label>
+    <label>Query parameter value <input name="auth_query_param_value" type="password" autocomplete="new-password"></label>
+    <label>OAuth configuration JSON <textarea name="oauth_config" spellcheck="false"></textarea></label>
+  </details>
+  <button type="submit">{{ 'Save agent' if id else 'Create agent' }}</button>
+</form>
+<p><a href="{{ root }}/admin/?section=a2a#a2a-agents">Back to A2A agents</a></p>

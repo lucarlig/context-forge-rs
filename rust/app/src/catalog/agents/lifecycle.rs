@@ -50,14 +50,14 @@ const UPDATE_AGENT: &str = "
         agent_type=$6, protocol_binding=$7, protocol_version=$8, capabilities=$9, skills=$10,
         config=$11, passthrough_headers=$12, tags=$13, auth_type=$14, auth_value=$15,
         auth_query_params=$16, team_id=$17, visibility=$18,
-        modified_by=$19, modified_from_ip=$20, modified_via='api', modified_user_agent=$21,
+        modified_by=$19, modified_from_ip=$20, modified_via=$27, modified_user_agent=$21,
         oauth_config=$22, uaid=$23, uaid_registry=$24, uaid_proto=$25, uaid_native_id=$26,
         version=version+1, updated_at=CURRENT_TIMESTAMP WHERE id=$1";
 
 const UPDATE_TOOL: &str = "
     UPDATE tools SET name=$2, custom_name_slug=$2, custom_name=$3, url=$4,
         description=$5, tags=$6, display_name=$7,
-        modified_by=$8, modified_from_ip=$9, modified_via='api', modified_user_agent=$10,
+        modified_by=$8, modified_from_ip=$9, modified_via=$13, modified_user_agent=$10,
         auth_type=CASE WHEN auth_type IS NOT DISTINCT FROM $11 THEN $12 ELSE auth_type END,
         auth_value=CASE WHEN auth_type IS NOT DISTINCT FROM $11 THEN NULL ELSE auth_value END,
         version=COALESCE(version, 0)+1, updated_at=CURRENT_TIMESTAMP
@@ -131,6 +131,7 @@ impl Database {
                         .bind(&agent.modified_user_agent)
                         .bind(&previous.auth_type)
                         .bind(&agent.auth_type)
+                        .bind(agent.modified_via.as_deref().unwrap_or("api"))
                         .execute(&mut *$tx)
                         .await?;
                 }
@@ -161,6 +162,7 @@ impl Database {
                     .bind(&agent.uaid_registry)
                     .bind(&agent.uaid_proto)
                     .bind(&agent.uaid_native_id)
+                    .bind(agent.modified_via.as_deref().unwrap_or("api"))
                     .execute(&mut *$tx)
                     .await?;
                 let row = sqlx::query_as(BY_ID)

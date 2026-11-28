@@ -87,7 +87,7 @@ impl GatewayService {
         }
     }
 
-    async fn prepare_admin_catalog_team(
+    pub(in crate::gateway) async fn prepare_admin_catalog_team(
         &self,
         principal: &Principal,
         creating: bool,
