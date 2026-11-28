@@ -7,9 +7,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY rust/app/Cargo.toml rust/app/
 COPY rust/app/src rust/app/src
 COPY rust/app/migrations rust/app/migrations
+# Rebuild the workspace package when this layer changes, even with older source timestamps.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=context-forge-rs-release-${TARGETARCH},target=/src/target,sharing=locked \
-    CARGO_PROFILE_RELEASE_STRIP=debuginfo cargo build --locked --release --workspace --bins \
+    cargo clean --locked --release --package context-forge-rs \
+    && CARGO_PROFILE_RELEASE_STRIP=debuginfo cargo build --locked --release --workspace --bins \
     && install -D target/release/context-forge-rs /out/context-forge-rs \
     && install -D target/release/context-forge-translate /out/context-forge-translate
 

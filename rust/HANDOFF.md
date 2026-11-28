@@ -101,6 +101,8 @@ or missing authentication. The Rust check also verified Unix output mode `0600`.
 `Containerfile` builds both binaries from the Cargo lockfile and copies
 them into a Debian runtime image. The runtime checks `/ready`, runs as
 UID and GID 10001, and stores SQLite under `/var/lib/context-forge`.
+The build clears cached workspace artifacts when Docker reruns the build
+step. Cached dependencies stay available.
 Compose runs the native migration job before the gateway starts and
 connects the gateway to PostgreSQL and Redis on the Compose network.
 
@@ -111,6 +113,27 @@ inspect the runtime for Python executables and files, repeat SQLite
 migrations, and verify data after container replacement. The Compose
 check covers migration ordering, PostgreSQL data persistence after
 gateway restart, and readiness during a Redis outage and recovery.
+
+## Server CLI
+
+The native server accepts `--host`, `--port`, and `--uds` on Unix.
+TCP flags override the canonical environment variables and their aliases.
+`--port 0` logs the bound port and uses it for HTTP and browser policies.
+`--help` and `--version` exit before opening the database or a listener.
+
+Eight Rust Anything cases compare TCP flag and environment precedence,
+ephemeral binding, Unix socket startup, occupied paths, help, version,
+and invalid options. Live requests check readiness, login, and JSON-RPC
+ping. The native version identifies the Rust package.
+
+Rust preserves occupied socket paths and removes the socket it owns at
+shutdown. Socket permissions follow the process umask. The pinned Python
+launcher deletes an occupied regular file after a failed bind and uses
+mode `0666` for a new socket. A Rust test checks that TCP trust ranges
+cannot replace a Unix peer's client address. Explicit wildcard trust
+enables forwarded client addresses.
+A Linux arm64 container check verifies Unix socket readiness and removal
+after graceful shutdown.
 
 ## HTTP request boundary
 

@@ -3,6 +3,7 @@
 use std::{error::Error, sync::Arc};
 
 use axum::{Json, http::StatusCode};
+use clap::Parser;
 use context_forge_rs::{
     access::Authorizer,
     config::Settings,
@@ -14,14 +15,18 @@ use context_forge_rs::{
     probes::{self, RedisProbe},
     schema,
 };
-use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
+mod server_cli;
+
+use server_cli::{ServerArgs, ServerListener};
+
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    match std::env::args().nth(1).as_deref() {
+    let command = std::env::args_os().nth(1);
+    match command.as_deref().and_then(|argument| argument.to_str()) {
         Some(context_forge_rs::response_filter::WORKER_ARG) => {
             context_forge_rs::response_filter::worker().map_err(Into::into)
         }
@@ -34,8 +39,9 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 #[tokio::main]
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    let command = std::env::args_os().nth(1);
+    let args = std::env::args().skip(2);
+    match command.as_deref().and_then(|argument| argument.to_str()) {
         Some("rotate-credentials") => {
             return context_forge_rs::credential_rotation::cli(args).await;
         }
@@ -45,13 +51,21 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         _ => {}
     }
+    let options = ServerArgs::parse();
     let (filter, handle) = reload::Layer::new(LevelFilter::INFO);
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    let settings = Settings::from_env()?;
+    let mut settings = Settings::from_env_with_listener(options.host, options.port)?;
+    let listener = ServerListener::bind(
+        &settings,
+        #[cfg(unix)]
+        options.uds,
+    )
+    .await?;
+    settings.port = listener.port().unwrap_or(settings.port);
     let database = Database::from_settings(&settings)?;
     let redis = settings.redis.as_ref().map(RedisProbe::new).transpose()?;
     let verifier = Settings::jwt_verifier()?;
@@ -81,7 +95,12 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
     let diagnostics =
         Diagnostics::from_settings(&settings, database.clone(), redis.clone(), access.clone())?;
-    let http_boundary = HttpBoundary::from_env(settings.port, access.clone(), database.clone())?;
+    let http_boundary = HttpBoundary::from_env(
+        &settings.host,
+        settings.port,
+        access.clone(),
+        database.clone(),
+    )?;
     let email_auth_enabled = Settings::email_auth_enabled()?;
     let issuer = Settings::jwt_issuer()?;
     let (management_page_size, management_max_page_size) = Settings::management_page_sizes()?;
@@ -142,7 +161,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 database.clone(),
                 access.clone(),
                 issuer.clone(),
-                Settings::local_accounts()?,
+                Settings::local_accounts(settings.port)?,
                 service.clone(),
             )
             .await?
@@ -176,7 +195,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 Json(serde_json::json!({"detail":"Not Found"})),
             )
         });
-    let listener = TcpListener::bind((settings.host.as_str(), settings.port)).await?;
     let background = catalog_available.then(|| {
         [
             tokio::spawn(
@@ -195,14 +213,13 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             tokio::spawn(service.run_metrics_maintenance(shutdown.clone())),
         ]
     });
-    tracing::info!(address = %listener.local_addr()?, "gateway listening");
     let stop = shutdown.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         stop.cancel();
     });
-    http_boundary
-        .serve(listener, app, shutdown, async {
+    listener
+        .serve(http_boundary, app, shutdown, async {
             if let Some(tasks) = background {
                 for result in futures_util::future::join_all(tasks).await {
                     result?;

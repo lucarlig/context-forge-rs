@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{error::Error, future::Future, pin::pin, sync::Arc};
+use std::{
+    error::Error,
+    future::Future,
+    net::{Ipv4Addr, SocketAddr},
+    pin::pin,
+    sync::Arc,
+};
 
 use axum::{
     Extension, Json, Router,
@@ -39,6 +45,9 @@ mod response_policy;
 pub(crate) use proxy::public_scheme;
 pub(crate) use response_policy::allowed_origins;
 
+#[derive(Clone, Copy)]
+struct UnixPeer;
+
 // HeaderMap can hold 24,576 distinct names at its largest table capacity.
 const HTTP1_HEADER_CAPACITY: usize = 24_576;
 
@@ -56,6 +65,7 @@ pub struct HttpBoundary {
 
 impl HttpBoundary {
     pub fn from_env(
+        host: &str,
         port: u16,
         auth: Arc<Authorizer>,
         database: Database,
@@ -86,7 +96,7 @@ impl HttpBoundary {
             responses: response_policy::ResponsePolicy::from_env(port)?,
             csrf: csrf::Csrf::from_env(auth.clone())?,
             traces: TraceLayer::from_env(database.clone())?.map(Arc::new),
-            telemetry: Telemetry::from_env(port)?.map(Arc::new),
+            telemetry: Telemetry::from_env(host, port)?.map(Arc::new),
             rate_limiter: rate_limit::RateLimiter::from_env(auth, database)?,
             legacy_api: legacy_api::LegacyApi::from_env()?,
         })
@@ -105,7 +115,31 @@ impl HttpBoundary {
 
     pub async fn serve<T>(
         self,
-        mut listener: TcpListener,
+        listener: TcpListener,
+        router: Router,
+        shutdown: CancellationToken,
+        background: impl Future<Output = T>,
+    ) -> T {
+        self.serve_listener(listener, Some, router, shutdown, background)
+            .await
+    }
+
+    #[cfg(unix)]
+    pub async fn serve_unix<T>(
+        self,
+        listener: tokio::net::UnixListener,
+        router: Router,
+        shutdown: CancellationToken,
+        background: impl Future<Output = T>,
+    ) -> T {
+        self.serve_listener(listener, |_| None, router, shutdown, background)
+            .await
+    }
+
+    async fn serve_listener<L: Listener, T>(
+        self,
+        mut listener: L,
+        peer_address: impl Fn(L::Addr) -> Option<SocketAddr>,
         router: Router,
         shutdown: CancellationToken,
         background: impl Future<Output = T>,
@@ -129,8 +163,11 @@ impl HttpBoundary {
                 () = shutdown.cancelled() => break,
                 accepted = Listener::accept(&mut listener) => accepted,
             };
+            let peer = peer_address(address);
+            let address = peer.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
             let service = ServiceBuilder::new()
                 .layer(Extension(ConnectInfo(address)))
+                .option_layer(peer.is_none().then_some(Extension(UnixPeer)))
                 .service(app.clone());
             let connection = http
                 .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
@@ -343,6 +380,59 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_listener_requires_explicit_proxy_trust_for_forwarded_client() {
+        use tokio::net::{UnixListener, UnixStream};
+
+        let directory =
+            std::env::temp_dir().join(format!("cf-{:x}", Uuid::new_v4().as_u64_pair().0));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("sock");
+        for (policy, expected_peer) in [("0.0.0.0/0", "0.0.0.0"), ("*", "203.0.113.7")] {
+            let listener = UnixListener::bind(&path).unwrap();
+            let boundary = HttpBoundary {
+                header_limits: None,
+                correlation: None,
+                proxies: proxy::ProxyHeaders::parse(policy).unwrap(),
+                responses: response_policy::ResponsePolicy::from_env(4444).unwrap(),
+                rate_limiter: None,
+                csrf: None,
+                legacy_api: legacy_api::LegacyApi::Enabled(None),
+                traces: None,
+                telemetry: None,
+            };
+            let stop = CancellationToken::new();
+            let app =
+                Router::new().route(
+                    "/",
+                    get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
+                        peer.ip().to_string()
+                    }),
+                );
+            let gateway = tokio::spawn(boundary.serve_unix(
+                listener,
+                app,
+                stop.clone(),
+                std::future::ready(()),
+            ));
+            let mut stream = UnixStream::connect(&path).await.unwrap();
+            stream
+                .write_all(
+                    b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-Forwarded-For: 203.0.113.7\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            stop.cancel();
+            gateway.await.unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200") && response.ends_with(expected_peer));
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn configured_header_count_reaches_the_gateway_over_http() {

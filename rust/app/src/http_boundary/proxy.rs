@@ -17,6 +17,8 @@ use ipnet::IpNet;
 
 use crate::config::value;
 
+use super::UnixPeer;
+
 pub(super) struct ProxyHeaders {
     networks: Vec<IpNet>,
     trust_all: bool,
@@ -107,7 +109,12 @@ async fn forwarded(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .copied();
-    if peer.is_some_and(|peer| policy.trusts(peer.0.ip())) {
+    let trusted = if request.extensions().get::<UnixPeer>().is_some() {
+        policy.trust_all
+    } else {
+        peer.is_some_and(|peer| policy.trusts(peer.0.ip()))
+    };
+    if trusted {
         if let Some(address) = policy.client_address(request.headers()) {
             request.extensions_mut().insert(ConnectInfo(address));
         }

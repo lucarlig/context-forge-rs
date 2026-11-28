@@ -107,7 +107,7 @@ pub(crate) struct Telemetry {
 }
 
 impl Telemetry {
-    pub(crate) fn from_env(port: u16) -> Result<Option<Self>, SettingsError> {
+    pub(crate) fn from_env(host: &str, port: u16) -> Result<Option<Self>, SettingsError> {
         if !flag("OTEL_ENABLE_OBSERVABILITY")?.unwrap_or(false) {
             return Ok(None);
         }
@@ -181,7 +181,6 @@ impl Telemetry {
             .build();
         let tracer = provider.tracer_with_scope(scope());
         let framework_tracer = provider.tracer_with_scope(framework::scope());
-        let host = value("HOST", "127.0.0.1")?;
         let http_clients = flag("OTEL_HTTPX_INSTRUMENTATION_ENABLED")?
             .unwrap_or(false)
             .then(|| SemanticConventions::from_env("http"))
@@ -203,7 +202,7 @@ impl Telemetry {
             framework_tracer,
             redaction,
             baggage,
-            host,
+            host: host.to_owned(),
             port,
             http_clients,
             redis_commands,

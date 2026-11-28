@@ -261,6 +261,21 @@ impl Settings {
         Ok(settings)
     }
     pub fn from_env() -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Self::from_env_with_listener(None, None)
+    }
+
+    pub fn from_env_with_listener(
+        host: Option<String>,
+        port: Option<u16>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let host = match host {
+            Some(host) => host,
+            None => value(listener_env("HOST", "MCG_HOST"), "127.0.0.1")?,
+        };
+        let port = match port {
+            Some(port) => port,
+            None => parse(listener_env("PORT", "MCG_PORT"), 4444)?,
+        };
         let redis = match value("CACHE_TYPE", "database")?.as_str() {
             "redis" => Self::redis_connection()?,
             "database" | "memory" | "none" => None,
@@ -282,8 +297,8 @@ impl Settings {
         }
 
         Ok(Self {
-            host: value("HOST", "127.0.0.1")?,
-            port: parse("PORT", 4444)?,
+            host,
+            port,
             database_url: value("DATABASE_URL", "sqlite:///./mcp.db")?,
             db_pool_size,
             db_pool_timeout: positive_seconds("DB_POOL_TIMEOUT", 30.0)?,
@@ -500,7 +515,7 @@ impl Settings {
         })
     }
 
-    pub fn local_accounts() -> Result<AccountSettings, Box<dyn Error + Send + Sync>> {
+    pub fn local_accounts(port: u16) -> Result<AccountSettings, Box<dyn Error + Send + Sync>> {
         use zeroize::Zeroizing;
         let enabled =
             |name, default| Ok::<_, Box<dyn Error + Send + Sync>>(flag(name)?.unwrap_or(default));
@@ -546,7 +561,7 @@ impl Settings {
             csrf_samesite: value("CSRF_COOKIE_SAMESITE", "Strict")?,
             csrf_secure: enabled("CSRF_COOKIE_SECURE", true)?,
             csrf_httponly: enabled("CSRF_COOKIE_HTTPONLY", false)?,
-            browser: crate::local_auth::browser::BrowserSettings::from_env()?,
+            browser: crate::local_auth::browser::BrowserSettings::from_env(port)?,
             a2a_enabled: enabled("MCPGATEWAY_A2A_ENABLED", true)?,
             page_size,
             max_page_size,
@@ -1301,6 +1316,14 @@ pub(crate) fn flag(name: &str) -> Result<Option<bool>, Box<dyn Error + Send + Sy
         Err(env::VarError::NotUnicode(_)) => Err(format!("invalid Unicode in {name}").into()),
     }
 }
+fn listener_env(primary: &'static str, legacy: &'static str) -> &'static str {
+    if env::var_os(primary).is_none() && env::var_os(legacy).is_some() {
+        legacy
+    } else {
+        primary
+    }
+}
+
 pub(crate) fn value(name: &str, default: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
     match env::var(name) {
         Ok(value) => Ok(value),

@@ -79,7 +79,7 @@ pub(crate) struct BrowserSettings {
 }
 
 impl BrowserSettings {
-    pub(crate) fn from_env() -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+    pub(crate) fn from_env(port: u16) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         if !flag("MCPGATEWAY_ADMIN_API_ENABLED")?.unwrap_or(false) {
             return Ok(None);
         }
@@ -102,7 +102,7 @@ impl BrowserSettings {
         {
             return Err("invalid COOKIE_SAMESITE".into());
         }
-        let origins = allowed_origins(parse("PORT", 4444)?)?
+        let origins = allowed_origins(port)?
             .into_iter()
             .filter_map(|origin| forms::allowed_origin(&origin))
             .collect();

@@ -16,9 +16,11 @@ cargo run --locked
 
 The binary listens on `127.0.0.1:4444` and uses `sqlite:///./mcp.db` by default. Set `HOST`, `PORT`, and `DATABASE_URL` to configure it. SQLite paths follow the upstream SQLAlchemy URL format. PostgreSQL URLs accept the upstream `postgresql+psycopg://` scheme.
 
+`--host` and `--port` override the listener environment variables. The gateway uses `MCG_HOST` and `MCG_PORT` when their canonical variables are unset. Use `--port 0` to select an available port. On Unix, `--uds /path/to/gateway.sock` binds a filesystem socket with permissions set by the process umask.
+
 ### Containers
 
-The image contains the gateway and `context-forge-translate`. It runs as UID 10001 and checks `/ready`. Put a strong `PLATFORM_ADMIN_PASSWORD` and independent random values for `JWT_SECRET_KEY` and `AUTH_ENCRYPTION_SECRET` in a private `.env` file.
+The image contains the gateway and `context-forge-translate`. It runs as UID 10001 and checks `/ready` over TCP on `PORT`. Put a strong `PLATFORM_ADMIN_PASSWORD` and independent random values for `JWT_SECRET_KEY` and `AUTH_ENCRYPTION_SECRET` in a private `.env` file.
 
 ```sh
 docker build -f Containerfile -t context-forge-rs:local .
