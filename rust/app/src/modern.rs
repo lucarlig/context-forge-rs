@@ -526,6 +526,13 @@ impl ServerHandler for GatewayHandler {
         );
         let correlation = parts.extensions.get::<CorrelationId>().cloned();
         let invocation = Box::pin(with_progress(invocation, updates, &context));
+        let invocation = crate::observability::with_trace(
+            parts
+                .extensions
+                .get::<crate::observability::TraceContext>()
+                .cloned(),
+            invocation,
+        );
         let mut result = match with_correlation(correlation, invocation).await {
             Ok(value) if value["resultType"] == "input_required" => {
                 let mut result: InputRequiredResult = serde_json::from_value(value)
@@ -571,7 +578,14 @@ impl ServerHandler for GatewayHandler {
             },
             None,
         );
-        let reply = with_progress(invocation, updates, &context).await;
+        let reply = with_correlation(
+            parts.extensions.get::<CorrelationId>().cloned(),
+            crate::observability::with_trace(
+                parts.extensions.get().cloned(),
+                with_progress(invocation, updates, &context),
+            ),
+        )
+        .await;
         HandlerErrorStatus::record(parts, &reply);
         match reply? {
             ReadResourceResponse::Complete(mut result) => {
@@ -616,7 +630,14 @@ impl ServerHandler for GatewayHandler {
             },
             None,
         );
-        let reply = with_progress(invocation, updates, &context).await;
+        let reply = with_correlation(
+            parts.extensions.get::<CorrelationId>().cloned(),
+            crate::observability::with_trace(
+                parts.extensions.get().cloned(),
+                with_progress(invocation, updates, &context),
+            ),
+        )
+        .await;
         HandlerErrorStatus::record(parts, &reply);
         match reply? {
             GetPromptResponse::Complete(mut result) => {

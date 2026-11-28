@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use jiff::Timestamp;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::AssertSqlSafe;
 
-use super::RequestTrace;
+use super::{
+    RequestTrace,
+    operation::{Operation, Outcome},
+};
 use crate::database::Database;
 
 #[derive(Clone, Copy)]
@@ -59,9 +62,86 @@ impl Dialect {
                 http_status_code=$6 WHERE trace_id=$1")
         }
     }
+
+    fn insert_operation(self) -> String {
+        let time = self.cast(6, "TIMESTAMPTZ");
+        let attributes = self.cast(7, "JSON");
+        format!(
+            "INSERT INTO observability_spans
+             (span_id,trace_id,parent_span_id,name,kind,start_time,created_at,attributes,resource_type,resource_name,resource_id,status)
+             SELECT $1,trace_id,span_id,$4,$5,{time},{time},{attributes},$8,$9,$10,'unset'
+             FROM observability_spans WHERE trace_id=$2 AND span_id=$3"
+        )
+    }
+
+    fn finish_operation(self) -> String {
+        let time = self.cast(2, "TIMESTAMPTZ");
+        let attributes = self.cast(5, "JSON");
+        format!(
+            "UPDATE observability_spans SET end_time={time},duration_ms=$3,status=$4,attributes={attributes},
+             status_message=$6 WHERE span_id=$1 AND end_time IS NULL"
+        )
+    }
 }
 
 impl Database {
+    pub(super) async fn start_operation(
+        &self,
+        span: &Operation,
+        attrs: &Value,
+    ) -> Result<bool, sqlx::Error> {
+        macro_rules! insert {
+            ($pool:ident, $dialect:expr) => {{
+                let result = sqlx::query(AssertSqlSafe($dialect.insert_operation()))
+                    .bind(&span.id)
+                    .bind(&span.parent.trace_id)
+                    .bind(&span.parent.span_id)
+                    .bind(span.name)
+                    .bind(span.kind)
+                    .bind($dialect.time(span.started_at))
+                    .bind(attrs.to_string())
+                    .bind(span.resource_type)
+                    .bind(&span.resource_name)
+                    .bind(&span.resource_id)
+                    .execute($pool)
+                    .await?;
+                Ok(result.rows_affected() == 1)
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => insert!(pool, Dialect::Sqlite),
+            Self::Postgres(pool) => insert!(pool, Dialect::Postgres),
+        }
+    }
+
+    pub(super) async fn finish_operation(
+        &self,
+        id: &str,
+        duration: f64,
+        outcome: Outcome,
+        attrs: &Value,
+    ) -> Result<(), sqlx::Error> {
+        let now = Timestamp::now();
+        macro_rules! update {
+            ($pool:ident, $dialect:expr) => {{
+                sqlx::query(AssertSqlSafe($dialect.finish_operation()))
+                    .bind(id)
+                    .bind($dialect.time(now))
+                    .bind(duration)
+                    .bind(outcome.status())
+                    .bind(attrs.to_string())
+                    .bind(outcome.message())
+                    .execute($pool)
+                    .await?;
+            }};
+        }
+        match self {
+            Self::Sqlite(pool) => update!(pool, Dialect::Sqlite),
+            Self::Postgres(pool) => update!(pool, Dialect::Postgres),
+        }
+        Ok(())
+    }
+
     pub(super) async fn start_http_trace(&self, trace: &RequestTrace) -> Result<bool, sqlx::Error> {
         let resource =
             json!({"service.name":"mcp-gateway","service.version":env!("CARGO_PKG_VERSION")})

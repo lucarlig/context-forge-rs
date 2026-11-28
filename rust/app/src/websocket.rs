@@ -24,6 +24,7 @@ use crate::{
     access,
     gateway::GatewayService,
     mcp::{MAX_REQUEST_BODY_BYTES, RelayContext, legacy_transport_reply},
+    observability::{TraceContext, with_trace},
     tokens::TokenRequest,
 };
 
@@ -74,10 +75,11 @@ async fn open(
         return StatusCode::FORBIDDEN.into_response();
     }
     let headers = request.headers().clone();
+    let trace = request.extensions().get::<TraceContext>().cloned();
     let context = RelayContext::capture(&state.gateway, request).await;
     upgrade
         .max_message_size(MAX_REQUEST_BODY_BYTES)
-        .on_upgrade(move |socket| relay(socket, state, headers, peer, context))
+        .on_upgrade(move |socket| with_trace(trace, relay(socket, state, headers, peer, context)))
 }
 
 async fn relay(

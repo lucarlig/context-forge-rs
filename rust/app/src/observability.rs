@@ -20,8 +20,12 @@ use crate::{
     database::Database,
 };
 
+mod operation;
 pub(crate) mod query;
 mod store;
+pub(crate) use operation::{
+    OperationSpan, Outcome, SpanResource, TraceContext, current_trace, with_trace,
+};
 
 const INCLUDE: &str = r#"["^/rpc/?$","^/sse$","^/message$","^/mcp(?:/|$)","^/servers/[^/]+/mcp/?$","^/servers/[^/]+/sse$","^/servers/[^/]+/message$","^/a2a(?:/|$)","^/v1/a2a(?:/|$)"]"#;
 const EXCLUDE: &str = r#"["/health","/healthz","/ready","/metrics","/static/.*"]"#;
@@ -139,7 +143,11 @@ struct RequestTrace {
     span_attrs: Value,
 }
 
-async fn observe(State(layer): State<Arc<TraceLayer>>, request: Request, next: Next) -> Response {
+async fn observe(
+    State(layer): State<Arc<TraceLayer>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path();
     if layer.sample_rate == 0.0 || !layer.observes(path) {
         return next.run(request).await;
@@ -217,7 +225,9 @@ async fn observe(State(layer): State<Arc<TraceLayer>>, request: Request, next: N
             return next.run(request).await;
         }
     };
-    let response = next.run(request).await;
+    let context = TraceContext::root(trace.id.clone(), trace.span.clone());
+    request.extensions_mut().insert(context.clone());
+    let response = with_trace(Some(context), next.run(request)).await;
     let code = response.status().as_u16();
     let size = response
         .headers()

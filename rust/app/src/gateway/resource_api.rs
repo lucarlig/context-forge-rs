@@ -137,6 +137,7 @@ async fn read(
     let uri = record.uri.clone();
     let resolved_id = record.id.clone();
     let started = std::time::Instant::now();
+    let span = service.resource_span(&uri, Some(&principal), server).await;
     let result = resource_content(&service, &principal, record, uri, &headers, false).await;
     service
         .record_rest_execution(
@@ -147,6 +148,11 @@ async fn read(
             result.is_ok(),
         )
         .await;
+    span.finish(crate::observability::Outcome::completed(
+        result.is_ok(),
+        "Resource read failed",
+    ))
+    .await;
     result.map(Json)
 }
 
@@ -164,6 +170,7 @@ async fn test_uri(
         .ok_or_else(|| missing_resource(&uri))?;
     let resolved_id = record.id.clone();
     let started = std::time::Instant::now();
+    let span = service.resource_span(&uri, Some(&principal), None).await;
     let result = resource_content(&service, &principal, record, uri, &headers, true).await;
     service
         .record_rest_execution(
@@ -174,6 +181,11 @@ async fn test_uri(
             result.is_ok(),
         )
         .await;
+    span.finish(crate::observability::Outcome::completed(
+        result.is_ok(),
+        "Resource read failed",
+    ))
+    .await;
     let content = result?;
     Ok(Json(json!({"content":content})))
 }

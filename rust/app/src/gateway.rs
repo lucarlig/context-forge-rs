@@ -85,6 +85,7 @@ use crate::{
     grpc::GrpcSettings,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     oauth_client::OAuthConfig,
+    observability::{OperationSpan, Outcome, SpanResource},
     proxy_catalog_cache::ProxyCatalogCache,
     secret_envelope::SecretEnvelope,
     sessions::Session,
@@ -828,15 +829,55 @@ impl GatewayService {
         downstream: Option<&Session>,
     ) -> Result<Value, ToolError> {
         let started = std::time::Instant::now();
-        let mut metric = None;
+        let mut execution = ToolExecution::default();
         let result = self
-            .call_tool_inner(principal, server, request, context, downstream, &mut metric)
+            .call_tool_inner(
+                principal,
+                server,
+                request,
+                context,
+                downstream,
+                &mut execution,
+            )
             .await;
+        let outcome = match &result {
+            Ok(value) if value["resultType"] == "input_required" => Outcome::InputRequired,
+            Ok(value) if value["isError"] == true || value["is_error"] == true => {
+                Outcome::Error("Tool returned an error")
+            }
+            Ok(_) => Outcome::Ok,
+            Err(ToolError::Cancelled) => Outcome::Cancelled,
+            Err(ToolError::InvalidArguments(_)) => Outcome::Error("Invalid tool arguments"),
+            Err(_) => Outcome::Error("Tool execution failed"),
+        };
         if !matches!(&result, Ok(value) if value["resultType"] == "input_required") {
             let succeeded = matches!(&result, Ok(value) if value["isError"] != true && value["is_error"] != true);
-            self.record_target(metric, server, started, succeeded).await;
+            self.record_target(execution.metric, server, started, succeeded)
+                .await;
         }
+        execution.span.finish(outcome).await;
         result
+    }
+
+    async fn tool_span(
+        &self,
+        request: &CallToolRequestParams,
+        context: &ToolContext<'_>,
+        id: Option<&str>,
+        gateway: Option<&str>,
+        integration: &'static str,
+    ) -> OperationSpan {
+        OperationSpan::start(
+            &self.database,
+            "tool.invoke",
+            "client",
+            Some(SpanResource { kind:"tool", name:&request.name, id }),
+            || json!({
+                "tool.integration_type":integration, "tool.gateway_id":gateway,
+                "arguments_count":request.arguments.as_ref().map_or(0, serde_json::Map::len),
+                "has_headers":context.request_headers.is_some_and(|headers| !headers.is_empty()),
+            }),
+        ).await
     }
 
     async fn call_tool_inner(
@@ -846,7 +887,7 @@ impl GatewayService {
         mut request: CallToolRequestParams,
         mut context: ToolContext<'_>,
         downstream: Option<&Session>,
-        metric: &mut Option<metrics::ExecutionTarget>,
+        execution: &mut ToolExecution,
     ) -> Result<Value, ToolError> {
         let target = tokio::select! {
             biased;
@@ -860,7 +901,10 @@ impl GatewayService {
             DirectTarget::Found {
                 gateway, timeout, ..
             } => {
-                *metric = Some(metrics::ExecutionTarget::Forwarded);
+                execution.metric = Some(metrics::ExecutionTarget::Forwarded);
+                execution.span = self
+                    .tool_span(&request, &context, None, Some(&gateway.id), "MCP")
+                    .await;
                 (gateway, Some(timeout), String::new())
             }
             DirectTarget::Denied => {
@@ -873,10 +917,28 @@ impl GatewayService {
                     result = self.lookup_tool(principal, server, &request.name) => result?,
                 }
                 .ok_or(ToolError::NotFound)?;
-                *metric = Some(metrics::ExecutionTarget::Catalog(
+                execution.metric = Some(metrics::ExecutionTarget::Catalog(
                     MetricEntity::Tool,
                     tool.id.clone(),
                 ));
+                let integration = if tool.rest.is_some() {
+                    "REST"
+                } else if tool.grpc_service_id.is_some() {
+                    "gRPC"
+                } else if tool.a2a_agent_id.is_some() {
+                    "A2A"
+                } else {
+                    "MCP"
+                };
+                execution.span = self
+                    .tool_span(
+                        &request,
+                        &context,
+                        Some(&tool.id),
+                        Some(tool.gateway_id.as_str()).filter(|id| !id.is_empty()),
+                        integration,
+                    )
+                    .await;
                 if !tool.reachable {
                     return tool_result_error(format!("Unknown tool: {}", request.name));
                 }
@@ -903,7 +965,9 @@ impl GatewayService {
                     return tokio::select! {
                         biased;
                         () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
-                        result = a2a_api::call_tool(self, &tool, agent_id, &request, principal, context.request_headers) => result,
+                        result = execution.span.scope(
+                            Box::pin(a2a_api::call_tool(self, &tool, agent_id, &request, principal, context.request_headers))
+                        ) => result,
                     };
                 }
                 let transport = UpstreamTransport::from_name(&tool.gateway_transport);
@@ -1381,6 +1445,12 @@ pub(crate) enum ToolError {
     Cursor,
     #[error("Catalog database failure")]
     Database(#[from] sqlx::Error),
+}
+
+#[derive(Default)]
+struct ToolExecution {
+    metric: Option<metrics::ExecutionTarget>,
+    span: OperationSpan,
 }
 
 #[derive(Serialize)]

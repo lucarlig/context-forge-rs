@@ -506,6 +506,18 @@ HTTP traces, request selection, redaction, filters, cleanup, export,
 analytics, access control, and adoption of existing traces. A live Rust
 test checks repeated trace IDs, scoped access, and cleanup CSRF enforcement.
 
+Sampled requests also record tool calls, resource reads, and prompt renders.
+Operation spans link to their HTTP spans across stateful MCP, modern MCP, and
+queued legacy SSE. A2A calls record database spans under their HTTP request or
+invoking tool. Spans store argument counts and remove resource URI queries,
+fragments, and user info. They omit payloads and upstream error text.
+
+Seven Rust Anything cases match the pinned reference on SQLite and PostgreSQL.
+The comparison checks span names, outcomes, and safe metadata. Native checks
+verify parent links for queued SSE, WebSocket upgrades, and A2A tool calls. A
+live Rust test checks parent links and resource redaction across three MCP
+transports. External OpenTelemetry export remains open.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

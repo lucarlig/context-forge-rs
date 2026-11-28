@@ -1157,6 +1157,7 @@ async fn dispatch(
             crate::http_boundary::CorrelationId::current(),
             Box::pin(reply),
         );
+        let reply = crate::observability::with_trace(crate::observability::current_trace(), reply);
         if stateful {
             // Keep processing if the client loses the HTTP connection.
             let task = tokio::spawn(reply);

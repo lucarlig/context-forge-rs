@@ -93,6 +93,25 @@ async fn forward(
     *request.body_mut() = Some(json!({
         "agent_id":identifier, "parameters":invocation.parameters, "interaction_type":invocation.interaction_type,
     }).to_string().into());
+    let span = OperationSpan::start(
+        &app.database,"a2a.invoke","client",
+        Some(SpanResource {kind:"agent",name:"federated agent",id:None}),
+        || json!({"a2a.federation":true,"a2a.hop":hops+1,
+            "a2a.interaction_type":invocation.interaction_type.chars().take(50).collect::<String>()}),
+    ).await;
+    let result = forward_request(app, principal, request, hops).await;
+    let success = matches!(&result, Ok(value) if !protocol::has_rpc_error(value));
+    span.finish(Outcome::completed(success, "A2A federation request failed"))
+        .await;
+    result
+}
+
+async fn forward_request(
+    app: &GatewayService,
+    principal: &Principal,
+    request: reqwest::Request,
+    hops: u32,
+) -> Result<Value, CatalogApiError> {
     let response = app
         .upstream
         .with_timeout_cap(Duration::from_secs(30))

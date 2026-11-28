@@ -14,7 +14,7 @@ use rmcp::model::{
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Reference,
     ResourceContents, Role,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{
     DirectTarget, GatewayService, Principal, Session, ToolContext, UpstreamError, UpstreamUse,
@@ -23,7 +23,11 @@ use super::{
 use crate::catalog::{
     CatalogServer, ContentGateway, MetricEntity, PromptContentRecord, ResourceContentRecord,
 };
-use crate::upstream::UpstreamEndpoint;
+use crate::{
+    http_boundary::CorrelationId,
+    observability::{OperationSpan, Outcome},
+    upstream::UpstreamEndpoint,
+};
 
 impl GatewayService {
     pub(crate) async fn read_resource(
@@ -35,14 +39,26 @@ impl GatewayService {
         downstream: Option<&Session>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let started = std::time::Instant::now();
+        self.check_mcp_permission(principal, server, "resources.read")
+            .await?;
+        let span = self
+            .resource_span(
+                &params.uri,
+                principal,
+                server.map(|server| server.id.as_str()),
+            )
+            .await;
         let mut target = None;
         let result = self
             .read_resource_inner(params, principal, server, context, downstream, &mut target)
             .await;
-        if !matches!(result, Ok(ReadResourceResponse::InputRequired(_))) {
+        let pending = matches!(result, Ok(ReadResourceResponse::InputRequired(_)));
+        if !pending {
             self.record_target(target, server, started, result.is_ok())
                 .await;
         }
+        span.finish(content_outcome(&result, pending, "Resource read failed"))
+            .await;
         result
     }
 
@@ -55,8 +71,6 @@ impl GatewayService {
         downstream: Option<&Session>,
         metric: &mut Option<ExecutionTarget>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        self.check_mcp_permission(principal, server, "resources.read")
-            .await?;
         let uri = params.uri.clone();
         let unknown = || ErrorData::invalid_params(format!("Unknown resource: {uri}"), None);
         let (gateway, direct_timeout) = match self
@@ -157,26 +171,6 @@ impl GatewayService {
         downstream: Option<&Session>,
     ) -> Result<GetPromptResponse, ErrorData> {
         let started = std::time::Instant::now();
-        let mut target = None;
-        let result = self
-            .get_prompt_inner(params, principal, server, context, downstream, &mut target)
-            .await;
-        if !matches!(result, Ok(GetPromptResponse::InputRequired(_))) {
-            self.record_target(target, server, started, result.is_ok())
-                .await;
-        }
-        result
-    }
-
-    async fn get_prompt_inner(
-        &self,
-        mut params: GetPromptRequestParams,
-        principal: Option<&Principal>,
-        server: Option<&CatalogServer>,
-        context: ToolContext<'_>,
-        downstream: Option<&Session>,
-        metric: &mut Option<ExecutionTarget>,
-    ) -> Result<GetPromptResponse, ErrorData> {
         if params
             .arguments
             .iter()
@@ -190,6 +184,37 @@ impl GatewayService {
         }
         self.check_mcp_permission(principal, server, "prompts.read")
             .await?;
+        let span = self
+            .prompt_span(
+                &params.name,
+                params.arguments.as_ref().map_or(0, JsonObject::len),
+                principal,
+                server.map(|server| server.id.as_str()),
+            )
+            .await;
+        let mut target = None;
+        let result = self
+            .get_prompt_inner(params, principal, server, context, downstream, &mut target)
+            .await;
+        let pending = matches!(result, Ok(GetPromptResponse::InputRequired(_)));
+        if !pending {
+            self.record_target(target, server, started, result.is_ok())
+                .await;
+        }
+        span.finish(content_outcome(&result, pending, "Prompt render failed"))
+            .await;
+        result
+    }
+
+    async fn get_prompt_inner(
+        &self,
+        mut params: GetPromptRequestParams,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        context: ToolContext<'_>,
+        downstream: Option<&Session>,
+        metric: &mut Option<ExecutionTarget>,
+    ) -> Result<GetPromptResponse, ErrorData> {
         let prompt = self
             .database
             .prompt_content(
@@ -236,6 +261,40 @@ impl GatewayService {
         serde_json::from_value::<GetPromptResult>(result)
             .map(Into::into)
             .map_err(|_| invalid_upstream_result())
+    }
+
+    pub(super) async fn resource_span(
+        &self,
+        uri: &str,
+        principal: Option<&Principal>,
+        server: Option<&str>,
+    ) -> OperationSpan {
+        OperationSpan::start(&self.database,"resource.read","internal",None,|| {
+            let safe_uri = resource_trace_uri(uri);
+            let http_url = safe_uri.starts_with("http").then_some(&safe_uri);
+            json!({
+                "resource.uri":safe_uri,
+                "resource.type":if safe_uri.contains('{') && safe_uri.contains('}') {"template"} else {"static"},
+                "http.url":http_url, "user":principal.map_or("anonymous", |principal| principal.email.as_str()),
+                "server_id":server, "request_id":request_id(),
+            })
+        }).await
+    }
+
+    pub(super) async fn prompt_span(
+        &self,
+        name: &str,
+        arguments: usize,
+        principal: Option<&Principal>,
+        server: Option<&str>,
+    ) -> OperationSpan {
+        OperationSpan::start(&self.database,"prompt.render","internal",None,|| {
+            json!({
+                "prompt.id":name.chars().take(255).collect::<String>(), "arguments_count":arguments,
+                "user":principal.map_or("anonymous", |principal| principal.email.as_str()),
+                "server_id":server, "tenant_id":null, "request_id":request_id().as_deref().unwrap_or("none"),
+            })
+        }).await
     }
 
     pub(crate) async fn complete(
@@ -423,6 +482,36 @@ impl GatewayService {
                 }
             })
     }
+}
+
+fn content_outcome<T>(
+    result: &Result<T, ErrorData>,
+    pending: bool,
+    message: &'static str,
+) -> Outcome {
+    match result {
+        Ok(_) if pending => Outcome::InputRequired,
+        Ok(_) => Outcome::Ok,
+        Err(error) if error.code == ErrorCode(-32800) => Outcome::Cancelled,
+        Err(_) => Outcome::Error(message),
+    }
+}
+
+fn request_id() -> Option<String> {
+    CorrelationId::current()
+        .and_then(|id| id.as_str().map(|value| value.chars().take(64).collect()))
+}
+
+fn resource_trace_uri(uri: &str) -> String {
+    let without_query = uri.split(['?', '#']).next().unwrap_or_default();
+    if let Ok(mut url) = url::Url::parse(without_query)
+        && (!url.username().is_empty() || url.password().is_some())
+    {
+        let _ = url.set_password(None);
+        let _ = url.set_username("");
+        return url.as_str().chars().take(767).collect();
+    }
+    without_query.chars().take(767).collect()
 }
 
 fn prompt_completions(

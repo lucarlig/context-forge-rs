@@ -726,21 +726,30 @@ async fn invoke(
     let mut request = reqwest::Request::new(reqwest::Method::POST, url);
     *request.headers_mut() = headers;
     *request.body_mut() = Some(payload.to_string().into());
+    let span = OperationSpan::start(
+        &app.database,"a2a.invoke","client",
+        Some(SpanResource {kind:"agent",name:&agent.name,id:Some(&agent.id)}),
+        || json!({
+            "a2a.agent.name":agent.name,"a2a.agent.id":agent.id,"a2a.agent.type":agent.agent_type,
+            "a2a.interaction_type":input.interaction_type.chars().take(50).collect::<String>(),
+        }),
+    ).await;
     let started = std::time::Instant::now();
     let result = dispatch_upstream(app, request).await;
+    let failure = match &result {
+        Ok(body) if protocol::has_rpc_error(body) => Some("A2A agent returned a JSON-RPC error"),
+        Err(_) => Some(FAILURE),
+        Ok(_) => None,
+    };
+    let outcome = failure.map_or(Outcome::Ok, Outcome::Error);
     if matches!(source, InvocationSource::Tool) {
+        span.finish(outcome).await;
         return result;
     }
     let metric = app.a2a_metrics.record.then(|| AgentInteraction {
         response_time: started.elapsed(),
         kind: &input.interaction_type,
-        failure: match &result {
-            Ok(body) if protocol::has_rpc_error(body) => {
-                Some("A2A agent returned a JSON-RPC error")
-            }
-            Err(_) => Some(FAILURE),
-            Ok(_) => None,
-        },
+        failure,
     });
     if let Err(error) = app
         .database
@@ -749,6 +758,7 @@ async fn invoke(
     {
         tracing::warn!(%error, "failed to record A2A interaction");
     }
+    span.finish(outcome).await;
     result
 }
 

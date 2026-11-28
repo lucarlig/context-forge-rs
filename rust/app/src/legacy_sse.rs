@@ -34,11 +34,13 @@ use crate::{
     legacy_sse_cache::{Access, CacheResult, RedisQueue, Scope, SharedQueue},
     legacy_sse_database::DatabaseQueue,
     mcp::{MAX_REQUEST_BODY_BYTES, RelayContext, legacy_transport_reply},
+    observability::{TraceContext, with_trace},
     redis_sessions::RedisSessionDirectory,
 };
 
 const MAX_CONNECTIONS: usize = 4096;
 const QUEUE_LENGTH: usize = 128;
+const QUEUED_TRACE: &str = "io.contextforge/relayTrace";
 
 pub struct SseSettings {
     pub retry_ms: u64,
@@ -327,6 +329,7 @@ async fn enqueue(
 }
 
 async fn parse_message(request: Request) -> Result<Value, Box<Response>> {
+    let trace = request.extensions().get::<TraceContext>().cloned();
     let bytes = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|_| {
@@ -335,12 +338,19 @@ async fn parse_message(request: Request) -> Result<Value, Box<Response>> {
                 "Request body too large",
             ))
         })?;
-    serde_json::from_slice(&bytes).map_err(|_| {
+    let mut message: Value = serde_json::from_slice(&bytes).map_err(|_| {
         Box::new(detail(
             StatusCode::BAD_REQUEST,
             "Invalid JSON in request body",
         ))
-    })
+    })?;
+    if let Some(fields) = message.as_object_mut() {
+        fields.remove(QUEUED_TRACE);
+        if let Some(trace) = trace {
+            fields.insert(QUEUED_TRACE.to_owned(), json!(trace));
+        }
+    }
+    Ok(message)
 }
 
 fn session_scope<'a>(
@@ -438,14 +448,21 @@ async fn respond(
     outgoing: mpsc::Sender<Value>,
 ) {
     let run = async {
-        while let Some(request) = incoming.receive().await {
+        while let Some(mut request) = incoming.receive().await {
+            let trace = request
+                .as_object_mut()
+                .and_then(|object| object.remove(QUEUED_TRACE))
+                .and_then(|context| serde_json::from_value(context).ok());
             let initialized = request["method"] == "initialize";
-            let Some(reply) = legacy_transport_reply(
-                &gateway,
-                principal.as_ref(),
-                server.as_ref(),
-                &relay,
-                request,
+            let Some(reply) = with_trace(
+                trace,
+                legacy_transport_reply(
+                    &gateway,
+                    principal.as_ref(),
+                    server.as_ref(),
+                    &relay,
+                    request,
+                ),
             )
             .await
             else {

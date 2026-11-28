@@ -2322,6 +2322,185 @@ async fn observability_keeps_failed_traces_and_enforces_admin_scope() {
 }
 
 #[tokio::test]
+async fn operation_traces_follow_mcp_workers_and_redact_resource_queries() {
+    use serde_json::{Value, json};
+
+    let mut service = gateway_with_env(&[
+        ("OBSERVABILITY_ENABLED", "true"),
+        ("USE_STATEFUL_SESSIONS", "true"),
+    ])
+    .await;
+    let (client, origin) = (&service.client, &service.origin);
+    let post = |url: &str, body: Value| {
+        client
+            .post(url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+    };
+    let login = post(
+        &format!("{origin}/auth/email/login"),
+        json!({"email":EMAIL,"password":service.password}),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let login: Value = serde_json::from_slice(&login.bytes().await.unwrap()).unwrap();
+    let admin = login["access_token"].as_str().unwrap();
+    let uri = "file:///trace-resource?token=fixture-operation-secret";
+    let created = post(
+        &format!("{origin}/resources"),
+        json!({"resource":{"name":"trace-resource","uri":uri,"content":"fixture-private-content"}}),
+    )
+    .bearer_auth(admin)
+    .send()
+    .await
+    .unwrap();
+    assert!(
+        created.status().is_success(),
+        "{}",
+        created.text().await.unwrap()
+    );
+
+    let mcp = |body| {
+        post(&format!("{origin}/mcp/"), body)
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .bearer_auth(admin)
+    };
+    let initialized = mcp(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }})).send().await.unwrap().error_for_status().unwrap();
+    let session = initialized.headers()["mcp-session-id"].clone();
+    initialized.bytes().await.unwrap();
+    let notice = mcp(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .header("mcp-session-id", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(notice.status(), StatusCode::ACCEPTED);
+
+    let rpc = json!({"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":uri}});
+    let stateful_trace = "1b5e227112cf42ebc70fd2868c8edf91";
+    let sse_trace = "1b5e227112cf42ebc70fd2868c8edf92";
+    let modern_trace = "1b5e227112cf42ebc70fd2868c8edf93";
+    let traceparent = |trace| format!("00-{trace}-b7ad6b7169203331-01");
+    let reply = mcp(rpc.clone())
+        .header("mcp-session-id", session)
+        .header("traceparent", traceparent(stateful_trace))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(
+        reply
+            .text()
+            .await
+            .unwrap()
+            .contains("fixture-private-content")
+    );
+
+    let mut modern = rpc.clone();
+    modern["params"]["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    });
+    let reply = post(&format!("{origin}/mcp/"), modern)
+        .header(header::ACCEPT, "application/json")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "resources/read")
+        .header("mcp-name", uri)
+        .header("traceparent", traceparent(modern_trace))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    let status = reply.status();
+    let body = reply.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("fixture-private-content"), "{body}");
+
+    let mut stream = client
+        .get(format!("{origin}/sse"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let endpoint = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buffer = Vec::new();
+        while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            buffer.extend_from_slice(&stream.chunk().await.unwrap().unwrap());
+        }
+        String::from_utf8(buffer)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap()
+            .to_owned()
+    })
+    .await
+    .unwrap();
+    let accepted = post(&endpoint, rpc)
+        .bearer_auth(admin)
+        .header("traceparent", traceparent(sse_trace))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buffer = Vec::new();
+        while !buffer
+            .windows(b"fixture-private-content".len())
+            .any(|window| window == b"fixture-private-content")
+        {
+            buffer.extend_from_slice(&stream.chunk().await.unwrap().unwrap());
+        }
+    })
+    .await
+    .unwrap();
+
+    for id in [stateful_trace, sse_trace, modern_trace] {
+        let trace = client
+            .get(format!("{origin}/v1/observability/traces/{id}"))
+            .bearer_auth(admin)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!trace.contains("fixture-operation-secret"));
+        assert!(!trace.contains("fixture-private-content"));
+        let trace: Value = serde_json::from_str(&trace).unwrap();
+        let spans = trace["spans"].as_array().unwrap();
+        assert_eq!(spans.len(), 2);
+        let operation = spans
+            .iter()
+            .find(|span| span["name"] == "resource.read")
+            .unwrap();
+        let http = spans
+            .iter()
+            .find(|span| span["name"] == "http.request")
+            .unwrap();
+        assert_eq!(operation["parent_span_id"], http["span_id"]);
+        assert_eq!(operation["status"], "ok");
+        assert!(operation["end_time"].is_string());
+        assert_eq!(
+            operation["attributes"]["resource.uri"],
+            "file:///trace-resource"
+        );
+    }
+    drop(stream);
+    service.process.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn registry_registration_requires_browser_proof_and_serializes_oauth_duplicates() {
     use serde_json::{Value, json};
 
