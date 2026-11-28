@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -20,7 +20,7 @@ use axum::{
 };
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use opentelemetry::{
-    Context, InstrumentationScope, Key, KeyValue,
+    Array, Context, InstrumentationScope, Key, KeyValue, Value as OtelValue,
     global::{self, BoxedSpan},
     propagation::{Extractor, TextMapPropagator},
     trace::{
@@ -41,7 +41,7 @@ use opentelemetry_sdk::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tonic::{metadata::MetadataMap, transport::ClientTlsConfig};
 use url::Url;
 use uuid::Uuid;
@@ -55,6 +55,7 @@ use crate::{
 type SettingsError = Box<dyn Error + Send + Sync>;
 
 pub(crate) mod client;
+mod jaeger;
 pub(super) mod langfuse;
 pub(crate) mod redis_client;
 pub(crate) mod sql_client;
@@ -114,8 +115,11 @@ impl Telemetry {
         let builder = match exporter.as_str() {
             "none" => return Ok(None),
             "jaeger" => {
-                tracing::warn!("The configured OpenTelemetry exporter is unavailable");
-                return Ok(None);
+                let Ok(exporter) = jaeger::Exporter::from_env() else {
+                    tracing::warn!("Could not configure the Jaeger trace exporter");
+                    return Ok(None);
+                };
+                builder.with_span_processor(batch_processor(exporter)?)
             }
             "zipkin" => {
                 let Ok(exporter) = zipkin::Exporter::from_env() else {
@@ -290,6 +294,42 @@ fn collector_http_client(timeout: Duration) -> Result<reqwest::blocking::Client,
         .join()
         .map_err(|_| "could not create the telemetry HTTP client")??;
     Ok(client)
+}
+
+fn collector_service_name(resource: &Resource) -> Cow<'_, str> {
+    resource
+        .get_ref(&Key::from_static_str("service.name"))
+        .map(OtelValue::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(Cow::Borrowed(SERVICE))
+}
+
+fn timestamp_micros(time: SystemTime) -> i64 {
+    duration_micros(time.duration_since(UNIX_EPOCH).unwrap_or_default())
+}
+
+fn duration_micros(duration: Duration) -> i64 {
+    i64::try_from((duration.as_nanos() + 500) / 1000).unwrap_or(i64::MAX)
+}
+
+fn collector_json_value(value: &OtelValue) -> Value {
+    match value {
+        OtelValue::Bool(value) => json!(value),
+        OtelValue::I64(value) => json!(value),
+        OtelValue::F64(value) => json!(value),
+        OtelValue::Array(Array::Bool(values)) => json!(values),
+        OtelValue::Array(Array::I64(values)) => json!(values),
+        OtelValue::Array(Array::F64(values)) => json!(values),
+        OtelValue::Array(Array::String(values)) => {
+            json!(
+                values
+                    .iter()
+                    .map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+            )
+        }
+        _ => json!(value.as_str()),
+    }
 }
 
 fn otlp_exporter(

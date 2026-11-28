@@ -621,8 +621,23 @@ preserves trace ancestry, sampling, resource tags, and span status.
 Two Rust Anything replays verify sampled and unsampled requests. A live
 collector test verifies batch size, redacted query tags, and errors. The
 pinned exporter sets Zipkin debug on sampled spans. Rust leaves that flag
-unset for ordinary W3C sampling. Framework spans and Jaeger export remain
-open.
+unset for ordinary W3C sampling.
+
+Set `OTEL_TRACES_EXPORTER=jaeger` to send binary Thrift batches over HTTP.
+`OTEL_EXPORTER_JAEGER_ENDPOINT` defaults to `http://localhost:14268/api/traces`.
+`OTEL_EXPORTER_JAEGER_TIMEOUT` defaults to 10 seconds. Set
+`OTEL_EXPORTER_JAEGER_USER` and `OTEL_EXPORTER_JAEGER_PASSWORD` together to
+use Basic authentication. The exporter uses the OpenTelemetry batch settings.
+It preserves trace IDs, parent IDs, sampling, typed tags, events, and links.
+[Jaeger HTTP API](https://www.jaegertracing.io/docs/2.23/architecture/apis/)
+
+The Rust exporter uses the binary protocol from Apache Thrift 0.25.0 with
+server features disabled. Three Rust Anything replays use the pinned
+gateway with the retired Jaeger exporter and its compatible Python SDK 1.21.
+A live Rust test decodes the batch and verifies the Basic authentication
+header and W3C IDs. Jaeger 2.23.0 ingests and returns the Rust request and
+prompt spans with their expected ancestry. Framework spans remain open.
+[Apache Thrift 0.25.0](https://github.com/apache/thrift/releases/tag/v0.25.0)
 
 Set `OTEL_COPY_RESOURCE_ATTRS_TO_SPANS=true` to copy `arize.project.name`
 and `model_id` from the OpenTelemetry resource to recorded spans. Other

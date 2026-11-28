@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::BTreeMap,
-    fmt,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, fmt, time::Duration};
 
 use opentelemetry::{
-    Array, Key, Value,
+    Array, Value,
     trace::{Event, SpanId, SpanKind, Status},
 };
 use opentelemetry_sdk::{
@@ -19,7 +15,10 @@ use serde::Serialize;
 use serde_json::json;
 use url::Url;
 
-use super::{SERVICE, SettingsError, collector_http_client, validate_collector_url};
+use super::{
+    SettingsError, collector_http_client, collector_json_value, collector_service_name,
+    duration_micros, timestamp_micros, validate_collector_url,
+};
 use crate::config::{parse, value};
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:9411/api/v2/spans";
@@ -70,16 +69,10 @@ impl SpanExporter for Exporter {
         if batch.is_empty() {
             return Ok(());
         }
-        let service = self
-            .resource
-            .get_ref(&Key::from_static_str("service.name"))
-            .map(Value::as_str)
-            .filter(|name| !name.is_empty());
+        let service = collector_service_name(&self.resource);
         let spans: Vec<_> = batch
             .iter()
-            .map(|span| {
-                ZipkinSpan::new(span, &self.resource, service.as_deref().unwrap_or(SERVICE))
-            })
+            .map(|span| ZipkinSpan::new(span, &self.resource, &service))
             .collect();
         let body = serde_json::to_vec(&spans)
             .map_err(|_| OTelSdkError::InternalFailure("Could not encode Zipkin spans".into()))?;
@@ -179,8 +172,8 @@ impl<'a> ZipkinSpan<'a> {
                 SpanKind::Consumer => Some("CONSUMER"),
                 SpanKind::Internal => None,
             },
-            timestamp: timestamp(span.start_time),
-            duration: micros(
+            timestamp: timestamp_micros(span.start_time),
+            duration: duration_micros(
                 span.end_time
                     .duration_since(span.start_time)
                     .unwrap_or_default(),
@@ -210,21 +203,18 @@ impl From<&Event> for Annotation {
         let attributes: BTreeMap<_, _> = event
             .attributes
             .iter()
-            .map(|attribute| (attribute.key.as_str(), json_value(&attribute.value)))
+            .map(|attribute| {
+                (
+                    attribute.key.as_str(),
+                    collector_json_value(&attribute.value),
+                )
+            })
             .collect();
         Self {
-            timestamp: timestamp(event.timestamp),
+            timestamp: timestamp_micros(event.timestamp),
             value: json!({(event.name.as_ref()): attributes}).to_string(),
         }
     }
-}
-
-fn timestamp(time: SystemTime) -> i64 {
-    micros(time.duration_since(UNIX_EPOCH).unwrap_or_default())
-}
-
-fn micros(duration: Duration) -> i64 {
-    i64::try_from((duration.as_nanos() + 500) / 1000).unwrap_or(i64::MAX)
 }
 
 fn tag_value(value: &Value) -> String {
@@ -239,22 +229,4 @@ fn tag_value(value: &Value) -> String {
 
 fn string_list(values: &[impl ToString]) -> String {
     json!(values.iter().map(ToString::to_string).collect::<Vec<_>>()).to_string()
-}
-
-fn json_value(value: &Value) -> serde_json::Value {
-    match value {
-        Value::Bool(value) => json!(value),
-        Value::I64(value) => json!(value),
-        Value::F64(value) => json!(value),
-        Value::Array(Array::Bool(values)) => json!(values),
-        Value::Array(Array::I64(values)) => json!(values),
-        Value::Array(Array::F64(values)) => json!(values),
-        Value::Array(Array::String(values)) => json!(
-            values
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Vec<_>>()
-        ),
-        _ => json!(value.as_str()),
-    }
 }

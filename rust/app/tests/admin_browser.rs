@@ -2925,6 +2925,132 @@ async fn zipkin_posts_batched_json_with_trace_ancestry_and_redacted_tags() {
 }
 
 #[tokio::test]
+async fn jaeger_posts_authenticated_binary_thrift_with_w3c_ids() {
+    use axum::{Router, body::Bytes, http::HeaderMap, routing::post};
+    use base64::{Engine as _, prelude::BASE64_STANDARD};
+    use serde_json::{Value, json};
+    use thrift::protocol::{TBinaryInputProtocol, TInputProtocol, TType};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/collector/jaeger", listener.local_addr().unwrap());
+    let (exports, mut batches) = tokio::sync::mpsc::unbounded_channel();
+    let collector = tokio::spawn(async move {
+        let router = Router::new().route(
+            "/collector/jaeger",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let exports = exports.clone();
+                async move {
+                    exports.send((headers, body)).unwrap();
+                    StatusCode::ACCEPTED
+                }
+            }),
+        );
+        axum::serve(listener, router).await.unwrap();
+    });
+    let user = "fixture";
+    let password = Uuid::new_v4().to_string();
+    let mut gateway = gateway_with_env(&[
+        ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_TRACES_EXPORTER", "jaeger"),
+        ("OTEL_EXPORTER_JAEGER_ENDPOINT", &endpoint),
+        ("OTEL_EXPORTER_JAEGER_USER", user),
+        ("OTEL_EXPORTER_JAEGER_PASSWORD", &password),
+        ("OTEL_EXPORTER_JAEGER_TIMEOUT", "2"),
+        ("OTEL_SERVICE_NAME", "jaeger-fixture"),
+        ("OTEL_BSP_SCHEDULE_DELAY", "30"),
+    ])
+    .await;
+    let post = |path: &str, body: Value| {
+        gateway
+            .client
+            .post(format!("{}{path}", gateway.origin))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+    };
+    let login = post(
+        "/auth/email/login",
+        json!({"email": EMAIL, "password": gateway.password}),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let login: Value = serde_json::from_slice(&login.bytes().await.unwrap()).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    let high = 0xaac53b0bd38e466d_u64;
+    let low = 0xa187048fcbd7cb95_u64;
+    let parent = 0xf8d17194f321ac55_u64;
+    let response = post("/rpc", json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+        .bearer_auth(token)
+        .header(
+            "traceparent",
+            format!("00-{high:016x}{low:016x}-{parent:016x}-01"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(response.text().await.unwrap().contains("\"result\""));
+
+    let (headers, body) = tokio::time::timeout(Duration::from_secs(5), batches.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(headers[header::CONTENT_TYPE], "application/x-thrift");
+    let authorization = format!(
+        "Basic {}",
+        BASE64_STANDARD.encode(format!("{user}:{password}"))
+    );
+    assert_eq!(headers[header::AUTHORIZATION], authorization);
+    assert!(
+        !body
+            .windows(password.len())
+            .any(|window| window == password.as_bytes())
+    );
+
+    fn field(input: &mut impl TInputProtocol, id: i16, kind: TType) {
+        let field = input.read_field_begin().unwrap();
+        assert_eq!(field.id, Some(id));
+        assert_eq!(field.field_type, kind);
+    }
+
+    let mut input = TBinaryInputProtocol::new(body.as_ref(), true);
+    input.read_struct_begin().unwrap();
+    field(&mut input, 1, TType::Struct);
+    input.read_struct_begin().unwrap();
+    field(&mut input, 1, TType::String);
+    assert_eq!(input.read_string().unwrap(), "jaeger-fixture");
+    input.read_field_end().unwrap();
+    assert_eq!(input.read_field_begin().unwrap().field_type, TType::Stop);
+    input.read_struct_end().unwrap();
+    input.read_field_end().unwrap();
+    field(&mut input, 2, TType::List);
+    let spans = input.read_list_begin().unwrap();
+    assert_eq!(spans.element_type, TType::Struct);
+    assert_eq!(spans.size, 1);
+    input.read_struct_begin().unwrap();
+    let mut read_id = |id| {
+        field(&mut input, id, TType::I64);
+        let value = input.read_i64().unwrap();
+        input.read_field_end().unwrap();
+        value
+    };
+    assert_eq!(read_id(1).to_be_bytes(), low.to_be_bytes());
+    assert_eq!(read_id(2).to_be_bytes(), high.to_be_bytes());
+    assert_ne!(read_id(3), 0);
+    assert_eq!(read_id(4).to_be_bytes(), parent.to_be_bytes());
+    field(&mut input, 5, TType::String);
+    assert_eq!(input.read_string().unwrap(), "POST /rpc");
+    input.read_field_end().unwrap();
+    field(&mut input, 7, TType::I32);
+    assert_eq!(input.read_i32().unwrap(), 1);
+    gateway.process.kill().await.unwrap();
+    collector.abort();
+}
+
+#[tokio::test]
 async fn langfuse_exports_validated_credentials_and_authenticated_session_metadata() {
     use axum::{Router, body::Bytes, http::HeaderMap, routing::post};
     use base64::{Engine as _, prelude::BASE64_STANDARD};
