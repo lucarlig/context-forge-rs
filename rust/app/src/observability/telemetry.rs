@@ -103,6 +103,7 @@ pub(crate) struct Telemetry {
     http_clients: Option<SemanticConventions>,
     redis_commands: Option<RedisConventions>,
     sql_queries: Option<SemanticConventions>,
+    system_traces: bool,
 }
 
 impl Telemetry {
@@ -193,6 +194,7 @@ impl Telemetry {
             .unwrap_or(false)
             .then(|| SemanticConventions::from_env("database"))
             .transpose()?;
+        let system_traces = flag("OTEL_SYSTEM_TRACES_ENABLED")?.unwrap_or(false);
         langfuse::configure_policy(is_langfuse, environment, redaction.clone())?;
         global::set_tracer_provider(provider.clone());
         Ok(Some(Self {
@@ -206,11 +208,25 @@ impl Telemetry {
             http_clients,
             redis_commands,
             sql_queries,
+            system_traces,
         }))
     }
 
     pub(crate) fn apply(self: Arc<Self>, router: Router) -> Router {
         router.layer(middleware::from_fn_with_state(self, observe))
+    }
+
+    pub(crate) fn system_context(&self) -> Option<TraceContext> {
+        self.system_traces.then(|| self.trace_context())
+    }
+
+    fn trace_context(&self) -> TraceContext {
+        TraceContext {
+            http_clients: self.http_clients,
+            redis_commands: self.redis_commands,
+            sql_queries: self.sql_queries,
+            ..TraceContext::default()
+        }
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -608,12 +624,9 @@ async fn observe_request(
 ) -> Response {
     let context = TraceContext {
         exported: Some(exported),
-        http_clients: telemetry.http_clients,
-        redis_commands: telemetry.redis_commands,
-        sql_queries: telemetry.sql_queries,
         framework,
         baggage,
-        ..TraceContext::default()
+        ..telemetry.trace_context()
     };
     request.extensions_mut().insert(context.clone());
     with_trace(Some(context), next.run(request)).await
@@ -742,6 +755,16 @@ pub(super) enum ExportSpan {
 }
 
 impl ExportSpan {
+    pub(super) fn root(name: &'static str, attributes: impl IntoIterator<Item = KeyValue>) -> Self {
+        let tracer = global::tracer_with_scope(scope());
+        Self::Recording(
+            tracer
+                .span_builder(name)
+                .with_attributes(attributes)
+                .start_with_context(&tracer, &Context::new()),
+        )
+    }
+
     pub(super) fn context(&self) -> ExportContext {
         match self {
             Self::Recording(span) => ExportContext::from_span(span.span_context()),
@@ -764,7 +787,7 @@ impl Extractor for ExportContext {
     }
 }
 
-fn exported_attributes(attributes: &Value) -> impl Iterator<Item = KeyValue> {
+pub(super) fn exported_attributes(attributes: &Value) -> impl Iterator<Item = KeyValue> {
     attributes.as_object().into_iter().flat_map(|fields| {
         fields.iter().filter_map(|(key, value)| {
             // The database keeps identity metadata in its administrator-only trace store.

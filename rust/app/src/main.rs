@@ -180,9 +180,11 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let background = catalog_available.then(|| {
         [
             tokio::spawn(
-                service
-                    .clone()
-                    .run_gateway_health(health_settings, shutdown.clone()),
+                http_boundary.with_system_tracing(
+                    service
+                        .clone()
+                        .run_gateway_health(health_settings, shutdown.clone()),
+                ),
             ),
             tokio::spawn(service.clone().run_gateway_lifecycle(shutdown.clone())),
             tokio::spawn(
@@ -199,13 +201,16 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         shutdown_signal().await;
         stop.cancel();
     });
-    http_boundary.serve(listener, app, shutdown).await;
-    if let Some(tasks) = background {
-        for task in tasks {
-            task.await?;
-        }
-    }
-    Ok(())
+    http_boundary
+        .serve(listener, app, shutdown, async {
+            if let Some(tasks) = background {
+                for result in futures_util::future::join_all(tasks).await {
+                    result?;
+                }
+            }
+            Ok(())
+        })
+        .await
 }
 
 async fn shutdown_signal() {

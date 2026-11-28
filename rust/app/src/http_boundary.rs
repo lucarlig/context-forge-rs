@@ -26,7 +26,7 @@ use crate::{
     access::Authorizer,
     config::{flag, parse, value},
     database::Database,
-    observability::{TraceLayer, telemetry::Telemetry},
+    observability::{TraceLayer, telemetry::Telemetry, with_trace},
 };
 
 mod compression;
@@ -92,12 +92,24 @@ impl HttpBoundary {
         })
     }
 
-    pub async fn serve(
+    pub fn with_system_tracing<F: Future>(
+        &self,
+        operation: F,
+    ) -> impl Future<Output = F::Output> + use<F> {
+        let context = self
+            .telemetry
+            .as_deref()
+            .and_then(Telemetry::system_context);
+        with_trace(context, operation)
+    }
+
+    pub async fn serve<T>(
         self,
         mut listener: TcpListener,
         router: Router,
         shutdown: CancellationToken,
-    ) {
+        background: impl Future<Output = T>,
+    ) -> T {
         let count = self.header_limits.map_or(HTTP1_HEADER_CAPACITY, |limits| {
             // Let the middleware describe ordinary excess counts in its JSON response.
             limits
@@ -141,9 +153,11 @@ impl HttpBoundary {
         drop(listener);
         connections.close();
         connections.wait().await;
+        let result = background.await;
         if let Some(telemetry) = telemetry {
             telemetry.shutdown().await;
         }
+        result
     }
 
     fn apply(self, mut router: Router) -> Router {
@@ -354,7 +368,8 @@ mod tests {
             "/",
             get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
         );
-        let gateway = tokio::spawn(boundary.serve(listener, router, stop.clone()));
+        let gateway =
+            tokio::spawn(boundary.serve(listener, router, stop.clone(), std::future::ready(())));
 
         async fn response(address: SocketAddr, count: usize) -> String {
             let mut request =

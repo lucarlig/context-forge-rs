@@ -20,6 +20,7 @@ use crate::{
     database::Database,
 };
 
+pub(crate) mod background;
 pub(crate) mod baggage;
 pub(crate) mod framework;
 mod operation;
@@ -29,6 +30,15 @@ pub(crate) mod telemetry;
 pub(crate) use operation::{
     OperationSpan, Outcome, SpanResource, TraceContext, current_trace, with_trace,
 };
+
+pub(crate) fn safe_upstream_url(url: &url::Url) -> String {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    bounded(url.as_str(), 2000)
+}
 
 const INCLUDE: &str = r#"["^/rpc/?$","^/sse$","^/message$","^/mcp(?:/|$)","^/servers/[^/]+/mcp/?$","^/servers/[^/]+/sse$","^/servers/[^/]+/message$","^/a2a(?:/|$)","^/v1/a2a(?:/|$)"]"#;
 const EXCLUDE: &str = r#"["/health","/healthz","/ready","/metrics","/static/.*"]"#;

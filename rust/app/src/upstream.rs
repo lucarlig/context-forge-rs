@@ -628,7 +628,10 @@ impl UpstreamClient {
         self.discover_selected_catalog(endpoint, true, true).await
     }
 
-    pub(crate) async fn probe(&self, endpoint: UpstreamEndpoint<'_>) -> Result<(), UpstreamError> {
+    pub(crate) async fn probe(
+        &self,
+        endpoint: UpstreamEndpoint<'_>,
+    ) -> Result<Option<u16>, UpstreamError> {
         let deadline = self.deadline()?;
         if endpoint.transport == UpstreamTransport::Sse {
             return timeout_at(deadline, async {
@@ -638,7 +641,7 @@ impl UpstreamClient {
                     .await?;
                 let status = response.status();
                 if status.is_success() {
-                    Ok(())
+                    Ok(Some(status.as_u16()))
                 } else {
                     Err(UpstreamError::Status(status.as_u16()))
                 }
@@ -648,7 +651,7 @@ impl UpstreamClient {
         }
         let session = self.open_session(endpoint, deadline).await?;
         session.close().await;
-        Ok(())
+        Ok(None)
     }
 
     pub(crate) async fn test_handshake(

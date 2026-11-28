@@ -2849,6 +2849,180 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
 }
 
 #[tokio::test]
+async fn system_trace_records_gateway_probe_outcomes_without_query_credentials() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use axum::{Json, Router, body::Bytes, response::IntoResponse, routing::post};
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value::Value as Attribute,
+    };
+    use prost::Message;
+    use serde_json::{Value, json};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = format!("http://{}", listener.local_addr().unwrap());
+    let (trace_tx, mut trace_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outage = Arc::new(AtomicBool::new(false));
+    let remote = outage.clone();
+    let mock = tokio::spawn(async move {
+        let routes = Router::new()
+            .route(
+                "/v1/traces",
+                post(move |body: Bytes| {
+                    let trace_tx = trace_tx.clone();
+                    async move {
+                        trace_tx
+                            .send(ExportTraceServiceRequest::decode(body).unwrap())
+                            .unwrap();
+                        ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
+                    }
+                }),
+            )
+            .route(
+                "/mcp",
+                post(move |Json(message): Json<Value>| {
+                    let remote = remote.clone();
+                    async move {
+                        if remote.load(Ordering::Relaxed) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        if message["id"].is_null() {
+                            return StatusCode::ACCEPTED.into_response();
+                        }
+                        let result = match message["method"].as_str() {
+                            Some("initialize") => json!({
+                                "protocolVersion": message["params"]["protocolVersion"],
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "health-test", "version": "1"},
+                            }),
+                            Some("tools/list") => json!({"tools": []}),
+                            _ => json!({}),
+                        };
+                        Json(json!({"jsonrpc": "2.0", "id": message["id"], "result": result}))
+                            .into_response()
+                    }
+                }),
+            );
+        axum::serve(listener, routes).await.unwrap();
+    });
+
+    let mut gateway = gateway_with_env(&[
+        ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_SYSTEM_TRACES_ENABLED", "true"),
+        ("OTEL_HTTPX_INSTRUMENTATION_ENABLED", "true"),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", &format!("{peer}/v1/traces")),
+        ("OTEL_BSP_SCHEDULE_DELAY", "25"),
+        ("HEALTH_CHECK_INTERVAL", "1"),
+    ])
+    .await;
+    let jwt: Value = serde_json::from_slice(
+        &gateway
+            .client
+            .post(format!("{}/auth/email/login", gateway.origin))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"email": EMAIL, "password": gateway.password}).to_string())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    const SECRET: &str = "probe-query-private-fixture";
+    let gateway_url = format!("{peer}/mcp");
+    gateway
+        .client
+        .post(format!("{}/gateways", gateway.origin))
+        .bearer_auth(jwt["access_token"].as_str().unwrap())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "name": "health-trace-fixture", "url": format!("{gateway_url}?token={SECRET}"),
+                "transport": "STREAMABLEHTTP", "visibility": "public"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    for (health, status) in [("healthy", 1), ("unhealthy", 2)] {
+        let mut collected = Vec::new();
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let batch = trace_rx.recv().await.unwrap();
+                assert!(!format!("{batch:?}").contains(SECRET));
+                collected.extend(
+                    batch
+                        .resource_spans
+                        .into_iter()
+                        .flat_map(|resource| resource.scope_spans)
+                        .flat_map(|scope| scope.spans),
+                );
+                let Some(check) = collected.iter().find(|span| {
+                    span.name == "gateway.health_check"
+                        && span
+                            .status
+                            .as_ref()
+                            .is_some_and(|status_field| status_field.code == status)
+                }) else {
+                    continue;
+                };
+                let Some(batch) = collected.iter().find(|span| {
+                    span.name == "gateway.health_check_batch"
+                        && span.span_id == check.parent_span_id
+                }) else {
+                    continue;
+                };
+                assert!(batch.parent_span_id.is_empty());
+                assert_eq!(batch.trace_id, check.trace_id);
+                assert!(
+                    collected
+                        .iter()
+                        .any(|span| span.name == "POST" && span.parent_span_id == check.span_id)
+                );
+                for (key, expected) in [
+                    ("health.status", Attribute::StringValue(health.to_owned())),
+                    ("gateway.url", Attribute::StringValue(gateway_url.clone())),
+                ] {
+                    let actual = check
+                        .attributes
+                        .iter()
+                        .find(|field| field.key == key)
+                        .and_then(|field| field.value.as_ref()?.value.as_ref());
+                    assert_eq!(actual, Some(&expected));
+                }
+                assert!(
+                    batch
+                        .attributes
+                        .iter()
+                        .any(|field| field.key == "gateway.count"
+                            && matches!(
+                                field.value.as_ref().and_then(|value| value.value.as_ref()),
+                                Some(Attribute::IntValue(1))
+                            ))
+                );
+                break;
+            }
+        })
+        .await
+        .unwrap();
+        outage.store(true, Ordering::Relaxed);
+    }
+    gateway.process.kill().await.unwrap();
+    mock.abort();
+}
+
+#[tokio::test]
 async fn zipkin_posts_batched_json_with_trace_ancestry_and_redacted_tags() {
     use axum::{Json, Router, http::HeaderMap, routing::post};
     use serde_json::{Value, json};

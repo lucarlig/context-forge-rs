@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use super::{ExportSpan, SemanticConventions};
-use crate::observability::{baggage, bounded, current_trace, with_trace};
+use crate::observability::{baggage, bounded, current_trace, safe_upstream_url, with_trace};
 use opentelemetry::{
     KeyValue,
     trace::{Span, SpanKind, Status},
@@ -118,7 +118,7 @@ pub(crate) async fn mcp_call<T, E>(
     ];
     if let Ok(url) = Url::parse(endpoint) {
         attributes.push(KeyValue::new("url.path", bounded(url.path(), 2000)));
-        attributes.push(KeyValue::new("url.full", safe_url(&url)));
+        attributes.push(KeyValue::new("url.full", safe_upstream_url(&url)));
         if let Some(host) = url.host_str() {
             attributes.push(KeyValue::new("server.address", bounded(host, 255)));
         }
@@ -152,15 +152,6 @@ fn signature_owns_headers(url: &Url, headers: &[&str]) -> bool {
     })
 }
 
-fn safe_url(url: &Url) -> String {
-    let mut url = url.clone();
-    url.set_query(None);
-    url.set_fragment(None);
-    let _ = url.set_password(None);
-    let _ = url.set_username("");
-    bounded(url.as_str(), 2000)
-}
-
 fn http_method(method: &Method) -> &'static str {
     match *method {
         Method::CONNECT => "CONNECT",
@@ -178,7 +169,7 @@ fn http_method(method: &Method) -> &'static str {
 
 fn request_attributes(request: &Request, mode: SemanticConventions) -> Vec<KeyValue> {
     let method = request.method().as_str();
-    let url = safe_url(request.url());
+    let url = safe_upstream_url(request.url());
     let mut attrs = Vec::new();
     if mode.legacy() {
         attrs.push(KeyValue::new("http.method", bounded(method, 64)));

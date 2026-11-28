@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use futures_util::{StreamExt, stream};
+use opentelemetry::{
+    KeyValue,
+    trace::{Span as _, Status},
+};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use super::*;
-use crate::gateway_records::{CatalogRefreshCompletion, CatalogRefreshInput, GatewayRecord};
+use crate::{
+    gateway_records::{CatalogRefreshCompletion, CatalogRefreshInput, GatewayRecord},
+    observability::{background::SystemSpan, safe_upstream_url, with_trace},
+};
 
 const PAGE_SIZE: i64 = 100;
+type HealthFailures = HashMap<String, (i32, u32)>;
 
 pub struct GatewayHealth {
     pub interval: Duration,
@@ -61,17 +70,60 @@ impl GatewayService {
     async fn health_cycle(
         &self,
         settings: &GatewayHealth,
-        failures: &HashMap<String, (i32, u32)>,
-    ) -> Result<HashMap<String, (i32, u32)>, sqlx::Error> {
+        failures: &HealthFailures,
+    ) -> Result<HealthFailures, sqlx::Error> {
+        let page = self.database.gateways_for_health(None, PAGE_SIZE).await?;
+        if page.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let started = Instant::now();
+        let mut span = SystemSpan::start(
+            "gateway.health_check_batch",
+            || json!({"check.type": "health"}),
+        );
+        let result = with_trace(
+            span.context(),
+            self.check_health_pages(settings, failures, page),
+        )
+        .await;
+        match result {
+            Ok((total, updated)) => {
+                if let Some(span) = span.recording() {
+                    span.set_attributes([
+                        KeyValue::new("gateway.count", total),
+                        KeyValue::new("check.completed", true),
+                        KeyValue::new(
+                            "check.duration_ms",
+                            i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                        ),
+                    ]);
+                    span.set_status(Status::Ok);
+                }
+                Ok(updated)
+            }
+            Err(error) => {
+                if let Some(span) = span.recording() {
+                    span.set_status(Status::error("Could not read gateway health candidates"));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn check_health_pages(
+        &self,
+        settings: &GatewayHealth,
+        failures: &HealthFailures,
+        mut page: Vec<GatewayRecord>,
+    ) -> Result<(i64, HealthFailures), sqlx::Error> {
         let mut recent_failures = HashMap::new();
-        let mut cursor = None;
+        let mut total = 0;
         loop {
-            let page = self
-                .database
-                .gateways_for_health(cursor.as_deref(), PAGE_SIZE)
-                .await?;
-            let last_page = page.len() < PAGE_SIZE as usize;
-            cursor = page.last().map(|record| record.id.clone());
+            total += page.len() as i64;
+            let cursor = page
+                .last()
+                .filter(|_| page.len() == PAGE_SIZE as usize)
+                .map(|record| record.id.clone());
             let results = stream::iter(page.into_iter().map(|record| async move {
                 let count = failures
                     .get(&record.id)
@@ -93,9 +145,13 @@ impl GatewayService {
                     }
                 }
             }
-            if last_page {
-                return Ok(recent_failures);
-            }
+            let Some(cursor) = cursor else {
+                return Ok((total, recent_failures));
+            };
+            page = self
+                .database
+                .gateways_for_health(Some(&cursor), PAGE_SIZE)
+                .await?;
         }
     }
 
@@ -108,11 +164,50 @@ impl GatewayService {
         let Some(transport) = UpstreamTransport::from_name(&record.transport) else {
             return Ok(0);
         };
+        let mut span = SystemSpan::start("gateway.health_check", || {
+            let url = Url::parse(&record.url)
+                .ok()
+                .map(|url| safe_upstream_url(&url));
+            json!({
+                "gateway.name": record.name,
+                "gateway.id": record.id,
+                "gateway.url": url,
+                "gateway.transport": record.transport,
+                "gateway.enabled": record.enabled,
+                "http.method": "GET",
+                "http.url": url,
+            })
+        });
+        let result = with_trace(
+            span.context(),
+            self.probe_and_save_health(record, settings, failures, transport, &mut span),
+        )
+        .await;
+        if result.is_err()
+            && let Some(span) = span.recording()
+        {
+            span.set_status(Status::error("Could not save gateway health"));
+        }
+        result
+    }
+
+    async fn probe_and_save_health(
+        &self,
+        record: &GatewayRecord,
+        settings: &GatewayHealth,
+        failures: u32,
+        transport: UpstreamTransport,
+        span: &mut SystemSpan,
+    ) -> Result<u32, sqlx::Error> {
         let Some(connection) = self
             .database
             .gateway_connection(&record.id, &record.url, true, Some(record.version), None)
             .await?
         else {
+            if let Some(span) = span.recording() {
+                span.set_attribute(KeyValue::new("health.status", "skipped"));
+                span.set_status(Status::Ok);
+            }
             return Ok(0);
         };
         let upstream = self.upstream.with_timeout_cap(settings.timeout);
@@ -134,8 +229,10 @@ impl GatewayService {
                 credentials: credentials.as_ref(),
             };
             match upstream.probe(endpoint).await {
-                Ok(()) => Ok((true, credentials)),
-                Err(UpstreamError::Status(401 | 403)) => Ok((false, credentials)),
+                Ok(status) => Ok((true, status, credentials)),
+                Err(UpstreamError::Status(status @ (401 | 403))) => {
+                    Ok((false, Some(status), credentials))
+                }
                 Err(UpstreamError::Status(status)) => {
                     Err(format!("server responded with HTTP {status}"))
                 }
@@ -144,9 +241,13 @@ impl GatewayService {
         })
         .await
         .unwrap_or_else(|_| Err(UpstreamError::Timeout.to_string()));
-        let (authenticated, credentials) = match probe {
+        let (authenticated, status, credentials) = match probe {
             Ok(result) => result,
             Err(error) => {
+                if let Some(span) = span.recording() {
+                    span.set_attribute(KeyValue::new("health.status", "unhealthy"));
+                    span.set_status(Status::error("Gateway health check failed"));
+                }
                 if let Some(threshold) = settings.failure_threshold
                     && record.enabled
                     && record.reachable
@@ -180,7 +281,7 @@ impl GatewayService {
             transport,
             credentials: credentials.as_ref(),
         };
-        if should_refresh
+        let refreshed = should_refresh
             && self
                 .refresh_healthy_gateway(
                     record,
@@ -189,12 +290,22 @@ impl GatewayService {
                     recovering,
                     RefreshSelection::ALL,
                 )
-                .await?
-        {
-            return Ok(0);
-        }
-        if self.database.set_gateway_health(record, None).await? && recovering {
+                .await?;
+        if !refreshed && self.database.set_gateway_health(record, None).await? && recovering {
             self.publish_health_change(record);
+        }
+        if let Some(span) = span.recording() {
+            span.set_attributes([
+                KeyValue::new("health.status", "healthy"),
+                KeyValue::new("success", true),
+            ]);
+            if let Some(status) = status {
+                span.set_attribute(KeyValue::new("http.status_code", i64::from(status)));
+            }
+            if !authenticated {
+                span.set_attribute(KeyValue::new("auth.status", "unauthorized"));
+            }
+            span.set_status(Status::Ok);
         }
         Ok(0)
     }

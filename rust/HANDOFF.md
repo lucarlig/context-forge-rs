@@ -651,6 +651,16 @@ their Rust equivalents. When the gateway generates a trace ID, Axum and
 the transport share that trace. The pinned gateway generates two traces.
 Additional endpoint phases and background spans remain open.
 
+Set `OTEL_SYSTEM_TRACES_ENABLED=true` to export scheduled gateway health
+checks. Each nonempty cycle exports a batch span with its gateway count
+and duration. Individual checks attach their outcomes and parent any
+enabled HTTP client spans. The setting defaults to off. The scheduler
+runs in both modes. Health-check span URLs omit query strings and fragments.
+
+Four Rust Anything cases match the pinned gateway for healthy and failed
+checks, an empty catalog, and default-off system tracing. A live Rust test
+checks span ancestry and verifies redaction of a credential in the probe URL.
+
 Set `OTEL_BAGGAGE_ENABLED=true` to attach approved request baggage to
 OpenTelemetry spans as `baggage.<key>`. Configure the allowlist with
 `OTEL_BAGGAGE_HEADER_MAPPINGS`, a JSON array of `header_name` and
