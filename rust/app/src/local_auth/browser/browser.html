@@ -363,7 +363,7 @@
               <td>{{ item.visibility|default('—', true) }}</td>
               {% if part.actions %}<td><div class="actions">
                 {% if item.oauth %}
-                <a href="{{ root }}/oauth/authorize/{{ item.id }}">Authorize</a>
+                <a href="{{ oauth_root }}/oauth/authorize/{{ item.id }}">Authorize</a>
                 {% endif %}
                 {% if item.refresh %}
                 <form method="post" action="{{ root }}/admin/gateways/{{ item.id }}/tools/refresh">

@@ -480,6 +480,7 @@ impl Settings {
         }
         Ok(GatewayOAuthSettings {
             redirect_uri: format!("{origin}{callback_path}"),
+            admin_root: admin_root(cimd_base)?,
             callback_path,
             browser_origin: origin,
             csrf_origins: allowlist("CSRF_TRUSTED_ORIGINS")?,
@@ -594,6 +595,7 @@ impl Settings {
             vault.kdf = kdf;
             vault
         });
+        let root_path = value("APP_ROOT_PATH", "")?.trim_end_matches('/').to_owned();
         Ok(Some(SsoSettings {
             upstream: Self::upstream_client()?,
             vault,
@@ -601,7 +603,8 @@ impl Settings {
             binding_key,
             app_domain: url::Url::parse(&value("APP_DOMAIN", "http://localhost:4444")?)?,
             allowed_origins: allowlist("ALLOWED_ORIGINS")?,
-            root_path: value("APP_ROOT_PATH", "")?.trim_end_matches('/').to_owned(),
+            admin_root: admin_root(&root_path)?,
+            root_path,
             secure_cookies: flag("SECURE_COOKIES")?.unwrap_or(true)
                 || value("ENVIRONMENT", "development")? == "production",
             same_site: value("COOKIE_SAMESITE", "lax")?,
@@ -670,7 +673,11 @@ impl Settings {
             }
         };
         let admin = ui.is_none() && flag("MCPGATEWAY_ADMIN_API_ENABLED")?.unwrap_or(false);
-        let mount = if admin { "/admin" } else { "/app" };
+        let mount = if admin {
+            format!("{}/admin", admin_root("")?)
+        } else {
+            "/app".to_owned()
+        };
         frontend.truncate(frontend.trim_end_matches('/').len());
         let parsed = url::Url::parse(&frontend)?;
         if !matches!(parsed.scheme(), "http" | "https")
@@ -681,8 +688,8 @@ impl Settings {
         {
             return Err("invalid browser-facing URL for password reset".into());
         }
-        if !parsed.path().ends_with(mount) {
-            frontend.push_str(mount);
+        if !parsed.path().ends_with(&mount) {
+            frontend.push_str(&mount);
         }
         Ok(ResetSettings {
             enabled: flag("PASSWORD_RESET_ENABLED")?.unwrap_or(true),
@@ -877,6 +884,7 @@ impl Settings {
         shutdown: CancellationToken,
     ) -> Result<SseSettings, Box<dyn Error + Send + Sync>> {
         let mut settings = Self::sse_settings(shutdown)?;
+        settings.legacy_api_enabled = legacy_api_enabled()?;
         settings.backend = match (value("CACHE_TYPE", "database")?.as_str(), &self.redis) {
             ("redis", Some(redis)) => {
                 let directory =
@@ -1302,6 +1310,15 @@ pub(crate) fn value(name: &str, default: &str) -> Result<String, Box<dyn Error +
         Err(env::VarError::NotPresent) => Ok(default.to_owned()),
         Err(env::VarError::NotUnicode(_)) => Err(format!("invalid Unicode in {name}").into()),
     }
+}
+
+pub(crate) fn legacy_api_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
+    Ok(flag("LEGACY_API_ENABLED")?.unwrap_or(true))
+}
+
+pub(crate) fn admin_root(root: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let version = if legacy_api_enabled()? { "" } else { "/v1" };
+    Ok(format!("{root}{version}"))
 }
 
 pub(crate) fn parse<T: FromStr>(name: &str, default: T) -> Result<T, Box<dyn Error + Send + Sync>> {

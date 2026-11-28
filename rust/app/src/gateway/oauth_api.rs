@@ -28,6 +28,7 @@ const MAX_STATUS_GATEWAYS: usize = 100;
 pub struct GatewayOAuthSettings {
     pub(crate) redirect_uri: String,
     pub(crate) callback_path: String,
+    pub(crate) admin_root: String,
     pub(crate) browser_origin: String,
     pub(crate) csrf_origins: HashSet<String>,
     pub(crate) callback_csrf: Option<CsrfTokens>,
@@ -88,6 +89,7 @@ impl Default for GatewayOAuthSettings {
         Self {
             redirect_uri: "http://localhost:4444/oauth/callback".to_owned(),
             callback_path: "/oauth/callback".to_owned(),
+            admin_root: String::new(),
             browser_origin: "http://localhost:4444".to_owned(),
             csrf_origins: HashSet::new(),
             callback_csrf: None,

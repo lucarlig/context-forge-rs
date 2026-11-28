@@ -172,7 +172,8 @@ pub(super) async fn callback(
         }
     };
     if !popup {
-        let root = root
+        let root = settings
+            .admin_root
             .replace('&', "&amp;")
             .replace('"', "&quot;")
             .replace('<', "&lt;")

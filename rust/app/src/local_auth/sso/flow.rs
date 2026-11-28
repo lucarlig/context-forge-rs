@@ -190,7 +190,7 @@ pub(super) async fn callback(
     let Some(cookie) = make_cookie(settings, "jwt_token", &access, Some(3600)) else {
         return redirect_to_login(settings, "token_too_large");
     };
-    let mut response = redirect(&format!("{}/admin", settings.root_path))?;
+    let mut response = redirect(&format!("{}/admin", settings.admin_root))?;
     response.headers_mut().append(header::SET_COOKIE, cookie);
     if let Some(hint) = identity.logout_hint.as_deref()
         && hint.len() <= 3800
@@ -540,7 +540,10 @@ fn invalid_authorization() -> AccountError {
 }
 
 fn redirect_to_login(settings: &SsoSettings, error: &str) -> Result<Response, AccountError> {
-    redirect(&format!("{}/admin/login?error={error}", settings.root_path))
+    redirect(&format!(
+        "{}/admin/login?error={error}",
+        settings.admin_root
+    ))
 }
 
 fn redirect(location: &str) -> Result<Response, AccountError> {

@@ -214,11 +214,17 @@ impl Csrf {
     }
 
     fn exempt_path(&self, path: &str) -> bool {
+        let admin_alias = path
+            .strip_prefix("/v1")
+            .filter(|path| *path == "/admin" || path.starts_with("/admin/"));
         self.exempt.iter().any(|exempt| {
-            path == exempt
-                || path
-                    .strip_prefix(exempt.trim_end_matches('/'))
-                    .is_some_and(|suffix| suffix.starts_with('/'))
+            let matches = |path: &str| {
+                path == exempt
+                    || path
+                        .strip_prefix(exempt.trim_end_matches('/'))
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            };
+            matches(path) || admin_alias.is_some_and(matches)
         })
     }
 

@@ -29,7 +29,7 @@ use crate::{
     access::{auth_cookie, browser_request, cookie},
     auth::TeamVisibility,
     catalog::ManagedCatalog,
-    config::{flag, parse, value},
+    config::{admin_root, flag, parse, value},
     http_boundary::{allowed_origins, csrf::ADMIN_CSRF_COOKIE as CSRF_COOKIE},
     jwt::TokenUse,
 };
@@ -39,6 +39,7 @@ const CHANGE: &str = "/admin/change-password-required";
 
 pub(crate) struct BrowserSettings {
     root: String,
+    mount_path: String,
     secure: bool,
     same_site: String,
     origins: Vec<String>,
@@ -79,7 +80,8 @@ impl BrowserSettings {
             .filter_map(|origin| forms::allowed_origin(&origin))
             .collect();
         Ok(Some(Self {
-            root,
+            root: admin_root(&root)?,
+            mount_path: root,
             secure: flag("SECURE_COOKIES")?.unwrap_or(true)
                 || value("ENVIRONMENT", "development")? == "production",
             same_site,
@@ -114,10 +116,10 @@ impl BrowserSettings {
     }
 
     fn cookie_path(&self) -> &str {
-        if self.root.is_empty() {
+        if self.mount_path.is_empty() {
             "/"
         } else {
-            &self.root
+            &self.mount_path
         }
     }
 }
@@ -360,7 +362,9 @@ async fn home(
             .uri()
             .query()
             .map_or_else(String::new, |query| format!("?{query}"));
-        return Ok(Redirect::temporary(&format!("{}{path}{query}", settings.root)).into_response());
+        return Ok(
+            Redirect::temporary(&format!("{}{path}{query}", settings.mount_path)).into_response(),
+        );
     }
     let proof = sessions::proof(&accounts, request.headers(), &principal, token)?;
     let (parts, _) = request.into_parts();
@@ -376,6 +380,7 @@ async fn home(
             title => "ContextForge",
             page => "home",
             root => settings.root,
+            oauth_root => settings.mount_path,
             email => principal.email,
             proof => proof,
             catalog => catalog,

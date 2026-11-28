@@ -30,6 +30,7 @@ use crate::{
 
 mod compression;
 pub(crate) mod csrf;
+mod legacy_api;
 mod proxy;
 mod rate_limit;
 mod response_policy;
@@ -47,6 +48,7 @@ pub struct HttpBoundary {
     responses: response_policy::ResponsePolicy,
     rate_limiter: Option<rate_limit::RateLimiter>,
     csrf: Option<csrf::Csrf>,
+    legacy_api: legacy_api::LegacyApi,
 }
 
 impl HttpBoundary {
@@ -81,6 +83,7 @@ impl HttpBoundary {
             responses: response_policy::ResponsePolicy::from_env(port)?,
             csrf: csrf::Csrf::from_env(auth.clone())?,
             rate_limiter: rate_limit::RateLimiter::from_env(auth, database)?,
+            legacy_api: legacy_api::LegacyApi::from_env()?,
         })
     }
 
@@ -135,6 +138,7 @@ impl HttpBoundary {
     }
 
     fn apply(self, mut router: Router) -> Router {
+        router = self.legacy_api.filter_routes(router);
         router = self.responses.apply(router);
         if let Some(limits) = self.header_limits {
             router = router.layer(middleware::from_fn_with_state(limits, limit_headers));
@@ -149,7 +153,7 @@ impl HttpBoundary {
         if let Some(csrf) = self.csrf {
             router = csrf.apply(router);
         }
-        router
+        self.legacy_api.decorate(router)
     }
 }
 
@@ -323,6 +327,7 @@ mod tests {
             responses: response_policy::ResponsePolicy::from_env(4444).unwrap(),
             rate_limiter: None,
             csrf: None,
+            legacy_api: legacy_api::LegacyApi::Enabled(None),
         };
         let router = Router::new().route(
             "/",
@@ -371,6 +376,7 @@ mod tests {
             responses: response_policy::ResponsePolicy::from_env(4444).unwrap(),
             rate_limiter: None,
             csrf: None,
+            legacy_api: legacy_api::LegacyApi::Enabled(None),
         }
         .apply(Router::new().route("/", get(|| async { StatusCode::UNAUTHORIZED })));
         let request = || {

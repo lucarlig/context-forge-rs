@@ -582,7 +582,7 @@ impl GatewayService {
         };
         let oauth_browser = self.access.protect_browser_api(
             oauth_api::browser_router().with_state(self.clone()),
-            Some(format!("{}/admin/login", self.gateway_oauth.root_path())),
+            Some(format!("{}/admin/login", self.gateway_oauth.admin_root)),
         );
         self.access
             .protect_api(

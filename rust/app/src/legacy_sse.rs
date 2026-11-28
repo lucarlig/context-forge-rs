@@ -47,6 +47,7 @@ pub struct SseSettings {
     pub backend: SseBackend,
     pub session_ttl: Duration,
     pub message_ttl: Duration,
+    pub legacy_api_enabled: bool,
 }
 
 pub enum SseBackend {
@@ -65,6 +66,7 @@ impl Default for SseSettings {
             backend: SseBackend::Memory,
             session_ttl: Duration::from_secs(3600),
             message_ttl: Duration::from_secs(600),
+            legacy_api_enabled: true,
         }
     }
 }
@@ -115,6 +117,8 @@ pub(crate) fn router(
         .route("/message", post(enqueue))
         .route("/servers/{server_id}/sse", get(open))
         .route("/servers/{server_id}/message", post(enqueue))
+        .route("/v1/servers/{server_id}/sse", get(open))
+        .route("/v1/servers/{server_id}/message", post(enqueue))
         .route("/v1/virtual-servers/{server_id}/sse", get(open))
         .route("/v1/virtual-servers/{server_id}/message", post(enqueue))
         .with_state(Arc::new(SseState {
@@ -150,7 +154,14 @@ async fn open(State(state): State<Arc<SseState>>, request: Request) -> Response 
     };
     let scheme = crate::http_boundary::public_scheme(request.headers(), request.uri());
     let path = match server.as_ref() {
-        Some(server) => format!("/servers/{}/message", server.id),
+        Some(server) => {
+            let version = if state.settings.legacy_api_enabled {
+                ""
+            } else {
+                "/v1"
+            };
+            format!("{version}/servers/{}/message", server.id)
+        }
         None => "/message".to_owned(),
     };
     let id = Uuid::new_v4();

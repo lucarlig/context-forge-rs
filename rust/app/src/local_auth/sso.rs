@@ -29,6 +29,7 @@ pub(crate) struct SsoSettings {
     pub(crate) app_domain: url::Url,
     pub(crate) allowed_origins: HashSet<String>,
     pub(crate) root_path: String,
+    pub(crate) admin_root: String,
     pub(crate) secure_cookies: bool,
     pub(crate) same_site: String,
     pub(crate) identity_policy: SsoIdentityPolicy,

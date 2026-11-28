@@ -1704,3 +1704,125 @@ async fn roots_dashboard_shares_the_registry_and_requires_unrestricted_admin() {
     assert_eq!(root["name"], "Research");
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn disabling_legacy_api_preserves_versioned_browser_forms_and_server_sse() {
+    let mut gateway = gateway_with_env(&[
+        ("LEGACY_API_ENABLED", "false"),
+        ("MCPGATEWAY_UI_ENABLED", "true"),
+        ("ROOT_ALLOWED_SCHEMES", "[\"https\"]"),
+    ])
+    .await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let login = format!("{origin}/v1/admin/login");
+    let redirect = client.get(origin).send().await.unwrap();
+    assert_eq!(redirect.headers()[header::LOCATION], "/v1/admin/");
+    assert_eq!(
+        client
+            .get(format!("{origin}/admin/login"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let page = client.get(&login).send().await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let proof = cookie(&page, "mcpgateway_csrf_token").to_owned();
+    let signed_in = client
+        .post(&login)
+        .header(header::ORIGIN, origin)
+        .header(header::COOKIE, format!("mcpgateway_csrf_token={proof}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(format!(
+            "email={EMAIL}&password={password}&csrf_token={proof}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed_in.status(), StatusCode::SEE_OTHER);
+    assert_eq!(signed_in.headers()[header::LOCATION], "/v1/admin");
+    let jwt = cookie(&signed_in, "jwt_token");
+    let proof = cookie(&signed_in, "mcpgateway_csrf_token");
+    let cookies = format!("jwt_token={jwt}; mcpgateway_csrf_token={proof}");
+    let root = |proof: &str| {
+        client
+            .post(format!("{origin}/v1/admin/roots"))
+            .header(header::ACCEPT, "text/html")
+            .header(header::ORIGIN, origin)
+            .header(header::COOKIE, &cookies)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(format!(
+                "csrf_token={proof}&uri=https%3A%2F%2Fexample.test%2Fdocs"
+            ))
+    };
+    assert_eq!(
+        root("").send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let saved = root(proof).send().await.unwrap();
+    assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+    assert_eq!(saved.headers()[header::LOCATION], "/v1/admin#roots");
+
+    let server = client
+        .post(format!("{origin}/v1/servers"))
+        .bearer_auth(jwt)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"server":{"name":"Versioned stream"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(server.status(), StatusCode::CREATED);
+    let server: serde_json::Value = serde_json::from_str(&server.text().await.unwrap()).unwrap();
+    let id = server["id"].as_str().unwrap();
+    let path = format!("{origin}/servers/{id}");
+    assert_eq!(
+        client
+            .get(format!("{path}/sse"))
+            .bearer_auth(jwt)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let mut stream = client
+        .get(format!("{origin}/v1/servers/{id}/sse"))
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert!(!stream.headers().contains_key("sunset"));
+    let endpoint = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut frame = Vec::new();
+        while !frame.ends_with(b"\r\n\r\n") {
+            frame.extend_from_slice(&stream.chunk().await.unwrap().expect("SSE endpoint"));
+        }
+        std::str::from_utf8(&frame)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap()
+            .to_owned()
+    })
+    .await
+    .unwrap();
+    assert!(endpoint.starts_with(&format!("{origin}/v1/servers/{id}/message?session_id=")));
+    let posted = client
+        .post(endpoint)
+        .bearer_auth(jwt)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), StatusCode::ACCEPTED);
+    drop(stream);
+    gateway.process.kill().await.unwrap();
+}

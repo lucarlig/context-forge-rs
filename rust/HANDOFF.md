@@ -154,6 +154,18 @@ current and previous token windows. The replays cover the login cookie, missing
 or forged proofs, Bearer requests, origin checks, and configured headers and path
 exemptions.
 
+Legacy API aliases publish `Sunset`, `Deprecation`, and successor links on
+successful responses. The middleware attaches headers without reading the
+response body. `LEGACY_API_ENABLED=false` blocks unversioned API aliases and
+keeps the MCP transports and well-known discovery routes available. Browser
+forms and virtual-server SSE message URLs use `/v1` when aliases are disabled.
+
+Five Rust Anything scenarios match on SQLite and PostgreSQL. They cover the
+default, configured, and invalid sunset dates, disabled aliases, and an active
+SSE stream. Chromium verifies versioned sign-in, form submissions with CSRF
+proof, and sign-out. A native test posts an SSE message to the advertised `/v1`
+URL with legacy aliases disabled.
+
 ## Admin browser authentication
 
 Enable `MCPGATEWAY_ADMIN_API_ENABLED` for the admin sign-in and password change
