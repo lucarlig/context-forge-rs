@@ -21,6 +21,7 @@ mod metrics;
 pub use metrics::ExecutionMetricsSettings;
 mod metrics_maintenance;
 mod oauth_api;
+mod observability;
 mod openapi;
 mod prompt_api;
 mod proxy;
@@ -138,6 +139,7 @@ pub struct GatewayService {
     a2a_metrics: A2aMetricsSettings,
     execution_metrics: ExecutionMetricsSettings,
     audit: audit::AuditSettings,
+    observability_enabled: bool,
     metrics_maintenance_stats: metrics_maintenance::MaintenanceStats,
     uaid: crate::uaid::UaidSettings,
     email_auth_enabled: bool,
@@ -269,6 +271,7 @@ impl GatewayService {
             a2a_metrics: A2aMetricsSettings::default(),
             execution_metrics: ExecutionMetricsSettings::default(),
             audit: audit::AuditSettings::default(),
+            observability_enabled: false,
             metrics_maintenance_stats: metrics_maintenance::MaintenanceStats::default(),
             uaid: crate::uaid::UaidSettings::default(),
             email_auth_enabled: true,
@@ -642,6 +645,7 @@ impl GatewayService {
             .merge(catalog_admin)
             .merge(metrics_maintenance::router(self))
             .merge(audit::router(self))
+            .merge(observability::router(self))
             .merge(search)
             .merge(oauth_browser)
     }

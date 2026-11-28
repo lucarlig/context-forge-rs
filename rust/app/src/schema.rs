@@ -23,7 +23,8 @@ const A2A_METRICS: &str = include_str!("../migrations/010_a2a_metrics.sql");
 const SECURITY_EVENTS: &str = include_str!("../migrations/011_security_events.sql");
 const EXECUTION_METRICS: &str = include_str!("../migrations/012_execution_metrics.sql");
 const AUDIT_TRAILS: &str = include_str!("../migrations/013_audit_trails.sql");
-const MIGRATIONS: [&str; 16] = [
+const OBSERVABILITY: &str = include_str!("../migrations/014_observability.sql");
+const MIGRATIONS: [&str; 17] = [
     "identity",
     "catalog",
     "legacy_sse",
@@ -40,6 +41,7 @@ const MIGRATIONS: [&str; 16] = [
     "security_events",
     "execution_metrics",
     "audit_trails",
+    "observability",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -253,7 +255,7 @@ impl Database {
             return Ok(());
         }
         macro_rules! upgrade {
-            ($transaction:ident, $usage:expr, $accounts:expr, $columns:expr, $agent_metrics:expr, $execution_metrics:expr) => {{
+            ($transaction:ident, $usage:expr, $accounts:expr, $columns:expr, $agent_metrics:expr, $execution_metrics:expr, $observability:expr) => {{
                 sqlx::query(CREATE_HISTORY)
                     .execute(&mut *$transaction)
                     .await?;
@@ -364,6 +366,11 @@ impl Database {
                                 .execute(&mut *$transaction)
                                 .await?;
                         }
+                        16 => {
+                            sqlx::raw_sql($observability)
+                                .execute(&mut *$transaction)
+                                .await?;
+                        }
                         _ => unreachable!("unknown migration implementation"),
                     }
                     sqlx::query(RECORD)
@@ -385,7 +392,8 @@ impl Database {
                     crate::local_auth::SQLITE_MIGRATION,
                     "SELECT name FROM pragma_table_info($1)",
                     sqlx::AssertSqlSafe(A2A_METRICS.replace("BIGSERIAL", "INTEGER")),
-                    sqlx::AssertSqlSafe(EXECUTION_METRICS.replace("BIGSERIAL", "INTEGER"))
+                    sqlx::AssertSqlSafe(EXECUTION_METRICS.replace("BIGSERIAL", "INTEGER")),
+                    sqlx::AssertSqlSafe(OBSERVABILITY.replace("BIGSERIAL", "INTEGER"))
                 );
             }
             Self::Postgres(pool) => {
@@ -404,7 +412,8 @@ impl Database {
                     "SELECT CAST(column_name AS TEXT) FROM information_schema.columns
                      WHERE table_schema = current_schema() AND table_name = $1",
                     A2A_METRICS,
-                    EXECUTION_METRICS
+                    EXECUTION_METRICS,
+                    OBSERVABILITY
                 );
             }
         }

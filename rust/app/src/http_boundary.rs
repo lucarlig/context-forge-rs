@@ -26,6 +26,7 @@ use crate::{
     access::Authorizer,
     config::{flag, parse, value},
     database::Database,
+    observability::TraceLayer,
 };
 
 mod compression;
@@ -49,6 +50,7 @@ pub struct HttpBoundary {
     rate_limiter: Option<rate_limit::RateLimiter>,
     csrf: Option<csrf::Csrf>,
     legacy_api: legacy_api::LegacyApi,
+    traces: Option<Arc<TraceLayer>>,
 }
 
 impl HttpBoundary {
@@ -82,6 +84,7 @@ impl HttpBoundary {
             proxies: proxy::ProxyHeaders::from_env()?,
             responses: response_policy::ResponsePolicy::from_env(port)?,
             csrf: csrf::Csrf::from_env(auth.clone())?,
+            traces: TraceLayer::from_env(database.clone())?.map(Arc::new),
             rate_limiter: rate_limit::RateLimiter::from_env(auth, database)?,
             legacy_api: legacy_api::LegacyApi::from_env()?,
         })
@@ -145,6 +148,9 @@ impl HttpBoundary {
         }
         if let Some(limiter) = self.rate_limiter {
             router = limiter.apply(router);
+        }
+        if let Some(traces) = self.traces {
+            router = traces.apply(router);
         }
         router = self.proxies.apply(router);
         if let Some(correlation) = self.correlation {
@@ -332,6 +338,7 @@ mod tests {
             rate_limiter: None,
             csrf: None,
             legacy_api: legacy_api::LegacyApi::Enabled(None),
+            traces: None,
         };
         let router = Router::new().route(
             "/",
@@ -381,6 +388,7 @@ mod tests {
             rate_limiter: None,
             csrf: None,
             legacy_api: legacy_api::LegacyApi::Enabled(None),
+            traces: None,
         }
         .apply(Router::new().route("/", get(|| async { StatusCode::UNAUTHORIZED })));
         let request = || {

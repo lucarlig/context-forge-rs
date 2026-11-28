@@ -29,6 +29,7 @@ pub mod mcp;
 mod modern;
 mod modern_validation;
 mod oauth_client;
+mod observability;
 pub mod probes;
 mod process_sandbox;
 mod proxy_catalog_cache;

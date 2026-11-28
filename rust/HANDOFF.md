@@ -477,6 +477,35 @@ validation, and historical database adoption. A live Rust test checks
 authorization and verifies that an audit insert failure preserves the catalog
 mutation.
 
+## HTTP request traces
+
+Set `OBSERVABILITY_ENABLED=true` to enable trace recording and query routes.
+The configured include and exclude patterns control request selection.
+`OBSERVABILITY_TRACE_HTTP_REQUESTS` and `OBSERVABILITY_SAMPLE_RATE` control
+recording. The gateway redacts credential values in query parameters.
+
+The gateway commits a trace and its HTTP span before dispatch. It records
+response status and duration after dispatch in a separate database
+transaction. A valid W3C trace header supplies the trace ID and parent
+attribute. Requests with the same trace ID keep independent HTTP spans.
+The first request to create the trace owns the trace summary.
+
+The observability API supports trace and span filters, retention cleanup,
+JSON, CSV, and NDJSON export, time series, and latency percentiles. The
+series routes return empty arrays when observability is disabled. Trace
+operations require unrestricted platform access and the relevant permission.
+Cookie-authenticated cleanup also requires CSRF proof.
+
+Structured JSON attribute filters work on both SQLite and PostgreSQL.
+The pinned Python reference returns HTTP 500 for those structured filters.
+SQLx uses UTC for PostgreSQL sessions. Historical PostgreSQL timestamps
+retain their instants and microseconds and appear in UTC in the trace API.
+
+Ten Rust Anything cases match on SQLite and PostgreSQL. They cover live
+HTTP traces, request selection, redaction, filters, cleanup, export,
+analytics, access control, and adoption of existing traces. A live Rust
+test checks repeated trace IDs, scoped access, and cleanup CSRF enforcement.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

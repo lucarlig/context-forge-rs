@@ -2201,6 +2201,127 @@ async fn audit_feed_scopes_records_and_survives_audit_storage_failure() {
 }
 
 #[tokio::test]
+async fn observability_keeps_failed_traces_and_enforces_admin_scope() {
+    use serde_json::{Value, json};
+
+    let mut service = gateway_with_env(&[
+        ("OBSERVABILITY_ENABLED", "true"),
+        (
+            "OBSERVABILITY_INCLUDE_PATHS",
+            r#"["^/rpc/?$","^/fixture-"]"#,
+        ),
+    ])
+    .await;
+    let (client, origin) = (&service.client, &service.origin);
+    let url = |path: &str| format!("{origin}{path}");
+    let post_json = |path: &str, token: Option<&str>, body: Value| {
+        let request = client
+            .post(url(path))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        let request = match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        async move {
+            let result = request.send().await.unwrap();
+            let status = result.status();
+            let body = result.text().await.unwrap();
+            assert!(status.is_success(), "{status} {body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        }
+    };
+    let login = post_json(
+        "/auth/email/login",
+        None,
+        json!({"email":EMAIL,"password":service.password}),
+    )
+    .await;
+    let admin = login["access_token"].as_str().unwrap();
+    let team = post_json("/teams", Some(admin), json!({"name":"Trace Scope"})).await;
+    let scoped = post_json(
+        "/tokens",
+        Some(admin),
+        json!({
+            "name":"scoped trace admin",
+            "team_id":team["id"],"expires_in_days":1,
+            "scope":{"permissions":["admin.system_config","metrics:read"]},
+        }),
+    )
+    .await;
+    let scoped = scoped["access_token"].as_str().unwrap();
+    let id = "193afceac4d0430fafeb9b2b162561ee";
+    let parent = "b7ad6b7169203331";
+    let traceparent = format!("00-{id}-{parent}-01");
+    let failure = client
+        .get(url("/fixture-trace?token=fixture-query-value&safe=1"))
+        .header("traceparent", &traceparent)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failure.status(), StatusCode::NOT_FOUND);
+    let second = client
+        .post(url("/rpc"))
+        .header("traceparent", &traceparent)
+        .header(header::CONTENT_TYPE, "application/json")
+        .bearer_auth(admin)
+        .body(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let response = client
+        .get(url(&format!("/v1/observability/traces/{id}")))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains("fixture-query-value"));
+    let trace: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(trace["trace_id"], id);
+    assert_eq!(trace["status"], "error");
+    assert_eq!(trace["http_status_code"], 404);
+    assert_eq!(trace["attributes"]["parent_span_id"], parent);
+    let spans = trace["spans"].as_array().unwrap();
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0]["attributes"]["http.status_code"], 404);
+    assert_eq!(spans[1]["attributes"]["http.status_code"], 200);
+    for path in [
+        "/v1/observability/traces",
+        "/v1/observability/metrics/timeseries",
+    ] {
+        let unauthenticated = client.get(url(path)).send().await.unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let denied = client
+            .get(url(path))
+            .bearer_auth(scoped)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+    let denied = client
+        .delete(url("/v1/observability/traces/cleanup"))
+        .bearer_auth(scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied = client
+        .delete(url("/v1/observability/traces/cleanup"))
+        .header(header::COOKIE, format!("jwt_token={admin}"))
+        .header(header::ACCEPT, "text/html")
+        .header(header::ORIGIN, origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    service.process.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn registry_registration_requires_browser_proof_and_serializes_oauth_duplicates() {
     use serde_json::{Value, json};
 
