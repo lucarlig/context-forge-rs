@@ -24,6 +24,7 @@ const PATH_ENCODING: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
+pub(crate) const ROOTS_ADMIN_PERMISSION: &str = "admin.system_config";
 
 #[derive(Default)]
 pub struct RootSettings {
@@ -33,7 +34,7 @@ pub struct RootSettings {
     pub defaults: Vec<String>,
 }
 
-pub(super) struct RootRegistry {
+pub(crate) struct RootRegistry {
     settings: RootSettings,
     roots: Mutex<Vec<Root>>,
     events: broadcast::Sender<Value>,
@@ -48,9 +49,9 @@ impl Default for RootRegistry {
 }
 
 #[derive(Clone, Serialize)]
-struct Root {
-    uri: String,
-    name: String,
+pub(crate) struct Root {
+    pub(crate) uri: String,
+    pub(crate) name: String,
     #[serde(rename = "_meta")]
     meta: Option<()>,
 }
@@ -158,13 +159,122 @@ impl RootRegistry {
         root
     }
 
-    fn find(&self, uri: &str) -> Result<Root, RootError> {
+    pub(crate) fn find(&self, uri: &str) -> Result<Root, RootError> {
         let canonical = self.canonical(uri)?;
         self.items()
             .iter()
             .find(|root| root.uri == canonical)
             .cloned()
             .ok_or_else(|| not_found(uri))
+    }
+
+    pub(crate) fn search(&self, query: &str, limit: usize) -> Vec<Root> {
+        self.items()
+            .iter()
+            .filter(|root| {
+                query.is_empty()
+                    || root.name.to_lowercase().contains(query)
+                    || root.uri.to_lowercase().contains(query)
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn add(&self, uri: &str, name: Option<String>) -> Result<Root, RootError> {
+        let uri = self.canonical(uri)?;
+        validate_name(name.as_deref())?;
+        let mut roots = self.items();
+        if roots.iter().any(|root| root.uri == uri) {
+            return Err(RootError::Detail(
+                StatusCode::CONFLICT,
+                "Root already exists".into(),
+            ));
+        }
+        Ok(self.insert(&mut roots, root_from_uri(uri, name)))
+    }
+
+    pub(crate) fn rename(&self, uri: &str, name: Option<String>) -> Result<Root, RootError> {
+        let canonical = self.canonical(uri)?;
+        let mut roots = self.items();
+        let root = roots
+            .iter_mut()
+            .find(|root| root.uri == canonical)
+            .ok_or_else(|| not_found(uri))?;
+        if let Some(name) = name {
+            validate_name(Some(&name))?;
+            root.name = name;
+        }
+        let _ = self.events.send(json!({
+            "type":"root_updated","data":{"uri":root.uri,"name":root.name}
+        }));
+        Ok(root.clone())
+    }
+
+    pub(crate) fn remove(&self, uri: &str) -> Result<(), RootError> {
+        let canonical = self.canonical(uri)?;
+        let mut roots = self.items();
+        let index = roots
+            .iter()
+            .position(|root| root.uri == canonical)
+            .ok_or_else(|| RootError::Detail(StatusCode::NOT_FOUND, "Root not found".into()))?;
+        roots.remove(index);
+        let _ = self
+            .events
+            .send(json!({"type":"root_removed","data":{"uri":canonical}}));
+        Ok(())
+    }
+}
+
+impl Root {
+    pub(crate) fn export_payload(&self, email: &str, now: Timestamp) -> Value {
+        json!({
+            "exported_at": now.to_string().trim_end_matches('Z'),
+            "exported_by": email,
+            "export_type":"root","version":"1.0","root":{"uri":self.uri,"name":self.name}
+        })
+    }
+}
+
+impl GatewayService {
+    pub(crate) fn root_search_limit(&self, requested: Option<u32>) -> Result<usize, RootError> {
+        let limit = requested.unwrap_or(self.management_page_size);
+        if !(1..=self.management_max_page_size).contains(&limit) {
+            return Err(RootError::Detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid root search limit".into(),
+            ));
+        }
+        Ok(limit as usize)
+    }
+
+    pub(crate) async fn can_administer_roots(
+        &self,
+        principal: &Principal,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(principal.is_global_admin()
+            && self
+                .access
+                .allows(
+                    principal,
+                    ROOTS_ADMIN_PERMISSION,
+                    RoleContext::Global,
+                    false,
+                )
+                .await?)
+    }
+
+    pub(crate) async fn admin_roots(
+        &self,
+        principal: &Principal,
+    ) -> Result<&RootRegistry, RootError> {
+        if !self.can_administer_roots(principal).await? {
+            return Err(RootError::Detail(
+                StatusCode::FORBIDDEN,
+                "Access denied".into(),
+            ));
+        }
+        Ok(&self.roots)
     }
 }
 
@@ -188,7 +298,7 @@ async fn require_admin(service: &GatewayService, principal: &Principal) -> Resul
     if !principal.is_global_admin()
         || !service
             .access
-            .allows(principal, "admin.system_config", RoleContext::Global, true)
+            .allows(principal, ROOTS_ADMIN_PERMISSION, RoleContext::Global, true)
             .await?
     {
         return Err(RootError::Detail(
@@ -220,20 +330,7 @@ async fn add(
     Json(input): Json<RootCreate>,
 ) -> Result<Json<Root>, RootError> {
     require_admin(&service, &principal).await?;
-    let uri = service.roots.canonical(&input.uri)?;
-    validate_name(input.name.as_deref())?;
-    let mut roots = service.roots.items();
-    if roots.iter().any(|root| root.uri == uri) {
-        return Err(RootError::Detail(
-            StatusCode::CONFLICT,
-            "Root already exists".into(),
-        ));
-    }
-    Ok(Json(
-        service
-            .roots
-            .insert(&mut roots, root_from_uri(uri, input.name)),
-    ))
+    Ok(Json(service.roots.add(&input.uri, input.name)?))
 }
 
 async fn detail(
@@ -258,20 +355,7 @@ async fn update(
     Json(input): Json<RootUpdate>,
 ) -> Result<Json<Root>, RootError> {
     require_admin(&service, &principal).await?;
-    let canonical = service.roots.canonical(&uri)?;
-    let mut roots = service.roots.items();
-    let root = roots
-        .iter_mut()
-        .find(|root| root.uri == canonical)
-        .ok_or_else(|| not_found(&uri))?;
-    if let Some(name) = input.name {
-        validate_name(Some(&name))?;
-        root.name = name;
-    }
-    let _ = service.roots.events.send(json!({
-        "type":"root_updated","data":{"uri":root.uri,"name":root.name}
-    }));
-    Ok(Json(root.clone()))
+    Ok(Json(service.roots.rename(&uri, input.name)?))
 }
 
 async fn remove(
@@ -280,17 +364,7 @@ async fn remove(
     Path(uri): Path<String>,
 ) -> Result<Json<Value>, RootError> {
     require_admin(&service, &principal).await?;
-    let canonical = service.roots.canonical(&uri)?;
-    let mut roots = service.roots.items();
-    let index = roots
-        .iter()
-        .position(|root| root.uri == canonical)
-        .ok_or_else(|| RootError::Detail(StatusCode::NOT_FOUND, "Root not found".into()))?;
-    roots.remove(index);
-    let _ = service
-        .roots
-        .events
-        .send(json!({"type":"root_removed","data":{"uri":canonical}}));
+    service.roots.remove(&uri)?;
     Ok(Json(json!({"status":"success","message":"Root removed"})))
 }
 
@@ -306,11 +380,9 @@ async fn export(
 ) -> Result<Json<Value>, RootError> {
     require_admin(&service, &principal).await?;
     let root = service.roots.find(&query.uri)?;
-    Ok(Json(json!({
-        "exported_at": Timestamp::now().to_string().trim_end_matches('Z'),
-        "exported_by": principal.email,
-        "export_type":"root","version":"1.0","root":{"uri":root.uri,"name":root.name}
-    })))
+    Ok(Json(
+        root.export_payload(&principal.email, Timestamp::now()),
+    ))
 }
 
 async fn changes(
@@ -496,7 +568,7 @@ fn not_found(uri: &str) -> RootError {
     RootError::Detail(StatusCode::NOT_FOUND, format!("Root not found: {uri}"))
 }
 
-enum RootError {
+pub(crate) enum RootError {
     Detail(StatusCode, String),
     Policy(&'static str),
     Database,

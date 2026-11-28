@@ -241,6 +241,9 @@ pub(super) fn render_template(
                 .add_template("grpc_edit.html", include_str!("grpc_edit.html"))
                 .expect("valid gRPC editor template");
             environment
+                .add_template("roots.html", include_str!("roots.html"))
+                .expect("valid roots template");
+            environment
         });
     let html = TEMPLATES
         .get_template(template)

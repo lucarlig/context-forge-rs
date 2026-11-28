@@ -307,6 +307,20 @@ the directory, versioned routes, tag filtering, the agent lifecycle, and
 the A2A feature flag. Chromium exercises the dashboard workflow. A Rust
 test covers stored credential redaction and read-only token enforcement.
 
+## Roots dashboard
+
+The Roots section lets unrestricted platform administrators search, inspect,
+add, rename, export, and delete roots. The browser and REST API share the
+in-memory registry, URI policy, and change stream. Browser form writes require
+CSRF proof. Both admin route prefixes support the JSON detail and search
+endpoints, form submissions, and JSON downloads.
+
+Five Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+bearer and browser sessions, versioned routes, URI policy errors, and scope
+denials. Chromium verifies the workflow through the downloaded JSON file. A
+Rust test checks that a team-scoped admin token cannot manage global roots
+and that authorized browser writes reach the REST change stream.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

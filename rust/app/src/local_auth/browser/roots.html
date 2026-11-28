@@ -1,0 +1,35 @@
+<section id="roots" aria-labelledby="roots-heading">
+  <h2 id="roots-heading">Roots</h2>
+  {% if roots.error %}<p role="alert">{{ roots.error }}</p>{% endif %}
+  {% if roots.rows %}
+  <div class="table-scroll">
+    <table aria-labelledby="roots-heading">
+      <thead><tr><th scope="col">Name</th><th scope="col">URI</th><th scope="col">Actions</th></tr></thead>
+      <tbody>
+        {% for entry in roots.rows %}
+        <tr>
+          <th scope="row">{{ entry.root.name or entry.root.uri }}</th>
+          <td>{{ entry.root.uri }}</td>
+          <td class="actions">
+            <a href="{{ root }}/admin/roots/{{ entry.encoded_uri }}?view=html">View and edit</a>
+            <a href="{{ root }}/admin/roots/export?uri={{ entry.encoded_uri }}">Download JSON</a>
+            <details><summary>Delete</summary>
+              <form method="post" action="{{ root }}/admin/roots/{{ entry.encoded_uri }}/delete">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <button type="submit">Confirm delete</button>
+              </form>
+            </details>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p>No roots found.</p>{% endif %}
+  <form method="post" action="{{ root }}/admin/roots">
+    <input type="hidden" name="csrf_token" value="{{ proof }}">
+    <label>URI <input name="uri" maxlength="2048" required></label>
+    <label>Name <input name="name" maxlength="255"></label>
+    <button type="submit">Add root</button>
+  </form>
+</section>

@@ -24,6 +24,7 @@ pub(crate) mod public_rpc;
 mod resource_api;
 mod rest_tool;
 mod roots;
+pub(crate) use roots::{ROOTS_ADMIN_PERMISSION, Root, RootError};
 mod server_api;
 mod tags;
 mod token_api;

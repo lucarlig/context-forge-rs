@@ -1573,3 +1573,134 @@ async fn grpc_dashboard_preserves_metadata_and_enforces_team_scope() {
     assert_eq!(record["enabled"], false);
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn roots_dashboard_shares_the_registry_and_requires_unrestricted_admin() {
+    let mut gateway = gateway_with_env(&[("ROOT_ALLOWED_SCHEMES", "[\"https\"]")]).await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL,"password":password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let admin = login["access_token"].as_str().unwrap();
+    let team = client
+        .post(format!("{origin}/teams"))
+        .bearer_auth(admin)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"Root fixture team","visibility":"private"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(team.status(), StatusCode::CREATED);
+    let team: serde_json::Value = serde_json::from_str(&team.text().await.unwrap()).unwrap();
+    let tokens = format!("{origin}/tokens");
+    let scoped = client
+        .post(&tokens)
+        .bearer_auth(admin)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::json!({"name":"root-team-token","expires_in_days":1,"team_id":team["id"],
+            "scope":{"permissions":["admin.dashboard","admin.system_config"]}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scoped.status(), StatusCode::CREATED);
+    let scoped: serde_json::Value = serde_json::from_str(&scoped.text().await.unwrap()).unwrap();
+    let restricted = scoped["access_token"].as_str().unwrap();
+    let dashboard = client
+        .get(format!("{origin}/admin/?section=roots"))
+        .bearer_auth(restricted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dashboard.status(), StatusCode::OK);
+    assert!(
+        !dashboard
+            .text()
+            .await
+            .unwrap()
+            .contains("id=\"roots-heading\"")
+    );
+
+    let uri = "https://example.test/research%20docs";
+    let admin_roots = format!("{origin}/v1/admin/roots");
+    let create = |credential| {
+        client
+            .post(&admin_roots)
+            .bearer_auth(credential)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("uri", uri)
+                    .append_pair("name", "Research")
+                    .finish(),
+            )
+    };
+    assert_eq!(
+        create(restricted).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let denied = client
+        .get(format!("{admin_roots}/search"))
+        .bearer_auth(restricted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let mut events = tokio::time::timeout(
+        Duration::from_secs(3),
+        client
+            .get(format!("{origin}/roots/changes"))
+            .bearer_auth(admin)
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(events.status(), StatusCode::OK);
+    let response = create(admin).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()[header::LOCATION], "/admin#roots");
+    let event = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut buffer = Vec::new();
+        while !buffer.ends_with(b"\n\n") {
+            buffer.extend_from_slice(&events.chunk().await.unwrap().expect("root change event"));
+        }
+        let frame = std::str::from_utf8(&buffer).unwrap().trim_end();
+        serde_json::from_str::<serde_json::Value>(frame.strip_prefix("data: ").unwrap()).unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        event,
+        serde_json::json!({"type":"root_added","data":{"uri":uri,"name":"Research"}})
+    );
+    drop(events);
+
+    let detail = client
+        .get(format!(
+            "{origin}/roots/https%3A%2F%2Fexample.test%2Fresearch%2520docs"
+        ))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let root: serde_json::Value = serde_json::from_str(&detail.text().await.unwrap()).unwrap();
+    assert_eq!(root["uri"], uri);
+    assert_eq!(root["name"], "Research");
+    gateway.process.kill().await.unwrap();
+}

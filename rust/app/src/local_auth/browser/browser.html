@@ -86,6 +86,16 @@
     </form>
     {% endif %}
     <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
+    {% elif page == "root-detail" %}
+    <h1>Root details</h1>
+    <dl><dt>URI</dt><dd>{{ entry.root.uri }}</dd></dl>
+    <form method="post" action="{{ root }}/admin/roots/{{ entry.encoded_uri }}/update">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Name <input name="name" maxlength="255" value="{{ entry.root.name }}"></label>
+      <button type="submit">Save name</button>
+    </form>
+    <p><a href="{{ root }}/admin/roots/export?uri={{ entry.encoded_uri }}">Download JSON</a></p>
+    <p><a href="{{ root }}/admin/?section=roots#roots">Back to roots</a></p>
     {% elif page == "grpc-edit" %}
     {% include "grpc_edit.html" %}
     {% elif page == "grpc-methods" %}
@@ -297,7 +307,9 @@
         <label>Search agents <input type="search" name="q" maxlength="500" value="{{ catalog.a2a.q|default('', true) }}"></label>
         <label>Tags <input name="tags" value="{{ catalog.a2a.tags|default('', true) }}"></label>
         {% endif %}
-        {% if catalog.users %}
+        {% if catalog.selected == "roots" %}
+        <label>Search roots <input type="search" name="q" maxlength="500" value="{{ catalog.roots.query }}"></label>
+        {% elif catalog.users %}
         <label>Search users <input type="search" name="q" maxlength="500" value="{{ catalog.users.query }}"></label>
         {% else %}
         {% if catalog.selected == "teams" %}
@@ -329,6 +341,10 @@
     {% if catalog.grpc %}
       {% set registry = catalog.grpc %}
       {% include "grpc.html" %}
+    {% endif %}
+    {% if catalog.roots %}
+      {% set roots = catalog.roots %}
+      {% include "roots.html" %}
     {% endif %}
     {% for part in catalog.sections %}
     <section id="{{ part.fragment }}" aria-labelledby="heading-{{ part.name }}">
