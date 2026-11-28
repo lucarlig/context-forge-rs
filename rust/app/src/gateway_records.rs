@@ -98,6 +98,14 @@ pub(crate) struct ImpactServer {
     owner_email: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+pub(crate) struct RegistryGateway {
+    pub(crate) id: String,
+    pub(crate) url: String,
+    pub(crate) enabled: bool,
+    pub(crate) auth_type: Option<String>,
+}
+
 macro_rules! gateway_select {
     () => {
         "SELECT g.id, g.name, g.slug, g.url, g.description, g.tool_validation_policy, g.transport,
@@ -332,6 +340,49 @@ const GATEWAY_DELETES: &[&str] = &[
 ];
 
 impl Database {
+    pub(crate) async fn registry_gateways(
+        &self,
+        urls: &[&str],
+        email: &str,
+        scope: &TeamVisibility,
+    ) -> Result<Vec<RegistryGateway>, sqlx::Error> {
+        let admin = *scope == TeamVisibility::Admin;
+        let teams = match scope {
+            TeamVisibility::Teams(teams) => teams.as_slice(),
+            TeamVisibility::Admin | TeamVisibility::Public => &[],
+        };
+        let teams = serde_json::json!(teams).to_string();
+        let urls = serde_json::json!(urls).to_string();
+        macro_rules! find_matches {
+            ($pool:ident, $teams:literal, $urls:literal) => {
+                sqlx::query_as(concat!(
+                    "WITH visible_teams(id) AS (", $teams, "), registry_urls(url) AS (", $urls, ")
+                     SELECT g.id,g.url,g.enabled,g.auth_type FROM gateways g
+                     WHERE g.url IN (SELECT url FROM registry_urls) AND ",
+                    managed_visibility!(
+                        "g", "$2", "($2 OR g.team_id IN (SELECT id FROM visible_teams))", "$1", "visible_teams"
+                    ),
+                    " ORDER BY CASE WHEN g.owner_email=$1 AND g.created_via='catalog' THEN 0
+                                    WHEN g.owner_email=$1 THEN 1
+                                    WHEN g.created_via='catalog' THEN 2 ELSE 3 END,g.id"
+                ))
+                .bind(email).bind(admin).bind(&teams).bind(&urls).fetch_all($pool).await
+            };
+        }
+        match self {
+            Self::Sqlite(pool) => find_matches!(
+                pool,
+                "SELECT value FROM json_each($3)",
+                "SELECT value FROM json_each($4)"
+            ),
+            Self::Postgres(pool) => find_matches!(
+                pool,
+                "SELECT json_array_elements_text(CAST($3 AS JSON))",
+                "SELECT json_array_elements_text(CAST($4 AS JSON))"
+            ),
+        }
+    }
+
     pub(crate) async fn gateways_for_health(
         &self,
         after_id: Option<&str>,

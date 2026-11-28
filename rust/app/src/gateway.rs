@@ -29,6 +29,7 @@ mod server_api;
 mod tags;
 mod token_api;
 pub(crate) use token_api::{AdminTokenPage, AdminTokenQuery};
+mod registry;
 mod tool_api;
 mod unified_search;
 pub use unified_search::SearchSettings;
@@ -596,6 +597,12 @@ impl GatewayService {
         let search = self
             .access
             .protect_browser_api(unified_search::router(self), None);
+        let registry_admin = if self.search.admin {
+            self.access
+                .protect_browser_api(registry::admin_router().with_state(self.clone()), None)
+        } else {
+            Router::new()
+        };
         self.access
             .protect_api(
                 router
@@ -604,6 +611,7 @@ impl GatewayService {
                     .merge(roots::router())
                     .merge(export_api::router())
                     .merge(import_api::router())
+                    .merge(registry::router())
                     .merge(tags::router())
                     .merge(prompt_api::router(self.max_prompt_bytes))
                     .merge(tool_api::router())
@@ -612,6 +620,7 @@ impl GatewayService {
                     .with_state(self.clone()),
             )
             .merge(grpc_admin)
+            .merge(registry_admin)
             .merge(search)
             .merge(oauth_browser)
     }

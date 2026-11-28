@@ -192,6 +192,25 @@ pub(crate) fn flag(input: Option<&str>) -> Result<bool, CatalogApiError> {
     }
 }
 
+pub(super) fn query_boolean(
+    name: &str,
+    input: Option<&str>,
+    default: bool,
+) -> Result<bool, CatalogApiError> {
+    let Some(input) = input else {
+        return Ok(default);
+    };
+    flag(Some(input)).map_err(|_| {
+        CatalogApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"detail":[{
+                "type":"bool_parsing","loc":["query",name],
+                "msg":"Input should be a valid boolean, unable to interpret input","input":input
+            }]}),
+        )
+    })
+}
+
 pub(super) async fn require_catalog_permission(
     service: &GatewayService,
     principal: &Principal,

@@ -25,6 +25,11 @@ use percent_encoding::utf8_percent_encode;
 use self::forms::{Form, csrf, render};
 use self::sessions::{Denial, Session, access, clear_session_cookies, create_session};
 use super::*;
+
+pub(crate) fn registry_partial(registry: Value) -> Response {
+    forms::render_template("registry.html", minijinja::context! { registry })
+        .unwrap_or_else(IntoResponse::into_response)
+}
 use crate::{
     access::{auth_cookie, browser_request, cookie},
     auth::TeamVisibility,

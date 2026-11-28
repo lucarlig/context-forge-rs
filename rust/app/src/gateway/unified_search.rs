@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-mod registry;
-
 use axum::extract::Query;
 
 use super::{
@@ -12,8 +10,8 @@ use crate::catalog::{SearchFilters, SearchKind, parse_tag_groups};
 
 #[derive(Default)]
 pub struct SearchSettings {
-    admin: bool,
-    registry: Option<registry::Registry>,
+    pub(super) admin: bool,
+    pub(super) registry: Option<registry::CatalogRegistry>,
 }
 
 impl SearchSettings {
@@ -21,9 +19,10 @@ impl SearchSettings {
         use crate::config::{flag, parse, value};
         let enabled = flag("MCPGATEWAY_CATALOG_ENABLED")?.unwrap_or(true);
         let registry = if enabled {
-            Some(registry::Registry::new(
+            Some(registry::CatalogRegistry::new(
                 value("MCPGATEWAY_CATALOG_FILE", "mcp-catalog.yml")?,
                 Duration::from_secs(parse("MCPGATEWAY_CATALOG_CACHE_TTL", 3600)?),
+                parse::<i64>("MCPGATEWAY_CATALOG_PAGE_SIZE", 100)?.max(1),
             ))
         } else {
             None
@@ -364,10 +363,9 @@ async fn supplementary_items(
                 .allows(principal, "servers.read", RoleContext::AnyTeam, false)
                 .await? =>
         {
-            match &service.search.registry {
-                Some(registry) => registry.search(filter.text, filter.limit as usize).await,
-                None => Vec::new(),
-            }
+            service
+                .registry_search(principal, filter.text, filter.limit)
+                .await?
         }
         _ => Vec::new(),
     };

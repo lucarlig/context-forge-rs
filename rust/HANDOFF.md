@@ -371,6 +371,25 @@ cannot see a private tool owned by the same account in a different team.
 New MCP and A2A registrations save display names for their tools. Refresh an
 existing MCP gateway or edit an existing A2A agent to populate missing names.
 
+## Curated MCP registry
+
+`/v1/catalog` lists the curated catalog even when the admin API is disabled.
+It filters by category, authentication, provider, text, repeated tags,
+availability, and registration state. Both admin prefixes provide the list,
+health checks, and an HTML partial. The dashboard can browse and filter entries.
+
+Registration state comes from caller-visible gateways on each request. When
+several visible gateways share a URL, caller-owned and catalog-created
+gateways take priority. Health checks use address pinning, the gateway's URL
+policy, and a five-second timeout.
+
+Eight Rust Anything read cases match on SQLite and PostgreSQL. They cover
+filtering and pagination, registration visibility, status checks, browser
+authentication, feature flags, YAML reloads, and unified search. Chromium
+verifies the dashboard filters. The live Rust test checks that a team-scoped
+token selects a visible gateway when a private gateway in another team shares
+its catalog URL.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

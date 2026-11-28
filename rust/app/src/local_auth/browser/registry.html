@@ -1,0 +1,28 @@
+<section aria-labelledby="registry-heading">
+  <h2 id="registry-heading">MCP registry</h2>
+  {% if registry.data.servers %}
+  <table aria-labelledby="registry-heading">
+    <thead><tr><th scope="col">Server</th><th scope="col">Category</th><th scope="col">Authentication</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+    {% for entry in registry.data.servers %}
+      <tr>
+        <th scope="row">{{ entry.name }}<br><small>{{ entry.provider }}</small></th>
+        <td>{{ entry.category }}</td>
+        <td>{{ entry.auth_type }}</td>
+        <td>{% if entry.requires_oauth_config %}OAuth setup required{% elif entry.is_registered %}Registered{% elif entry.is_available %}Available{% else %}Unavailable{% endif %}</td>
+      </tr>
+      {% if entry.description %}<tr><td colspan="4">{{ entry.description }}</td></tr>{% endif %}
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No matching servers.</p>
+  {% endif %}
+  {% if registry.previous or registry.next %}
+  <nav aria-label="Registry pages">
+    {% if registry.previous %}<a href="{{ registry.previous }}">Previous</a>{% endif %}
+    <span>Page {{ registry.page }} of {{ registry.pages }}</span>
+    {% if registry.next %}<a href="{{ registry.next }}">Next</a>{% endif %}
+  </nav>
+  {% endif %}
+</section>

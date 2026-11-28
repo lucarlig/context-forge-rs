@@ -1799,6 +1799,87 @@ async fn unified_search_keeps_owned_tools_inside_the_token_team() {
 }
 
 #[tokio::test]
+async fn registry_selects_gateways_after_enforcing_team_scope() {
+    use serde_json::{Value, json};
+
+    let mut gateway = gateway().await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        fixture,
+        ..
+    } = &gateway;
+    let post = |path, token: Option<&str>, body: Value| {
+        let request = client
+            .post(format!("{origin}{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        let request = match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert!(status.is_success(), "{status} {body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        }
+    };
+    let login = post(
+        "/auth/email/login",
+        None,
+        json!({"email":EMAIL,"password":password}),
+    )
+    .await;
+    let admin = login["access_token"].as_str().unwrap();
+    let selected = post("/teams", Some(admin), json!({"name":"Registry Selected"})).await;
+    let sibling = post("/teams", Some(admin), json!({"name":"Registry Sibling"})).await;
+    let scoped = post("/tokens", Some(admin), json!({
+        "name":"registry-read","team_id":selected["id"],"expires_in_days":1,"scope":{"permissions":["servers.read"]}
+    })).await;
+    let token = scoped["access_token"].as_str().unwrap();
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", fixture.0.join("mcp.db").display()))
+            .await
+            .unwrap();
+    for (id, visibility, team) in [
+        ("owned", "private", sibling["id"].as_str()),
+        ("shared", "public", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO gateways
+            (id,name,slug,visibility,team_id,owner_email,created_via,url,transport)
+            VALUES($1,$1,$1,$2,$3,$4,'catalog','https://mcp.deepwiki.com/mcp','STREAMABLEHTTP')",
+        )
+        .bind(id)
+        .bind(visibility)
+        .bind(team)
+        .bind(if team.is_some() {
+            EMAIL
+        } else {
+            "other@example.test"
+        })
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    pool.close().await;
+    let url = format!("{origin}/v1/catalog?search=deepwiki&show_registered_only=true");
+    let unauthenticated = client.get(&url).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    for (token, expected) in [(admin, "owned"), (token, "shared")] {
+        let response = client.get(&url).bearer_auth(token).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["servers"][0]["gateway_id"], expected);
+    }
+    gateway.process.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn disabling_legacy_api_preserves_versioned_browser_forms_and_server_sse() {
     let mut gateway = gateway_with_env(&[
         ("LEGACY_API_ENABLED", "false"),

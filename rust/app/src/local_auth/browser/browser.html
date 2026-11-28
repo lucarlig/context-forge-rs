@@ -307,6 +307,27 @@
         <label>Search catalogs <input type="search" name="q" maxlength="500" value="{{ catalog.search.query }}"></label>
         <label>Tags <input name="tags" maxlength="500" value="{{ catalog.search.tags }}"></label>
         {% endif %}
+        {% if catalog.registry %}
+        <label>Search registry <input type="search" name="search" value="{{ catalog.registry.search }}"></label>
+        <div>
+          <label for="registry-category">Category</label>
+          <select id="registry-category" name="category">
+            <option value="">All categories</option>
+            {% for option in catalog.registry.data.categories %}
+            <option value="{{ option }}"{% if catalog.registry.category == option %} selected{% endif %}>{{ option }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="registry-authentication">Authentication</label>
+          <select id="registry-authentication" name="auth_type">
+            <option value="">All authentication types</option>
+            {% for option in catalog.registry.data.auth_types %}
+            <option value="{{ option }}"{% if catalog.registry.auth_type == option %} selected{% endif %}>{{ option }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        {% endif %}
         {% if catalog.selected == "a2a" %}
         <label>Search agents <input type="search" name="q" maxlength="500" value="{{ catalog.a2a.q|default('', true) }}"></label>
         <label>Tags <input name="tags" value="{{ catalog.a2a.tags|default('', true) }}"></label>
@@ -315,7 +336,7 @@
         <label>Search roots <input type="search" name="q" maxlength="500" value="{{ catalog.roots.query }}"></label>
         {% elif catalog.users %}
         <label>Search users <input type="search" name="q" maxlength="500" value="{{ catalog.users.query }}"></label>
-        {% else %}
+        {% elif not catalog.registry %}
         {% if catalog.selected == "teams" %}
         <label>Search teams <input type="search" name="q" maxlength="500" value="{{ catalog.teams.search|default('', true) }}"></label>
         <label>Visibility <select name="visibility"><option value="">All</option><option value="private"{% if catalog.teams.visibility == "private" %} selected{% endif %}>Private</option><option value="public"{% if catalog.teams.visibility == "public" %} selected{% endif %}>Public</option></select></label>
@@ -339,6 +360,10 @@
       {% endfor %}
       {% if not catalog.search.count and (catalog.search.query or catalog.search.tags) %}<p>No matching entries.</p>{% endif %}
     </section>
+    {% endif %}
+    {% if catalog.registry %}
+      {% set registry = catalog.registry %}
+      {% include "registry.html" %}
     {% endif %}
     {% if catalog.tokens %}
       {% set tokens = catalog.tokens %}

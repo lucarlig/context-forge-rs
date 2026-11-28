@@ -244,6 +244,9 @@ pub(super) fn render_template(
                 .add_template("roots.html", include_str!("roots.html"))
                 .expect("valid roots template");
             environment
+                .add_template("registry.html", include_str!("registry.html"))
+                .expect("valid MCP registry template");
+            environment
         });
     let html = TEMPLATES
         .get_template(template)

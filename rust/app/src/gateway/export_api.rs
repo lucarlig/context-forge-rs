@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    catalog_api::{CatalogApiError, normalized_tags, require_catalog_permission},
+    catalog_api::{CatalogApiError, normalized_tags, query_boolean, require_catalog_permission},
     *,
 };
 
@@ -147,8 +147,16 @@ async fn full_export(
     let request = ExportRequest {
         selection: Selection::All(types),
         tags: csv(query.tags.as_deref()).map(str::to_owned).collect(),
-        include_inactive: boolean("include_inactive", query.include_inactive, false)?,
-        include_dependencies: boolean("include_dependencies", query.include_dependencies, true)?,
+        include_inactive: query_boolean(
+            "include_inactive",
+            query.include_inactive.as_deref(),
+            false,
+        )?,
+        include_dependencies: query_boolean(
+            "include_dependencies",
+            query.include_dependencies.as_deref(),
+            true,
+        )?,
     };
     configuration(&service, &principal, &request).await
 }
@@ -171,7 +179,11 @@ async fn selective_export(
         selection: Selection::Specific(selections),
         tags: Vec::new(),
         include_inactive: true,
-        include_dependencies: boolean("include_dependencies", query.include_dependencies, true)?,
+        include_dependencies: query_boolean(
+            "include_dependencies",
+            query.include_dependencies.as_deref(),
+            true,
+        )?,
     };
     configuration(&service, &principal, &request).await
 }
@@ -618,21 +630,6 @@ fn nonempty(value: &str) -> Option<&str> {
 
 fn entity_types(value: Option<&str>) -> Vec<String> {
     csv(value).map(str::to_ascii_lowercase).collect()
-}
-
-fn boolean(name: &str, value: Option<String>, default: bool) -> Result<bool, CatalogApiError> {
-    if value.is_none() {
-        return Ok(default);
-    }
-    catalog_api::flag(value.as_deref()).map_err(|_| {
-        CatalogApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            json!({"detail":[{
-                "type":"bool_parsing","loc":["query",name],
-                "msg":"Input should be a valid boolean, unable to interpret input","input":value
-            }]}),
-        )
-    })
 }
 
 fn parsed(raw: Option<&str>) -> Value {

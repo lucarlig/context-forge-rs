@@ -378,6 +378,7 @@ fn read_query(uri: &Uri) -> Result<AdminListQuery, CatalogApiError> {
 pub(super) struct Dashboard {
     navigation: Vec<Link>,
     search: Option<Value>,
+    registry: Option<Value>,
     sections: Vec<Section>,
     include_inactive: bool,
     team: Option<String>,
@@ -513,6 +514,8 @@ pub(super) async fn dashboard(
     let grpc_visible = super::grpc::visible(accounts, service, principal, team).await?;
     let roots_visible = service.can_administer_roots(principal).await?;
     let diagnostics_visible = crate::diagnostics::allowed(principal);
+    let registry_visible = service.registry_enabled()
+        && allows(accounts, principal, ManagedCatalog::Servers, "read", None).await?;
     let parameters = forms::query(uri);
     let selected = parameters
         .get("section")
@@ -524,6 +527,7 @@ pub(super) async fn dashboard(
                 || (*name == "a2a" && a2a_visible)
                 || (*name == "grpc" && grpc_visible)
                 || (*name == "roots" && roots_visible)
+                || (*name == "registry" && registry_visible)
                 || *name == "search"
                 || permitted.iter().any(|kind| kind.name() == *name)
         });
@@ -532,7 +536,7 @@ pub(super) async fn dashboard(
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
-    let mut navigation = Vec::with_capacity(permitted.len() + 9);
+    let mut navigation = Vec::with_capacity(permitted.len() + 10);
     if !permitted.is_empty()
         || tokens_visible
         || users_visible
@@ -540,6 +544,7 @@ pub(super) async fn dashboard(
         || a2a_visible
         || grpc_visible
         || roots_visible
+        || registry_visible
         || diagnostics_visible
     {
         navigation.push(Link {
@@ -555,6 +560,22 @@ pub(super) async fn dashboard(
     });
     let search = if selected == Some("search") {
         Some(service.dashboard_search(principal, uri).await?)
+    } else {
+        None
+    };
+    if registry_visible {
+        navigation.push(Link {
+            label: "MCP registry",
+            href: href(Some("registry"), None),
+            selected: selected == Some("registry"),
+        });
+    }
+    let registry = if selected == Some("registry") {
+        Some(
+            service
+                .registry_panel(principal, uri.query(), &base, true)
+                .await?,
+        )
     } else {
         None
     };
@@ -702,6 +723,7 @@ pub(super) async fn dashboard(
     Ok(Dashboard {
         navigation,
         search,
+        registry,
         sections,
         include_inactive,
         team: team.map(str::to_owned),
