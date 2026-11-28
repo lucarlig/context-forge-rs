@@ -44,6 +44,7 @@ use crate::{
     events::{Journal, parse_cursor},
     gateway::{GatewayService, ToolError},
     modern::Modern,
+    observability::framework,
     sessions::{
         PendingError, PendingRequest, Session, SessionAccess, SessionError, Sessions,
         new_session_id,
@@ -254,6 +255,7 @@ fn is_loopback_host(value: &str) -> bool {
 }
 
 async fn handle_request(State(state): State<Arc<McpState>>, request: Request) -> Response {
+    let ingress = framework::Phase::mcp("mcp.transport.enter", Some(request.uri().path()));
     let supported: &'static [&str] = if state.modern.is_some() {
         &SUPPORTED_VERSIONS
     } else {
@@ -278,6 +280,7 @@ async fn handle_request(State(state): State<Arc<McpState>>, request: Request) ->
         );
     }
 
+    drop(ingress);
     if request.method() != Method::GET
         && version.is_some_and(|version| version == MODERN_VERSION)
         && let Some(modern) = &state.modern
@@ -891,7 +894,14 @@ async fn dispatch(
             Some(_) => return invalid_envelope(),
         };
         if let (Some(id), "initialize") = (id.as_ref(), method.as_str()) {
-            let Some(result) = initialize(params.as_ref(), server.as_ref()) else {
+            let initialization = framework::Phase::mcp("mcp.initialize", None);
+            let initialized = {
+                let _sdk = initialization
+                    .as_ref()
+                    .and_then(framework::Phase::initialize);
+                initialize(params.as_ref(), server.as_ref())
+            };
+            let Some(result) = initialized else {
                 return invalid_params(id);
             };
             let can_prime = result.protocol_version == ProtocolVersion::V_2025_11_25;
@@ -911,6 +921,7 @@ async fn dispatch(
                 },
                 None => (None, None),
             };
+            drop(initialization);
             let reply = std::future::ready(rpc_success(id, result));
             return post_reply(state.json_response, session_id, reply, None, journal).await;
         }
@@ -1807,12 +1818,14 @@ struct RpcSuccess<'a, T> {
 }
 
 pub(crate) fn rpc_success(id: &Value, result: impl Serialize) -> Response {
-    Json(RpcSuccess {
-        jsonrpc: "2.0",
-        id,
-        result,
+    framework::serialize_rpc(|| {
+        Json(RpcSuccess {
+            jsonrpc: "2.0",
+            id,
+            result,
+        })
+        .into_response()
     })
-    .into_response()
 }
 
 #[derive(Serialize)]
@@ -1837,19 +1850,21 @@ pub(crate) fn rpc_error(
     message: &str,
     data: Option<impl Serialize>,
 ) -> Response {
-    (
-        status,
-        Json(RpcError {
-            jsonrpc: "2.0",
-            id,
-            error: RpcErrorDetails {
-                code,
-                message,
-                data,
-            },
-        }),
-    )
-        .into_response()
+    framework::serialize_rpc(|| {
+        (
+            status,
+            Json(RpcError {
+                jsonrpc: "2.0",
+                id,
+                error: RpcErrorDetails {
+                    code,
+                    message,
+                    data,
+                },
+            }),
+        )
+            .into_response()
+    })
 }
 
 #[cfg(test)]

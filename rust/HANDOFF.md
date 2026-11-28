@@ -636,8 +636,21 @@ server features disabled. Three Rust Anything replays use the pinned
 gateway with the retired Jaeger exporter and its compatible Python SDK 1.21.
 A live Rust test decodes the batch and verifies the Basic authentication
 header and W3C IDs. Jaeger 2.23.0 ingests and returns the Rust request and
-prompt spans with their expected ancestry. Framework spans remain open.
+prompt spans with their expected ancestry.
 [Apache Thrift 0.25.0](https://github.com/apache/thrift/releases/tag/v0.25.0)
+
+Axum emits HTTP server spans alongside the gateway transport spans.
+Matched requests use route templates. A route miss uses the HTTP method.
+RPC, health, readiness, and version tracing covers dependency resolution
+and handler work. RPC and probes also time JSON serialization. MCP traces
+cover transport entry and initialization, with an `rmcp` initialization span.
+
+Eight Rust Anything cases verify these phases, statuses, and parent links.
+The comparison maps Python instrumentation scopes and function names to
+their Rust equivalents. When the gateway generates a trace ID, Axum and
+the transport share that trace. The pinned gateway generates two traces.
+Additional endpoint phases, background spans, and baggage propagation remain
+open.
 
 Set `OTEL_COPY_RESOURCE_ATTRS_TO_SPANS=true` to copy `arize.project.name`
 and `model_id` from the OpenTelemetry resource to recorded spans. Other

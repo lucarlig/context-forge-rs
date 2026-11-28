@@ -82,8 +82,14 @@ struct Health {
     error: Option<&'static str>,
 }
 
-async fn health(State(state): State<Arc<ProbeState>>) -> impl IntoResponse {
-    let health = if state.database.ping().await.is_ok() {
+async fn health(State(state): State<Arc<ProbeState>>) -> axum::response::Response {
+    use crate::observability::framework;
+    const FUNCTION: &str = concat!(module_path!(), "::health");
+    framework::dependencies(FUNCTION);
+    let healthy = framework::handler(FUNCTION, state.database.ping())
+        .await
+        .is_ok();
+    let health = if healthy {
         Health {
             status: "healthy",
             error: None,
@@ -94,7 +100,9 @@ async fn health(State(state): State<Arc<ProbeState>>) -> impl IntoResponse {
             error: Some("Database connection error"),
         }
     };
-    ([(VARY, "Origin")], Json(health))
+    framework::serialize(FUNCTION, || {
+        ([(VARY, "Origin")], Json(health)).into_response()
+    })
 }
 
 #[derive(Serialize)]
@@ -120,32 +128,42 @@ struct Readiness {
     status_items: Vec<DependencyStatus>,
 }
 
-async fn ready(State(state): State<Arc<ProbeState>>) -> impl IntoResponse {
-    let mut status_items = vec![DependencyStatus::new(
-        "Database",
-        state.database.ping().await.is_ok(),
-        "Database Connection Successful",
-        "Cannot connect to Database",
-    )];
-    if let Some(probe) = &state.redis {
-        status_items.push(DependencyStatus::new(
-            "Cache",
-            probe.ping().await,
-            "Cache Connection Successful",
-            "Cannot connect to Cache",
-        ));
-    }
+async fn ready(State(state): State<Arc<ProbeState>>) -> axum::response::Response {
+    use crate::observability::framework;
+    const FUNCTION: &str = concat!(module_path!(), "::ready");
+    framework::dependencies(FUNCTION);
+    let status_items = framework::handler(FUNCTION, async {
+        let mut items = vec![DependencyStatus::new(
+            "Database",
+            state.database.ping().await.is_ok(),
+            "Database Connection Successful",
+            "Cannot connect to Database",
+        )];
+        if let Some(probe) = &state.redis {
+            items.push(DependencyStatus::new(
+                "Cache",
+                probe.ping().await,
+                "Cache Connection Successful",
+                "Cannot connect to Cache",
+            ));
+        }
+        items
+    })
+    .await;
     let (code, status) = if status_items.iter().all(|item| item.status_code == 200) {
         (StatusCode::OK, "ready")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "unready")
     };
-    (
-        code,
-        [(VARY, "Origin")],
-        Json(Readiness {
-            status,
-            status_items,
-        }),
-    )
+    framework::serialize(FUNCTION, || {
+        (
+            code,
+            [(VARY, "Origin")],
+            Json(Readiness {
+                status,
+                status_items,
+            }),
+        )
+            .into_response()
+    })
 }

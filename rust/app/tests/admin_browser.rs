@@ -2628,6 +2628,7 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
     );
     let tool_trace = "182cf4c06e0e4efa8e5369b811a358ad";
     let unsampled_trace = "182cf4c06e0e4efa8e5369b811a358ae";
+    let missing_trace = "182cf4c06e0e4efa8e5369b811a358af";
     let mut sampled_outbound = None;
     for (request_trace, flags) in [(tool_trace, "01"), (unsampled_trace, "00")] {
         let reply = post_json(
@@ -2669,10 +2670,25 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
         }
     }
 
+    let missing = client
+        .get(format!("{origin}/collector-fixture-not-found"))
+        .header(
+            "traceparent",
+            format!("00-{missing_trace}-{remote_span}-01"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    missing.bytes().await.unwrap();
+
     let is_sql = |span: &Span| span.attributes.iter().any(|field| field.key == "db.system");
-    let (mut statements, mut spans) = (Vec::new(), Vec::new());
+    let id = |trace| u128::from_str_radix(trace, 16).unwrap().to_be_bytes();
+    let (trace_id, tool_trace_id, ignored_trace) = (id(trace), id(tool_trace), id(unsampled_trace));
+    let missing_trace_id = id(missing_trace);
+    let (mut statements, mut spans, mut phases) = (Vec::new(), Vec::new(), Vec::new());
     tokio::time::timeout(Duration::from_secs(5), async {
-        while spans.len() < 5 || statements.is_empty() {
+        while spans.len() < 5 || statements.is_empty() || phases.len() < 9 {
             let (headers, request) = batches.recv().await.unwrap();
             assert_eq!(headers["x-fixture-export"], "collector");
             let dump = format!("{request:?}");
@@ -2681,16 +2697,27 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
             assert!(!dump.contains("otlp-upstream-sentinel"));
             assert!(!dump.contains("otlp-baggage-sentinel"));
             assert!(!dump.contains(EMAIL));
-            for span in request
+            for scope in request
                 .resource_spans
                 .into_iter()
                 .flat_map(|resource| resource.scope_spans)
-                .flat_map(|scope| scope.spans)
             {
-                if is_sql(&span) {
-                    statements.push(span);
-                } else {
-                    spans.push(span);
+                let framework = scope.scope.is_some_and(|scope| scope.name == "axum");
+                for span in scope.spans {
+                    assert_ne!(span.trace_id, ignored_trace);
+                    if ![trace_id, tool_trace_id, missing_trace_id]
+                        .iter()
+                        .any(|id| span.trace_id == *id)
+                    {
+                        continue;
+                    }
+                    if framework {
+                        phases.push(span);
+                    } else if is_sql(&span) {
+                        statements.push(span);
+                    } else {
+                        spans.push(span);
+                    }
                 }
             }
         }
@@ -2703,7 +2730,8 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
             .is_err()
     );
     assert_eq!(spans.len(), 5);
-    for span in spans.iter().chain(&statements) {
+    assert_eq!(phases.len(), 9);
+    for span in spans.iter().chain(&statements).chain(&phases) {
         for (key, expected) in [
             ("arize.project.name", "fixture-project"),
             ("model_id", "fixture-model"),
@@ -2724,7 +2752,6 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
                 .all(|field| field.key != "fixture.unrelated")
         );
     }
-    let trace_id = u128::from_str_radix(trace, 16).unwrap().to_be_bytes();
     let root = spans
         .iter()
         .find(|span| span.name == "POST /rpc" && span.trace_id == trace_id)
@@ -2739,7 +2766,30 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
         root.parent_span_id,
         u64::from_str_radix(remote_span, 16).unwrap().to_be_bytes()
     );
-    assert_eq!(child.parent_span_id, root.span_id);
+    let phase = |name| {
+        phases
+            .iter()
+            .find(|span| span.name == name && span.trace_id == trace_id)
+            .unwrap()
+    };
+    let router = phase("POST /rpc");
+    assert_eq!(router.parent_span_id, root.parent_span_id);
+    let not_found = phases
+        .iter()
+        .find(|span| span.trace_id == missing_trace_id)
+        .unwrap();
+    assert_eq!(not_found.name, "GET");
+    assert_eq!(not_found.parent_span_id, root.parent_span_id);
+    assert!(
+        not_found
+            .attributes
+            .iter()
+            .all(|tag| tag.key != "http.route")
+    );
+    for name in ["axum.dependencies", "axum.handler", "axum.serialization"] {
+        assert_eq!(phase(name).parent_span_id, router.span_id);
+    }
+    assert_eq!(child.parent_span_id, phase("axum.handler").span_id);
     assert_eq!(child.trace_state, "fixture=keep");
     let read = statements
         .iter()
@@ -2747,9 +2797,6 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
         .expect("resource read query span");
     assert_eq!(read.trace_id, trace_id);
     assert_eq!(read.kind, 3);
-    let ignored_trace = u128::from_str_radix(unsampled_trace, 16)
-        .unwrap()
-        .to_be_bytes();
     assert!(statements.iter().all(|span| {
         span.trace_id != ignored_trace
             && span
@@ -2765,10 +2812,7 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
     assert_eq!(outbound.kind, 3);
     assert_eq!(outbound.parent_span_id, tool.span_id);
     assert_eq!(outbound.span_id, sampled_outbound.unwrap());
-    assert_eq!(
-        outbound.trace_id,
-        u128::from_str_radix(tool_trace, 16).unwrap().to_be_bytes()
-    );
+    assert_eq!(outbound.trace_id, tool_trace_id);
     gateway.process.kill().await.unwrap();
     collector_task.abort();
 }
@@ -2870,7 +2914,7 @@ async fn zipkin_posts_batched_json_with_trace_ancestry_and_redacted_tags() {
     }
     let spans = tokio::time::timeout(Duration::from_secs(5), async {
         let mut spans = HashMap::new();
-        while spans.len() < 4 {
+        while spans.len() < 6 {
             let (headers, batch) = batches.recv().await.unwrap();
             assert_eq!(headers[header::CONTENT_TYPE], "application/json");
             let [span] = batch.as_slice() else {
@@ -2878,26 +2922,29 @@ async fn zipkin_posts_batched_json_with_trace_ancestry_and_redacted_tags() {
             };
             assert!(!span.to_string().contains("zipkin-query-marker"));
             assert_ne!(span["traceId"], unsampled);
+            let trace_id = span["traceId"].as_str().unwrap();
+            let name = span["name"].as_str().unwrap();
+            if ![success, failure].contains(&trace_id)
+                || (span["tags"]["otel.scope.name"] != "mcp-gateway" && name != "axum.handler")
+            {
+                continue;
+            }
             assert_eq!(span["localEndpoint"]["serviceName"], "zipkin-fixture");
             assert_eq!(span["tags"]["fixture.resource"], "exported");
             assert!(span["timestamp"].as_u64().unwrap() > 0);
             assert!(span["duration"].as_u64().unwrap() > 0);
             assert!(span.get("debug").is_none());
-            let key = (
-                span["traceId"].as_str().unwrap().to_owned(),
-                span["name"].as_str().unwrap().to_owned(),
-            );
-            spans.insert(key, span.clone());
+            spans.insert((trace_id.to_owned(), name.to_owned()), span.clone());
         }
         spans
     })
     .await
     .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(180), batches.recv())
-            .await
-            .is_err()
-    );
+    while let Ok(Some((_, batch))) =
+        tokio::time::timeout(Duration::from_millis(180), batches.recv()).await
+    {
+        assert!(batch.iter().all(|span| span["traceId"] != unsampled));
+    }
     for trace in [success, failure] {
         let span = |name: &str| &spans[&(trace.to_owned(), name.to_owned())];
         let request = span("POST /rpc");
@@ -2910,7 +2957,7 @@ async fn zipkin_posts_batched_json_with_trace_ancestry_and_redacted_tags() {
                 .unwrap()
                 .contains("fixture=visible")
         );
-        assert_eq!(operation["parentId"], request["id"]);
+        assert_eq!(operation["parentId"], span("axum.handler")["id"]);
         assert!(operation.get("kind").is_none());
         if trace == failure {
             assert_eq!(operation["tags"]["otel.status_code"], "ERROR");
@@ -2957,6 +3004,7 @@ async fn jaeger_posts_authenticated_binary_thrift_with_w3c_ids() {
         ("OTEL_EXPORTER_JAEGER_PASSWORD", &password),
         ("OTEL_EXPORTER_JAEGER_TIMEOUT", "2"),
         ("OTEL_SERVICE_NAME", "jaeger-fixture"),
+        ("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "1"),
         ("OTEL_BSP_SCHEDULE_DELAY", "30"),
     ])
     .await;
@@ -2994,10 +3042,18 @@ async fn jaeger_posts_authenticated_binary_thrift_with_w3c_ids() {
         .unwrap();
     assert!(response.text().await.unwrap().contains("\"result\""));
 
-    let (headers, body) = tokio::time::timeout(Duration::from_secs(5), batches.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let (headers, body) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (headers, body) = batches.recv().await.unwrap();
+            if body.windows(9).any(|window| window == b"POST /rpc")
+                && body.windows(8).any(|window| window == low.to_be_bytes())
+            {
+                break (headers, body);
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(headers[header::CONTENT_TYPE], "application/x-thrift");
     let authorization = format!(
         "Basic {}",

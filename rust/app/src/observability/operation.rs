@@ -33,6 +33,8 @@ pub(crate) struct TraceContext {
     pub(super) sql_queries: Option<SemanticConventions>,
     #[serde(skip)]
     pub(super) mcp_session: Option<String>,
+    #[serde(skip)]
+    pub(super) framework: Option<Box<super::framework::RequestTrace>>,
     #[serde(default)]
     pub(super) mcp_call: bool,
 }

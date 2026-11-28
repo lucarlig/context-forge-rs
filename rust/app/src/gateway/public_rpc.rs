@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::{
     mcp::{self, McpState, rpc_error, rpc_success},
+    observability::framework,
     sessions::{PendingRequest, SessionAccess, SessionError},
 };
 
@@ -65,6 +66,10 @@ impl From<ToolError> for RpcFault {
 }
 
 pub(crate) async fn handle(State(state): State<Arc<McpState>>, request: Request) -> Response {
+    framework::handler(framework::RPC, Box::pin(handle_rpc(state, request))).await
+}
+
+async fn handle_rpc(state: Arc<McpState>, request: Request) -> Response {
     let (mut parts, body) = request.into_parts();
     let body = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
         Ok(body) => body,

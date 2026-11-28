@@ -13,7 +13,7 @@ use std::{
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, MatchedPath, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Version, header},
     middleware::{self, Next},
     response::Response,
@@ -46,7 +46,7 @@ use tonic::{metadata::MetadataMap, transport::ClientTlsConfig};
 use url::Url;
 use uuid::Uuid;
 
-use super::{QueryRedaction, TraceContext, bounded, with_trace};
+use super::{QueryRedaction, TraceContext, bounded, framework, with_trace};
 use crate::{
     config::{flag, parse, value},
     http_boundary::CorrelationId,
@@ -95,6 +95,7 @@ impl SemanticConventions {
 pub(crate) struct Telemetry {
     provider: SdkTracerProvider,
     tracer: SdkTracer,
+    framework_tracer: SdkTracer,
     redaction: QueryRedaction,
     host: String,
     port: u16,
@@ -164,6 +165,7 @@ impl Telemetry {
             .with_resource(Resource::builder().with_attributes(attributes).build())
             .build();
         let tracer = provider.tracer_with_scope(scope());
+        let framework_tracer = provider.tracer_with_scope(framework::scope());
         let redaction = QueryRedaction::from_env()?;
         let host = value("HOST", "127.0.0.1")?;
         let http_clients = flag("OTEL_HTTPX_INSTRUMENTATION_ENABLED")?
@@ -183,6 +185,7 @@ impl Telemetry {
         Ok(Some(Self {
             provider,
             tracer,
+            framework_tracer,
             redaction,
             host,
             port,
@@ -236,7 +239,7 @@ impl SpanProcessor for ResourceSpanAttributes {
 
 const SERVICE: &str = "mcp-gateway";
 
-fn scope() -> InstrumentationScope {
+pub(super) fn scope() -> InstrumentationScope {
     InstrumentationScope::builder(SERVICE)
         .with_version(env!("CARGO_PKG_VERSION"))
         .with_schema_url("https://opentelemetry.io/schemas/1.11.0")
@@ -434,9 +437,11 @@ async fn observe(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if !traces_path(path) {
-        return next.run(request).await;
-    }
+    let gateway = traces_path(path);
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str);
     let parent = TraceContextPropagator::new().extract(&Headers(request.headers()));
     let remote = parent.span().span_context().clone();
     if remote.is_valid() && !remote.is_sampled() {
@@ -444,6 +449,7 @@ async fn observe(
             request,
             next,
             ExportContext::child_context(&remote),
+            None,
             &telemetry,
         )
         .await;
@@ -459,7 +465,6 @@ async fn observe(
     };
     let mut attributes = vec![
         KeyValue::new("http.request.method", method.to_owned()),
-        KeyValue::new("http.route", path.clone()),
         KeyValue::new("url.path", path.clone()),
         KeyValue::new("network.protocol.version", protocol),
         KeyValue::new("server.address", bounded(&telemetry.host, 255)),
@@ -468,16 +473,6 @@ async fn observe(
     if let Some(ConnectInfo(client)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
         attributes.push(KeyValue::new("client.address", client.ip().to_string()));
         attributes.push(KeyValue::new("client.port", i64::from(client.port())));
-    }
-    if let Some(user_agent) = request
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-    {
-        attributes.push(KeyValue::new(
-            "user_agent.original",
-            bounded(user_agent, 500),
-        ));
     }
     if let Some(query) = request.uri().query() {
         attributes.push(KeyValue::new(
@@ -490,50 +485,100 @@ async fn observe(
     {
         attributes.push(KeyValue::new("correlation_id", bounded(value, 64)));
     }
-    let mut span = telemetry
-        .tracer
-        .span_builder(bounded(&format!("{method} {path}"), 255))
-        .with_kind(SpanKind::Server)
-        .with_attributes(attributes)
-        .start_with_context(&telemetry.tracer, &parent);
+    let gateway_span = gateway.then(|| {
+        let mut attributes = attributes.clone();
+        attributes.push(KeyValue::new("http.route", path.clone()));
+        if let Some(user_agent) = request
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+        {
+            attributes.push(KeyValue::new(
+                "user_agent.original",
+                bounded(user_agent, 500),
+            ));
+        }
+        telemetry
+            .tracer
+            .span_builder(bounded(&format!("{method} {path}"), 255))
+            .with_kind(SpanKind::Server)
+            .with_attributes(attributes)
+            .start_with_context(&telemetry.tracer, &parent)
+    });
+    let framework_span = {
+        let name = if let Some(route) = route {
+            attributes.push(KeyValue::new("http.route", bounded(route, 2000)));
+            bounded(&format!("{method} {route}"), 255)
+        } else {
+            bounded(method, 255)
+        };
+        attributes.push(KeyValue::new(
+            "url.scheme",
+            crate::http_boundary::public_scheme(request.headers(), request.uri()),
+        ));
+        let framework_parent = match &gateway_span {
+            Some(span) if !remote.is_valid() => {
+                parent.with_remote_span_context(span.span_context().clone())
+            }
+            _ => parent.clone(),
+        };
+        telemetry
+            .framework_tracer
+            .span_builder(name)
+            .with_kind(SpanKind::Server)
+            .with_attributes(attributes)
+            .start_with_context(&telemetry.framework_tracer, &framework_parent)
+    };
+    let root = gateway_span.as_ref().unwrap_or(&framework_span);
+    let request_trace = Box::new(framework::RequestTrace {
+        root: ExportContext::from_span(framework_span.span_context()),
+        dispatch_started: SystemTime::now(),
+        handler: None,
+    });
     let response = observe_request(
         request,
         next,
-        ExportContext::from_span(span.span_context()),
+        ExportContext::from_span(root.span_context()),
+        Some(request_trace),
         &telemetry,
     )
     .await;
-    if !span.is_recording() {
+    let mut spans: Vec<_> = [
+        (gateway_span, Status::Ok),
+        (Some(framework_span), Status::Unset),
+    ]
+    .into_iter()
+    .filter_map(|(span, success)| {
+        let mut span = span.filter(Span::is_recording)?;
+        let code = response.status();
+        span.set_attribute(KeyValue::new(
+            "http.response.status_code",
+            i64::from(code.as_u16()),
+        ));
+        let status = if code.is_server_error() {
+            Status::error("Gateway returned a server error")
+        } else {
+            success
+        };
+        Some((span, status))
+    })
+    .collect();
+    if spans.is_empty() {
         return response;
     }
-    span.set_attribute(KeyValue::new(
-        "http.response.status_code",
-        i64::from(response.status().as_u16()),
-    ));
-    let status = if response.status().is_server_error() {
-        Status::error("Gateway returned a server error")
-    } else {
-        Status::Ok
-    };
     let (parts, body) = response.into_parts();
     if body.is_end_stream() {
-        span.set_status(status);
-        span.end();
+        finish_spans(&mut spans, false);
         return Response::from_parts(parts, body);
     }
-    Response::from_parts(
-        parts,
-        Body::new(TracedBody {
-            body,
-            span: Some((span, status)),
-        }),
-    )
+    Response::from_parts(parts, Body::new(TracedBody { body, spans }))
 }
 
 async fn observe_request(
     mut request: Request,
     next: Next,
     exported: ExportContext,
+    framework: Option<Box<framework::RequestTrace>>,
     telemetry: &Telemetry,
 ) -> Response {
     let context = TraceContext {
@@ -541,6 +586,7 @@ async fn observe_request(
         http_clients: telemetry.http_clients,
         redis_commands: telemetry.redis_commands,
         sql_queries: telemetry.sql_queries,
+        framework,
         ..TraceContext::default()
     };
     request.extensions_mut().insert(context.clone());
@@ -549,25 +595,23 @@ async fn observe_request(
 
 struct TracedBody {
     body: Body,
-    span: Option<(SdkSpan, Status)>,
+    spans: Vec<(SdkSpan, Status)>,
 }
 
-impl TracedBody {
-    fn end_span(&mut self, failed: bool) {
-        if let Some((mut span, status)) = self.span.take() {
-            span.set_status(if failed {
-                Status::error("Response body failed")
-            } else {
-                status
-            });
-            span.end();
-        }
+fn finish_spans(spans: &mut Vec<(SdkSpan, Status)>, failed: bool) {
+    for (mut span, status) in spans.drain(..) {
+        span.set_status(if failed {
+            Status::error("Response body failed")
+        } else {
+            status
+        });
+        span.end();
     }
 }
 
 impl Drop for TracedBody {
     fn drop(&mut self) {
-        self.end_span(false);
+        finish_spans(&mut self.spans, false);
     }
 }
 
@@ -582,7 +626,7 @@ impl HttpBody for TracedBody {
         let result = Pin::new(&mut self.body).poll_frame(cx);
         let failed = matches!(result, Poll::Ready(Some(Err(_))));
         if failed || self.body.is_end_stream() || matches!(result, Poll::Ready(None)) {
-            self.end_span(failed);
+            finish_spans(&mut self.spans, failed);
         }
         result
     }

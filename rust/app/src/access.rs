@@ -1024,30 +1024,37 @@ async fn authorize_api(
     mut request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
+    let authenticated =
+        api_principal(&access, request.headers(), peer(&request), missing, target).await;
+    if matches!(target, ApiTarget::PublicRpc) {
+        use crate::observability::framework;
+        framework::dependencies(framework::RPC);
+    }
+    request.extensions_mut().insert(authenticated?);
+    dispatch_with_usage(&access, request, next).await
+}
+
+async fn api_principal(
+    access: &Authorizer,
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+    missing: &'static str,
+    target: ApiTarget,
+) -> Result<Principal, AuthError> {
     if matches!(target, ApiTarget::PublicRpc)
-        && request
-            .headers()
-            .get_all(header::AUTHORIZATION)
-            .iter()
-            .count()
-            == 1
-        && request
-            .headers()
+        && headers.get_all(header::AUTHORIZATION).iter().count() == 1
+        && headers
             .get(header::AUTHORIZATION)
             .is_some_and(|value| value.is_empty())
     {
         return Err(AuthError::ApiRequired(missing));
     }
-    let token = bearer(request.headers())?.ok_or(AuthError::ApiRequired(missing))?;
+    let token = bearer(headers)?.ok_or(AuthError::ApiRequired(missing))?;
     let target = match target {
         ApiTarget::Management => ServerTarget::Endpoint(None),
         ApiTarget::PublicRpc => ServerTarget::RpcParameters,
     };
-    let principal = access
-        .authenticate_for(token, peer(&request), target)
-        .await?;
-    request.extensions_mut().insert(principal);
-    dispatch_with_usage(&access, request, next).await
+    access.authenticate_for(token, peer, target).await
 }
 
 async fn authorize_browser_api(

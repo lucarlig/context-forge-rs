@@ -298,14 +298,31 @@ async fn method_not_allowed() -> Response {
 }
 
 async fn show(State(state): State<Arc<Diagnostics>>, request: Request) -> Response {
+    use crate::observability::framework;
+    const FUNCTION: &str = concat!(module_path!(), "::show");
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|value| value.0);
-    let principal = match state.authorize(request.headers(), peer).await {
+    let authorization = state.authorize(request.headers(), peer).await;
+    framework::dependencies(FUNCTION);
+    let principal = match authorization {
         Ok(principal) => principal,
         Err(response) => return *response,
     };
+    framework::handler(
+        FUNCTION,
+        Box::pin(show_authorized(state, request, peer, principal)),
+    )
+    .await
+}
+
+async fn show_authorized(
+    state: Arc<Diagnostics>,
+    request: Request,
+    peer: Option<SocketAddr>,
+    principal: Option<Principal>,
+) -> Response {
     let started = Instant::now();
     let peer = peer.map(|address| address.ip().to_string());
     let reservation = match state
