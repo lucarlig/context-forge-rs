@@ -609,8 +609,20 @@ Anonymous sessions omit the session ID from trace exports.
 
 A live Rust collector test checks the validated authorization against a
 signal-specific header override and verifies that a stateless request
-cannot attach session metadata. Framework spans and Jaeger and Zipkin
-export remain open.
+cannot attach session metadata.
+
+Set `OTEL_TRACES_EXPORTER=zipkin` to send JSON batches to a Zipkin v2
+collector. `OTEL_EXPORTER_ZIPKIN_ENDPOINT` defaults to
+`http://localhost:9411/api/v2/spans`. `OTEL_EXPORTER_ZIPKIN_TIMEOUT`
+defaults to 10 seconds. Zipkin uses the OpenTelemetry batch settings and
+preserves trace ancestry, sampling, resource tags, and span status.
+[Zipkin v2 API](https://zipkin.io/zipkin-api/)
+
+Two Rust Anything replays verify sampled and unsampled requests. A live
+collector test verifies batch size, redacted query tags, and errors. The
+pinned exporter sets Zipkin debug on sampled spans. Rust leaves that flag
+unset for ordinary W3C sampling. Framework spans and Jaeger export remain
+open.
 
 Set `OTEL_COPY_RESOURCE_ATTRS_TO_SPANS=true` to copy `arize.project.name`
 and `model_id` from the OpenTelemetry resource to recorded spans. Other

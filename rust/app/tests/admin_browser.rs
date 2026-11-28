@@ -2774,6 +2774,157 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
 }
 
 #[tokio::test]
+async fn zipkin_posts_batched_json_with_trace_ancestry_and_redacted_tags() {
+    use axum::{Json, Router, http::HeaderMap, routing::post};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/collector/zipkin", listener.local_addr().unwrap());
+    let (exports, mut batches) = tokio::sync::mpsc::unbounded_channel();
+    let collector = tokio::spawn(async move {
+        let router = Router::new().route(
+            "/collector/zipkin",
+            post(move |headers: HeaderMap, Json(batch): Json<Vec<Value>>| {
+                let exports = exports.clone();
+                async move {
+                    exports.send((headers, batch)).unwrap();
+                    StatusCode::ACCEPTED
+                }
+            }),
+        );
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut gateway = gateway_with_env(&[
+        ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_TRACES_EXPORTER", "zipkin"),
+        ("OTEL_EXPORTER_ZIPKIN_ENDPOINT", &endpoint),
+        ("OTEL_EXPORTER_ZIPKIN_TIMEOUT", "2"),
+        ("OTEL_SERVICE_NAME", "zipkin-fixture"),
+        ("OTEL_RESOURCE_ATTRIBUTES", "fixture.resource=exported"),
+        ("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "1"),
+        ("OTEL_BSP_SCHEDULE_DELAY", "30"),
+    ])
+    .await;
+    let post_json = |path, body: Value| {
+        gateway
+            .client
+            .post(format!("{}{path}", gateway.origin))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+    };
+    let login = post_json(
+        "/auth/email/login",
+        json!({"email":EMAIL,"password":gateway.password}),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let login: Value = serde_json::from_slice(&login.bytes().await.unwrap()).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    let prompt = "zipkin-prompt";
+    post_json(
+        "/prompts",
+        json!({"prompt":{"name":prompt,"template":"fixture"}}),
+    )
+    .bearer_auth(token)
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+
+    let success = "1b5e227112cf42ebc70fd2868c8edf91";
+    let failure = "1b5e227112cf42ebc70fd2868c8edf92";
+    let unsampled = "1b5e227112cf42ebc70fd2868c8edf93";
+    let parent = "b7ad6b7169203331";
+    for (trace, sampled, name) in [
+        (success, "01", prompt),
+        (failure, "01", "missing"),
+        (unsampled, "00", prompt),
+    ] {
+        let response = post_json(
+            "/rpc?api_key=zipkin-query-marker&fixture=visible",
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":name},
+            }),
+        )
+        .bearer_auth(token)
+        .header("traceparent", format!("00-{trace}-{parent}-{sampled}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+        let reply: Value = serde_json::from_slice(&response).unwrap();
+        assert!(
+            reply
+                .get(if trace == failure { "error" } else { "result" })
+                .is_some()
+        );
+    }
+    let spans = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut spans = HashMap::new();
+        while spans.len() < 4 {
+            let (headers, batch) = batches.recv().await.unwrap();
+            assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+            let [span] = batch.as_slice() else {
+                panic!("expected one span per batch");
+            };
+            assert!(!span.to_string().contains("zipkin-query-marker"));
+            assert_ne!(span["traceId"], unsampled);
+            assert_eq!(span["localEndpoint"]["serviceName"], "zipkin-fixture");
+            assert_eq!(span["tags"]["fixture.resource"], "exported");
+            assert!(span["timestamp"].as_u64().unwrap() > 0);
+            assert!(span["duration"].as_u64().unwrap() > 0);
+            assert!(span.get("debug").is_none());
+            let key = (
+                span["traceId"].as_str().unwrap().to_owned(),
+                span["name"].as_str().unwrap().to_owned(),
+            );
+            spans.insert(key, span.clone());
+        }
+        spans
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(180), batches.recv())
+            .await
+            .is_err()
+    );
+    for trace in [success, failure] {
+        let span = |name: &str| &spans[&(trace.to_owned(), name.to_owned())];
+        let request = span("POST /rpc");
+        let operation = span("prompt.render");
+        assert_eq!(request["kind"], "SERVER");
+        assert_eq!(request["parentId"], parent);
+        assert!(
+            request["tags"]["url.query"]
+                .as_str()
+                .unwrap()
+                .contains("fixture=visible")
+        );
+        assert_eq!(operation["parentId"], request["id"]);
+        assert!(operation.get("kind").is_none());
+        if trace == failure {
+            assert_eq!(operation["tags"]["otel.status_code"], "ERROR");
+            assert_eq!(operation["tags"]["error"], "Prompt render failed");
+        } else {
+            assert_eq!(operation["tags"]["otel.status_code"], "OK");
+            assert!(operation["tags"].get("error").is_none());
+        }
+    }
+    gateway.process.kill().await.unwrap();
+    collector.abort();
+}
+
+#[tokio::test]
 async fn langfuse_exports_validated_credentials_and_authenticated_session_metadata() {
     use axum::{Router, body::Bytes, http::HeaderMap, routing::post};
     use base64::{Engine as _, prelude::BASE64_STANDARD};

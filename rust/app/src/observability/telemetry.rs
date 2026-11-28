@@ -37,7 +37,7 @@ use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
     trace::{
         BatchConfigBuilder, BatchSpanProcessor, SdkTracer, SdkTracerProvider, Span as SdkSpan,
-        SpanData, SpanProcessor,
+        SpanData, SpanExporter as SdkSpanExporter, SpanProcessor,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,7 @@ pub(crate) mod client;
 pub(super) mod langfuse;
 pub(crate) mod redis_client;
 pub(crate) mod sql_client;
+mod zipkin;
 use redis_client::RedisConventions;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -112,9 +113,16 @@ impl Telemetry {
         let builder = SdkTracerProvider::builder();
         let builder = match exporter.as_str() {
             "none" => return Ok(None),
-            "jaeger" | "zipkin" => {
+            "jaeger" => {
                 tracing::warn!("The configured OpenTelemetry exporter is unavailable");
                 return Ok(None);
+            }
+            "zipkin" => {
+                let Ok(exporter) = zipkin::Exporter::from_env() else {
+                    tracing::warn!("Could not configure the Zipkin trace exporter");
+                    return Ok(None);
+                };
+                builder.with_span_processor(batch_processor(exporter)?)
             }
             "otlp" => {
                 if endpoint.is_empty() {
@@ -129,23 +137,7 @@ impl Telemetry {
                     tracing::warn!("Could not configure the OTLP trace exporter");
                     return Ok(None);
                 };
-                let queue = parse("OTEL_BSP_MAX_QUEUE_SIZE", 2048)?;
-                let batch = parse("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", 512)?;
-                let delay = parse("OTEL_BSP_SCHEDULE_DELAY", 5000)?;
-                if batch == 0 || queue == 0 || delay == 0 {
-                    return Err("OpenTelemetry batch sizes and delay must be positive".into());
-                }
-                builder.with_span_processor(
-                    BatchSpanProcessor::builder(exporter)
-                        .with_batch_config(
-                            BatchConfigBuilder::default()
-                                .with_max_queue_size(queue)
-                                .with_max_export_batch_size(batch)
-                                .with_scheduled_delay(Duration::from_millis(delay))
-                                .build(),
-                        )
-                        .build(),
-                )
+                builder.with_span_processor(batch_processor(exporter)?)
             }
             _ => builder.with_simple_exporter(opentelemetry_stdout::SpanExporter::default()),
         };
@@ -255,6 +247,51 @@ fn settings_pairs(input: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
+fn batch_processor(
+    exporter: impl SdkSpanExporter + 'static,
+) -> Result<BatchSpanProcessor, SettingsError> {
+    let queue = parse("OTEL_BSP_MAX_QUEUE_SIZE", 2048)?;
+    let batch = parse("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", 512)?;
+    let delay = parse("OTEL_BSP_SCHEDULE_DELAY", 5000)?;
+    if batch == 0 || queue == 0 || delay == 0 {
+        return Err("OpenTelemetry batch sizes and delay must be positive".into());
+    }
+    Ok(BatchSpanProcessor::builder(exporter)
+        .with_batch_config(
+            BatchConfigBuilder::default()
+                .with_max_queue_size(queue)
+                .with_max_export_batch_size(batch)
+                .with_scheduled_delay(Duration::from_millis(delay))
+                .build(),
+        )
+        .build())
+}
+
+fn validate_collector_url(endpoint: &Url) -> Result<(), SettingsError> {
+    if endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || !matches!(endpoint.scheme(), "http" | "https")
+    {
+        return Err("invalid telemetry collector endpoint".into());
+    }
+    Ok(())
+}
+
+fn collector_http_client(timeout: Duration) -> Result<reqwest::blocking::Client, SettingsError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = std::thread::Builder::new()
+        .spawn(move || {
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
+                .build()
+        })?
+        .join()
+        .map_err(|_| "could not create the telemetry HTTP client")??;
+    Ok(client)
+}
+
 fn otlp_exporter(
     raw_endpoint: &str,
     configured_headers: &str,
@@ -273,16 +310,10 @@ fn otlp_exporter(
     } else {
         Url::parse(raw_endpoint)?
     };
-    if endpoint.host().is_none()
-        || !endpoint.username().is_empty()
-        || endpoint.password().is_some()
-        || !matches!(endpoint.scheme(), "http" | "https")
-    {
-        return Err("invalid OTLP endpoint".into());
-    }
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    validate_collector_url(&endpoint)?;
     let exporter = SpanExporter::builder();
     if protocol == "grpc" && authorization.is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         if insecure == Some(false) && endpoint.scheme() != "https" {
             return Err("secure OTLP gRPC requires an HTTPS endpoint".into());
         }
@@ -314,15 +345,7 @@ fn otlp_exporter(
         "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
         parse("OTEL_EXPORTER_OTLP_TIMEOUT", 10_000)?,
     )?;
-    let http = std::thread::Builder::new()
-        .spawn(move || {
-            reqwest::blocking::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_millis(timeout))
-                .build()
-        })?
-        .join()
-        .map_err(|_| "could not create the OTLP HTTP client")??;
+    let http = collector_http_client(Duration::from_millis(timeout))?;
     let headers = settings_pairs(configured_headers)
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
