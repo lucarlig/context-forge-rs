@@ -85,7 +85,7 @@ use crate::{
     grpc::GrpcSettings,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     oauth_client::OAuthConfig,
-    observability::{OperationSpan, Outcome, SpanResource},
+    observability::{OperationSpan, Outcome, SpanResource, telemetry::client::mcp_call},
     proxy_catalog_cache::ProxyCatalogCache,
     secret_envelope::SecretEnvelope,
     sessions::Session,
@@ -949,7 +949,9 @@ impl GatewayService {
                     return tokio::select! {
                         biased;
                         () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
-                        result = rest_tool::execute(self, &tool, rest, &request, principal, context.request_headers) => {
+                        result = execution.span.scope(
+                            Box::pin(rest_tool::execute(self, &tool, rest, &request, principal, context.request_headers))
+                        ) => {
                             result.map(|value| rest_tool::for_caller(value, context.client_capabilities.is_some()))
                         }
                     };
@@ -992,15 +994,16 @@ impl GatewayService {
             .transport
             .filter(|_| gateway.available)
             .ok_or(ToolError::Unavailable)?;
-        let mut credentials = match self
-            .configured_upstream(
+        let mut credentials = match execution
+            .span
+            .scope(Box::pin(self.configured_upstream(
                 &gateway.id,
                 &gateway.url,
                 gateway.needs_upstream_config,
                 context.request_headers,
                 principal,
                 UpstreamUse::Invocation,
-            )
+            )))
             .await
         {
             Ok(credentials) => credentials,
@@ -1051,10 +1054,20 @@ impl GatewayService {
         let legacy_caller = context.client_capabilities.is_none();
         let cancellation = context.cancellation;
         let client = direct_timeout.map(|timeout| self.upstream.with_timeout_cap(timeout));
-        let result = client
+        let tool = request.name.clone();
+        let invoke = client
             .as_ref()
             .unwrap_or(&self.upstream)
-            .call_tool_with_context(endpoint, request, context, association.as_deref())
+            .call_tool_with_context(endpoint, request, context, association.as_deref());
+        let result = execution
+            .span
+            .scope(Box::pin(mcp_call(
+                &gateway.id,
+                &gateway.url,
+                transport.name(),
+                &tool,
+                Box::pin(invoke),
+            )))
             .await;
         match result {
             Ok(result) if legacy_caller && result["resultType"] == "input_required" => {

@@ -263,7 +263,7 @@ async fn read(
     headers: &HeaderMap,
     payload: Option<Value>,
 ) -> Result<CardResponse, UpstreamError> {
-    let (client, url) = upstream.pinned_client(target.as_str(), None, None).await?;
+    let (client, url) = upstream.pinned_client(target.as_str(), None).await?;
     let mut builder = if let Some(payload) = payload {
         client
             .post(url)
@@ -275,11 +275,11 @@ async fn read(
     if !headers.contains_key(header::ACCEPT) {
         builder = builder.header(header::ACCEPT, "application/json");
     }
-    let response = builder
+    let request = builder
         .header(header::ACCEPT_ENCODING, "identity")
         .headers(headers.clone())
-        .send()
-        .await?;
+        .build()?;
+    let response = crate::observability::telemetry::client::execute(&client, request).await?;
     let headers = response.headers();
     let mut result = CardResponse {
         status: response.status(),

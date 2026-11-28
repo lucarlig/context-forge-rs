@@ -411,11 +411,10 @@ async fn status(
     };
     let started = Instant::now();
     let response = tokio::time::timeout(Duration::from_secs(5), async {
-        let (client, url) = service
-            .upstream
-            .pinned_client(&entry.url, None, None)
-            .await?;
-        Ok::<_, UpstreamError>(client.get(url).send().await?.status().as_u16() < 500)
+        let (client, url) = service.upstream.pinned_client(&entry.url, None).await?;
+        let request = client.get(url).build()?;
+        let response = crate::observability::telemetry::client::execute(&client, request).await?;
+        Ok::<_, UpstreamError>(response.status().as_u16() < 500)
     })
     .await;
     let (available, error) = match response {

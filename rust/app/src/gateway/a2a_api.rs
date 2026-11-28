@@ -736,7 +736,7 @@ async fn invoke(
     ).await;
     span.inject_trace_context(request.headers_mut());
     let started = std::time::Instant::now();
-    let result = dispatch_upstream(app, request).await;
+    let result = span.scope(Box::pin(dispatch_upstream(app, request))).await;
     let failure = match &result {
         Ok(body) if protocol::has_rpc_error(body) => Some("A2A agent returned a JSON-RPC error"),
         Err(_) => Some(FAILURE),

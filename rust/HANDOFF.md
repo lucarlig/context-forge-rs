@@ -539,8 +539,22 @@ spans in Rust Anything. The cases cover parent links, operation spans,
 stateful MCP, sampling, redaction, and disabled export. Native checks verify
 the shared trace ID, queued SSE propagation, and shutdown flushing. The
 live Rust test decodes OTLP exports with database tracing disabled.
-Framework spans, optional database, Redis and outbound HTTP instrumentation,
-and vendor-specific exporters remain open.
+
+Enable `OTEL_HTTPX_INSTRUMENTATION_ENABLED` to export client spans for
+gateway HTTP calls. The setting applies to the Rust HTTP client. Set
+`OTEL_SEMCONV_STABILITY_OPT_IN=http` for standard HTTP attributes, or
+`http/dup` for both attribute forms. Client spans attach to their gateway
+operation and send their trace context upstream. Unsampled calls propagate
+their trace ID without exporting spans. MCP tool calls propagate their
+operation context when HTTP client spans are disabled.
+
+Exported client URLs omit user info, query strings, and fragments. A live Rust
+test verifies those exports, their wire span IDs, and unsampled propagation.
+Twelve Rust Anything cases match the pinned reference for outbound span
+status, ancestry, and wire propagation across REST, MCP, and A2A. Native
+checks verify per-request context in a reused upstream MCP session.
+Framework spans, database and Redis instrumentation, and vendor-specific
+exporters remain open.
 
 ## Gateway and protocol verification
 

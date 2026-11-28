@@ -2501,32 +2501,51 @@ async fn operation_traces_follow_mcp_workers_and_redact_resource_queries() {
 }
 
 #[tokio::test]
-async fn otlp_exports_request_and_operation_spans_with_database_tracing_disabled() {
-    use axum::{Router, body::Bytes, http::HeaderMap, routing::post};
+async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
+    use axum::{
+        Json, Router,
+        body::Bytes,
+        http::HeaderMap,
+        routing::{get, post},
+    };
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use prost::Message;
     use serde_json::{Value, json};
 
     let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/v1/traces", collector.local_addr().unwrap());
+    let mock = format!("http://{}", collector.local_addr().unwrap());
+    let endpoint = format!("{mock}/v1/traces");
     let (exports, mut batches) = tokio::sync::mpsc::unbounded_channel();
+    let (requests, mut upstream_headers) = tokio::sync::mpsc::unbounded_channel();
     let collector_task = tokio::spawn(async move {
-        let router = Router::new().route(
-            "/v1/traces",
-            post(move |headers: HeaderMap, body: Bytes| {
-                let exports = exports.clone();
-                async move {
-                    let _ =
-                        exports.send((headers, ExportTraceServiceRequest::decode(body).unwrap()));
-                    ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
-                }
-            }),
-        );
+        let router = Router::new()
+            .route(
+                "/v1/traces",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    let exports = exports.clone();
+                    async move {
+                        let _ = exports
+                            .send((headers, ExportTraceServiceRequest::decode(body).unwrap()));
+                        ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
+                    }
+                }),
+            )
+            .route(
+                "/upstream",
+                get(move |headers: HeaderMap| {
+                    let requests = requests.clone();
+                    async move {
+                        let _ = requests.send(headers);
+                        Json(json!({"fixture":"otel-remote-ok"}))
+                    }
+                }),
+            );
         axum::serve(collector, router).await.unwrap();
     });
     let mut gateway = gateway_with_env(&[
         ("OBSERVABILITY_ENABLED", "false"),
         ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_HTTPX_INSTRUMENTATION_ENABLED", "true"),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
         ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
         ("OTEL_EXPORTER_OTLP_HEADERS", "x-fixture-export=collector"),
@@ -2563,6 +2582,20 @@ async fn otlp_exports_request_and_operation_spans_with_database_tracing_disabled
     .error_for_status()
     .unwrap();
 
+    post_json(
+        "/tools",
+        json!({"tool":{
+        "name":"otlp-rest","url":format!("{mock}/upstream?token=otlp-upstream-sentinel"),
+        "request_type":"GET","integration_type":"REST","input_schema":{"type":"object"},
+    },"visibility":"public"}),
+    )
+    .bearer_auth(admin)
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+
     let trace = "1e5b53ee2d60348d927b2cc4249d20f9";
     let remote_span = "438b9406bbdabb20";
     let sampled = post_json(
@@ -2584,26 +2617,58 @@ async fn otlp_exports_request_and_operation_spans_with_database_tracing_disabled
             .unwrap()
             .contains("otlp-payload-sentinel")
     );
-    post_json("/rpc", json!({"jsonrpc":"2.0","id":2,"method":"ping"}))
+    let tool_trace = "182cf4c06e0e4efa8e5369b811a358ad";
+    let mut sampled_outbound = None;
+    for flags in ["01", "00"] {
+        let reply = post_json(
+            "/rpc",
+            json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"otlp-rest","arguments":{}}
+            }),
+        )
         .bearer_auth(admin)
-        .header("traceparent", format!("00-{trace}-{remote_span}-00"))
+        .header(
+            "traceparent",
+            format!("00-{tool_trace}-{remote_span}-{flags}"),
+        )
+        .header("tracestate", "fixture=keep")
+        .header("baggage", "private=otlp-baggage-sentinel")
         .send()
         .await
         .unwrap()
         .error_for_status()
-        .unwrap()
-        .bytes()
-        .await
         .unwrap();
+        assert!(reply.text().await.unwrap().contains("otel-remote-ok"));
+        let headers = tokio::time::timeout(Duration::from_secs(3), upstream_headers.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let envelope = headers["traceparent"].to_str().unwrap();
+        let parts = envelope.split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[1], tool_trace);
+        assert_ne!(parts[2], remote_span);
+        assert_eq!(parts[3], flags);
+        assert!(!headers.contains_key("baggage"));
+        if flags == "01" {
+            assert_eq!(headers["tracestate"], "fixture=keep");
+            sampled_outbound = Some(u64::from_str_radix(parts[2], 16).unwrap().to_be_bytes());
+        } else {
+            assert!(!headers.contains_key("tracestate"));
+        }
+    }
 
     let mut spans = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while spans.len() < 2 {
+        while spans.len() < 5 {
             let (headers, request) = batches.recv().await.unwrap();
             assert_eq!(headers["x-fixture-export"], "collector");
             let dump = format!("{request:?}");
             assert!(!dump.contains("otlp-query-sentinel"));
             assert!(!dump.contains("otlp-payload-sentinel"));
+            assert!(!dump.contains("otlp-upstream-sentinel"));
+            assert!(!dump.contains("otlp-baggage-sentinel"));
             assert!(!dump.contains(EMAIL));
             spans.extend(
                 request
@@ -2621,13 +2686,16 @@ async fn otlp_exports_request_and_operation_spans_with_database_tracing_disabled
             .await
             .is_err()
     );
-    assert_eq!(spans.len(), 2);
-    let root = spans.iter().find(|span| span.name == "POST /rpc").unwrap();
+    assert_eq!(spans.len(), 5);
+    let trace_id = u128::from_str_radix(trace, 16).unwrap().to_be_bytes();
+    let root = spans
+        .iter()
+        .find(|span| span.name == "POST /rpc" && span.trace_id == trace_id)
+        .unwrap();
     let child = spans
         .iter()
         .find(|span| span.name == "resource.read")
         .unwrap();
-    let trace_id = u128::from_str_radix(trace, 16).unwrap().to_be_bytes();
     assert_eq!(root.trace_id, trace_id);
     assert_eq!(child.trace_id, trace_id);
     assert_eq!(
@@ -2636,6 +2704,18 @@ async fn otlp_exports_request_and_operation_spans_with_database_tracing_disabled
     );
     assert_eq!(child.parent_span_id, root.span_id);
     assert_eq!(child.trace_state, "fixture=keep");
+    let tool = spans
+        .iter()
+        .find(|span| span.name == "tool.invoke")
+        .unwrap();
+    let outbound = spans.iter().find(|span| span.name == "GET").unwrap();
+    assert_eq!(outbound.kind, 3);
+    assert_eq!(outbound.parent_span_id, tool.span_id);
+    assert_eq!(outbound.span_id, sampled_outbound.unwrap());
+    assert_eq!(
+        outbound.trace_id,
+        u128::from_str_radix(tool_trace, 16).unwrap().to_be_bytes()
+    );
     gateway.process.kill().await.unwrap();
     collector_task.abort();
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    borrow::Cow,
     error::Error,
     net::SocketAddr,
     pin::Pin,
@@ -19,9 +20,13 @@ use axum::{
 };
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use opentelemetry::{
-    InstrumentationScope, KeyValue, global,
+    InstrumentationScope, KeyValue,
+    global::{self, BoxedSpan},
     propagation::{Extractor, TextMapPropagator},
-    trace::{Span, SpanContext, SpanKind, Status, TraceContextExt, Tracer, TracerProvider},
+    trace::{
+        Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceState, Tracer,
+        TracerProvider,
+    },
 };
 use opentelemetry_otlp::{
     Protocol, SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig,
@@ -37,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tonic::{metadata::MetadataMap, transport::ClientTlsConfig};
 use url::Url;
+use uuid::Uuid;
 
 use super::{QueryRedaction, TraceContext, bounded, with_trace};
 use crate::{
@@ -46,12 +52,16 @@ use crate::{
 
 type SettingsError = Box<dyn Error + Send + Sync>;
 
+pub(crate) mod client;
+pub(super) use client::HttpSemantics;
+
 pub(crate) struct Telemetry {
     provider: SdkTracerProvider,
     tracer: SdkTracer,
     redaction: QueryRedaction,
     host: String,
     port: u16,
+    http_clients: Option<HttpSemantics>,
 }
 
 impl Telemetry {
@@ -114,6 +124,7 @@ impl Telemetry {
         let tracer = provider.tracer_with_scope(scope());
         let redaction = QueryRedaction::from_env()?;
         let host = value("HOST", "127.0.0.1")?;
+        let http_clients = HttpSemantics::from_env()?;
         global::set_tracer_provider(provider.clone());
         Ok(Some(Self {
             provider,
@@ -121,6 +132,7 @@ impl Telemetry {
             redaction,
             host,
             port,
+            http_clients,
         }))
     }
 
@@ -257,7 +269,7 @@ impl Extractor for Headers<'_> {
 
 async fn observe(
     State(telemetry): State<Arc<Telemetry>>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
@@ -265,9 +277,15 @@ async fn observe(
         return next.run(request).await;
     }
     let parent = TraceContextPropagator::new().extract(&Headers(request.headers()));
-    let parent_span = parent.span();
-    if parent_span.span_context().is_valid() && !parent_span.span_context().is_sampled() {
-        return next.run(request).await;
+    let remote = parent.span().span_context().clone();
+    if remote.is_valid() && !remote.is_sampled() {
+        return observe_request(
+            request,
+            next,
+            ExportContext::child_context(&remote),
+            telemetry.http_clients,
+        )
+        .await;
     }
     let method = request.method().as_str();
     let path = bounded(path, 2000);
@@ -317,15 +335,16 @@ async fn observe(
         .with_kind(SpanKind::Server)
         .with_attributes(attributes)
         .start_with_context(&telemetry.tracer, &parent);
+    let response = observe_request(
+        request,
+        next,
+        ExportContext::from_span(span.span_context()),
+        telemetry.http_clients,
+    )
+    .await;
     if !span.is_recording() {
-        return next.run(request).await;
+        return response;
     }
-    let context = TraceContext {
-        stored: None,
-        exported: Some(ExportContext::from_span(span.span_context())),
-    };
-    request.extensions_mut().insert(context.clone());
-    let response = with_trace(Some(context), next.run(request)).await;
     span.set_attribute(KeyValue::new(
         "http.response.status_code",
         i64::from(response.status().as_u16()),
@@ -348,6 +367,21 @@ async fn observe(
             span: Some((span, status)),
         }),
     )
+}
+
+async fn observe_request(
+    mut request: Request,
+    next: Next,
+    exported: ExportContext,
+    http_clients: Option<HttpSemantics>,
+) -> Response {
+    let context = TraceContext {
+        exported: Some(exported),
+        http_clients,
+        ..TraceContext::default()
+    };
+    request.extensions_mut().insert(context.clone());
+    with_trace(Some(context), next.run(request)).await
 }
 
 struct TracedBody {
@@ -418,20 +452,46 @@ impl ExportContext {
         }
     }
 
-    pub(super) fn start_operation(
+    fn child_context(parent: &SpanContext) -> Self {
+        Self::from_span(&SpanContext::new(
+            parent.trace_id(),
+            SpanId::from_bytes((Uuid::new_v4().as_u128() as u64).to_be_bytes()),
+            parent.trace_flags(),
+            false,
+            TraceState::default(),
+        ))
+    }
+
+    pub(super) fn start_operation(&self, name: &'static str, attributes: &Value) -> ExportSpan {
+        self.start_span(name, SpanKind::Internal, exported_attributes(attributes))
+    }
+
+    pub(super) fn start_span(
         &self,
-        name: &'static str,
-        attributes: &Value,
-    ) -> opentelemetry::global::BoxedSpan {
+        name: impl Into<Cow<'static, str>>,
+        kind: SpanKind,
+        attributes: impl IntoIterator<Item = KeyValue>,
+    ) -> ExportSpan {
         let context = TraceContextPropagator::new().extract(self);
+        let span = context.span();
+        let parent = span.span_context();
+        if !parent.is_sampled() {
+            return ExportSpan::Unsampled(Self::child_context(parent));
+        }
         let tracer = global::tracer_with_scope(scope());
-        tracer
-            .span_builder(name)
-            .with_attributes(exported_attributes(attributes))
-            .start_with_context(&tracer, &context)
+        ExportSpan::Recording(
+            tracer
+                .span_builder(name)
+                .with_kind(kind)
+                .with_attributes(attributes)
+                .start_with_context(&tracer, &context),
+        )
     }
 
     pub(super) fn inject(&self, headers: &mut HeaderMap) {
+        for name in ["traceparent", "tracestate", "baggage"] {
+            headers.remove(name);
+        }
         if let Ok(value) = HeaderValue::from_str(&self.traceparent) {
             headers.insert("traceparent", value);
         }
@@ -439,6 +499,20 @@ impl ExportContext {
             && let Ok(value) = HeaderValue::from_str(&self.tracestate)
         {
             headers.insert("tracestate", value);
+        }
+    }
+}
+
+pub(super) enum ExportSpan {
+    Recording(BoxedSpan),
+    Unsampled(ExportContext),
+}
+
+impl ExportSpan {
+    pub(super) fn context(&self) -> ExportContext {
+        match self {
+            Self::Recording(span) => ExportContext::from_span(span.span_context()),
+            Self::Unsampled(context) => context.clone(),
         }
     }
 }

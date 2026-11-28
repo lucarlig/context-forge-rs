@@ -49,8 +49,15 @@ impl GatewayService {
             )
             .await;
         let mut target = None;
-        let result = self
-            .read_resource_inner(params, principal, server, context, downstream, &mut target)
+        let result = span
+            .scope(Box::pin(self.read_resource_inner(
+                params,
+                principal,
+                server,
+                context,
+                downstream,
+                &mut target,
+            )))
             .await;
         let pending = matches!(result, Ok(ReadResourceResponse::InputRequired(_)));
         if !pending {
@@ -193,8 +200,15 @@ impl GatewayService {
             )
             .await;
         let mut target = None;
-        let result = self
-            .get_prompt_inner(params, principal, server, context, downstream, &mut target)
+        let result = span
+            .scope(Box::pin(self.get_prompt_inner(
+                params,
+                principal,
+                server,
+                context,
+                downstream,
+                &mut target,
+            )))
             .await;
         let pending = matches!(result, Ok(GetPromptResponse::InputRequired(_)));
         if !pending {

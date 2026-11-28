@@ -49,6 +49,7 @@ use zeroize::Zeroizing;
 use crate::{
     credentials::{QueryValues, UpstreamCredentials},
     events::PassiveEvents,
+    observability::telemetry::client::{HttpClientSpan, execute as execute_http},
     sessions::SessionLifetime,
     sigv4::SigV4,
     upstream_tls,
@@ -557,7 +558,7 @@ impl UpstreamClient {
     }
 
     pub(crate) async fn check_pinned_endpoint(&self, endpoint: &str) -> Result<(), UpstreamError> {
-        timeout(CONNECT_TIMEOUT, self.pinned_client(endpoint, None, None))
+        timeout(CONNECT_TIMEOUT, self.pinned_client(endpoint, None))
             .await
             .map_err(|_| UpstreamError::Timeout)?
             .map(|_| ())
@@ -1065,17 +1066,10 @@ impl UpstreamClient {
         let tls = endpoint
             .credentials
             .and_then(|credentials| credentials.tls.as_ref());
-        let sigv4 = endpoint.credentials.and_then(|credentials| {
-            credentials.sigv4.as_ref().map(|signer| RequestSigning {
-                signer: signer.clone(),
-                headers: credentials.headers.clone(),
-            })
-        });
-        let defaults = endpoint
+        let sigv4 = endpoint
             .credentials
-            .filter(|_| sigv4.is_none())
-            .map(|credentials| &credentials.headers);
-        let (client, url) = self.pinned_client(endpoint.url, tls, defaults).await?;
+            .and_then(|credentials| credentials.sigv4.clone());
+        let (client, url) = self.pinned_client(endpoint.url, tls).await?;
         Ok(Session {
             client,
             url,
@@ -1086,6 +1080,9 @@ impl UpstreamClient {
             query: endpoint
                 .credentials
                 .map_or_else(QueryValues::new, |credentials| credentials.query.clone()),
+            headers: endpoint
+                .credentials
+                .map_or_else(HeaderMap::new, |credentials| credentials.headers.clone()),
             sigv4,
             next_id: AtomicI64::new(1),
         })
@@ -1095,7 +1092,6 @@ impl UpstreamClient {
         &self,
         endpoint: &str,
         tls: Option<&TlsMaterial>,
-        defaults: Option<&HeaderMap>,
     ) -> Result<(Client, Url), UpstreamError> {
         let url = self.policy.validate_url(endpoint)?;
         let mut builder = Client::builder()
@@ -1108,9 +1104,6 @@ impl UpstreamClient {
             .tls_backend_preconfigured(
                 upstream_tls::client_config(tls).map_err(|_| UpstreamError::Transport)?,
             );
-        if let Some(headers) = defaults {
-            builder = builder.default_headers(headers.clone());
-        }
         if let Some(domain) = url.domain() {
             let port = url
                 .port_or_known_default()
@@ -1154,9 +1147,7 @@ impl UpstreamClient {
         signer: Option<&crate::sigv4::SigV4>,
     ) -> Result<RestResponse, UpstreamError> {
         timeout_at(self.deadline()?, async {
-            let (client, url) = self
-                .pinned_client(request.url().as_str(), None, None)
-                .await?;
+            let (client, url) = self.pinned_client(request.url().as_str(), None).await?;
             *request.url_mut() = url;
             request
                 .headers_mut()
@@ -1188,7 +1179,7 @@ impl UpstreamClient {
         body: Option<&Value>,
     ) -> Result<T, UpstreamError> {
         timeout_at(self.deadline()?, async {
-            let (client, url) = self.pinned_client(endpoint, tls, None).await?;
+            let (client, url) = self.pinned_client(endpoint, tls).await?;
             let mut request = match body {
                 Some(body) => client
                     .post(url)
@@ -1199,11 +1190,11 @@ impl UpstreamClient {
             if let Some(authorization) = authorization {
                 request = request.header(AUTHORIZATION, authorization.clone());
             }
-            let response = request
+            let request = request
                 .header(ACCEPT, "application/json")
                 .header(reqwest::header::USER_AGENT, "ContextForge")
-                .send()
-                .await?;
+                .build()?;
+            let response = execute_http(&client, request).await?;
             let status = response.status().as_u16();
             if status != 200 && (body.is_none() || status != 201) {
                 return Err(UpstreamError::Status(status));
@@ -1252,7 +1243,7 @@ impl UpstreamClient {
         basic: Option<&HeaderValue>,
     ) -> Result<(Zeroizing<Vec<u8>>, bool), UpstreamError> {
         timeout_at(self.deadline()?, async {
-            let (client, url) = self.pinned_client(endpoint, tls, None).await?;
+            let (client, url) = self.pinned_client(endpoint, tls).await?;
             let mut request = client
                 .post(url)
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -1261,7 +1252,7 @@ impl UpstreamClient {
             if let Some(basic) = basic {
                 request = request.header(AUTHORIZATION, basic.clone());
             }
-            let response = request.send().await?;
+            let response = execute_http(&client, request.build()?).await?;
             if !response.status().is_success() {
                 return Err(UpstreamError::Status(response.status().as_u16()));
             }
@@ -1312,13 +1303,9 @@ struct Session {
     session_id: Option<HeaderValue>,
     sse: Option<Mutex<Option<SseStream>>>,
     query: QueryValues,
-    sigv4: Option<RequestSigning>,
-    next_id: AtomicI64,
-}
-
-struct RequestSigning {
-    signer: Arc<SigV4>,
     headers: HeaderMap,
+    sigv4: Option<Arc<SigV4>>,
+    next_id: AtomicI64,
 }
 
 impl Session {
@@ -1779,23 +1766,22 @@ impl Session {
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<Response, UpstreamError> {
-        let Some(signing) = &self.sigv4 else {
-            return Ok(builder.send().await?);
-        };
         let mut request = builder.build()?;
-        for name in signing.headers.keys() {
+        for name in self.headers.keys() {
             if !request.headers().contains_key(name) {
-                for value in signing.headers.get_all(name) {
+                for value in self.headers.get_all(name) {
                     request.headers_mut().append(name, value.clone());
                 }
             }
         }
-        signing
-            .signer
-            .sign(&mut request)
-            .map_err(|_| UpstreamError::Transport)?;
-        let response = self.client.execute(request).await?;
-        if matches!(response.status().as_u16(), 401 | 403) {
+        let span = HttpClientSpan::start(&mut request);
+        if let Some(signer) = &self.sigv4 {
+            signer
+                .sign(&mut request)
+                .map_err(|_| UpstreamError::Transport)?;
+        }
+        let response = span.execute(&self.client, request).await?;
+        if self.sigv4.is_some() && matches!(response.status().as_u16(), 401 | 403) {
             return Err(UpstreamError::Status(response.status().as_u16()));
         }
         Ok(response)
@@ -2109,12 +2095,13 @@ async fn send_rest_request(
     mut request: reqwest::Request,
     signer: Option<&SigV4>,
 ) -> Result<Response, UpstreamError> {
+    let span = HttpClientSpan::start(&mut request);
     if let Some(signer) = signer {
         signer
             .sign(&mut request)
             .map_err(|_| UpstreamError::Transport)?;
     }
-    Ok(client.execute(request).await?)
+    Ok(span.execute(client, request).await?)
 }
 
 async fn http_error(response: Response) -> UpstreamError {

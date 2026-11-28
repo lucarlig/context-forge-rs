@@ -299,12 +299,11 @@ impl Documents {
 
 async fn fetch(upstream: &UpstreamClient, endpoint: &str) -> Document {
     let (client, url) = upstream
-        .pinned_client(endpoint, None, None)
+        .pinned_client(endpoint, None)
         .await
         .map_err(|error| FetchError::Policy(url_error("OpenAPI spec URL", endpoint, &error)))?;
-    let response = client
-        .get(url)
-        .send()
+    let request = client.get(url).build().map_err(|_| FetchError::Transport)?;
+    let response = crate::observability::telemetry::client::execute(&client, request)
         .await
         .map_err(|_| FetchError::Transport)?;
     if !response.status().is_success() {

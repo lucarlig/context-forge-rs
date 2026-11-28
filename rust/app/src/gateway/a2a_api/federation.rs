@@ -100,7 +100,9 @@ async fn forward(
             "a2a.interaction_type":invocation.interaction_type.chars().take(50).collect::<String>()}),
     ).await;
     span.inject_trace_context(request.headers_mut());
-    let result = forward_request(app, principal, request, hops).await;
+    let result = span
+        .scope(Box::pin(forward_request(app, principal, request, hops)))
+        .await;
     let success = matches!(&result, Ok(value) if !protocol::has_rpc_error(value));
     span.finish(Outcome::completed(success, "A2A federation request failed"))
         .await;

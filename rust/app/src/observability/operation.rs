@@ -5,14 +5,16 @@ use std::{future::Future, time::Instant};
 use jiff::Timestamp;
 use opentelemetry::{
     KeyValue,
-    global::BoxedSpan,
     trace::{Span, Status},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{bounded, telemetry::ExportContext};
+use super::{
+    bounded,
+    telemetry::{ExportContext, ExportSpan, HttpSemantics},
+};
 use crate::database::Database;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -21,6 +23,10 @@ pub(crate) struct TraceContext {
     pub(super) stored: Option<StoredTrace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) exported: Option<ExportContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) http_clients: Option<HttpSemantics>,
+    #[serde(default)]
+    pub(super) mcp_call: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -104,34 +110,36 @@ pub(super) struct Operation {
 #[derive(Default)]
 pub(crate) struct OperationSpan {
     active: Option<Operation>,
-    exported: Option<ExportedOperation>,
+    exported: Option<Box<ExportedOperation>>,
 }
 
 struct ExportedOperation {
-    span: BoxedSpan,
+    span: ExportSpan,
     started: Instant,
     tool: bool,
 }
 
 impl ExportedOperation {
-    fn finish(mut self, outcome: Outcome) {
+    fn finish(self, outcome: Outcome) {
+        let ExportSpan::Recording(mut span) = self.span else {
+            return;
+        };
         if self.tool {
-            self.span.set_attributes([
+            span.set_attributes([
                 KeyValue::new("success", matches!(outcome, Outcome::Ok)),
                 KeyValue::new("cancelled", matches!(outcome, Outcome::Cancelled)),
                 KeyValue::new("duration.ms", self.started.elapsed().as_secs_f64() * 1000.0),
             ]);
         }
         if matches!(outcome, Outcome::InputRequired) {
-            self.span
-                .set_attribute(KeyValue::new("input_required", true));
+            span.set_attribute(KeyValue::new("input_required", true));
         }
-        self.span.set_status(match outcome {
+        span.set_status(match outcome {
             Outcome::Error(message) => Status::error(message),
             Outcome::Cancelled => Status::error("Operation cancelled"),
             Outcome::Ok | Outcome::InputRequired => Status::Ok,
         });
-        self.span.end();
+        span.end();
     }
 }
 
@@ -161,10 +169,12 @@ impl OperationSpan {
             attributes["tool.id"] = json!(resource_id);
         }
         let started = Instant::now();
-        let exported = context.exported.map(|parent| ExportedOperation {
-            span: parent.start_operation(name, &attributes),
-            started,
-            tool,
+        let exported = context.exported.map(|parent| {
+            Box::new(ExportedOperation {
+                span: parent.start_operation(name, &attributes),
+                started,
+                tool,
+            })
         });
         let mut result = Self {
             active: None,
@@ -205,7 +215,7 @@ impl OperationSpan {
                 });
             }
             if let Some(span) = &self.exported {
-                context.exported = Some(ExportContext::from_span(span.span.span_context()));
+                context.exported = Some(span.span.context());
             }
             context
         });
@@ -214,7 +224,7 @@ impl OperationSpan {
 
     pub(crate) fn inject_trace_context(&self, headers: &mut axum::http::HeaderMap) {
         if let Some(exported) = &self.exported {
-            ExportContext::from_span(exported.span.span_context()).inject(headers);
+            exported.span.context().inject(headers);
         }
     }
 
