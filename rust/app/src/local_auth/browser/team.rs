@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod members;
+mod requests;
 
 use axum::http::{Uri, request::Parts};
 use axum::routing::delete;
@@ -40,7 +41,7 @@ pub(super) fn routes(router: Router<Arc<Accounts>>, base: &str) -> Router<Arc<Ac
         )
         .route(&item, delete(mutate).layer(Extension(Action::Delete)));
     router = members::routes(router, &item);
-    router
+    requests::routes(router, &item)
 }
 
 pub(super) async fn visible(
@@ -59,7 +60,12 @@ pub(super) async fn panel(
 ) -> Result<Panel, CatalogApiError> {
     let mut query: DirectoryQuery = uri.map(parse_query).transpose()?.unwrap_or_default();
     query.include_inactive = include_inactive;
-    team_panel(accounts, service, principal, &query, View::Explore, true).await
+    let view = if query.relationship.as_deref() == Some("public") {
+        View::Discover
+    } else {
+        View::Explore
+    };
+    team_panel(accounts, service, principal, &query, view, true).await
 }
 
 fn parse_query<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, CatalogApiError> {

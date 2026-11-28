@@ -1046,3 +1046,170 @@ async fn admin_team_directory_applies_token_scope_before_pagination_and_updates(
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn team_join_requests_keep_scope_and_serialize_cancel_and_approval() {
+    let mut gateway = gateway().await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let login = |email: &str, password: &str| {
+        let request = client
+            .post(format!("{origin}/auth/email/login"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({"email": email, "password": password}).to_string());
+        async move {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let session: serde_json::Value =
+                serde_json::from_str(&response.text().await.unwrap()).unwrap();
+            session["access_token"].as_str().unwrap().to_owned()
+        }
+    };
+    let owner = login(EMAIL, password).await;
+    let member_email = "joiner@example.test";
+    let member_password = "Fixture!AccountPassword_83zP";
+    let create = client
+        .post(format!("{origin}/auth/email/admin/users"))
+        .bearer_auth(&owner)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":member_email,"password":member_password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let applicant = login(member_email, member_password).await;
+
+    let created = client
+        .post(format!("{origin}/teams"))
+        .bearer_auth(&owner)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"Public Join Fixture","visibility":"public"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let team: serde_json::Value = serde_json::from_str(&created.text().await.unwrap()).unwrap();
+    let team = team["id"].as_str().unwrap();
+    let directory = format!("{origin}/admin/?section=teams&relationship=public");
+    let page = client
+        .get(&directory)
+        .bearer_auth(&applicant)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(page.text().await.unwrap().contains("Public Join Fixture"));
+
+    let memberships = client
+        .get(format!("{origin}/teams"))
+        .bearer_auth(&applicant)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(memberships.status(), StatusCode::OK);
+    let memberships: serde_json::Value =
+        serde_json::from_str(&memberships.text().await.unwrap()).unwrap();
+    let own = memberships["teams"][0]["id"].as_str().unwrap();
+    let issued = client
+        .post(format!("{origin}/tokens"))
+        .bearer_auth(&applicant)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::json!({
+                "name":"team-join-fixture","team_id":own,"expires_in_days":1,
+                "scope":{"permissions":["admin.dashboard","teams.join","teams.read"]},
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let token: serde_json::Value = serde_json::from_str(&issued.text().await.unwrap()).unwrap();
+    let scoped = token["access_token"].as_str().unwrap();
+    let scoped_directory = client
+        .get(&directory)
+        .bearer_auth(scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scoped_directory.status(), StatusCode::OK);
+    assert!(
+        !scoped_directory
+            .text()
+            .await
+            .unwrap()
+            .contains("Public Join Fixture")
+    );
+
+    let team_admin = format!("{origin}/admin/teams/{team}");
+    let submit = |credential: &str| {
+        client
+            .post(format!("{team_admin}/join-request"))
+            .bearer_auth(credential)
+            .send()
+    };
+    assert_eq!(
+        submit(scoped).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        submit(&applicant).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(submit(&applicant).await.unwrap().status(), StatusCode::OK);
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        gateway.fixture.0.join("mcp.db").display()
+    ))
+    .await
+    .unwrap();
+    let request: String = sqlx::query_scalar(
+        "SELECT id FROM email_team_join_requests WHERE team_id=? AND user_email=?",
+    )
+    .bind(team)
+    .bind(member_email)
+    .fetch_one(&database)
+    .await
+    .unwrap();
+
+    let approve = client
+        .post(format!("{team_admin}/join-requests/{request}/approve"))
+        .bearer_auth(&owner)
+        .send();
+    let cancel = client
+        .delete(format!("{team_admin}/join-request/{request}"))
+        .bearer_auth(&applicant)
+        .send();
+    let (approve, cancel) = tokio::join!(approve, cancel);
+    let (approve, cancel) = (approve.unwrap().status(), cancel.unwrap().status());
+    assert!(matches!(
+        (approve, cancel),
+        (StatusCode::OK, StatusCode::NOT_FOUND) | (StatusCode::NOT_FOUND, StatusCode::OK)
+    ));
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM email_team_join_requests WHERE id=?")
+            .bind(&request)
+            .fetch_one(&database)
+            .await
+            .unwrap();
+    let membership: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_team_members WHERE team_id=? AND user_email=? AND is_active",
+    )
+    .bind(team)
+    .bind(member_email)
+    .fetch_one(&database)
+    .await
+    .unwrap();
+    if approve == StatusCode::OK {
+        assert_eq!((status.as_str(), membership), ("approved", 1));
+    } else {
+        assert_eq!((status.as_str(), membership), ("cancelled", 0));
+    }
+    database.close().await;
+    gateway.process.kill().await.unwrap();
+}

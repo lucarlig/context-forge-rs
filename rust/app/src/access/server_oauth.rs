@@ -189,6 +189,7 @@ impl ServerOAuthVerifier {
             catalog_scopes: None,
             server_limit: None,
             is_admin: identity.is_admin,
+            unrestricted_team_session: false,
             scopes: Vec::new(),
             credential_hash: Sha256::digest(token.as_bytes()).into(),
         }))

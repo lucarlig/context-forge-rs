@@ -32,7 +32,7 @@
     th { white-space: nowrap; }
   </style>
 </head>
-<body{% if page == "home" or page == "team-members" %} class="dashboard"{% endif %}>
+<body{% if page == "home" or page == "team-members" or page == "team-requests" %} class="dashboard"{% endif %}>
   <main>
     {% if page == "login" %}
     <h1>Sign in to ContextForge</h1>
@@ -111,6 +111,10 @@
       <button type="submit">Search</button>
     </form>
     {% include "team_members.html" %}
+    {% elif page == "team-requests" %}
+    <p><a href="{{ root }}/admin/?section=teams#teams">Back to teams</a></p>
+    <h1>Join requests · {{ team.name }}</h1>
+    {% include "team_requests.html" %}
     {% elif page == "user-edit" %}
     <h1>Edit user</h1>
     <p>{{ user.user.email }}</p>

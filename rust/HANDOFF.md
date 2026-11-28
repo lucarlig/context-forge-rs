@@ -281,7 +281,18 @@ Six Rust Anything scenarios match on SQLite and PostgreSQL. They cover
 directory filters, the versioned alias, settings, and individual and bulk
 membership changes.
 Chromium verifies team and member forms with security headers enabled.
-Browser join requests and their review flow remain open.
+
+The Public relationship filter lets signed-in users discover public teams
+and request membership. Team-scoped credentials stay within their scope.
+Applicants can cancel pending requests. Owners can approve or reject them
+through the team review queue. Members can leave a team when its ownership
+rules allow it.
+
+Seven Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+submission, duplicate requests, cancellation, review, expiry, leaving,
+feature gating, and the versioned routes. Chromium verifies the workflow
+from public discovery through review. A Rust integration test verifies that
+concurrent approval and cancellation settle the request only once.
 
 ## Gateway and protocol verification
 

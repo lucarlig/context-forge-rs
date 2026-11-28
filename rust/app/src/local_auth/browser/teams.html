@@ -33,7 +33,32 @@
           <td>{{ item.team.member_count }}{% if item.team.max_members %} of {{ item.team.max_members }}{% endif %}</td>
           <td class="actions">
             {% if item.members %}<a href="{{ root }}/admin/teams/{{ item.team.id }}/members">Members</a>{% endif %}
+            {% if item.review %}<a href="{{ root }}/admin/teams/{{ item.team.id }}/join-requests">Join requests</a>{% endif %}
+            {% if item.join %}
+            <details><summary>Request to join</summary>
+              <form method="post" action="{{ root }}/admin/teams/{{ item.team.id }}/join-request?directory=1">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <label>Message (optional) <textarea name="message" maxlength="500"></textarea></label>
+                <button type="submit">Send request</button>
+              </form>
+            </details>
+            {% endif %}
+            {% if item.cancel_join %}
+            <form method="post" action="{{ root }}/admin/teams/{{ item.team.id }}/join-request/{{ item.team.pending_join_request }}/cancel?directory=1">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <span>Request pending</span>
+              <button type="submit">Cancel request</button>
+            </form>
+            {% endif %}
             {% if item.edit %}<a href="{{ root }}/admin/teams/{{ item.team.id }}/edit?directory=1">Edit</a>{% endif %}
+            {% if item.leave %}
+            <details><summary>Leave team</summary>
+              <form method="post" action="{{ root }}/admin/teams/{{ item.team.id }}/leave?directory=1">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <button type="submit">Confirm leave</button>
+              </form>
+            </details>
+            {% endif %}
             {% if item.delete %}
             <details><summary>Delete</summary>
               <form method="post" action="{{ root }}/admin/teams/{{ item.team.id }}/delete?directory=1">

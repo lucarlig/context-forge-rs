@@ -102,17 +102,26 @@ pub(super) async fn leave(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AccountError> {
     access_team(&accounts, &principal, &id, "teams.join", TeamAccess::Member).await?;
+    leave_team(&accounts, &principal, &id).await?;
+    Ok(success("Successfully left the team"))
+}
+
+pub(super) async fn leave_team(
+    accounts: &Accounts,
+    principal: &Principal,
+    id: &str,
+) -> Result<(), AccountError> {
     accounts
         .database
         .write_team_member(
-            &id,
+            id,
             &principal.email,
             &principal.email,
             MemberMutation::Remove,
             &accounts.settings,
         )
         .await?;
-    Ok(success("Successfully left the team"))
+    Ok(())
 }
 
 pub(super) async fn list_invites(
@@ -269,29 +278,42 @@ pub(super) async fn join(
     Json(input): Json<JoinInput>,
 ) -> Result<Json<Value>, AccountError> {
     permit(&accounts, &principal, "teams.join", None).await?;
+    let (record, created) =
+        request_join(&accounts, &principal, &id, input.message.as_deref(), true).await?;
+    if !created {
+        return Err(AccountError::bad_request(
+            "User already has a pending join request for this team",
+        ));
+    }
+    Ok(Json(record.metadata()))
+}
+
+pub(super) async fn request_join(
+    accounts: &Accounts,
+    principal: &Principal,
+    id: &str,
+    message: Option<&str>,
+    reopen_expired: bool,
+) -> Result<(storage::JoinRequest, bool), AccountError> {
     if !accounts.settings.teams.allow_join_requests {
         return Err(denied("Team join requests are currently disabled"));
     }
-    if input
-        .message
-        .as_ref()
-        .is_some_and(|message| message.chars().count() > 500)
-    {
+    if message.is_some_and(|message| message.chars().count() > 500) {
         return Err(AccountError::detail(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Join request message is too long",
         ));
     }
-    let record = accounts
+    accounts
         .database
         .request_team_membership(
-            &id,
+            id,
             &principal.email,
-            input.message.as_deref(),
+            message,
             &accounts.settings.teams,
+            reopen_expired,
         )
-        .await?;
-    Ok(Json(record.metadata()))
+        .await
 }
 
 pub(super) async fn list_requests(

@@ -100,11 +100,8 @@ pub fn resolve_session_teams(
         return Ok(TeamVisibility::Public);
     }
 
-    let requested = match claims.get("teams") {
-        None | Some(Value::Null) => return Ok(db_visibility.clone()),
-        Some(Value::Array(teams)) if teams.is_empty() => return Ok(db_visibility.clone()),
-        Some(Value::Array(teams)) => teams,
-        Some(_) => return Err(InvalidClaim::Teams),
+    let Some(requested) = session_team_claim(claims.get("teams"))? else {
+        return Ok(db_visibility.clone());
     };
 
     let TeamVisibility::Teams(db_teams) = db_visibility else {
@@ -118,6 +115,21 @@ pub fn resolve_session_teams(
         .cloned()
         .collect();
     Ok(TeamVisibility::from_teams(intersection))
+}
+
+pub(crate) fn unrestricted_session_teams(payload: &Value) -> bool {
+    payload
+        .as_object()
+        .is_some_and(|claims| matches!(session_team_claim(claims.get("teams")), Ok(None)))
+}
+
+fn session_team_claim(teams: Option<&Value>) -> Result<Option<&[Value]>, InvalidClaim> {
+    match teams {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(teams)) if teams.is_empty() => Ok(None),
+        Some(Value::Array(teams)) => Ok(Some(teams)),
+        Some(_) => Err(InvalidClaim::Teams),
+    }
 }
 
 /// Check whether a token's permission scope permits an RBAC check to proceed.

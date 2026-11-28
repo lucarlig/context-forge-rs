@@ -8,6 +8,7 @@ pub(in crate::local_auth) const CREATE: &str = "teams.create";
 pub(in crate::local_auth) const UPDATE: &str = "teams.update";
 pub(in crate::local_auth) const DELETE: &str = "teams.delete";
 pub(in crate::local_auth) const MEMBERS: &str = "teams.manage_members";
+pub(in crate::local_auth) const JOIN: &str = "teams.join";
 
 pub(in crate::local_auth) async fn allowed(
     accounts: &Accounts,
@@ -31,6 +32,7 @@ pub(in crate::local_auth) enum View {
     List,
     Explore,
     Unified,
+    Discover,
     Search,
     Ids,
 }
@@ -84,6 +86,10 @@ pub(in crate::local_auth) struct Row {
     pub(in crate::local_auth) edit: bool,
     pub(in crate::local_auth) delete: bool,
     pub(in crate::local_auth) members: bool,
+    pub(in crate::local_auth) join: bool,
+    pub(in crate::local_auth) cancel_join: bool,
+    pub(in crate::local_auth) review: bool,
+    pub(in crate::local_auth) leave: bool,
 }
 
 pub(in crate::local_auth) async fn directory(
@@ -92,14 +98,16 @@ pub(in crate::local_auth) async fn directory(
     query: &DirectoryQuery,
     view: View,
 ) -> Result<Vec<Value>, AccountError> {
-    let discover = matches!(view, View::Explore | View::Unified)
-        && (!principal.is_admin()
-            || view == View::Unified
-            || query.relationship.as_deref() == Some("public"));
+    let public_discovery = view == View::Discover && principal.can_discover_public_teams();
+    let discover = public_discovery
+        || matches!(view, View::Explore | View::Unified)
+            && (!principal.is_admin()
+                || view == View::Unified
+                || query.relationship.as_deref() == Some("public"));
     let actor = TeamActor {
         email: &principal.email,
         admin: principal.is_admin()
-            && view != View::Unified
+            && !matches!(view, View::Unified | View::Discover)
             && query.relationship.as_deref().is_none_or(str::is_empty),
     };
     let rows = accounts
@@ -120,7 +128,11 @@ pub(in crate::local_auth) async fn directory(
     let mut output = Vec::new();
     for row in rows {
         let team = row.team;
-        if !in_token_scope(principal, &team.id)
+        if !(in_token_scope(principal, &team.id)
+            || public_discovery
+                && team.is_active
+                && !team.is_personal
+                && team.visibility == "public")
             || query
                 .visibility
                 .as_deref()
@@ -163,6 +175,9 @@ pub(in crate::local_auth) async fn directory(
         } else {
             let mut metadata = team.metadata();
             metadata["relationship"] = json!(relation);
+            if relation == "public" {
+                metadata["pending_join_request"] = json!(row.pending_request_id);
+            }
             metadata
         });
     }
@@ -190,13 +205,111 @@ pub(in crate::local_auth) async fn row(
     let members = active
         && (owner_or_admin || relationship == "Member" || relationship == "Personal")
         && allowed(accounts, principal, READ, Some(team_id)).await?;
+    let joinable = active
+        && relationship == "Public"
+        && can_request_team(principal, team_id)
+        && allowed(accounts, principal, JOIN, None).await?;
+    let pending = team["pending_join_request"].is_string();
+    let review = active
+        && relationship == "Owner"
+        && allowed(accounts, principal, MEMBERS, Some(team_id)).await?;
+    let leave = active
+        && matches!(relationship, "Owner" | "Member")
+        && allowed(accounts, principal, JOIN, Some(team_id)).await?;
     Ok(Row {
         team,
         relationship,
         edit,
         delete,
         members,
+        join: joinable && !pending && accounts.settings.teams.allow_join_requests,
+        cancel_join: joinable && pending,
+        review,
+        leave,
     })
+}
+
+fn can_request_team(principal: &Principal, team: &str) -> bool {
+    principal.can_discover_public_teams() || in_token_scope(principal, team)
+}
+
+pub(in crate::local_auth) async fn submit_join(
+    accounts: &Accounts,
+    principal: &Principal,
+    id: &str,
+    message: &str,
+) -> Result<(Value, bool), AccountError> {
+    if !can_request_team(principal, id) {
+        return Err(denied("Access denied"));
+    }
+    let result = membership::request_join(accounts, principal, id, Some(message), false).await;
+    let (request, created) = result.map_err(|mut error| {
+        if error.0 == StatusCode::FORBIDDEN && accounts.settings.teams.allow_join_requests {
+            error.0 = StatusCode::BAD_REQUEST;
+        }
+        error
+    })?;
+    Ok((request.metadata(), created))
+}
+
+pub(in crate::local_auth) async fn cancel_join(
+    accounts: &Accounts,
+    principal: &Principal,
+    team: &str,
+    request: &str,
+) -> Result<(), AccountError> {
+    if !can_request_team(principal, team) {
+        return Err(denied("Access denied"));
+    }
+    accounts
+        .database
+        .cancel_team_join_request(team, request, &principal.email)
+        .await
+}
+
+pub(in crate::local_auth) async fn join_queue(
+    accounts: &Accounts,
+    principal: &Principal,
+    id: &str,
+) -> Result<(Value, Vec<Value>), AccountError> {
+    let team = team(accounts, principal, id, MEMBERS, TeamAccess::Owner).await?;
+    let records = accounts.database.team_join_requests(id).await?;
+    let records = records
+        .iter()
+        .map(|record| {
+            let mut metadata = record.metadata();
+            metadata["expired"] = json!(record.expired());
+            metadata
+        })
+        .collect();
+    Ok((team.metadata(), records))
+}
+
+pub(in crate::local_auth) async fn review_join(
+    accounts: &Accounts,
+    principal: &Principal,
+    id: &str,
+    request: &str,
+    approve: bool,
+) -> Result<(), AccountError> {
+    team(accounts, principal, id, MEMBERS, TeamAccess::Owner).await?;
+    accounts
+        .database
+        .review_team_membership(id, request, &principal.email, approve, &accounts.settings)
+        .await?;
+    Ok(())
+}
+
+pub(in crate::local_auth) async fn leave_team(
+    accounts: &Accounts,
+    principal: &Principal,
+    id: &str,
+) -> Result<(), AccountError> {
+    let team = team(accounts, principal, id, JOIN, TeamAccess::Member).await?;
+    if team.is_personal {
+        return Err(AccountError::bad_request("Cannot leave your personal team"));
+    }
+    membership::leave_team(accounts, principal, id).await
 }
 
 pub(in crate::local_auth) async fn can_create(

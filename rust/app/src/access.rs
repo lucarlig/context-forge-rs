@@ -59,6 +59,7 @@ pub struct Principal {
     catalog_scopes: Option<Vec<String>>,
     pub(crate) server_limit: Option<String>,
     is_admin: bool,
+    unrestricted_team_session: bool,
     scopes: Vec<String>,
     credential_hash: [u8; 32],
 }
@@ -462,6 +463,8 @@ impl Authorizer {
             catalog_scopes,
             server_limit,
             is_admin: identity.is_admin,
+            unrestricted_team_session: jwt.token_use() == TokenUse::Session
+                && auth::unrestricted_session_teams(jwt.payload()),
             scopes,
             credential_hash: Sha256::digest(token.as_bytes()).into(),
         })
@@ -489,6 +492,7 @@ impl Authorizer {
             catalog_scopes: None,
             server_limit: None,
             is_admin: identity.is_admin,
+            unrestricted_team_session: true,
             scopes: Vec::new(),
             credential_hash: Sha256::digest(token.as_bytes()).into(),
         })
@@ -784,6 +788,10 @@ impl Principal {
 
     pub(crate) fn is_global_admin(&self) -> bool {
         self.is_admin && self.visibility == TeamVisibility::Admin
+    }
+
+    pub(crate) fn can_discover_public_teams(&self) -> bool {
+        self.unrestricted_team_session || self.is_global_admin()
     }
 
     pub(crate) fn token_allows(&self, permission: &str) -> bool {

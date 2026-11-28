@@ -59,6 +59,10 @@ pub(in crate::local_auth::teams) struct JoinRequest {
 }
 
 impl JoinRequest {
+    pub(in crate::local_auth::teams) fn expired(&self) -> bool {
+        elapsed(&self.expires_at)
+    }
+
     pub(in crate::local_auth::teams) fn metadata(&self) -> Value {
         json!({"id":self.id,"team_id":self.team_id,"team_name":self.team_name,"user_email":self.user_email,
                "message":self.message,"status":self.status,"requested_at":iso(&self.requested_at),"expires_at":iso(&self.expires_at)})
@@ -489,7 +493,8 @@ impl Database {
         email: &str,
         message: Option<&str>,
         settings: &TeamSettings,
-    ) -> Result<JoinRequest, AccountError> {
+        reopen_expired: bool,
+    ) -> Result<(JoinRequest, bool), AccountError> {
         macro_rules! request {
             ($tx:ident,$postgres:tt) => {{
                 let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_team)?;
@@ -508,11 +513,12 @@ impl Database {
                 if teams>=settings.max_teams {
                     return Err(AccountError::bad_request(format!("User has reached the maximum team limit of {}",settings.max_teams)));
                 }
-                let prior:Option<(String,String)>=sqlx::query_as("SELECT status,CAST(expires_at AS TEXT)
-                    FROM email_team_join_requests WHERE team_id=$1 AND user_email=$2")
+                let prior:Option<JoinRequest>=sqlx::query_as(concat!(join_fields!(),
+                    " WHERE j.team_id=$1 AND j.user_email=$2 AND j.status='pending'"))
                     .bind(id).bind(email).fetch_optional(&mut *$tx).await?;
-                if prior.is_some_and(|(status,expires)|status=="pending" && !elapsed(&expires)) {
-                    return Err(AccountError::bad_request("User already has a pending join request for this team"));
+                if let Some(prior) = prior && (!reopen_expired || !prior.expired()) {
+                    $tx.commit().await?;
+                    return Ok((prior, false));
                 }
                 let command=if $postgres {
                     "INSERT INTO email_team_join_requests(id,team_id,user_email,message,status,requested_at,expires_at)
@@ -530,10 +536,42 @@ impl Database {
                 let row=sqlx::query_as(concat!(join_fields!()," WHERE j.id=$1"))
                     .bind(request).fetch_one(&mut *$tx).await?;
                 $tx.commit().await?;
-                Ok(row)
+                Ok((row, true))
             }};
         }
         team_transaction!(self, request)
+    }
+
+    pub(in crate::local_auth::teams) async fn cancel_team_join_request(
+        &self,
+        team: &str,
+        request: &str,
+        email: &str,
+    ) -> Result<(), AccountError> {
+        macro_rules! cancel {
+            ($tx:ident,$postgres:tt) => {{
+                let changed = sqlx::query(
+                    "UPDATE email_team_join_requests
+                    SET status='cancelled',reviewed_at=CURRENT_TIMESTAMP,reviewed_by=$3
+                    WHERE id=$1 AND team_id=$2 AND user_email=$3 AND status='pending'",
+                )
+                .bind(request)
+                .bind(team)
+                .bind(email)
+                .execute(&mut *$tx)
+                .await?
+                .rows_affected();
+                if changed == 0 {
+                    return Err(AccountError::detail(
+                        StatusCode::NOT_FOUND,
+                        "Join request not found or unavailable",
+                    ));
+                }
+                $tx.commit().await?;
+                Ok(())
+            }};
+        }
+        team_transaction!(self, cancel)
     }
 
     pub(in crate::local_auth::teams) async fn team_join_requests(
@@ -565,7 +603,7 @@ impl Database {
                 team_permission!($tx,id,actor,false);
                 let row:JoinRequest=sqlx::query_as(concat!(join_fields!()," WHERE j.id=$1 AND j.team_id=$2 AND j.status='pending'"))
                     .bind(request).bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_request)?;
-                if approve && elapsed(&row.expires_at) {
+                if approve && row.expired() {
                     return Err(AccountError::bad_request("Join request has expired"));
                 }
                 let member=if approve {

@@ -1,0 +1,45 @@
+{% if record %}
+  <p role="status">Join request pending</p>
+  <form method="post" action="{{ root }}/admin/teams/{{ record.team_id }}/join-request/{{ record.id }}/cancel?directory=1">
+    <input type="hidden" name="csrf_token" value="{{ proof }}">
+    <button type="submit">Cancel request</button>
+  </form>
+{% elif cancelled %}
+  <p role="status">Join request cancelled</p>
+  {% if can_join %}
+  <form method="post" action="{{ root }}/admin/teams/{{ team_id }}/join-request?directory=1">
+    <input type="hidden" name="csrf_token" value="{{ proof }}">
+    <label>Message (optional) <textarea name="message" maxlength="500"></textarea></label>
+    <button type="submit">Request to join</button>
+  </form>
+  {% endif %}
+{% elif records %}
+  <div class="table-scroll">
+    <table aria-label="Team join requests">
+      <thead><tr><th scope="col">Requester</th><th scope="col">Message</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+      <tbody>
+      {% for request in records %}
+        <tr>
+          <th scope="row">{{ request.user_email }}</th>
+          <td>{{ request.message|default('', true) }}</td>
+          <td>{% if request.expired %}Expired{% else %}Pending{% endif %}</td>
+          <td class="actions">
+            {% if not request.expired %}
+            <form method="post" action="{{ root }}/admin/teams/{{ team.id }}/join-requests/{{ request.id }}/approve?directory=1">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <button type="submit">Approve</button>
+            </form>
+            {% endif %}
+            <form method="post" action="{{ root }}/admin/teams/{{ team.id }}/join-requests/{{ request.id }}/reject?directory=1">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <button type="submit">Reject</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p>No pending join requests.</p>
+{% endif %}

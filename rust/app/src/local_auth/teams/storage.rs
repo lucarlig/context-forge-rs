@@ -44,6 +44,7 @@ pub(super) struct DirectoryTeam {
     #[sqlx(flatten)]
     pub(super) team: Team,
     pub(super) role: Option<String>,
+    pub(super) pending_request_id: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -222,8 +223,10 @@ impl Database {
         include_inactive: bool,
     ) -> Result<Vec<DirectoryTeam>, sqlx::Error> {
         const SQL: &str = concat!(
-            "SELECT ", team_fields!(), ", m.role FROM email_teams t
+            "SELECT ", team_fields!(), ", m.role, j.id AS pending_request_id FROM email_teams t
              LEFT JOIN email_team_members m ON m.team_id=t.id AND m.user_email=$1 AND m.is_active=TRUE
+             LEFT JOIN email_team_join_requests j
+                ON j.team_id=t.id AND j.user_email=$1 AND j.status='pending'
              WHERE (t.is_active OR $3)
                AND ((NOT t.is_personal AND $2) OR (t.is_personal AND t.created_by=$1)
                     OR (NOT t.is_personal AND m.user_email IS NOT NULL)

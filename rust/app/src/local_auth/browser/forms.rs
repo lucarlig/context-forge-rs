@@ -226,6 +226,9 @@ pub(super) fn render_template(
                 .add_template("team_members.html", include_str!("team_members.html"))
                 .expect("valid team members template");
             environment
+                .add_template("team_requests.html", include_str!("team_requests.html"))
+                .expect("valid team join requests template");
+            environment
         });
     let html = TEMPLATES
         .get_template(template)
