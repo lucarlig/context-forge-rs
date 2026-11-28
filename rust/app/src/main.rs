@@ -51,6 +51,13 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some("export") => run(Startup::Configuration("export")),
         Some("import") => run(Startup::Configuration("import")),
         Some("init-secrets") => context_forge_rs::init_secrets::run(),
+        Some("--config-schema") => {
+            let output = std::env::args_os().nth(2);
+            context_forge_rs::configuration_cli::write_settings_schema(
+                output.as_deref().map(std::path::Path::new),
+            )?;
+            Ok(())
+        }
         _ => {
             let arguments = ServerArgs::parse();
             load_environment(arguments.env_file.as_deref())?;

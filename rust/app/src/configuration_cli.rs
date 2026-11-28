@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -19,6 +20,17 @@ use crate::{
 };
 
 type CliError = Box<dyn Error + Send + Sync>;
+const SETTINGS_SCHEMA: &str = include_str!("config/settings-v1.1.2.json");
+
+pub fn write_settings_schema(output: Option<&Path>) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    if let Some(path) = output.filter(|path| !path.as_os_str().is_empty()) {
+        fs::write(path, SETTINGS_SCHEMA)?;
+        writeln!(stdout, "✅ Schema written to {}", path.display())
+    } else {
+        writeln!(stdout, "{SETTINGS_SCHEMA}")
+    }
+}
 
 #[derive(Parser)]
 #[command(

@@ -50,6 +50,8 @@ Compose runs `context-forge-rs migrate` before starting the gateway. PostgreSQL 
 
 ### Database and configuration commands
 
+Use `context-forge-rs --config-schema [OUTPUT]` to print or save the configuration JSON Schema for the pinned ContextForge release.
+
 `context-forge-rs init-secrets` writes `.env.secrets` by default. Use `--output` to choose another file, `--force` to overwrite it, or `--stdout` to print the generated values. On Unix, files written by this command have mode `0600`.
 
 Run `context-forge-rs migrate` to prepare the native database schema before starting the gateway. Set `MCPGATEWAY_SKIP_MIGRATIONS=true` on gateway workers to require a current native schema at startup.
