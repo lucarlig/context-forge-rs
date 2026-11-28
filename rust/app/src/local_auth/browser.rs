@@ -3,6 +3,7 @@
 mod a2a;
 mod catalog;
 mod forms;
+mod grpc;
 mod keycloak;
 mod recovery;
 mod sessions;
@@ -156,6 +157,7 @@ pub(super) fn router(
         router = users::routes(router, path);
         router = team::routes(router, path);
         router = a2a::routes(router, path);
+        router = grpc::routes(router, path);
         for kind in ManagedCatalog::ALL {
             let base = format!("{path}/{}", kind.name());
             router = router

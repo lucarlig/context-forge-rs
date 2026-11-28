@@ -6,7 +6,10 @@ mod requests;
 use axum::http::{Uri, request::Parts};
 use axum::routing::delete;
 
-use super::{catalog::AuthorizedForm, *};
+use super::{
+    catalog::AuthorizedForm, forms::render_with_proof as render_form,
+    sessions::authorized_read as authorize, *,
+};
 use crate::gateway::{CatalogApiError, PaginationMeta};
 use crate::local_auth::teams::dashboard::{self, DirectoryQuery, View};
 
@@ -154,55 +157,6 @@ async fn team_panel(
         visibility: query.visibility.clone(),
         relationship: query.relationship.clone(),
     })
-}
-
-async fn authorize(
-    accounts: &Accounts,
-    request: Request,
-    peer: SocketAddr,
-) -> Result<(Principal, Parts, String), Box<Response>> {
-    let settings = settings_for(accounts);
-    let Session { principal, token } =
-        access(accounts, request.headers(), request.uri(), peer.ip())
-            .await
-            .map_err(|denial| Box::new(denial.response(settings, request.headers())))?;
-    if password_change_pending(accounts, &principal)
-        .await
-        .map_err(|error| Box::new(error.into_response()))?
-    {
-        return Err(Box::new(settings.redirect(CHANGE)));
-    }
-    if sessions::bearer_token(settings, request.headers()).is_none()
-        && !browser_request(request.headers())
-    {
-        return Err(Box::new(
-            AccountError::detail(
-                StatusCode::UNAUTHORIZED,
-                "Cookie authentication not allowed for API requests. Use Authorization header.",
-            )
-            .into_response(),
-        ));
-    }
-    let proof = sessions::proof(accounts, request.headers(), &principal, token)
-        .map_err(|error| Box::new(error.into_response()))?;
-    let (parts, _) = request.into_parts();
-    Ok((principal, parts, proof))
-}
-
-fn render_form(
-    accounts: &Accounts,
-    template: &str,
-    context: minijinja::Value,
-    proof: &str,
-) -> Result<Response, AccountError> {
-    let mut response = forms::render_template(template, context)?;
-    sessions::set_proof(
-        &mut response,
-        settings_for(accounts),
-        accounts.settings.token_seconds,
-        proof,
-    )?;
-    Ok(response)
 }
 
 async fn directory(

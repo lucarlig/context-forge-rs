@@ -32,7 +32,7 @@
     th { white-space: nowrap; }
   </style>
 </head>
-<body{% if page == "home" or page == "team-members" or page == "team-requests" %} class="dashboard"{% endif %}>
+<body{% if page in ["home", "team-members", "team-requests", "grpc-methods"] %} class="dashboard"{% endif %}>
   <main>
     {% if page == "login" %}
     <h1>Sign in to ContextForge</h1>
@@ -86,6 +86,30 @@
     </form>
     {% endif %}
     <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
+    {% elif page == "grpc-edit" %}
+    {% include "grpc_edit.html" %}
+    {% elif page == "grpc-methods" %}
+    <h1>gRPC methods · {{ service.name }}</h1>
+    <p>{{ service.target }}</p>
+    {% if methods %}
+    <div class="table-scroll">
+      <table aria-label="Reflected gRPC methods">
+        <thead><tr><th scope="col">Method</th><th scope="col">Input type</th><th scope="col">Output type</th><th scope="col">Streaming</th></tr></thead>
+        <tbody>{% for method in methods %}
+          <tr>
+            <th scope="row">{{ method.full_name }}</th>
+            <td>{{ method.input_type }}</td><td>{{ method.output_type }}</td>
+            <td>{% if method.client_streaming and method.server_streaming %}Bidirectional{% elif method.server_streaming %}Server{% elif method.client_streaming %}Client{% else %}Unary{% endif %}</td>
+          </tr>
+        {% endfor %}</tbody>
+      </table>
+    </div>
+    {% else %}<p>No reflected methods.</p>{% endif %}
+    <p><a href="{{ back }}">Back to gRPC services</a></p>
+    {% elif page == "grpc-error" %}
+    <h1>gRPC request failed</h1>
+    <p role="alert">{{ error }}</p>
+    <p><a href="{{ back }}">Back to gRPC services</a></p>
     {% elif page == "a2a-edit" %}
     {% include "a2a_edit.html" %}
     {% elif page == "a2a-test" %}
@@ -301,6 +325,10 @@
     {% if catalog.a2a %}
       {% set agents = catalog.a2a %}
       {% include "a2a.html" %}
+    {% endif %}
+    {% if catalog.grpc %}
+      {% set registry = catalog.grpc %}
+      {% include "grpc.html" %}
     {% endif %}
     {% for part in catalog.sections %}
     <section id="{{ part.fragment }}" aria-labelledby="heading-{{ part.name }}">

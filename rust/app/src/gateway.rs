@@ -10,6 +10,7 @@ mod content;
 mod exchanged_tokens;
 mod export_api;
 mod grpc_api;
+pub(crate) use grpc_api::{GrpcBrowserAction, GrpcBrowserPage, GrpcPageQuery};
 mod health;
 mod import_api;
 mod lifecycle;
@@ -572,12 +573,15 @@ impl GatewayService {
         if self.email_auth_enabled {
             router = router.merge(token_api::router());
         }
-        if self.grpc.admin_enabled {
-            router = router.merge(grpc_api::router());
-        }
-        let oauth_browser = self.access.protect_oauth_browser(
+        let grpc_admin = if self.grpc.admin_enabled {
+            self.access
+                .protect_browser_api(grpc_api::router(self), None)
+        } else {
+            Router::new()
+        };
+        let oauth_browser = self.access.protect_browser_api(
             oauth_api::browser_router().with_state(self.clone()),
-            format!("{}/admin/login", self.gateway_oauth.root_path()),
+            Some(format!("{}/admin/login", self.gateway_oauth.root_path())),
         );
         self.access
             .protect_api(
@@ -594,6 +598,7 @@ impl GatewayService {
                     .merge(resource_api::router(self.resource_limits.max_bytes))
                     .with_state(self.clone()),
             )
+            .merge(grpc_admin)
             .merge(oauth_browser)
     }
 

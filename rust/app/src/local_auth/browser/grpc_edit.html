@@ -1,0 +1,26 @@
+<h1>{{ title }}</h1>
+<form method="post" action="{{ root }}/admin/grpc/{% if id %}{{ id }}/edit{% else %}new{% endif %}{{ filters }}">
+  <input type="hidden" name="csrf_token" value="{{ proof }}">
+  <label>Service name <input name="name" maxlength="255" value="{{ data.name|default('', true) }}" required></label>
+  <label>Target (host:port) <input name="target" value="{{ data.target|default('', true) }}" placeholder="localhost:50051" required></label>
+  <label>Description <textarea name="description">{{ data.description|default('', true) }}</textarea></label>
+  <label>Visibility
+    <select name="visibility">
+      <option value="public"{% if data.visibility == "public" %} selected{% endif %}>Public</option>
+      <option value="team"{% if data.visibility == "team" %} selected{% endif %}>Team</option>
+      <option value="private"{% if data.visibility == "private" %} selected{% endif %}>Private</option>
+    </select>
+  </label>
+  {% if not id %}<label>Team ID <input name="team_id" value="{{ team|default('', true) }}"></label>{% endif %}
+  <label><input type="checkbox" name="reflection_enabled" value="true"{% if not id or data.reflection_enabled %} checked{% endif %}> Enable server reflection</label>
+  <details>
+    <summary>TLS and metadata</summary>
+    <label><input type="checkbox" name="tls_enabled" value="true"{% if data.tls_enabled %} checked{% endif %}> Enable TLS</label>
+    <label>Certificate path <input name="tls_cert_path" value="{{ data.tls_cert_path|default('', true) }}"></label>
+    <label>Key path <input name="tls_key_path" value="{{ data.tls_key_path|default('', true) }}"></label>
+    <label>Metadata JSON <textarea name="grpc_metadata" spellcheck="false"></textarea></label>
+    {% if id %}<p>Leave metadata blank to keep the stored values. Enter <code>{}</code> to clear them.</p>{% endif %}
+  </details>
+  <button type="submit">{{ "Save service" if id else "Register service" }}</button>
+</form>
+<p><a href="{{ back }}">Back to gRPC services</a></p>

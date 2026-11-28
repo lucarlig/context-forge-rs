@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use axum::http::{Uri, request::Parts};
+use axum::http::Uri;
 use serde_json::Map;
 
 use super::{
     catalog::{AuthorizedForm, editor},
+    forms::render_with_proof,
+    sessions::authorized_read as authorize,
     *,
 };
 use crate::gateway::{
@@ -176,39 +178,6 @@ async fn read_panel(
     })
 }
 
-async fn authorize(
-    accounts: &Accounts,
-    request: Request,
-    peer: SocketAddr,
-) -> Result<(Principal, Parts, String), Box<Response>> {
-    let settings = settings_for(accounts);
-    let Session { principal, token } =
-        access(accounts, request.headers(), request.uri(), peer.ip())
-            .await
-            .map_err(|denial| Box::new(denial.response(settings, request.headers())))?;
-    if password_change_pending(accounts, &principal)
-        .await
-        .map_err(|error| Box::new(error.into_response()))?
-    {
-        return Err(Box::new(settings.redirect(CHANGE)));
-    }
-    if sessions::bearer_token(settings, request.headers()).is_none()
-        && !browser_request(request.headers())
-    {
-        return Err(Box::new(
-            AccountError::detail(
-                StatusCode::UNAUTHORIZED,
-                "Cookie authentication not allowed for API requests. Use Authorization header.",
-            )
-            .into_response(),
-        ));
-    }
-    let proof = sessions::proof(accounts, request.headers(), &principal, token)
-        .map_err(|error| Box::new(error.into_response()))?;
-    let (parts, _) = request.into_parts();
-    Ok((principal, parts, proof))
-}
-
 async fn read(
     State(accounts): State<Arc<Accounts>>,
     Extension(service): Extension<Arc<GatewayService>>,
@@ -260,22 +229,6 @@ async fn read(
         response.await.into_response()
     })
     .await
-}
-
-fn render_with_proof(
-    accounts: &Accounts,
-    template: &str,
-    context: minijinja::Value,
-    proof: &str,
-) -> Result<Response, AccountError> {
-    let mut response = forms::render_template(template, context)?;
-    sessions::set_proof(
-        &mut response,
-        settings_for(accounts),
-        accounts.settings.token_seconds,
-        proof,
-    )?;
-    Ok(response)
 }
 
 fn account_error(error: AccountError) -> CatalogApiError {

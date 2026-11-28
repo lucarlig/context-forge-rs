@@ -460,6 +460,18 @@ services' tools from MCP listings. The pinned gateway listed those tools.
 Native tests cover team-scoped writes, concurrent reflection, and dependent
 record cleanup.
 
+The gRPC Services dashboard uses the same registry and reflection operations
+as the JSON API. It lists active and inactive services, registers and edits
+services, and lets authorized users inspect methods and manage service state.
+The editor hides stored metadata and keeps it when the field is blank.
+The JSON routes accept bearer tokens and browser sessions on `/admin/grpc`
+and `/v1/admin/grpc`. Browser session writes require CSRF proof.
+
+Four Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+pagination, versioned routes, the service lifecycle, and the disabled feature.
+Chromium verifies registration, method inspection, metadata preservation,
+reflection, activation, deactivation, and deletion.
+
 The TLS fixture matched trusted-root connections and rejected a hostname
 mismatch. Rust also passed mutual TLS with a certificate chain and private
 key in the gateway's `certs` directory. The v1.1.2 gateway disconnected during

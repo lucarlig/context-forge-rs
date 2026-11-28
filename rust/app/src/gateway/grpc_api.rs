@@ -2,23 +2,67 @@
 
 use std::collections::BTreeMap;
 
-use axum::extract::{Path, Query};
+use axum::{
+    extract::{OriginalUri, Path, Query, Request},
+    http::Method,
+    middleware::{self, Next},
+};
 use sqlx::types::Json as DbJson;
 
 use super::{catalog_api::*, *};
-use crate::grpc::{self, Discovery, GrpcError, GrpcTarget};
+use crate::{
+    access::BrowserApiSession,
+    grpc::{self, Discovery, GrpcError, GrpcTarget},
+    http_boundary::csrf::browser_proof_valid,
+};
 
+mod dashboard;
 mod registry;
+pub(crate) use dashboard::{GrpcBrowserAction, GrpcBrowserPage};
 use registry::{ServiceChange, ServiceWriteError};
 
-pub(super) fn router() -> Router<Arc<GatewayService>> {
-    Router::new()
-        .route("/admin/grpc", get(list).post(register))
-        .route("/admin/grpc/{id}", get(detail).put(update))
-        .route("/admin/grpc/{id}/methods", get(methods))
-        .route("/admin/grpc/{id}/state", post(set_state))
-        .route("/admin/grpc/{id}/reflect", post(reflect))
-        .route("/admin/grpc/{id}/delete", post(delete))
+pub(super) fn router(app: &Arc<GatewayService>) -> Router {
+    let mut router = Router::new();
+    for base in ["/admin/grpc", "/v1/admin/grpc"] {
+        let item = format!("{base}/{{id}}");
+        router = router
+            .route(base, get(list).post(register))
+            .route(&item, get(detail).put(update))
+            .route(&format!("{item}/methods"), get(methods))
+            .route(&format!("{item}/state"), post(set_state))
+            .route(&format!("{item}/reflect"), post(reflect))
+            .route(&format!("{item}/delete"), post(delete));
+    }
+    router
+        .route_layer(middleware::from_fn_with_state(app.clone(), protect_session))
+        .with_state(app.clone())
+}
+
+async fn protect_session(
+    State(app): State<Arc<GatewayService>>,
+    OriginalUri(uri): OriginalUri,
+    request: Request,
+    next: Next,
+) -> Result<Response, CatalogApiError> {
+    let settings = &app.gateway_oauth;
+    if request.extensions().get::<BrowserApiSession>().is_some()
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        )
+        && !browser_proof_valid(
+            &settings.browser_origin,
+            &settings.csrf_origins,
+            &uri,
+            request.headers(),
+        )
+    {
+        return Err(CatalogApiError::detail(
+            StatusCode::FORBIDDEN,
+            "CSRF validation failed",
+        ));
+    }
+    Ok(next.run(request).await)
 }
 
 #[derive(Deserialize, Serialize, sqlx::FromRow)]
@@ -129,7 +173,7 @@ async fn require_access(
     principal: &Principal,
 ) -> Result<(), CatalogApiError> {
     require_catalog_permission(app, principal, "admin.grpc", false).await?;
-    if app.grpc.enabled {
+    if app.grpc_dashboard_enabled() {
         Ok(())
     } else {
         Err(CatalogApiError::detail(
@@ -144,13 +188,31 @@ async fn register(
     Extension(principal): Extension<Principal>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    Json(mut config): Json<ServiceConfig>,
+    Json(config): Json<ServiceConfig>,
 ) -> Result<(StatusCode, Json<ServiceRecord>), CatalogApiError> {
-    require_access(&app, &principal).await?;
+    create_service(
+        &app,
+        &principal,
+        config,
+        client_address(peer),
+        user_agent(&headers),
+    )
+    .await
+    .map(|record| (StatusCode::CREATED, Json(record)))
+}
+
+async fn create_service(
+    app: &GatewayService,
+    principal: &Principal,
+    mut config: ServiceConfig,
+    client_ip: Option<String>,
+    agent: Option<String>,
+) -> Result<ServiceRecord, CatalogApiError> {
+    require_access(app, principal).await?;
 
     let slug = config.validate()?;
-    validate_public_visibility(&app, &config)?;
-    require_target_permission(&app, &principal, config.team_id.as_deref()).await?;
+    validate_public_visibility(app, &config)?;
+    require_target_permission(app, principal, config.team_id.as_deref()).await?;
     if let Some(team) = &config.team_id
         && !app
             .database
@@ -177,8 +239,6 @@ async fn register(
         None
     };
     let id = Uuid::new_v4().simple().to_string();
-    let client_ip = client_address(peer);
-    let agent = user_agent(&headers);
     let inserted = app
         .database
         .insert_grpc_service(
@@ -192,10 +252,10 @@ async fn register(
         .await;
     let record = match inserted {
         Ok(record) => record,
-        Err(error) => return Err(write_error(&app, &principal, &config.name, error.into()).await),
+        Err(error) => return Err(write_error(app, principal, &config.name, error.into()).await),
     };
-    record.notify(&app);
-    Ok((StatusCode::CREATED, Json(record)))
+    record.notify(app);
+    Ok(record)
 }
 
 async fn detail(
@@ -225,60 +285,92 @@ async fn visible_record(
 }
 
 #[derive(Default, Deserialize)]
-struct ListQuery {
-    page: Option<i64>,
-    per_page: Option<i64>,
-    include_inactive: Option<String>,
-    team_id: Option<String>,
+pub(crate) struct GrpcPageQuery {
+    pub(crate) page: Option<i64>,
+    pub(crate) per_page: Option<i64>,
+    pub(crate) include_inactive: Option<String>,
+    pub(crate) team_id: Option<String>,
 }
 
 async fn list(
     State(app): State<Arc<GatewayService>>,
     Extension(principal): Extension<Principal>,
-    Query(query): Query<ListQuery>,
+    Query(query): Query<GrpcPageQuery>,
 ) -> Result<Json<Value>, CatalogApiError> {
-    require_access(&app, &principal).await?;
+    let page = registry_page(&app, &principal, &query).await?;
+    let links = app.admin_page_links(
+        &page.pagination,
+        "/admin/grpc",
+        page.include_inactive,
+        page.team.as_deref(),
+    );
+    Ok(Json(
+        json!({"data":page.records,"pagination":page.pagination,"links":links}),
+    ))
+}
+
+struct RegistryPage {
+    records: Vec<ServiceRecord>,
+    pagination: PaginationMeta,
+    include_inactive: bool,
+    team: Option<String>,
+}
+
+async fn registry_page(
+    app: &GatewayService,
+    principal: &Principal,
+    query: &GrpcPageQuery,
+) -> Result<RegistryPage, CatalogApiError> {
+    require_access(app, principal).await?;
     let include_inactive = flag(query.include_inactive.as_deref())?;
-    let page = query.page.unwrap_or(1);
-    let per_page = query
-        .per_page
-        .unwrap_or(i64::from(app.management_page_size));
-    if page < 1 || !(1..=i64::from(app.management_max_page_size)).contains(&per_page) {
-        return Err(CatalogApiError::detail(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Invalid pagination",
-        ));
-    }
-    let per_page = per_page.max(i64::from(app.grpc.min_page_size));
-    let team = query
-        .team_id
-        .as_deref()
-        .filter(|team| !team.is_empty())
-        .map(Uuid::parse_str)
-        .transpose()
-        .map_err(|_| CatalogApiError::detail(StatusCode::BAD_REQUEST, "Invalid team ID"))?
-        .map(|team| team.simple().to_string());
-    if team
-        .as_deref()
-        .is_some_and(|team| !team_in_scope(&principal, team))
-    {
-        return Err(denied_team());
-    }
-    let (data, pagination) = app
+    let (page, per_page) = app.admin_page_params(query.page, query.per_page)?;
+    let team = resolve_list_team(app, principal, query.team_id.as_deref()).await?;
+    let (records, pagination) = app
         .database
         .list_grpc_services(
-            access::catalog_scope(Some(&principal)),
+            access::catalog_scope(Some(principal)),
             (include_inactive, team.as_deref()),
             (page, per_page, app.grpc.max_page_offset),
         )
         .await?;
-    let links = app
-        .grpc
-        .include_page_links
-        .then(|| pagination.links("/admin/grpc", include_inactive, team.as_deref()));
-    Ok(Json(
-        json!({"data":data,"pagination":pagination,"links":links}),
-    ))
+    Ok(RegistryPage {
+        records,
+        pagination,
+        include_inactive,
+        team,
+    })
+}
+
+async fn resolve_list_team(
+    app: &GatewayService,
+    principal: &Principal,
+    team: Option<&str>,
+) -> Result<Option<String>, CatalogApiError> {
+    let Some(raw) = team.filter(|team| !team.is_empty()) else {
+        return Ok(None);
+    };
+    let uuid = Uuid::parse_str(raw)
+        .map_err(|_| CatalogApiError::detail(StatusCode::BAD_REQUEST, "Invalid team ID"))?;
+    match &principal.visibility {
+        TeamVisibility::Public => Err(denied_team()),
+        TeamVisibility::Teams(allowed) => allowed
+            .iter()
+            .find(|id| Uuid::parse_str(id).ok() == Some(uuid))
+            .cloned()
+            .map(Some)
+            .ok_or_else(denied_team),
+        TeamVisibility::Admin => {
+            let compact = uuid.simple().to_string();
+            let hyphenated = uuid.hyphenated().to_string();
+            let raw = raw.to_ascii_lowercase();
+            for id in [&raw, &compact, &hyphenated] {
+                if app.database.active_team(id).await? {
+                    return Ok(Some(id.clone()));
+                }
+            }
+            Ok(Some(compact))
+        }
+    }
 }
 
 fn validate_public_visibility(
@@ -377,7 +469,27 @@ async fn update(
     headers: HeaderMap,
     Json(patch): Json<serde_json::Map<String, Value>>,
 ) -> Result<Json<ServiceRecord>, CatalogApiError> {
-    let prior = editable_record(&app, &principal, &id).await?;
+    update_service(
+        &app,
+        &principal,
+        &id,
+        patch,
+        client_address(peer),
+        user_agent(&headers),
+    )
+    .await
+    .map(Json)
+}
+
+async fn update_service(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    patch: serde_json::Map<String, Value>,
+    client_ip: Option<String>,
+    agent: Option<String>,
+) -> Result<ServiceRecord, CatalogApiError> {
+    let prior = editable_record(app, principal, id).await?;
     let mut merged = serde_json::to_value(&prior.config).expect("service configuration serializes");
     for (key, value) in patch {
         if key != "team_id"
@@ -394,13 +506,11 @@ async fn update(
     })?;
     config.validate()?;
     if config.visibility != prior.config.visibility {
-        validate_public_visibility(&app, &config)?;
+        validate_public_visibility(app, &config)?;
     }
-    let client_ip = client_address(peer);
-    let agent = user_agent(&headers);
     let updated = mutate(
-        &app,
-        &principal,
+        app,
+        principal,
         &prior,
         ServiceChange::Config {
             config: &config,
@@ -411,10 +521,10 @@ async fn update(
     )
     .await?;
     if prior.config.visibility != updated.config.visibility {
-        prior.notify(&app);
-        updated.notify(&app);
+        prior.notify(app);
+        updated.notify(app);
     }
-    Ok(Json(updated))
+    Ok(updated)
 }
 
 #[derive(Deserialize)]
@@ -428,16 +538,27 @@ async fn set_state(
     Path(id): Path<String>,
     Query(query): Query<StateQuery>,
 ) -> Result<Json<ServiceRecord>, CatalogApiError> {
-    let prior = editable_record(&app, &principal, &id).await?;
-    let activate = match query.activate.as_deref() {
+    change_service_state(&app, &principal, &id, query.activate.as_deref())
+        .await
+        .map(Json)
+}
+
+async fn change_service_state(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+    requested: Option<&str>,
+) -> Result<ServiceRecord, CatalogApiError> {
+    let prior = editable_record(app, principal, id).await?;
+    let activate = match requested {
         Some(value) => flag(Some(value))?,
         None => !prior.enabled,
     };
-    let updated = mutate(&app, &principal, &prior, ServiceChange::State(activate)).await?;
+    let updated = mutate(app, principal, &prior, ServiceChange::State(activate)).await?;
     if prior.enabled != updated.enabled {
-        updated.notify(&app);
+        updated.notify(app);
     }
-    Ok(Json(updated))
+    Ok(updated)
 }
 
 async fn reflect(
@@ -445,11 +566,19 @@ async fn reflect(
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<ServiceRecord>, CatalogApiError> {
-    let prior = editable_record(&app, &principal, &id).await?;
+    reflect_service(&app, &principal, &id).await.map(Json)
+}
+
+async fn reflect_service(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+) -> Result<ServiceRecord, CatalogApiError> {
+    let prior = editable_record(app, principal, id).await?;
     let discovery = grpc::discover(&app.upstream, &prior.config.target(), app.grpc.timeout).await;
     let updated = mutate(
-        &app,
-        &principal,
+        app,
+        principal,
         &prior,
         ServiceChange::Reflection(discovery.as_ref().ok()),
     )
@@ -462,11 +591,11 @@ async fn reflect(
         ));
     }
     if prior.method_count > 0 {
-        prior.notify(&app);
+        prior.notify(app);
     } else {
-        updated.notify(&app);
+        updated.notify(app);
     }
-    Ok(Json(updated))
+    Ok(updated)
 }
 
 async fn delete(
@@ -474,17 +603,27 @@ async fn delete(
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, CatalogApiError> {
-    let prior = editable_record(&app, &principal, &id).await?;
+    delete_service(&app, &principal, &id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+}
+
+async fn delete_service(
+    app: &GatewayService,
+    principal: &Principal,
+    id: &str,
+) -> Result<(), CatalogApiError> {
+    let prior = editable_record(app, principal, id).await?;
     match app
         .database
         .change_grpc_service(&prior, ServiceChange::Delete)
         .await
     {
         Ok(_) => {
-            prior.notify(&app);
-            Ok(StatusCode::NO_CONTENT)
+            prior.notify(app);
+            Ok(())
         }
-        Err(error) => Err(write_error(&app, &principal, &prior.config.name, error).await),
+        Err(error) => Err(write_error(app, principal, &prior.config.name, error).await),
     }
 }
 
@@ -511,6 +650,10 @@ async fn methods(
     id: Path<String>,
 ) -> Result<Json<Value>, CatalogApiError> {
     let Json(record) = detail(state, principal, id).await?;
+    Ok(Json(json!({"methods":service_methods(&record)})))
+}
+
+fn service_methods(record: &ServiceRecord) -> Vec<Value> {
     let mut methods = Vec::new();
     if let Some(services) = record.discovered_services.0.as_object() {
         for (name, service) in services {
@@ -533,7 +676,7 @@ async fn methods(
             }
         }
     }
-    Ok(Json(json!({"methods":methods})))
+    methods
 }
 
 pub(super) async fn invoke(

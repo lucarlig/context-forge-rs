@@ -5,7 +5,7 @@ use std::{collections::HashSet, error::Error, fmt::Write, sync::Arc};
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, Method, StatusCode, header},
+    http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -48,6 +48,61 @@ const EXEMPT: &[&str] = &[
     "/llmchat/",
     "/api/logs/",
 ];
+
+pub(crate) fn browser_proof_valid(
+    app_origin: &str,
+    trusted_origins: &HashSet<String>,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> bool {
+    let Some(submitted) = text_header(headers, &HeaderName::from_static("x-csrf-token")) else {
+        return false;
+    };
+    let Some(proof) = cookie(headers, ADMIN_CSRF_COOKIE) else {
+        return false;
+    };
+    if !bool::from(proof.as_bytes().ct_eq(submitted.as_bytes())) {
+        return false;
+    }
+    let Some(candidate) = text_header(headers, &header::ORIGIN)
+        .or_else(|| text_header(headers, &header::REFERER))
+        .and_then(browser_origin)
+    else {
+        return false;
+    };
+    if candidate == app_origin
+        || trusted_origins
+            .iter()
+            .any(|trusted| browser_origin(trusted).as_deref() == Some(candidate.as_str()))
+    {
+        return true;
+    }
+    let loopback = url::Url::parse(app_origin).ok().is_some_and(|app| {
+        matches!(
+            app.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "0.0.0.0")
+        )
+    });
+    let host =
+        text_header(headers, &header::HOST).or_else(|| uri.authority().map(|value| value.as_str()));
+    loopback
+        && host
+            .and_then(|host| {
+                browser_origin(&format!("{}://{host}", super::public_scheme(headers, uri)))
+            })
+            .as_deref()
+            == Some(candidate.as_str())
+}
+
+fn browser_origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none())
+    .then(|| url.origin().ascii_serialization())
+}
 
 pub(crate) struct CsrfTokens {
     key: Option<hmac::Key>,

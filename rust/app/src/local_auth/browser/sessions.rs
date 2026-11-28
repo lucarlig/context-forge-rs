@@ -4,7 +4,7 @@ use std::net::IpAddr;
 
 use super::*;
 use crate::{access::AuthError, jwt::JwtError};
-use axum::http::Uri;
+use axum::http::{Uri, request::Parts};
 
 pub(super) struct Session<'a> {
     pub(super) principal: Principal,
@@ -93,6 +93,37 @@ pub(super) async fn access<'a>(
             None,
         )),
     }
+}
+
+pub(super) async fn authorized_read(
+    accounts: &Accounts,
+    request: Request,
+    peer: SocketAddr,
+) -> Result<(Principal, Parts, String), Box<Response>> {
+    let settings = settings_for(accounts);
+    let Session { principal, token } =
+        access(accounts, request.headers(), request.uri(), peer.ip())
+            .await
+            .map_err(|denial| Box::new(denial.response(settings, request.headers())))?;
+    if password_change_pending(accounts, &principal)
+        .await
+        .map_err(|error| Box::new(error.into_response()))?
+    {
+        return Err(Box::new(settings.redirect(CHANGE)));
+    }
+    if bearer_token(settings, request.headers()).is_none() && !browser_request(request.headers()) {
+        return Err(Box::new(
+            AccountError::detail(
+                StatusCode::UNAUTHORIZED,
+                "Cookie authentication not allowed for API requests. Use Authorization header.",
+            )
+            .into_response(),
+        ));
+    }
+    let proof = proof(accounts, request.headers(), &principal, token)
+        .map_err(|error| Box::new(error.into_response()))?;
+    let (parts, _) = request.into_parts();
+    Ok((principal, parts, proof))
 }
 
 pub(super) fn bearer_token<'a>(

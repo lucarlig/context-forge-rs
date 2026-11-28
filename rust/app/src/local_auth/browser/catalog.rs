@@ -385,6 +385,7 @@ pub(super) struct Dashboard {
     pub(super) users: Option<super::users::Panel>,
     pub(super) teams: Option<super::team::Panel>,
     pub(super) a2a: Option<super::a2a::Panel>,
+    pub(super) grpc: Option<super::grpc::Panel>,
     error: Option<&'static str>,
     message: Option<&'static str>,
 }
@@ -507,6 +508,7 @@ pub(super) async fn dashboard(
     let users_visible = super::users::visible(accounts, principal).await?;
     let teams_visible = super::team::visible(accounts, principal).await?;
     let a2a_visible = super::a2a::visible(accounts, service, principal, team).await?;
+    let grpc_visible = super::grpc::visible(accounts, service, principal, team).await?;
     let parameters = forms::query(uri);
     let selected = parameters
         .get("section")
@@ -516,6 +518,7 @@ pub(super) async fn dashboard(
                 || (*name == "users" && users_visible)
                 || (*name == "teams" && teams_visible)
                 || (*name == "a2a" && a2a_visible)
+                || (*name == "grpc" && grpc_visible)
                 || permitted.iter().any(|kind| kind.name() == *name)
         });
     if selected.is_none() {
@@ -523,8 +526,14 @@ pub(super) async fn dashboard(
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
-    let mut navigation = Vec::with_capacity(permitted.len() + 5);
-    if !permitted.is_empty() || tokens_visible || users_visible || teams_visible || a2a_visible {
+    let mut navigation = Vec::with_capacity(permitted.len() + 6);
+    if !permitted.is_empty()
+        || tokens_visible
+        || users_visible
+        || teams_visible
+        || a2a_visible
+        || grpc_visible
+    {
         navigation.push(Link {
             label: "All sections",
             href: href(None, None),
@@ -566,6 +575,13 @@ pub(super) async fn dashboard(
             selected: selected == Some("a2a"),
         });
     }
+    if grpc_visible {
+        navigation.push(Link {
+            label: "gRPC Services",
+            href: href(Some("grpc"), None),
+            selected: selected == Some("grpc"),
+        });
+    }
     let tokens = if selected == Some("tokens") {
         Some(super::token::panel(accounts, service, principal, uri).await?)
     } else {
@@ -595,6 +611,11 @@ pub(super) async fn dashboard(
             )
             .await?,
         )
+    } else {
+        None
+    };
+    let grpc = if selected == Some("grpc") {
+        Some(super::grpc::panel(accounts, service, principal, uri).await?)
     } else {
         None
     };
@@ -643,6 +664,7 @@ pub(super) async fn dashboard(
         users,
         teams,
         a2a,
+        grpc,
         error: match parameters.get("error").map(String::as_str) {
             Some("conflict") => Some("This entry changed. Check its current state and try again."),
             Some("delete_failed") => Some("Could not delete the entry."),

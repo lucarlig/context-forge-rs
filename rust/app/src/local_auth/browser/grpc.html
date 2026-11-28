@@ -1,0 +1,47 @@
+<section id="grpc-services" aria-labelledby="grpc-heading">
+  <h2 id="grpc-heading">gRPC Services</h2>
+  <p><a href="{{ root }}/admin/grpc/new{{ registry.filters }}">Register service</a></p>
+  {% if registry.page.rows %}
+  <div class="table-scroll">
+    <table aria-labelledby="grpc-heading">
+      <thead><tr><th scope="col">Service</th><th scope="col">Target</th><th scope="col">Visibility</th><th scope="col">Status</th><th scope="col">Methods</th><th scope="col">Actions</th></tr></thead>
+      <tbody>
+      {% for row in registry.page.rows %}
+        {% set service = row.service %}
+        <tr>
+          <th scope="row">{{ service.name }}</th>
+          <td>{{ service.target }}</td>
+          <td>{{ service.visibility|capitalize }}{% if service.team %} · {{ service.team }}{% endif %}</td>
+          <td>{% if service.enabled %}Active{% else %}Inactive{% endif %}{% if not service.reachable %} · Unreachable{% endif %}</td>
+          <td>{{ service.method_count }}</td>
+          <td class="actions">
+            <a href="{{ root }}/admin/grpc/{{ service.id }}/inspect{{ registry.filters }}">View methods</a>
+            {% if row.editable %}
+            <a href="{{ root }}/admin/grpc/{{ service.id }}/edit{{ registry.filters }}">Edit</a>
+            <form method="post" action="{{ root }}/admin/grpc/{{ service.id }}/manage{{ registry.filters }}">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <button type="submit" name="action" value="{{ 'disable' if service.enabled else 'enable' }}">{{ 'Deactivate' if service.enabled else 'Activate' }}</button>
+              <button type="submit" name="action" value="reflect">Refresh reflection</button>
+            </form>
+            <details><summary>Delete</summary>
+              <form method="post" action="{{ root }}/admin/grpc/{{ service.id }}/manage{{ registry.filters }}">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <button type="submit" name="action" value="delete">Confirm delete</button>
+              </form>
+            </details>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p>No gRPC services found.</p>{% endif %}
+  {% if registry.page.pagination.total_items %}
+  <nav class="page-links" aria-label="gRPC service pages">
+    {% if registry.previous %}<a href="{{ registry.previous }}">Previous</a>{% endif %}
+    <span>Page {{ registry.page.pagination.page }} of {{ registry.page.pagination.total_pages }}</span>
+    {% if registry.next %}<a href="{{ registry.next }}">Next</a>{% endif %}
+  </nav>
+  {% endif %}
+</section>

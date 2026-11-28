@@ -26,6 +26,10 @@ struct BrowserGateway {
 }
 
 async fn gateway() -> BrowserGateway {
+    gateway_with_env(&[]).await
+}
+
+async fn gateway_with_env(env: &[(&str, &str)]) -> BrowserGateway {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let fixture = FixtureDirectory(std::env::temp_dir().join(Uuid::new_v4().simple().to_string()));
     std::fs::create_dir(&fixture.0).unwrap();
@@ -48,6 +52,7 @@ async fn gateway() -> BrowserGateway {
         .env("SECURE_COOKIES", "false")
         .env("RATE_LIMITING_ENABLED", "false")
         .env("SSRF_ALLOW_LOCALHOST", "true")
+        .envs(env.iter().copied())
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1369,5 +1374,202 @@ async fn admin_a2a_editor_preserves_credentials_and_honors_token_permissions() {
         .unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     database.close().await;
+    gateway.process.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn grpc_dashboard_preserves_metadata_and_enforces_team_scope() {
+    let mut gateway = gateway_with_env(&[("MCPGATEWAY_GRPC_ENABLED", "true")]).await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL,"password":password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let owner = login["access_token"].as_str().unwrap();
+    let mut teams = Vec::new();
+    for name in ["gRPC service team", "Other service team"] {
+        let created = client
+            .post(format!("{origin}/teams"))
+            .bearer_auth(owner)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({"name":name,"visibility":"private"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let team: serde_json::Value = serde_json::from_str(&created.text().await.unwrap()).unwrap();
+        teams.push(team["id"].as_str().unwrap().to_owned());
+    }
+    let issue = client
+        .post(format!("{origin}/tokens"))
+        .bearer_auth(owner)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::json!({"name":"grpc-team-role","expires_in_days":1,"team_id":teams[1],
+            "scope":{"permissions":["admin.dashboard","admin.grpc"]}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issue.status(), StatusCode::CREATED);
+    let token: serde_json::Value = serde_json::from_str(&issue.text().await.unwrap()).unwrap();
+    let scoped = token["access_token"].as_str().unwrap();
+
+    let secret = format!("fixture-{}", Uuid::new_v4().simple());
+    let metadata = serde_json::json!({"fixture-token":secret}).to_string();
+    let form = |fields: &[(&str, &str)]| {
+        let mut body = url::form_urlencoded::Serializer::new(String::new());
+        body.extend_pairs(fields.iter().copied());
+        body.finish()
+    };
+    let dir = format!("{origin}/admin/grpc");
+    let create = client
+        .post(format!("{dir}/new"))
+        .bearer_auth(owner)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(form(&[
+            ("name", "gRPC Fixture"),
+            ("target", "127.0.0.1:1"),
+            ("visibility", "public"),
+            ("team_id", &teams[0]),
+            ("grpc_metadata", &metadata),
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::SEE_OTHER);
+
+    let list = client
+        .get(format!("{origin}/v1/admin/grpc"))
+        .bearer_auth(owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list: serde_json::Value = serde_json::from_str(&list.text().await.unwrap()).unwrap();
+    let record = &list["data"][0];
+    assert_eq!(record["grpc_metadata"]["fixture-token"], secret);
+    assert_eq!(record["reflection_enabled"], false);
+    let id = record["id"].as_str().unwrap();
+    let editor = format!("{dir}/{id}/edit");
+    let page = client.get(&editor).bearer_auth(owner).send().await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(!page.text().await.unwrap().contains(&secret));
+    let change = |credential: &str| {
+        client
+            .post(&editor)
+            .bearer_auth(credential)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form(&[
+                ("name", "Updated gRPC Fixture"),
+                ("grpc_metadata", ""),
+            ]))
+    };
+    assert_eq!(
+        change(scoped).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        change(owner).send().await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+
+    let denied = client
+        .post(format!("{dir}/{id}/manage"))
+        .bearer_auth(scoped)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("action=delete")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let record = client
+        .get(format!("{dir}/{id}"))
+        .bearer_auth(owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(record.status(), StatusCode::OK);
+    let record: serde_json::Value = serde_json::from_str(&record.text().await.unwrap()).unwrap();
+    assert_eq!(record["name"], "Updated gRPC Fixture");
+    assert_eq!(record["grpc_metadata"]["fixture-token"], secret);
+    assert_eq!(record["team_id"], teams[0]);
+
+    let login_url = format!("{origin}/admin/login");
+    let page = client.get(&login_url).send().await.unwrap();
+    let proof = cookie(&page, "mcpgateway_csrf_token");
+    let browser = client
+        .post(login_url)
+        .header(header::ORIGIN, origin)
+        .header(header::COOKIE, format!("mcpgateway_csrf_token={proof}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(form(&[
+            ("email", EMAIL),
+            ("password", password),
+            ("csrf_token", proof),
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(browser.status(), StatusCode::SEE_OTHER);
+    let proof = cookie(&browser, "mcpgateway_csrf_token");
+    let jwt = cookie(&browser, "jwt_token");
+    let cookies = format!("jwt_token={jwt}; mcpgateway_csrf_token={proof}");
+    let request = |accept| client.get(&dir).header(header::ACCEPT, accept);
+    assert_eq!(
+        request("text/html").send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for (accept, expected) in [
+        ("application/json", StatusCode::UNAUTHORIZED),
+        ("text/html", StatusCode::OK),
+    ] {
+        let response = request(accept)
+            .header(header::COOKIE, &cookies)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+
+    let deactivate = |site: &str| {
+        client
+            .post(format!("{dir}/{id}/state?activate=false"))
+            .header(header::ACCEPT, "text/html")
+            .header(header::ORIGIN, site)
+            .header(header::COOKIE, &cookies)
+    };
+    assert_eq!(
+        deactivate(origin).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        deactivate("https://foreign.example.test")
+            .header("X-CSRF-Token", proof)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = deactivate(origin)
+        .header("X-CSRF-Token", proof)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let record: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(record["enabled"], false);
     gateway.process.kill().await.unwrap();
 }

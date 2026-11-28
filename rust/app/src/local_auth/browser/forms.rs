@@ -235,6 +235,12 @@ pub(super) fn render_template(
                 .add_template("a2a_edit.html", include_str!("a2a_edit.html"))
                 .expect("valid A2A editor template");
             environment
+                .add_template("grpc.html", include_str!("grpc.html"))
+                .expect("valid gRPC catalog template");
+            environment
+                .add_template("grpc_edit.html", include_str!("grpc_edit.html"))
+                .expect("valid gRPC editor template");
+            environment
         });
     let html = TEMPLATES
         .get_template(template)
@@ -244,6 +250,22 @@ pub(super) fn render_template(
             AccountError::unavailable()
         })?;
     Ok(([(header::CACHE_CONTROL, "no-store, private")], Html(html)).into_response())
+}
+
+pub(super) fn render_with_proof(
+    accounts: &Accounts,
+    template: &str,
+    context: minijinja::Value,
+    proof: &str,
+) -> Result<Response, AccountError> {
+    let mut response = forms::render_template(template, context)?;
+    sessions::set_proof(
+        &mut response,
+        settings_for(accounts),
+        accounts.settings.token_seconds,
+        proof,
+    )?;
+    Ok(response)
 }
 
 pub(super) fn login_error(error: Option<&str>) -> Option<&'static str> {
