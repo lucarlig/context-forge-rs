@@ -5,7 +5,7 @@ use sqlx::types::Json;
 use uuid::Uuid;
 
 use super::Tier;
-use crate::database::Database;
+use crate::database::{Database, observed};
 
 pub(super) struct RateLimitEvent<'a> {
     pub(super) ip: &'a str,
@@ -53,7 +53,7 @@ impl RateLimitEvent<'_> {
                     .bind(description)
                     .bind(score)
                     .bind(context)
-                    .execute($pool)
+                    .execute(observed($pool))
                     .await?
             };
         }

@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use super::*;
+use crate::database::observed;
 
 #[derive(Default)]
 pub(crate) struct ServerLinkUpdate {
@@ -54,7 +55,7 @@ macro_rules! check_revision {
         ))
         .bind(&$expected.id).bind($expected.version).bind(&$expected.updated_at).bind($expected.enabled)
         .bind(&$expected.visibility).bind($expected.team_id.as_deref()).bind($expected.owner_email.as_deref())
-        .fetch_optional(&mut *$tx)
+        .fetch_optional(observed(&mut *$tx))
         .await?
         .ok_or(ServerWriteError::Changed)?
     };
@@ -99,7 +100,7 @@ macro_rules! replace_links {
                     ")"
                 ))
                 .bind(&encoded)
-                .fetch_all(&mut *$tx)
+                .fetch_all(observed(&mut *$tx))
                 .await?;
             let visible = existing
                 .iter()
@@ -121,7 +122,7 @@ macro_rules! replace_links {
             }
             sqlx::query(concat!("DELETE FROM ", $association, " WHERE server_id=$1"))
                 .bind(&$server.id)
-                .execute(&mut *$tx)
+                .execute(observed(&mut *$tx))
                 .await?;
             sqlx::query(concat!(
                 "INSERT INTO ",
@@ -136,7 +137,7 @@ macro_rules! replace_links {
             ))
             .bind(encoded)
             .bind(&$server.id)
-            .execute(&mut *$tx)
+            .execute(observed(&mut *$tx))
             .await?;
         }
     }};
@@ -165,13 +166,13 @@ impl Database {
                 };
                 if old_id.as_deref() != Some(server.id.as_str())
                     && sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM servers WHERE id=$1)")
-                        .bind(&server.id).fetch_one(&mut *$tx).await?
+                        .bind(&server.id).fetch_one(observed(&mut *$tx)).await?
                 {
                     return Err(ServerWriteError::DuplicateId);
                 }
                 if changed_scope && let Some((id,enabled)) = sqlx::query_as(SERVER_CONFLICT)
                     .bind(old_id.as_deref().unwrap_or(&server.id)).bind(&server.name).bind(&server.visibility)
-                    .bind(server.team_id.as_deref()).bind(server.owner_email.as_deref()).fetch_optional(&mut *$tx).await?
+                    .bind(server.team_id.as_deref()).bind(server.owner_email.as_deref()).fetch_optional(observed(&mut *$tx)).await?
                 {
                     return Err(ServerWriteError::Duplicate {id,enabled});
                 }
@@ -188,17 +189,17 @@ impl Database {
                     .bind(actor.as_deref()).bind(ip.as_deref()).bind(agent.as_deref());
                 if let Some(old_id) = old_id.as_deref() {
                     statement.bind(server.modified_via.as_deref().unwrap_or("api")).bind(old_id)
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 } else {
                     statement.bind(server.created_via.as_deref().unwrap_or("api"))
                         .bind(server.import_batch_id.as_deref()).bind(server.federation_source.as_deref())
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 replace_links!($tx, server, scope, links.tools, "Tools", "tools", "server_tool_association", "tool_id", $decode);
                 replace_links!($tx, server, scope, links.resources, "Resources", "resources", "server_resource_association", "resource_id", $decode);
                 replace_links!($tx, server, scope, links.prompts, "Prompts", "prompts", "server_prompt_association", "prompt_id", $decode);
                 if let Some(ids) = links.agents.as_ref() {
-                    if sqlx::query_scalar::<_, bool>($exists).bind("server_a2a_association").fetch_one(&mut *$tx).await? {
+                    if sqlx::query_scalar::<_, bool>($exists).bind("server_a2a_association").fetch_one(observed(&mut *$tx)).await? {
                         replace_links!($tx, server, scope, links.agents, "A2A agents", "a2a_agents", "server_a2a_association", "a2a_agent_id", $decode);
                     } else if !ids.is_empty() {
                         return Err(ServerWriteError::MissingLinks {kind:"A2A agents",ids:ids.clone()});
@@ -208,10 +209,10 @@ impl Database {
                     // Keep the records and any persisted configuration on unchanged bindings.
                     let existing = sqlx::query_as::<_, (String,String,String)>(
                         "SELECT id,protocol,binding FROM server_interfaces WHERE server_id=$1"
-                    ).bind(&server.id).fetch_all(&mut *$tx).await?;
+                    ).bind(&server.id).fetch_all(observed(&mut *$tx)).await?;
                     for (id,protocol,binding) in existing {
                         if !interfaces.iter().any(|interface|interface.protocol==protocol && interface.binding==binding) {
-                            sqlx::query("DELETE FROM server_interfaces WHERE id=$1").bind(id).execute(&mut *$tx).await?;
+                            sqlx::query("DELETE FROM server_interfaces WHERE id=$1").bind(id).execute(observed(&mut *$tx)).await?;
                         }
                     }
                     for interface in interfaces {
@@ -221,10 +222,10 @@ impl Database {
                                 tenant=EXCLUDED.tenant,enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP")
                             .bind(Uuid::new_v4().hyphenated().to_string()).bind(&server.id).bind(&interface.protocol)
                             .bind(&interface.binding).bind(interface.version.as_deref()).bind(interface.tenant.as_deref())
-                            .bind(interface.enabled).execute(&mut *$tx).await?;
+                            .bind(interface.enabled).execute(observed(&mut *$tx)).await?;
                     }
                 }
-                let updated = sqlx::query_as(SERVER_BY_ID).bind(&server.id).fetch_one(&mut *$tx).await?;
+                let updated = sqlx::query_as(SERVER_BY_ID).bind(&server.id).fetch_one(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(updated)
             }};
@@ -243,7 +244,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 save!(
                     tx,
                     " FOR UPDATE",
@@ -273,12 +276,12 @@ impl Database {
                     .bind(&id)
                     .bind(enabled)
                     .bind(jiff::Timestamp::now().to_string())
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 }
                 let updated = sqlx::query_as(SERVER_BY_ID)
                     .bind(id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(updated)
@@ -291,7 +294,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 change!(tx, " FOR UPDATE", "CAST(CAST($3 AS TEXT) AS TIMESTAMPTZ)")
             }
         }
@@ -307,7 +312,7 @@ impl Database {
                 let id = check_revision!($tx, expected, $lock);
                 let version = sqlx::query_scalar("UPDATE servers SET oauth_config_approved=TRUE,
                     oauth_config_generation=$2,version=COALESCE(version,0)+1 WHERE id=$1 RETURNING version")
-                    .bind(id).bind(generation).fetch_one(&mut *$tx).await?;
+                    .bind(id).bind(generation).fetch_one(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(version)
             }};
@@ -319,7 +324,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 approve!(tx, " FOR UPDATE")
             }
         }
@@ -350,10 +357,13 @@ impl Database {
                     if (table != "server_metrics_hourly" || purge_metrics)
                         && sqlx::query_scalar::<_, bool>($exists)
                             .bind(table)
-                            .fetch_one(&mut *$tx)
+                            .fetch_one(observed(&mut *$tx))
                             .await?
                     {
-                        sqlx::query(statement).bind(&id).execute(&mut *$tx).await?;
+                        sqlx::query(statement)
+                            .bind(&id)
+                            .execute(observed(&mut *$tx))
+                            .await?;
                     }
                 }
                 for statement in [
@@ -363,7 +373,10 @@ impl Database {
                     "DELETE FROM server_interfaces WHERE server_id=$1",
                     "DELETE FROM servers WHERE id=$1",
                 ] {
-                    sqlx::query(statement).bind(&id).execute(&mut *$tx).await?;
+                    sqlx::query(statement)
+                        .bind(&id)
+                        .execute(observed(&mut *$tx))
+                        .await?;
                 }
                 $tx.commit().await?;
                 Ok(())
@@ -380,7 +393,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 delete!(
                     tx,
                     " FOR UPDATE",

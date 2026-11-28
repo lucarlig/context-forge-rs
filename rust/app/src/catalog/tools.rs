@@ -2,6 +2,7 @@
 
 use super::entry_filters::fetch_catalog_entries;
 use super::*;
+use crate::database::observed;
 
 #[derive(Clone, Default, Serialize, sqlx::FromRow)]
 pub(crate) struct ToolRecord {
@@ -111,13 +112,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(TOOL_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(TOOL_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }

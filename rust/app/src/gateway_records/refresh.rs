@@ -13,6 +13,7 @@ use crate::{
         ToolDefinition, display_name, prompt_argument_schema, resource_registrations, slugify,
     },
     credentials::{CredentialCipher, decode_headers, decode_query},
+    database::observed,
     oauth_client::OAuthConfig,
     upstream::DiscoveredMetadata,
 };
@@ -265,7 +266,7 @@ macro_rules! apply_gateway_metadata {
             && sqlx::query_scalar::<_, bool>(GATEWAY_NAME_CONFLICT)
                 .bind(&$after.id).bind(&$after.slug).bind(&$after.visibility)
                 .bind($after.team_id.as_deref()).bind($after.owner_email.as_deref())
-                .fetch_one(&mut *$tx).await?
+                .fetch_one(observed(&mut *$tx)).await?
         {
             return Err(RegistrationError::NameConflict);
         }
@@ -278,7 +279,7 @@ macro_rules! apply_gateway_metadata {
             let candidates = sqlx::query_as::<_, AuthCandidate>(GATEWAY_URL_CANDIDATES)
                 .bind(&$after.id).bind(&$after.url).bind(&$after.visibility)
                 .bind($after.team_id.as_deref()).bind($after.owner_email.as_deref())
-                .fetch_all(&mut *$tx).await?;
+                .fetch_all(observed(&mut *$tx)).await?;
             if $after.auth_type.as_deref() != Some("one_time_auth")
                 && candidates.iter().any(|candidate| same_gateway_auth($after, candidate, $cipher))
             {
@@ -318,7 +319,7 @@ macro_rules! apply_gateway_metadata {
             .bind($client_key.is_some()).bind($client_key.flatten())
             .bind(&$after.status)
             .bind($after.modified_via.as_deref())
-            .execute(&mut *$tx).await?;
+            .execute(observed(&mut *$tx)).await?;
         if ($after.url != $before.url || $after.auth_type != $before.auth_type
             || $after.oauth_config != $before.oauth_config)
             && ($after.oauth_config.is_some() || $before.oauth_config.is_some())
@@ -327,30 +328,30 @@ macro_rules! apply_gateway_metadata {
                 "DELETE FROM oauth_states WHERE gateway_id = $1",
                 "DELETE FROM oauth_tokens WHERE gateway_id = $1",
             ] {
-                sqlx::query(statement).bind(&$after.id).execute(&mut *$tx).await?;
+                sqlx::query(statement).bind(&$after.id).execute(observed(&mut *$tx)).await?;
             }
         }
         if renamed {
             for statement in RENAMED_CATALOG_ITEMS {
                 sqlx::query(*statement).bind(&$after.id).bind(&$after.slug).bind(&$before.slug)
-                    .execute(&mut *$tx).await?;
+                    .execute(observed(&mut *$tx)).await?;
             }
         }
         if scope_changed {
             for statement in SCOPED_CATALOG_ITEMS {
                 sqlx::query(*statement).bind(&$after.id).bind(&$before.visibility).bind(&$after.visibility)
                     .bind($before.team_id.as_deref()).bind($after.team_id.as_deref())
-                    .execute(&mut *$tx).await?;
+                    .execute(observed(&mut *$tx)).await?;
             }
         }
         if $after.url != $before.url || $after.transport != $before.transport {
             sqlx::query("UPDATE tools SET url = $2, request_type = $3
                 WHERE gateway_id = $1 AND integration_type = 'MCP'")
                 .bind(&$after.id).bind(&$after.url).bind(&$after.transport)
-                .execute(&mut *$tx).await?;
+                .execute(observed(&mut *$tx)).await?;
         }
         if (renamed || scope_changed) && sqlx::query_scalar::<_, bool>(GATEWAY_TOOL_NAME_CONFLICT)
-            .bind(&$after.id).fetch_one(&mut *$tx).await?
+            .bind(&$after.id).fetch_one(observed(&mut *$tx)).await?
         {
             return Err(RegistrationError::ToolNameConflict);
         }
@@ -361,7 +362,7 @@ macro_rules! refresh_metadata {
     ($tx:ident, $exists:literal, $dialect:ident, $gateway:ident, $input:ident, $changes:ident) => {{
         if $input.include_resources {
             let mut existing: HashMap<_, _> = sqlx::query_as::<_, StoredResource>(STORED_RESOURCES)
-                .bind(&$gateway.id).fetch_all(&mut *$tx).await?
+                .bind(&$gateway.id).fetch_all(observed(&mut *$tx)).await?
                 .into_iter().map(|row| ((row.uri.clone(), row.uri_template.is_some()), row)).collect();
             let mut seen = HashSet::new();
             for item in resource_registrations($input.metadata) {
@@ -383,7 +384,7 @@ macro_rules! refresh_metadata {
                         sqlx::query("UPDATE resources SET original_name = $2, title = $3,
                             description = $4, mime_type = $5, size = $6, updated_at = CURRENT_TIMESTAMP WHERE id = $1")
                             .bind(previous.id).bind(item.name).bind(item.title).bind(item.description)
-                            .bind(item.mime).bind(item.size).execute(&mut *$tx).await?;
+                            .bind(item.mime).bind(item.size).execute(observed(&mut *$tx)).await?;
                         $changes.resources_updated += 1;
                     }
                 } else {
@@ -393,7 +394,7 @@ macro_rules! refresh_metadata {
                         .bind(item.title).bind(item.description).bind(item.mime).bind(item.size)
                         .bind(&$gateway.id).bind($gateway.owner_email.as_deref())
                         .bind($gateway.team_id.as_deref()).bind(&$gateway.visibility)
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                     $changes.resources_added += 1;
                 }
             }
@@ -405,7 +406,7 @@ macro_rules! refresh_metadata {
 
         if $input.include_prompts {
             let mut existing: HashMap<_, _> = sqlx::query_as::<_, StoredPrompt>(STORED_PROMPTS)
-                .bind(&$gateway.id).fetch_all(&mut *$tx).await?
+                .bind(&$gateway.id).fetch_all(observed(&mut *$tx)).await?
                 .into_iter().map(|row| (row.original_name.clone(), row)).collect();
             let mut seen = HashSet::new();
             for item in &$input.metadata.prompts {
@@ -426,7 +427,7 @@ macro_rules! refresh_metadata {
                             argument_schema = ", json_parameter!($dialect, "$4"),
                             ", updated_at = CURRENT_TIMESTAMP WHERE id = $1"))
                             .bind(previous.id).bind(&item.title).bind(&item.description)
-                            .bind(arguments.to_string()).execute(&mut *$tx).await?;
+                            .bind(arguments.to_string()).execute(observed(&mut *$tx)).await?;
                         $changes.prompts_updated += 1;
                     }
                 } else {
@@ -439,7 +440,7 @@ macro_rules! refresh_metadata {
                         .bind(slug).bind(&item.title).bind(&item.description).bind(arguments.to_string())
                         .bind(&$gateway.id).bind($gateway.owner_email.as_deref())
                         .bind($gateway.team_id.as_deref()).bind(&$gateway.visibility)
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                     $changes.prompts_added += 1;
                 }
             }
@@ -508,7 +509,7 @@ impl Database {
                     return Ok(Some(changes));
                 };
                 let mut stored_tools: HashMap<_, _> = sqlx::query_as::<_, StoredTool>(STORED_TOOLS)
-                    .bind(&gateway.id).fetch_all(&mut *$transaction).await?
+                    .bind(&gateway.id).fetch_all(observed(&mut *$transaction)).await?
                     .into_iter().map(|tool| (tool.original_name.clone(), tool)).collect();
                 let incoming: HashSet<&str> = input.tools.iter().map(|tool| tool.name.as_str()).collect();
                 for (_, stale) in stored_tools.extract_if(|name, _| !incoming.contains(name.as_str())) {
@@ -535,7 +536,7 @@ impl Database {
                                 .bind(previous.id).bind(&tool.description).bind(&tool.title)
                                 .bind(tool.input_schema.to_string()).bind(tool.output_schema.as_ref().map(Value::to_string))
                                 .bind(annotations.to_string()).bind(display_name(&tool.name))
-                                .execute(&mut *$transaction).await?;
+                                .execute(observed(&mut *$transaction)).await?;
                             changes.tools_updated += 1;
                         }
                     } else {
@@ -543,7 +544,7 @@ impl Database {
                         let name = format!("{}-{slug}", gateway.slug);
                         if sqlx::query_scalar::<_,bool>(TOOL_CONFLICT)
                             .bind(&name).bind(&gateway.visibility).bind(gateway.team_id.as_deref())
-                            .bind(gateway.owner_email.as_deref()).fetch_one(&mut *$transaction).await?
+                            .bind(gateway.owner_email.as_deref()).fetch_one(observed(&mut *$transaction)).await?
                         {
                             return Err(RegistrationError::ToolNameConflict);
                         }
@@ -554,7 +555,7 @@ impl Database {
                             .bind(annotations.to_string()).bind(&gateway.url).bind(gateway.owner_email.as_deref())
                             .bind(gateway.team_id.as_deref()).bind(&gateway.visibility).bind(&gateway.transport)
                             .bind(display_name(&tool.name))
-                            .execute(&mut *$transaction).await?;
+                            .execute(observed(&mut *$transaction)).await?;
                         changes.tools_added += 1;
                     }
                 }
@@ -568,7 +569,7 @@ impl Database {
                     updated_at = ", $now, " WHERE id = $1"))
                     .bind(&gateway.id).bind(input.capabilities.to_string()).bind(&now).bind(stamp_seen)
                     .bind(stamp_refresh)
-                    .execute(&mut *$transaction).await?;
+                    .execute(observed(&mut *$transaction)).await?;
                 match input.completion {
                     CatalogRefreshCompletion::Activate => set_gateway_state!($transaction, &gateway.id, true, &now, $now),
                     CatalogRefreshCompletion::Automatic | CatalogRefreshCompletion::Recover =>
@@ -597,7 +598,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *transaction))
+                    .await?;
                 sync!(
                     transaction,
                     " FOR UPDATE",

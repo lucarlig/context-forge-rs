@@ -4,6 +4,7 @@ use serde::Deserialize;
 use zeroize::Zeroize;
 
 use super::{flow::code_config, storage::OAuthGateway, *};
+use crate::database::observed;
 use crate::oauth_client::{IssuerMetadata, validate_endpoint};
 
 pub(super) async fn configured_client(
@@ -440,14 +441,14 @@ impl Database {
                 sqlx::query_as(SQL)
                     .bind(gateway)
                     .bind(issuer)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(SQL)
                     .bind(gateway)
                     .bind(issuer)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -464,7 +465,7 @@ impl Database {
                     SELECT $1,$2,$3,", $expires, " FROM gateways WHERE id=$1 AND version=$2 AND status='active'
                     ON CONFLICT(gateway_id) DO UPDATE SET gateway_version=excluded.gateway_version,claim=excluded.claim,expires_at=excluded.expires_at
                     WHERE ", $expired, " OR cf_oauth_registration_claims.gateway_version<>excluded.gateway_version"))
-                    .bind(&gateway.id).bind(gateway.version).bind(claim).execute($pool).await?.rows_affected()!=0
+                    .bind(&gateway.id).bind(gateway.version).bind(claim).execute(observed($pool)).await?.rows_affected()!=0
             };
         }
         Ok(match self {
@@ -493,14 +494,14 @@ impl Database {
                 sqlx::query(SQL)
                     .bind(gateway)
                     .bind(claim)
-                    .execute(pool)
+                    .execute(observed(pool))
                     .await?;
             }
             Self::Postgres(pool) => {
                 sqlx::query(SQL)
                     .bind(gateway)
                     .bind(claim)
-                    .execute(pool)
+                    .execute(observed(pool))
                     .await?;
             }
         }
@@ -522,7 +523,7 @@ impl Database {
                       AND EXISTS (SELECT 1 FROM cf_oauth_registration_claims WHERE gateway_id=$1 AND gateway_version=$2 AND claim=$4)
                     RETURNING version"))
                     .bind(&gateway.id).bind(gateway.version).bind(config).bind(claim)
-                    .fetch_optional(&mut *$tx).await?;
+                    .fetch_optional(observed(&mut *$tx)).await?;
                 if version.is_none() {
                     return Ok(None);
                 }
@@ -544,7 +545,7 @@ impl Database {
                         .bind(&registration.redirect_uris).bind(&registration.grant_types).bind(&registration.response_types)
                         .bind(registration.scope.as_deref()).bind(&credential.auth_method).bind(registration.management_uri.as_deref())
                         .bind(registration.management_token.as_deref()).bind(registration.expires_at.as_deref())
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 $tx.commit().await?;
                 Ok(version)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{entry_filters::fetch_catalog_entries, *};
+use crate::database::observed;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PromptWriteError {
@@ -37,7 +38,7 @@ macro_rules! check_revision {
         .bind(&$prompt.visibility)
         .bind($prompt.team_id.as_deref())
         .bind($prompt.enabled)
-        .fetch_optional(&mut *$tx)
+        .fetch_optional(observed(&mut *$tx))
         .await?
         .ok_or(PromptWriteError::Changed)?
     };
@@ -93,13 +94,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(PROMPT_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(PROMPT_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -127,7 +128,7 @@ impl Database {
                         $lock
                     ))
                     .bind(gateway)
-                    .fetch_optional(&mut *$tx)
+                    .fetch_optional(observed(&mut *$tx))
                     .await?;
                     if slug.as_deref() != prompt.gateway_slug.as_deref() {
                         return Err(PromptWriteError::Changed);
@@ -141,7 +142,7 @@ impl Database {
                         .bind(prompt.gateway_id.as_deref())
                         .bind(prompt.team_id.as_deref())
                         .bind(prompt.owner_email.as_deref())
-                        .fetch_optional(&mut *$tx)
+                        .fetch_optional(observed(&mut *$tx))
                         .await?
                 {
                     return Err(PromptWriteError::Duplicate { id, enabled });
@@ -190,10 +191,10 @@ impl Database {
                 } else {
                     query
                 };
-                query.execute(&mut *$tx).await?;
+                query.execute(observed(&mut *$tx)).await?;
                 let updated = sqlx::query_as(PROMPT_BY_ID)
                     .bind(&prompt.id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(updated)
@@ -206,7 +207,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 save!(tx, " FOR UPDATE", "CAST($10 AS JSON)", "CAST($11 AS JSON)")
             }
         }
@@ -229,12 +232,12 @@ impl Database {
                     .bind(&id)
                     .bind(enabled)
                     .bind(jiff::Timestamp::now().to_string())
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 }
                 let updated = sqlx::query_as(PROMPT_BY_ID)
                     .bind(id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(updated)
@@ -247,7 +250,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 change!(tx, " FOR UPDATE", "CAST(CAST($3 AS TEXT) AS TIMESTAMPTZ)")
             }
         }
@@ -274,19 +279,22 @@ impl Database {
                     if (table == "prompt_metrics" || purge_metrics)
                         && sqlx::query_scalar::<_, bool>($exists)
                             .bind(table)
-                            .fetch_one(&mut *$tx)
+                            .fetch_one(observed(&mut *$tx))
                             .await?
                     {
-                        sqlx::query(statement).bind(&id).execute(&mut *$tx).await?;
+                        sqlx::query(statement)
+                            .bind(&id)
+                            .execute(observed(&mut *$tx))
+                            .await?;
                     }
                 }
                 sqlx::query("DELETE FROM server_prompt_association WHERE prompt_id=$1")
                     .bind(&id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 sqlx::query("DELETE FROM prompts WHERE id=$1")
                     .bind(id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(())
@@ -303,7 +311,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 delete!(
                     tx,
                     " FOR UPDATE",

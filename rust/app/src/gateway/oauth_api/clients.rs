@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::database::observed;
 
 const READ: &str = "admin.oauth_clients:read";
 const DELETE: &str = "admin.oauth_clients:delete";
@@ -138,8 +139,18 @@ impl Database {
             CAST(expires_at AS TEXT) AS expires_at,is_active FROM registered_oauth_clients
             WHERE CAST($1 AS TEXT) IS NULL OR gateway_id=$1 ORDER BY created_at,id";
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(gateway).fetch_all(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(SQL).bind(gateway).fetch_all(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_as(SQL)
+                    .bind(gateway)
+                    .fetch_all(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(SQL)
+                    .bind(gateway)
+                    .fetch_all(observed(pool))
+                    .await
+            }
         }
     }
 
@@ -150,8 +161,18 @@ impl Database {
         const SQL: &str =
             "DELETE FROM registered_oauth_clients WHERE id=$1 RETURNING gateway_id,issuer";
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(id).fetch_optional(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(SQL).bind(id).fetch_optional(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_as(SQL)
+                    .bind(id)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(SQL)
+                    .bind(id)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
         }
     }
 }

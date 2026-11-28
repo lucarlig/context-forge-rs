@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Map;
 
 use super::{providers::Provider, *};
+use crate::database::observed;
 use crate::local_auth::storage::revoke_credentials;
 
 pub(crate) struct SsoIdentityPolicy {
@@ -150,12 +151,12 @@ impl Database {
                     "SELECT is_admin,admin_origin FROM email_users
                      WHERE id=$1 AND email=$2 AND auth_provider=$3 AND is_active", $lock))
                     .bind(&user.id).bind(&user.email).bind(&user.auth_provider)
-                    .fetch_optional(&mut *$tx).await?
+                    .fetch_optional(observed(&mut *$tx)).await?
                 else { return Ok(false); };
                 let personal_team = if mapping.personal_scope {
                     sqlx::query_scalar::<_,String>("SELECT id FROM email_teams WHERE created_by=$1
                         AND is_personal AND is_active ORDER BY id LIMIT 1")
-                        .bind(&user.email).fetch_optional(&mut *$tx).await?
+                        .bind(&user.email).fetch_optional(observed(&mut *$tx)).await?
                 } else {
                     None
                 };
@@ -171,7 +172,7 @@ impl Database {
                 }
                 let admin_role = sqlx::query_scalar::<_, String>(
                     "SELECT id FROM roles WHERE name=$1 AND scope='global' AND is_active")
-                    .bind(&defaults.admin_role).fetch_optional(&mut *$tx).await?;
+                    .bind(&defaults.admin_role).fetch_optional(observed(&mut *$tx)).await?;
                 let role_promotes = admin_role.as_ref().is_some_and(|role|
                     desired.iter().any(|(id,scope,_)| id==role && scope=="global"));
                 let manual_admin = current_admin && !relinking && origin.as_deref()!=Some("sso");
@@ -183,7 +184,7 @@ impl Database {
                     last_login=CASE WHEN $5 THEN CURRENT_TIMESTAMP ELSE last_login END,
                     auth_provider=$6,updated_at=CURRENT_TIMESTAMP WHERE id=$1")
                     .bind(&user.id).bind(admin).bind(admin_origin).bind(name).bind(existing).bind(provider)
-                    .execute(&mut *$tx).await?;
+                    .execute(observed(&mut *$tx)).await?;
                 if relinking {
                     revoke_credentials!($tx,&user.email,&user.email,"sso_provider_relinked");
                 }
@@ -193,18 +194,18 @@ impl Database {
                     } else if demoted {
                         sqlx::query("UPDATE user_roles SET is_active=FALSE WHERE user_email=$1
                             AND role_id=$2 AND scope='global' AND scope_id IS NULL")
-                            .bind(&user.email).bind(role).execute(&mut *$tx).await?;
+                            .bind(&user.email).bind(role).execute(observed(&mut *$tx)).await?;
                     }
                 }
                 if mapping.sync_roles || relinking {
                     let existing_roles = sqlx::query_as::<_, (String,String,String,Option<String>)>(
                         "SELECT id,role_id,scope,scope_id FROM user_roles
                          WHERE user_email=$1 AND is_active AND grant_source='sso'")
-                        .bind(&user.email).fetch_all(&mut *$tx).await?;
+                        .bind(&user.email).fetch_all(observed(&mut *$tx)).await?;
                     for (id,role,scope,scope_id) in existing_roles {
                         if !desired.contains(&(role,scope,scope_id)) {
                             sqlx::query("UPDATE user_roles SET is_active=FALSE WHERE id=$1").bind(id)
-                                .execute(&mut *$tx).await?;
+                                .execute(observed(&mut *$tx)).await?;
                         }
                     }
                 }
@@ -213,14 +214,14 @@ impl Database {
                         granted_at,is_active,grant_source) VALUES($1,$2,$3,$4,$5,$2,CURRENT_TIMESTAMP,TRUE,'sso')
                         ON CONFLICT DO NOTHING")
                         .bind(Uuid::new_v4().to_string()).bind(&user.email).bind(id).bind(scope).bind(scope_id)
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 if demoted {
                     sqlx::query("INSERT INTO user_roles(id,user_email,role_id,scope,granted_by,granted_at,is_active)
                         SELECT $1,$2,id,'global',$2,CURRENT_TIMESTAMP,TRUE FROM roles
                         WHERE name=$3 AND scope='global' AND is_active ON CONFLICT DO NOTHING")
                         .bind(Uuid::new_v4().to_string()).bind(&user.email).bind(&defaults.user_role)
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 $tx.commit().await?;
                 Ok(true)
@@ -247,7 +248,7 @@ macro_rules! add_mapped_role {
         let found = sqlx::query_as::<_,(String,String)>(
             "SELECT id,scope FROM roles WHERE name=$1 AND is_active AND (scope='global' OR (NOT $2 AND scope='team'))
              ORDER BY CASE WHEN scope='team' THEN 0 ELSE 1 END LIMIT 1")
-            .bind(role).bind(global).fetch_optional(&mut *$tx).await?;
+            .bind(role).bind(global).fetch_optional(observed(&mut *$tx)).await?;
         match found {
             Some((id, scope)) if scope == "team" && $personal => {
                 if let Some(team) = &$team {

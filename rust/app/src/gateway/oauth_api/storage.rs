@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use super::*;
+use crate::database::observed;
 
 #[derive(sqlx::FromRow)]
 pub(super) struct OAuthGateway {
@@ -85,7 +86,7 @@ impl Database {
         macro_rules! select {
             ($pool:ident,$array:literal) => {
                 sqlx::query_as(concat!("SELECT id,version,name,url,visibility,team_id,owner_email,CAST(oauth_config AS TEXT) AS oauth_config
-                    FROM gateways WHERE id IN (",$array,")")).bind(ids).fetch_all($pool).await
+                    FROM gateways WHERE id IN (",$array,")")).bind(ids).fetch_all(observed($pool)).await
             };
         }
         match self {
@@ -108,7 +109,7 @@ impl Database {
                 sqlx::query_as::<_,TokenStatus>(concat!("SELECT gateway_id,CAST(expires_at AS TEXT) AS expires_at,
                     CAST(updated_at AS TEXT) AS updated_at,CAST(scopes AS TEXT) AS scopes
                     FROM oauth_tokens WHERE app_user_email=$1 AND gateway_id IN (",$array,")"))
-                    .bind(email).bind(ids).fetch_all($pool).await?
+                    .bind(email).bind(ids).fetch_all(observed($pool)).await?
             };
         }
         let rows = match self {
@@ -185,7 +186,7 @@ impl Database {
                     .bind(Uuid::new_v4().simple().to_string()).bind(state.gateway_id).bind(state.state)
                     .bind(state.verifier).bind(state.email).bind(state.redirect_uri).bind(state.team_id)
                     .bind(state.browser_binding_hash).bind(state.gateway_version)
-                    .execute($pool).await?.rows_affected()!=0
+                    .execute(observed($pool)).await?.rows_affected()!=0
             };
         }
         Ok(match self {
@@ -207,7 +208,7 @@ impl Database {
                 sqlx::query_as(concat!("UPDATE oauth_states SET used=TRUE WHERE state=$1 AND NOT used AND ",$expiry,
                     " RETURNING gateway_id,code_verifier,app_user_email,redirect_uri,browser_binding_hash,
                       (SELECT version FROM gateways WHERE id=oauth_states.gateway_id) AS gateway_version"))
-                    .bind(state).fetch_optional($pool).await
+                    .bind(state).fetch_optional(observed($pool)).await
             };
         }
         match self {
@@ -245,7 +246,7 @@ impl Database {
                     .bind(Uuid::new_v4().simple().to_string()).bind(token.gateway_id).bind(token.subject).bind(token.email)
                     .bind(token.access_token).bind(token.refresh_token).bind(expires).bind(scopes).bind(aud).bind(token.learned_iss)
                     .bind(token.preserve_refresh).bind(token.expected_access).bind(token.gateway_version)
-                    .execute($pool).await?.rows_affected()!=0
+                    .execute(observed($pool)).await?.rows_affected()!=0
             };
         }
         Ok(match self {
@@ -274,7 +275,7 @@ impl Database {
                     .bind(id)
                     .bind(email)
                     .bind(version)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
@@ -282,7 +283,7 @@ impl Database {
                     .bind(id)
                     .bind(email)
                     .bind(version)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -302,7 +303,7 @@ impl Database {
                     SELECT $1,$2,$3,",$expiry," WHERE EXISTS(SELECT 1 FROM oauth_tokens WHERE gateway_id=$1 AND app_user_email=$2)
                     ON CONFLICT(gateway_id,app_user_email) DO UPDATE SET claim=excluded.claim,expires_at=excluded.expires_at
                     WHERE ",$past))
-                    .bind(gateway).bind(email).bind(claim).execute($pool).await?.rows_affected()!=0
+                    .bind(gateway).bind(email).bind(claim).execute(observed($pool)).await?.rows_affected()!=0
             };
         }
         Ok(match self {
@@ -332,7 +333,7 @@ impl Database {
                     .bind(gateway)
                     .bind(email)
                     .bind(claim)
-                    .execute($pool)
+                    .execute(observed($pool))
                     .await?;
             }};
         }

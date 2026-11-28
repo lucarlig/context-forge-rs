@@ -567,9 +567,20 @@ requests. Live Rust checks cover Redis-backed SSE queue writes and a Redis
 rate-limit command failure that falls back to memory. All eight tests that
 require external Redis or PostgreSQL pass with disposable instances.
 
-Framework spans, SQL query instrumentation, and vendor-specific exporters
-remain open. The pinned prompt-read capture emits zero SQL query spans on
-SQLite and PostgreSQL with the SQLAlchemy instrumentation flag enabled.
+Set `OTEL_SQLALCHEMY_INSTRUMENTATION_ENABLED=true` to export SQLx client
+spans for application queries on sampled requests. This covers pooled
+queries and statements executed in transactions on SQLite and PostgreSQL.
+Spans carry the statement operation, database system, duration, and outcome.
+They omit SQL text, bound values, and database error details.
+`OTEL_SEMCONV_STABILITY_OPT_IN=database` selects standard database attributes.
+
+Four Rust Anything cases match the pinned API responses and sampling on
+both databases. The pinned prompt-read capture emits zero SQL query spans
+with the flag enabled. Native assertions verify query spans, request parent
+links, and sanitized failure spans on both databases. The live Rust
+collector test also verifies SQL spans with database trace storage disabled.
+
+Framework spans and vendor-specific exporters remain open.
 
 ## Gateway and protocol verification
 

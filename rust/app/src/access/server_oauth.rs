@@ -5,6 +5,7 @@ use jiff::Timestamp;
 
 use super::*;
 use crate::{
+    database::observed,
     gateway::{oauth_issuers, resource_metadata_url},
     local_auth::{is_id_token, unverified_jwt_claims, verify_oidc_jwt},
     upstream::UpstreamClient,
@@ -241,13 +242,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_scalar(SELECT)
                     .bind(email)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_scalar(SELECT)
                     .bind(email)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -264,7 +265,7 @@ impl Database {
                 sqlx::query(concat!("UPDATE servers SET oauth_config=", $config, ",version=COALESCE(version,0)+1
                     WHERE id=$1 AND oauth_enabled AND oauth_config_approved AND oauth_config_generation=$2
                       AND ", $absent))
-                    .bind(id).bind(generation).bind(audience).execute($pool).await?;
+                    .bind(id).bind(generation).bind(audience).execute(observed($pool)).await?;
             }};
         }
         match self {

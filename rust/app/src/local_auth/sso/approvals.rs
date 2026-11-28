@@ -3,6 +3,7 @@
 use sqlx::types::Json as DbJson;
 
 use super::*;
+use crate::database::observed;
 
 #[derive(Deserialize)]
 pub(super) struct ApprovalQuery {
@@ -94,7 +95,7 @@ impl Database {
                     WHERE pending_user_approvals.status='expired'
                        OR (pending_user_approvals.status IN ('pending','approved') AND ", $expired, ")"))
                     .bind(Uuid::new_v4().to_string()).bind(email).bind(name).bind(provider)
-                    .bind(DbJson(metadata)).execute($pool).await?;
+                    .bind(DbJson(metadata)).execute(observed($pool)).await?;
             }};
         }
         match self {
@@ -122,7 +123,7 @@ impl Database {
                     CAST(requested_at AS TEXT) AS requested_at,CAST(expires_at AS TEXT) AS expires_at,status
                     FROM pending_user_approvals WHERE status='pending' AND ($1 OR ", $fresh,
                     ") ORDER BY requested_at DESC,id"))
-                    .bind(include_expired).fetch_all($pool).await
+                    .bind(include_expired).fetch_all(observed($pool)).await
             };
         }
         match self {
@@ -144,7 +145,7 @@ impl Database {
                 let item = sqlx::query_as::<_,(String,String,bool)>(concat!(
                     "SELECT email,status,", $fresh,
                     " FROM pending_user_approvals WHERE id=$1",$lock))
-                    .bind(id).fetch_optional(&mut *$tx).await?;
+                    .bind(id).fetch_optional(observed(&mut *$tx)).await?;
                 let Some((email, status, fresh)) = item else {
                     return Err(AccountError::detail(StatusCode::NOT_FOUND, "Approval request not found"));
                 };
@@ -153,7 +154,7 @@ impl Database {
                 }
                 if !fresh {
                     sqlx::query("UPDATE pending_user_approvals SET status='expired' WHERE id=$1")
-                        .bind(id).execute(&mut *$tx).await?;
+                        .bind(id).execute(observed(&mut *$tx)).await?;
                     $tx.commit().await?;
                     return Err(AccountError::bad_request("Approval request has expired"));
                 }
@@ -166,7 +167,7 @@ impl Database {
                 sqlx::query("UPDATE pending_user_approvals SET status=$2,approved_by=$3,approved_at=CURRENT_TIMESTAMP,
                     rejection_reason=$4,admin_notes=$5 WHERE id=$1")
                     .bind(id).bind(status).bind(reviewer).bind(reason).bind(review.notes.as_deref())
-                    .execute(&mut *$tx).await?;
+                    .execute(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(email)
             }};

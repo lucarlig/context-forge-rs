@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::database::observed;
 
 #[derive(sqlx::FromRow)]
 pub(super) struct Role {
@@ -74,7 +75,7 @@ macro_rules! check_parent {
                 UNION
                 SELECT r.id,r.inherits_from FROM roles r JOIN parents p ON r.id=p.parent
                 ) SELECT EXISTS(SELECT 1 FROM parents), EXISTS(SELECT 1 FROM parents WHERE id=$2)")
-                .bind(parent).bind($checking).fetch_one(&mut *$tx).await?;
+                .bind(parent).bind($checking).fetch_one(observed(&mut *$tx)).await?;
             if !exists || cycle {
                 return Err(invalid());
             }
@@ -92,7 +93,7 @@ impl Database {
             ($pool:ident) => {
                 sqlx::query_as(concat!("SELECT ",role_columns!()," FROM roles
                     WHERE (CAST($1 AS TEXT) IS NULL OR scope=$1) AND (NOT $2 OR is_active=TRUE)
-                    ORDER BY scope,name,id")).bind(scope).bind(active).fetch_all($pool).await
+                    ORDER BY scope,name,id")).bind(scope).bind(active).fetch_all(observed($pool)).await
             };
         }
         match self {
@@ -106,13 +107,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(ROLE_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(ROLE_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -129,7 +130,7 @@ impl Database {
         macro_rules! create {
             ($tx:ident,$permissions:literal) => {{
                 let conflict:bool=sqlx::query_scalar(ROLE_NAME_CONFLICT).bind(&input.scope).bind(&input.name)
-                    .bind(&id).fetch_one(&mut *$tx).await?;
+                    .bind(&id).fetch_one(observed(&mut *$tx)).await?;
                 if conflict {
                     return Err(invalid());
                 }
@@ -141,7 +142,7 @@ impl Database {
                     RETURNING ",role_columns!()))
                     .bind(id).bind(&input.name).bind(input.description.as_deref()).bind(&input.scope)
                     .bind(permissions).bind(parent).bind(actor).bind(input.is_system_role)
-                    .fetch_one(&mut *$tx).await.map_err(role_write_error)?;
+                    .fetch_one(observed(&mut *$tx)).await.map_err(role_write_error)?;
                 $tx.commit().await?;
                 Ok(role)
             }};
@@ -154,7 +155,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682073)")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 create!(tx, "CAST(CAST($5 AS TEXT) AS JSON)")
             }
@@ -169,7 +170,7 @@ impl Database {
         macro_rules! edit {
             ($tx:ident,$permissions:literal,$lock:literal) => {{
                 let before:Role=sqlx::query_as(concat!("SELECT ",role_columns!()," FROM roles WHERE id=$1 ",$lock))
-                    .bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(role_missing)?;
+                    .bind(id).fetch_optional(observed(&mut *$tx)).await?.ok_or_else(role_missing)?;
                 if before.is_system_role {
                     return Err(invalid());
                 }
@@ -180,7 +181,7 @@ impl Database {
                     validate_role(name,&before.scope,&[])?;
                 }
                 if (before.name!=name || input.is_active==Some(true)) && sqlx::query_scalar::<_,bool>(ROLE_NAME_CONFLICT)
-                    .bind(&before.scope).bind(name).bind(id).fetch_one(&mut *$tx).await?
+                    .bind(&before.scope).bind(name).bind(id).fetch_one(observed(&mut *$tx)).await?
                 {
                     return Err(invalid());
                 }
@@ -194,7 +195,7 @@ impl Database {
                     ",permissions),inherits_from=$5,is_active=COALESCE($6,is_active),updated_at=CURRENT_TIMESTAMP WHERE id=$1
                     RETURNING ",role_columns!()))
                     .bind(id).bind(name).bind(input.description.as_deref()).bind(permissions)
-                    .bind(parent).bind(input.is_active).fetch_one(&mut *$tx).await.map_err(role_write_error)?;
+                    .bind(parent).bind(input.is_active).fetch_one(observed(&mut *$tx)).await.map_err(role_write_error)?;
                 $tx.commit().await?;
                 Ok(role)
             }};
@@ -207,7 +208,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682073)")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 edit!(tx, "CAST(CAST($4 AS TEXT) AS JSON)", "FOR UPDATE")
             }
@@ -231,7 +232,7 @@ impl Database {
                       AND (CAST($2 AS TEXT) IS NULL OR u.scope=$2)
                       AND (CAST($3 AS TEXT) IS NULL OR u.scope_id=$3)
                       AND ($4 OR u.expires_at IS NULL OR ",$unexpired,") ORDER BY u.scope,u.granted_at,u.id"))
-                    .bind(user).bind(scope).bind(team).bind(include_expired).fetch_all($pool).await?
+                    .bind(user).bind(scope).bind(team).bind(include_expired).fetch_all(observed($pool)).await?
             };
         }
         let data = match self {
@@ -266,16 +267,16 @@ impl Database {
                 let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM roles
                     WHERE id=$1 AND scope=$2 AND is_active=TRUE) AND EXISTS(SELECT 1 FROM email_users WHERE email=$3)
                     AND (CAST($4 AS TEXT) IS NULL OR EXISTS(SELECT 1 FROM email_teams WHERE id=$4 AND is_active=TRUE))")
-                    .bind(&input.role_id).bind(scope).bind(user).bind(team).fetch_one(&mut *$tx).await?;
+                    .bind(&input.role_id).bind(scope).bind(user).bind(team).fetch_one(observed(&mut *$tx)).await?;
                 if !valid {
                     return Err(invalid());
                 }
                 sqlx::query(concat!("UPDATE user_roles SET is_active=FALSE WHERE user_email=$1 AND role_id=$2 AND scope=$3
                     AND scope_id IS NOT DISTINCT FROM $4 AND is_active=TRUE AND expires_at IS NOT NULL AND ",$expired))
-                    .bind(user).bind(&input.role_id).bind(scope).bind(team).execute(&mut *$tx).await?;
+                    .bind(user).bind(&input.role_id).bind(scope).bind(team).execute(observed(&mut *$tx)).await?;
                 let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_email=$1 AND role_id=$2
                     AND scope=$3 AND scope_id IS NOT DISTINCT FROM $4 AND is_active=TRUE)")
-                    .bind(user).bind(&input.role_id).bind(scope).bind(team).fetch_one(&mut *$tx).await?;
+                    .bind(user).bind(&input.role_id).bind(scope).bind(team).fetch_one(observed(&mut *$tx)).await?;
                 if exists {
                     return Err(invalid());
                 }
@@ -285,7 +286,7 @@ impl Database {
                     RETURNING id,user_email,role_id,CAST(NULL AS TEXT) AS role_name,scope,scope_id,granted_by,
                         CAST(granted_at AS TEXT) AS granted_at,CAST(expires_at AS TEXT) AS expires_at,is_active,grant_source"))
                     .bind(Uuid::new_v4().to_string()).bind(user).bind(&input.role_id).bind(scope).bind(team)
-                    .bind(actor).bind(expiry).fetch_one(&mut *$tx).await.map_err(role_write_error)?;
+                    .bind(actor).bind(expiry).fetch_one(observed(&mut *$tx)).await.map_err(role_write_error)?;
                 $tx.commit().await?;
                 Ok(assignment.format_timestamps())
             }};
@@ -302,7 +303,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682073)")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 assign!(
                     tx,
@@ -324,7 +325,7 @@ impl Database {
             ($pool:ident) => {
                 sqlx::query("UPDATE user_roles SET is_active=FALSE WHERE user_email=$1 AND role_id=$2
                     AND (CAST($3 AS TEXT) IS NULL OR scope=$3) AND scope_id IS NOT DISTINCT FROM $4 AND is_active=TRUE")
-                    .bind(user).bind(id).bind(scope).bind(team).execute($pool).await?.rows_affected()!=0
+                    .bind(user).bind(id).bind(scope).bind(team).execute(observed($pool)).await?.rows_affected()!=0
             };
         }
         Ok(match self {

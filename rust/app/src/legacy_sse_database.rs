@@ -8,7 +8,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::{
-    database::Database,
+    database::{Database, observed},
     legacy_sse_cache::{Access, CacheResult, IDLE_POLL, MAX_MESSAGES, MAX_QUEUE_BYTES, Scope},
 };
 
@@ -65,13 +65,16 @@ impl DatabaseQueue {
         let expires = expiry(now, ttl);
         macro_rules! register {
             ($pool:expr) => {{
-                sqlx::query(PRUNE_SESSIONS).bind(now).execute($pool).await?;
+                sqlx::query(PRUNE_SESSIONS)
+                    .bind(now)
+                    .execute(observed($pool))
+                    .await?;
                 sqlx::query(REGISTER)
                     .bind(&self.id)
                     .bind(scope.owner)
                     .bind(scope.server)
                     .bind(expires)
-                    .execute($pool)
+                    .execute(observed($pool))
                     .await?;
             }};
         }
@@ -95,7 +98,7 @@ impl DatabaseQueue {
                     sqlx::query_as::<_, Owner>(LOOKUP)
                         .bind(&self.id)
                         .bind(now)
-                        .fetch_optional($pool)
+                        .fetch_optional(observed($pool))
                         .await?
                 };
             }
@@ -119,7 +122,7 @@ impl DatabaseQueue {
                 let record = sqlx::query_as::<_, Sequence>(CLAIM_SEQUENCE)
                     .bind(&self.id)
                     .bind(now)
-                    .fetch_optional(&mut *transaction)
+                    .fetch_optional(observed(&mut *transaction))
                     .await?;
                 let Some((owner, server, sequence)) = record else {
                     transaction.rollback().await?;
@@ -133,7 +136,7 @@ impl DatabaseQueue {
                 sqlx::query(PRUNE_MESSAGES)
                     .bind(&self.id)
                     .bind(now)
-                    .execute(&mut *transaction)
+                    .execute(observed(&mut *transaction))
                     .await?;
                 let queued = sqlx::query(QUEUE_MESSAGE)
                     .bind(&self.id)
@@ -143,7 +146,7 @@ impl DatabaseQueue {
                     .bind(expires)
                     .bind(MAX_MESSAGES as i64)
                     .bind(MAX_QUEUE_BYTES as i64)
-                    .execute(&mut *transaction)
+                    .execute(observed(&mut *transaction))
                     .await?
                     .rows_affected()
                     == 1;
@@ -170,7 +173,7 @@ impl DatabaseQueue {
                     sqlx::query_as::<_, QueueHead>(HEAD)
                         .bind(&self.id)
                         .bind(now)
-                        .fetch_optional($pool)
+                        .fetch_optional(observed($pool))
                         .await?
                 };
             }
@@ -186,7 +189,7 @@ impl DatabaseQueue {
                             sqlx::query(REMOVE_MESSAGE)
                                 .bind(&self.id)
                                 .bind(sequence)
-                                .execute($pool)
+                                .execute(observed($pool))
                                 .await?
                                 .rows_affected()
                                 == 1
@@ -213,12 +216,12 @@ impl DatabaseQueue {
         let result = match &self.database {
             Database::Sqlite(pool) => sqlx::query(REMOVE_SESSION)
                 .bind(&self.id)
-                .execute(pool)
+                .execute(observed(pool))
                 .await
                 .map(|_| ()),
             Database::Postgres(pool) => sqlx::query(REMOVE_SESSION)
                 .bind(&self.id)
-                .execute(pool)
+                .execute(observed(pool))
                 .await
                 .map(|_| ()),
         };

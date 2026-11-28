@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use super::*;
+use crate::database::observed;
 
 pub(crate) struct AgentInteraction<'a> {
     pub(crate) response_time: Duration,
@@ -96,7 +97,7 @@ impl Database {
                     .bind(scope.can_own())
                     .bind(scope.email)
                     .bind(cutoff.to_string())
-                    .fetch_one($pool)
+                    .fetch_one(observed($pool))
                     .await
             };
         }
@@ -134,7 +135,10 @@ impl Database {
             SELECT id,CURRENT_TIMESTAMP,$2,$3,$4,$5 FROM a2a_agents WHERE id=$1";
         macro_rules! record {
             ($tx:ident) => {{
-                sqlx::query(UPDATE).bind(id).execute(&mut *$tx).await?;
+                sqlx::query(UPDATE)
+                    .bind(id)
+                    .execute(observed(&mut *$tx))
+                    .await?;
                 if let Some(metric) = metric {
                     let kind: String = metric.kind.chars().take(50).collect();
                     sqlx::query(INSERT)
@@ -143,7 +147,7 @@ impl Database {
                         .bind(metric.failure.is_none())
                         .bind(metric.failure)
                         .bind(kind)
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 }
                 $tx.commit().await

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::database::observed;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ToolWriteError {
@@ -35,7 +36,7 @@ macro_rules! check_revision {
         .bind($tool.team_id.as_deref())
         .bind($tool.enabled)
         .bind($tool.reachable)
-        .fetch_optional(&mut *$tx)
+        .fetch_optional(observed(&mut *$tx))
         .await?
         .ok_or(ToolWriteError::Changed)?
     };
@@ -98,7 +99,7 @@ impl Database {
                     let slug: Option<String> =
                         sqlx::query_scalar(concat!("SELECT slug FROM gateways WHERE id=$1", $lock))
                             .bind(gateway)
-                            .fetch_optional(&mut *$tx)
+                            .fetch_optional(observed(&mut *$tx))
                             .await?;
                     if slug.as_deref() != Some(tool.gateway_slug.as_str()) {
                         return Err(ToolWriteError::Changed);
@@ -111,7 +112,7 @@ impl Database {
                         .bind(&tool.visibility)
                         .bind(tool.team_id.as_deref())
                         .bind(tool.owner_email.as_deref())
-                        .fetch_optional(&mut *$tx)
+                        .fetch_optional(observed(&mut *$tx))
                         .await?
                 {
                     return Err(ToolWriteError::Duplicate { id, enabled });
@@ -175,19 +176,19 @@ impl Database {
                 if previous.is_some() {
                     query
                         .bind(tool.modified_via.as_deref().unwrap_or("api"))
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 } else {
                     query
                         .bind(tool.created_via.as_deref().unwrap_or("api"))
                         .bind(tool.import_batch_id.as_deref())
                         .bind(tool.federation_source.as_deref())
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 }
                 let updated = sqlx::query_as(TOOL_BY_ID)
                     .bind(&tool.id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(updated)
@@ -200,7 +201,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 save!(tx, " FOR UPDATE", "CAST(", " AS JSON)")
             }
         }
@@ -225,12 +228,12 @@ impl Database {
                     .bind(enabled)
                     .bind(reachable)
                     .bind(jiff::Timestamp::now().to_string())
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 }
                 let updated = sqlx::query_as(TOOL_BY_ID)
                     .bind(id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(updated)
@@ -243,7 +246,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 change!(tx, " FOR UPDATE", "CAST(CAST($4 AS TEXT) AS TIMESTAMPTZ)")
             }
         }
@@ -260,7 +265,7 @@ impl Database {
                 crate::catalog::delete_tool_dependencies!($tx, &id, purge_metrics, $exists);
                 sqlx::query("DELETE FROM tools WHERE id=$1")
                     .bind(id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(())
@@ -277,7 +282,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 delete!(
                     tx,
                     " FOR UPDATE",

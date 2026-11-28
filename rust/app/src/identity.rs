@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::database::observed;
 use crate::{auth::TeamVisibility, database::Database};
 
 const ACTIVE_MEMBERSHIPS: &str = "
@@ -41,7 +42,7 @@ impl Database {
                 sqlx::query_scalar(ACTIVE_TEAM_OWNER)
                     .bind(email)
                     .bind(team_id)
-                    .fetch_one($pool)
+                    .fetch_one(observed($pool))
                     .await
             };
         }
@@ -80,7 +81,7 @@ impl Database {
                 .bind(address)
                 .bind(subject)
                 .bind(jti)
-                .fetch_optional(pool)
+                .fetch_optional(observed(pool))
                 .await?
             }
             Self::Postgres(pool) => {
@@ -91,7 +92,7 @@ impl Database {
                 .bind(address)
                 .bind(subject)
                 .bind(jti)
-                .fetch_optional(pool)
+                .fetch_optional(observed(pool))
                 .await?
             }
         };
@@ -110,13 +111,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_scalar(ACTIVE_MEMBERSHIPS)
                     .bind(email)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_scalar(ACTIVE_MEMBERSHIPS)
                     .bind(email)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await
             }
         }
@@ -125,8 +126,18 @@ impl Database {
     pub(crate) async fn is_personal_team(&self, id: &str) -> Result<bool, sqlx::Error> {
         const QUERY: &str = "SELECT is_personal FROM email_teams WHERE id = $1";
         match self {
-            Self::Sqlite(pool) => sqlx::query_scalar(QUERY).bind(id).fetch_one(pool).await,
-            Self::Postgres(pool) => sqlx::query_scalar(QUERY).bind(id).fetch_one(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar(QUERY)
+                    .bind(id)
+                    .fetch_one(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar(QUERY)
+                    .bind(id)
+                    .fetch_one(observed(pool))
+                    .await
+            }
         }
     }
 
@@ -157,13 +168,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as::<_, GrantRow>(query!("julianday(u.expires_at) > julianday('now')"))
                     .bind(email)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await?
             }
             Self::Postgres(pool) => {
                 sqlx::query_as::<_, GrantRow>(query!("u.expires_at > CURRENT_TIMESTAMP"))
                     .bind(email)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await?
             }
         };

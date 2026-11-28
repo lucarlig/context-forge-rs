@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::{
     auth::TeamVisibility,
     catalog::{CATALOG_LOCK, CatalogScope, managed_visibility, visible_team_ids},
-    database::Database,
+    database::{Database, observed},
 };
 
 #[derive(Clone, Serialize, sqlx::FromRow)]
@@ -242,7 +242,7 @@ macro_rules! lock_gateway {
             .bind($expected.enabled)
             .bind($expected.reachable)
             .bind($expected.lifecycle_claimed_by.as_deref())
-            .fetch_optional(&mut *$transaction)
+            .fetch_optional(observed(&mut *$transaction))
             .await?
     };
 }
@@ -262,7 +262,7 @@ macro_rules! set_gateway_state {
                 .bind($id)
                 .bind($enabled)
                 .bind($now)
-                .execute(&mut *$transaction)
+                .execute(observed(&mut *$transaction))
                 .await?;
         }
     }};
@@ -285,7 +285,7 @@ macro_rules! write_gateway_health {
         .bind($reachable)
         .bind($now)
         .bind($error)
-        .execute(&mut *$transaction)
+        .execute(observed(&mut *$transaction))
         .await?;
         sqlx::query(concat!(
             "UPDATE tools SET reachable = $2, updated_at = ",
@@ -296,7 +296,7 @@ macro_rules! write_gateway_health {
         .bind($id)
         .bind($reachable)
         .bind($now)
-        .execute(&mut *$transaction)
+        .execute(observed(&mut *$transaction))
         .await?;
     }};
 }
@@ -307,7 +307,7 @@ macro_rules! finish_gateway_initialization {
             reachable = TRUE, registration_attempts = 0, next_retry_at = NULL, last_error = NULL,
             lifecycle_claimed_by = NULL, lifecycle_claimed_at = NULL, lifecycle_claim_expires_at = NULL,
             last_seen = ", $date, ", updated_at = ", $date, " WHERE id = $1"))
-            .bind(&$gateway.id).bind("active").bind($now).execute(&mut *$tx).await?;
+            .bind(&$gateway.id).bind("active").bind($now).execute(observed(&mut *$tx)).await?;
         if $gateway.enabled {
             write_gateway_health!($tx, &$gateway.id, true, $now, None::<&str>, $date);
         } else {
@@ -321,19 +321,19 @@ macro_rules! delete_catalog_rows {
         for (table, statement) in $optional {
             if sqlx::query_scalar::<_, bool>($table_exists)
                 .bind(table)
-                .fetch_one(&mut *$transaction)
+                .fetch_one(observed(&mut *$transaction))
                 .await?
             {
                 sqlx::query(*statement)
                     .bind($value)
-                    .execute(&mut *$transaction)
+                    .execute(observed(&mut *$transaction))
                     .await?;
             }
         }
         for statement in $required {
             sqlx::query(*statement)
                 .bind($value)
-                .execute(&mut *$transaction)
+                .execute(observed(&mut *$transaction))
                 .await?;
         }
     }};
@@ -392,7 +392,7 @@ impl Database {
                     .bind(admin)
                     .bind(&teams)
                     .bind(&urls)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             };
         }
@@ -412,7 +412,7 @@ impl Database {
                 sqlx::query_as::<_, GatewayRecord>(GATEWAY_HEALTH_QUERY)
                     .bind(after_id)
                     .bind(limit)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             };
         }
@@ -446,7 +446,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *transaction))
+                    .await?;
                 change!(
                     transaction,
                     " FOR UPDATE",
@@ -477,7 +479,7 @@ impl Database {
                     .bind(scope.can_own())
                     .bind(teams)
                     .bind(list.offset)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             };
         }
@@ -499,7 +501,7 @@ impl Database {
             ($pool:expr) => {
                 sqlx::query_as::<_, GatewayRecord>(GATEWAY_LOOKUP_QUERY)
                     .bind(key)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             };
         }
@@ -518,7 +520,7 @@ impl Database {
             ($pool:expr) => {
                 sqlx::query_as::<_, ImpactServer>(GATEWAY_IMPACT_QUERY)
                     .bind(gateway_id)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await?
             };
         }
@@ -568,7 +570,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *transaction))
+                    .await?;
                 delete!(
                     transaction,
                     " FOR UPDATE",
@@ -601,7 +605,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *transaction))
+                    .await?;
                 change!(
                     transaction,
                     " FOR UPDATE",

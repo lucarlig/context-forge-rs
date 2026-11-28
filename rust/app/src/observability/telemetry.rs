@@ -54,6 +54,7 @@ type SettingsError = Box<dyn Error + Send + Sync>;
 
 pub(crate) mod client;
 pub(crate) mod redis_client;
+pub(crate) mod sql_client;
 use redis_client::RedisConventions;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -94,6 +95,7 @@ pub(crate) struct Telemetry {
     port: u16,
     http_clients: Option<SemanticConventions>,
     redis_commands: Option<RedisConventions>,
+    sql_queries: Option<SemanticConventions>,
 }
 
 impl Telemetry {
@@ -164,6 +166,10 @@ impl Telemetry {
             .unwrap_or(false)
             .then(RedisConventions::from_env)
             .transpose()?;
+        let sql_queries = flag("OTEL_SQLALCHEMY_INSTRUMENTATION_ENABLED")?
+            .unwrap_or(false)
+            .then(|| SemanticConventions::from_env("database"))
+            .transpose()?;
         global::set_tracer_provider(provider.clone());
         Ok(Some(Self {
             provider,
@@ -173,6 +179,7 @@ impl Telemetry {
             port,
             http_clients,
             redis_commands,
+            sql_queries,
         }))
     }
 
@@ -419,6 +426,7 @@ async fn observe_request(
         exported: Some(exported),
         http_clients: telemetry.http_clients,
         redis_commands: telemetry.redis_commands,
+        sql_queries: telemetry.sql_queries,
         ..TraceContext::default()
     };
     request.extensions_mut().insert(context.clone());

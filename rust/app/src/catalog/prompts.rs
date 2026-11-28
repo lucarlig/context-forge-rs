@@ -2,6 +2,7 @@
 
 use super::entry_filters::fetch_catalog_entries;
 use super::*;
+use crate::database::observed;
 
 #[derive(Clone, Default, Serialize, sqlx::FromRow)]
 pub(crate) struct PromptRecord {
@@ -91,7 +92,7 @@ impl Database {
                     .bind(scope.visibility == &TeamVisibility::Admin)
                     .bind(teams)
                     .bind(server)
-                    .fetch_one($pool)
+                    .fetch_one(observed($pool))
                     .await
             };
         }

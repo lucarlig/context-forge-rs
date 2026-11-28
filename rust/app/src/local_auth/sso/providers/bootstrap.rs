@@ -6,6 +6,7 @@ use url::{Position, Url};
 
 use super::*;
 use crate::config::{allowlist, flag, parse, value};
+use crate::database::observed;
 
 const DEFAULT_SCOPE: &str = "openid profile email";
 type ConfigError = Box<dyn Error + Send + Sync>;
@@ -366,7 +367,7 @@ impl Database {
                 let existing = sqlx::query_as::<_, Provider>(MATCH)
                     .bind(id)
                     .bind(&config.name)
-                    .fetch_optional(&mut *$tx)
+                    .fetch_optional(observed(&mut *$tx))
                     .await?;
                 let mut target = id;
                 let mut same_secret = None;
@@ -392,12 +393,12 @@ impl Database {
                         .map_err(|_| "could not encrypt SSO client credentials")?,
                 };
                 bind_provider!($sql, target, &config, &encrypted, true)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 if existing.is_some() {
                     sqlx::query("DELETE FROM sso_auth_sessions WHERE provider_id=$1")
                         .bind(target)
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 }
                 $tx.commit().await?;
@@ -411,7 +412,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("LOCK TABLE sso_providers IN SHARE ROW EXCLUSIVE MODE")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 seed!(tx, POSTGRES_WRITE);
             }

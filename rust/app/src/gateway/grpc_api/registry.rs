@@ -3,6 +3,7 @@
 use super::*;
 use crate::{
     catalog::{CATALOG_LOCK, CatalogScope, delete_tool_dependencies, visible_team_ids},
+    database::observed,
     grpc::ReflectedMethod,
 };
 
@@ -103,7 +104,9 @@ macro_rules! service_write {
             }
             Database::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 $operation!(
                     tx,
                     "CURRENT_TIMESTAMP",
@@ -120,7 +123,7 @@ macro_rules! remove_tool {
         delete_tool_dependencies!($tx, tool, true, $table_exists);
         sqlx::query("DELETE FROM tools WHERE id = $1")
             .bind(tool)
-            .execute(&mut *$tx)
+            .execute(observed(&mut *$tx))
             .await?;
     }};
 }
@@ -141,7 +144,7 @@ macro_rules! save_discovery {
             "SELECT original_name, id FROM tools WHERE grpc_service_id = $1 ORDER BY id",
         )
         .bind(id)
-        .fetch_all(&mut *$tx)
+        .fetch_all(observed(&mut *$tx))
         .await?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
@@ -162,7 +165,7 @@ macro_rules! save_discovery {
                         .bind(&config.team_id)
                         .bind(owner)
                         .bind(&config.visibility)
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 } else {
                     sqlx::query(INSERT_TOOL)
@@ -177,7 +180,7 @@ macro_rules! save_discovery {
                         .bind(&config.team_id)
                         .bind(owner)
                         .bind(&config.visibility)
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 }
             }
@@ -197,7 +200,7 @@ macro_rules! save_discovery {
         .bind(service_count)
         .bind(method_count)
         .bind(DbJson(discovery.stored()))
-        .execute(&mut *$tx)
+        .execute(observed(&mut *$tx))
         .await?;
     }};
 }
@@ -223,8 +226,18 @@ impl Database {
         value: &str,
     ) -> Result<Option<ServiceRecord>, sqlx::Error> {
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(query).bind(value).fetch_optional(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(query).bind(value).fetch_optional(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_as(query)
+                    .bind(value)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(query)
+                    .bind(value)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
         }
     }
 
@@ -253,7 +266,7 @@ impl Database {
                     "SELECT COUNT(*) FROM grpc_services s",
                     ""
                 )))
-                .fetch_one(&mut *$tx)
+                .fetch_one(observed(&mut *$tx))
                 .await?;
                 let meta = PaginationMeta::new(page, per_page, total_items);
                 let offset = meta.offset(max_offset);
@@ -264,7 +277,7 @@ impl Database {
                 )))
                 .bind(per_page)
                 .bind(offset)
-                .fetch_all(&mut *$tx)
+                .fetch_all(observed(&mut *$tx))
                 .await?;
                 $tx.commit().await?;
                 Ok((records, meta))
@@ -312,14 +325,14 @@ impl Database {
                     .bind(&config.visibility)
                     .bind(client_ip)
                     .bind(user_agent)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 if let Some(discovery) = discovery {
                     save_discovery!($tx, $now, $exists, id, config, Some(owner), discovery);
                 }
                 let record = sqlx::query_as(SELECT_ONE)
                     .bind(id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(record)
@@ -342,7 +355,7 @@ impl Database {
                 ))
                 .bind(id)
                 .bind(prior.version)
-                .execute(&mut *$tx)
+                .execute(observed(&mut *$tx))
                 .await?
                 .rows_affected();
                 if touched != 1 {
@@ -370,41 +383,41 @@ impl Database {
                             .bind(modified_by)
                             .bind(client_ip)
                             .bind(user_agent)
-                            .execute(&mut *$tx)
+                            .execute(observed(&mut *$tx))
                             .await?;
                         if config.visibility != prior.config.visibility {
                             sqlx::query("UPDATE tools SET visibility = $2 WHERE grpc_service_id = $1")
                                 .bind(id)
                                 .bind(&config.visibility)
-                                .execute(&mut *$tx)
+                                .execute(observed(&mut *$tx))
                                 .await?;
                         }
                     }
                     ServiceChange::State(enabled) => {
                         sqlx::query("UPDATE grpc_services SET enabled = $2 WHERE id = $1")
-                            .bind(id).bind(enabled).execute(&mut *$tx).await?;
+                            .bind(id).bind(enabled).execute(observed(&mut *$tx)).await?;
                     }
                     ServiceChange::Reflection(Some(discovery)) => {
                         save_discovery!($tx, $now, $exists, id, &prior.config, prior.owner_email.as_deref(), discovery);
                     }
                     ServiceChange::Reflection(None) => {
                         sqlx::query("UPDATE grpc_services SET reachable = FALSE WHERE id = $1")
-                            .bind(id).execute(&mut *$tx).await?;
+                            .bind(id).execute(observed(&mut *$tx)).await?;
                     }
                     ServiceChange::Delete => {
                         let tools = sqlx::query_scalar::<_, String>(
                             "SELECT id FROM tools WHERE grpc_service_id = $1",
-                        ).bind(id).fetch_all(&mut *$tx).await?;
+                        ).bind(id).fetch_all(observed(&mut *$tx)).await?;
                         for tool_id in &tools {
                             remove_tool!($tx, tool_id, $exists);
                         }
                         sqlx::query("DELETE FROM grpc_services WHERE id = $1")
-                            .bind(id).execute(&mut *$tx).await?;
+                            .bind(id).execute(observed(&mut *$tx)).await?;
                         $tx.commit().await?;
                         return Ok(None);
                     }
                 }
-                let record = sqlx::query_as(SELECT_ONE).bind(id).fetch_one(&mut *$tx).await?;
+                let record = sqlx::query_as(SELECT_ONE).bind(id).fetch_one(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(Some(record))
             }};

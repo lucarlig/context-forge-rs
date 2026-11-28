@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::database::observed;
 
 macro_rules! locked_tool {
     ($tx:ident, $agent:ident, $lock:literal) => {{
@@ -15,7 +16,7 @@ macro_rules! locked_tool {
         .bind(&$agent.owner_email)
         .bind(&$agent.visibility)
         .bind(&$agent.team_id)
-        .fetch_optional(&mut *$tx)
+        .fetch_optional(observed(&mut *$tx))
         .await?
         .ok_or(AgentWriteError::Changed)?
     }};
@@ -34,7 +35,9 @@ macro_rules! agent_transaction {
             }
             Database::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 $operation!(
                     tx,
                     " FOR UPDATE",
@@ -103,7 +106,7 @@ impl Database {
                         .bind(&agent.team_id)
                         .bind(&agent.owner_email)
                         .bind(&agent.id)
-                        .fetch_optional(&mut *$tx)
+                        .fetch_optional(observed(&mut *$tx))
                         .await?
                 {
                     return Err(AgentWriteError::Duplicate { id, enabled });
@@ -113,7 +116,7 @@ impl Database {
                         || sqlx::query_scalar::<_, bool>(TOOL_CONFLICT)
                             .bind(tool)
                             .bind(&tool_name)
-                            .fetch_one(&mut *$tx)
+                            .fetch_one(observed(&mut *$tx))
                             .await?
                     {
                         return Err(AgentWriteError::ToolConflict);
@@ -132,7 +135,7 @@ impl Database {
                         .bind(&previous.auth_type)
                         .bind(&agent.auth_type)
                         .bind(agent.modified_via.as_deref().unwrap_or("api"))
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 }
                 sqlx::query(UPDATE_AGENT)
@@ -163,11 +166,11 @@ impl Database {
                     .bind(&agent.uaid_proto)
                     .bind(&agent.uaid_native_id)
                     .bind(agent.modified_via.as_deref().unwrap_or("api"))
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 let row = sqlx::query_as(BY_ID)
                     .bind(&agent.id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(row)
@@ -195,7 +198,7 @@ impl Database {
                     .bind(&agent.id)
                     .bind(enabled)
                     .bind(&stamp)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 if let Some(tool) = tool {
                     sqlx::query(
@@ -206,12 +209,12 @@ impl Database {
                     )
                     .bind(tool)
                     .bind(enabled)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 }
                 let row = sqlx::query_as(BY_ID)
                     .bind(&agent.id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(row)
@@ -241,22 +244,22 @@ impl Database {
                     if (table == "a2a_agent_metrics" || purge_metrics)
                         && sqlx::query_scalar::<_, bool>($exists)
                             .bind(table)
-                            .fetch_one(&mut *$tx)
+                            .fetch_one(observed(&mut *$tx))
                             .await?
                     {
                         sqlx::query(statement)
                             .bind(&agent.id)
-                            .execute(&mut *$tx)
+                            .execute(observed(&mut *$tx))
                             .await?;
                     }
                 }
                 sqlx::query("DELETE FROM server_a2a_association WHERE a2a_agent_id=$1")
                     .bind(&agent.id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 sqlx::query("DELETE FROM a2a_agents WHERE id=$1")
                     .bind(&agent.id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 if let Some(tool) = tool {
                     let derived: bool = sqlx::query_scalar(
@@ -264,13 +267,13 @@ impl Database {
                         AND NOT EXISTS(SELECT 1 FROM a2a_agents WHERE tool_id=$1))",
                     )
                     .bind(&tool)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                     if derived {
                         delete_tool_dependencies!($tx, &tool, purge_metrics, $exists);
                         sqlx::query("DELETE FROM tools WHERE id=$1")
                             .bind(&tool)
-                            .execute(&mut *$tx)
+                            .execute(observed(&mut *$tx))
                             .await?;
                     }
                 }

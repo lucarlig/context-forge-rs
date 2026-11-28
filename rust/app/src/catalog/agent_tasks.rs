@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use sqlx::types::Json;
 use uuid::Uuid;
 
-use crate::database::Database;
+use crate::database::{Database, observed};
 
 pub(crate) fn terminal_task_state(state: &str) -> bool {
     let state = state.trim().to_ascii_lowercase();
@@ -231,14 +231,14 @@ impl Database {
                 sqlx::query_as(GET)
                     .bind(agent)
                     .bind(task)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(GET)
                     .bind(agent)
                     .bind(task)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -261,7 +261,7 @@ impl Database {
                     .bind(timestamp)
                     .bind(row)
                     .bind(limit)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             };
         }
@@ -281,12 +281,12 @@ impl Database {
                 sqlx::query(cancel_sql!($now))
                     .bind(agent)
                     .bind(task)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 let result = sqlx::query_as(GET)
                     .bind(agent)
                     .bind(task)
-                    .fetch_optional(&mut *$tx)
+                    .fetch_optional(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(result)
@@ -328,7 +328,7 @@ impl Database {
             ($tx:ident, $lock:literal, $now:literal) => {{
                 // Sequence task events under the same agent lock as snapshot writes.
                 if sqlx::query_scalar::<_, String>(concat!("SELECT id FROM a2a_agents WHERE id = $1", $lock))
-                    .bind(agent).fetch_optional(&mut *$tx).await?.is_none()
+                    .bind(agent).fetch_optional(observed(&mut *$tx)).await?.is_none()
                 {
                     return Ok(());
                 }
@@ -342,12 +342,12 @@ impl Database {
                         .bind(task.latest_message.map(Json))
                         .bind(task.payload.map(Json))
                         .bind(terminal_task_state(task.state))
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 if let Some(event) = continuation {
                     let task_id = &event.task.task_id;
                     let updated: Option<AgentTask> = sqlx::query_as(GET).bind(agent).bind(task_id)
-                        .fetch_optional(&mut *$tx).await?;
+                        .fetch_optional(observed(&mut *$tx)).await?;
                     if let Some(updated) = updated {
                         let payload = json!({
                             "message_id":event.message_id,"parts":event.parts,
@@ -355,7 +355,7 @@ impl Database {
                         });
                         sqlx::query(CONTINUED).bind(Uuid::new_v4().to_string()).bind(agent).bind(task_id)
                             .bind(Uuid::new_v4().to_string()).bind(Json(payload))
-                            .execute(&mut *$tx).await?;
+                            .execute(observed(&mut *$tx)).await?;
                     }
                 }
                 $tx.commit().await?;

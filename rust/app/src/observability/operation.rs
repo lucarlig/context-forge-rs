@@ -27,6 +27,8 @@ pub(crate) struct TraceContext {
     pub(super) http_clients: Option<SemanticConventions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) redis_commands: Option<RedisConventions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) sql_queries: Option<SemanticConventions>,
     #[serde(default)]
     pub(super) mcp_call: bool,
 }
@@ -48,6 +50,13 @@ tokio::task_local! { static TRACE: TraceContext; }
 
 pub(crate) fn current_trace() -> Option<TraceContext> {
     TRACE.try_with(Clone::clone).ok()
+}
+
+pub(super) fn sql_trace() -> Option<(SemanticConventions, ExportContext)> {
+    TRACE
+        .try_with(|trace| Some((trace.sql_queries?, trace.exported.as_ref()?.clone())))
+        .ok()
+        .flatten()
 }
 
 pub(crate) async fn with_trace<T>(

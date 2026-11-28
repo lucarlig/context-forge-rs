@@ -6,6 +6,7 @@ use jiff::Timestamp;
 use uuid::Uuid;
 
 use super::*;
+use crate::database::observed;
 
 macro_rules! due_gateways {
     ($expires:literal, $retry:literal, $now:literal, $lock:literal) => {
@@ -52,7 +53,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 finish!(tx, " FOR UPDATE", "CAST(CAST($3 AS TEXT) AS TIMESTAMPTZ)")
             }
         }
@@ -72,7 +75,7 @@ impl Database {
                     next_retry_at = NULL, last_error = NULL, updated_at = CURRENT_TIMESTAMP,
                     lifecycle_claimed_by = NULL, lifecycle_claimed_at = NULL, lifecycle_claim_expires_at = NULL
                     WHERE id = $1")
-                    .bind(id).execute(&mut *$tx).await?;
+                    .bind(id).execute(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(true)
             }};
@@ -84,7 +87,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 queue!(tx, " FOR UPDATE")
             }
         }
@@ -108,7 +113,7 @@ impl Database {
                 let ids = sqlx::query_scalar::<_, String>($select)
                     .bind(&claimed_at)
                     .bind(limit)
-                    .fetch_all(&mut *$tx)
+                    .fetch_all(observed(&mut *$tx))
                     .await?;
                 let mut records = Vec::with_capacity(ids.len());
                 for id in ids {
@@ -124,12 +129,12 @@ impl Database {
                     .bind(&claim)
                     .bind(&claimed_at)
                     .bind(&expires_at)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                     records.push(
                         sqlx::query_as::<_, GatewayRecord>(CLAIMED_GATEWAY)
                             .bind(id)
-                            .fetch_one(&mut *$tx)
+                            .fetch_one(observed(&mut *$tx))
                             .await?,
                     );
                 }
@@ -189,7 +194,7 @@ impl Database {
                     WHERE id = $1 AND status = 'pending' AND lifecycle_claimed_by = $2 AND version = $3"))
                     .bind(&record.id).bind(record.lifecycle_claimed_by.as_deref()).bind(record.version)
                     .bind(attempts).bind(&retry).bind(error)
-                    .execute($pool).await?;
+                    .execute(observed($pool)).await?;
             }};
         }
         match self {

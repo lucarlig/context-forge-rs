@@ -5,7 +5,11 @@ use serde_json::{Value, json};
 use sqlx::AssertSqlSafe;
 use uuid::Uuid;
 
-use crate::{auth::TeamVisibility, database::Database, http_boundary::CorrelationId};
+use crate::{
+    auth::TeamVisibility,
+    database::{Database, observed},
+    http_boundary::CorrelationId,
+};
 
 pub(crate) struct AuditWrite<'a> {
     pub(crate) action: &'a str,
@@ -210,7 +214,7 @@ impl Database {
                     .bind(entry.after.as_ref().map(Value::to_string))
                     .bind(entry.context.as_ref().map(Value::to_string))
                     .bind(entry.requires_review())
-                    .execute($pool)
+                    .execute(observed($pool))
                     .await?;
             }};
         }
@@ -236,7 +240,7 @@ impl Database {
                     .bind(filters.until.map(|time| $dialect.time(time)))
                     .bind(filters.limit)
                     .bind(filters.offset)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             }};
         }
@@ -267,7 +271,7 @@ impl Database {
                     .bind(since.map(|time| $dialect.time(time)))
                     .bind(security)
                     .bind(limit)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             }};
         }

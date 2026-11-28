@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{Database, MetricEntity, MetricsDialect};
+use crate::database::observed;
 use sqlx::AssertSqlSafe;
 
 pub(super) const MAINTENANCE_LOCK: &str = "SELECT pg_advisory_xact_lock(1128682317)";
@@ -202,7 +203,7 @@ impl Database {
                 let rows = sqlx::query_as::<_, (i64, i64)>(AssertSqlSafe(query))
                     .bind(start)
                     .bind(end)
-                    .fetch_all(&mut *tx)
+                    .fetch_all(observed(&mut *tx))
                     .await?;
                 for (hour, records) in rows {
                     hours.insert(hour);
@@ -220,7 +221,7 @@ impl Database {
                         .bind(start)
                         .bind(end)
                         .bind(cutoff)
-                        .execute(&mut *tx)
+                        .execute(observed(&mut *tx))
                         .await?
                         .rows_affected() as i64;
                 }
@@ -229,13 +230,15 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(MAINTENANCE_LOCK).execute(&mut *tx).await?;
+                sqlx::query(MAINTENANCE_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 let query = MetricsDialect::Postgres.rollup_query(table, native_percentiles);
                 let counts = sqlx::query_as(AssertSqlSafe(query))
                     .bind(start)
                     .bind(end)
                     .bind(delete_before)
-                    .fetch_one(&mut *tx)
+                    .fetch_one(observed(&mut *tx))
                     .await?;
                 tx.commit().await?;
                 Ok(counts)
@@ -258,18 +261,20 @@ impl Database {
             ))
             .bind(cutoff)
             .bind(limit)
-            .execute(pool)
+            .execute(observed(pool))
             .await?
             .rows_affected(),
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(MAINTENANCE_LOCK).execute(&mut *tx).await?;
+                sqlx::query(MAINTENANCE_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 let result = sqlx::query(AssertSqlSafe(
                     MetricsDialect::Postgres.cleanup_query(table, column),
                 ))
                 .bind(cutoff)
                 .bind(limit)
-                .execute(&mut *tx)
+                .execute(observed(&mut *tx))
                 .await?;
                 tx.commit().await?;
                 result.rows_affected()
@@ -285,8 +290,16 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         let sql = format!("SELECT COUNT(*) FROM {}", table.name(hourly));
         match self {
-            Self::Sqlite(pool) => sqlx::query_scalar(AssertSqlSafe(sql)).fetch_one(pool).await,
-            Self::Postgres(pool) => sqlx::query_scalar(AssertSqlSafe(sql)).fetch_one(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar(AssertSqlSafe(sql))
+                    .fetch_one(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar(AssertSqlSafe(sql))
+                    .fetch_one(observed(pool))
+                    .await
+            }
         }
     }
 }

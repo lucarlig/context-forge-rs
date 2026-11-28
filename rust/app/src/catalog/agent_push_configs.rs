@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     credentials::{CredentialCipher, CredentialError},
-    database::Database,
+    database::{Database, observed},
 };
 
 #[derive(sqlx::FromRow)]
@@ -143,14 +143,14 @@ impl Database {
                 sqlx::query_scalar(EXISTS_TASK)
                     .bind(agent)
                     .bind(task)
-                    .fetch_one(pool)
+                    .fetch_one(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_scalar(EXISTS_TASK)
                     .bind(agent)
                     .bind(task)
-                    .fetch_one(pool)
+                    .fetch_one(observed(pool))
                     .await
             }
         }
@@ -166,14 +166,14 @@ impl Database {
                 sqlx::query_as(LIST)
                     .bind(agent)
                     .bind(task)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(LIST)
                     .bind(agent)
                     .bind(task)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await
             }
         }
@@ -191,7 +191,7 @@ impl Database {
                     .bind(agent)
                     .bind(task)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
@@ -199,7 +199,7 @@ impl Database {
                     .bind(agent)
                     .bind(task)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -217,14 +217,14 @@ impl Database {
                 .bind(agent)
                 .bind(task)
                 .bind(id)
-                .execute(pool)
+                .execute(observed(pool))
                 .await?
                 .rows_affected(),
             Self::Postgres(pool) => sqlx::query(delete)
                 .bind(agent)
                 .bind(task)
                 .bind(id)
-                .execute(pool)
+                .execute(observed(pool))
                 .await?
                 .rows_affected(),
         };
@@ -247,13 +247,13 @@ impl Database {
                     $lock
                 ))
                 .bind(agent)
-                .fetch_optional(&mut *$tx)
+                .fetch_optional(observed(&mut *$tx))
                 .await?
                 .is_none()
                     || !sqlx::query_scalar::<_, bool>(EXISTS_TASK)
                         .bind(agent)
                         .bind(task)
-                        .fetch_one(&mut *$tx)
+                        .fetch_one(observed(&mut *$tx))
                         .await?
                 {
                     return Err(PushConfigWriteError::MissingTask);
@@ -266,7 +266,7 @@ impl Database {
                 .bind(agent)
                 .bind(task)
                 .bind(input.webhook_url)
-                .fetch_optional(&mut *$tx)
+                .fetch_optional(observed(&mut *$tx))
                 .await?;
                 let stamp = Timestamp::now().strftime("%F %T%.6f").to_string();
                 let (created, id) = if let Some(current) = existing {
@@ -290,7 +290,7 @@ impl Database {
                             .bind(events.as_ref())
                             .bind(input.enabled)
                             .bind(&stamp)
-                            .execute(&mut *$tx)
+                            .execute(observed(&mut *$tx))
                             .await?;
                     }
                     (false, current.id)
@@ -305,7 +305,7 @@ impl Database {
                         .bind(events.as_ref())
                         .bind(input.enabled)
                         .bind(&stamp)
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                     (true, id)
                 };
@@ -313,7 +313,7 @@ impl Database {
                     .bind(agent)
                     .bind(task)
                     .bind(id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok((created, row))

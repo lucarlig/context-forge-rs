@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use super::*;
+use crate::database::observed;
 
 macro_rules! account_tables {
     ($identity:literal) => {
@@ -209,8 +210,18 @@ impl Database {
             directory_filter!()
         );
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(count).bind(prefix).fetch_one(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(count).bind(prefix).fetch_one(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_as(count)
+                    .bind(prefix)
+                    .fetch_one(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(count)
+                    .bind(prefix)
+                    .fetch_one(observed(pool))
+                    .await
+            }
         }
     }
 
@@ -233,7 +244,7 @@ impl Database {
                     .bind(prefix)
                     .bind(limit)
                     .bind(offset)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             };
         }
@@ -264,7 +275,7 @@ impl Database {
                 .bind(cursor.map(|cursor| cursor.created_at.as_str()))
                 .bind(cursor.map(|cursor| cursor.email.as_str()))
                 .bind(limit)
-                .fetch_all($pool)
+                .fetch_all(observed($pool))
                 .await
             };
         }
@@ -291,7 +302,7 @@ impl Database {
                     user_email,event_type,success,ip_address,failure_reason FROM email_auth_events
                     WHERE CAST($1 AS TEXT) IS NULL OR user_email=$1
                     ORDER BY timestamp DESC,id DESC LIMIT $2 OFFSET $3")
-                    .bind(email).bind(limit).bind(offset).fetch_all($pool).await?
+                    .bind(email).bind(limit).bind(offset).fetch_all(observed($pool)).await?
             };
         }
         let mut events = match self {
@@ -309,7 +320,7 @@ impl Database {
             ($pool:ident) => {
                 sqlx::query_as(SELECT_LOCAL_USER)
                     .bind(email)
-                    .fetch_optional($pool)
+                    .fetch_optional(observed($pool))
                     .await
             };
         }
@@ -352,7 +363,7 @@ impl Database {
                 if user.approval_required {
                     let consumed = sqlx::query(concat!("UPDATE pending_user_approvals SET status='completed'
                         WHERE email=$1 AND auth_provider=$2 AND status='approved' AND ", $fresh))
-                        .bind(&user.email).bind(&user.auth_provider).execute(&mut *$tx).await?;
+                        .bind(&user.email).bind(&user.auth_provider).execute(observed(&mut *$tx)).await?;
                     if consumed.rows_affected() == 0 {
                         return Ok(false);
                     }
@@ -361,7 +372,7 @@ impl Database {
                     .bind(&user.email).bind(user.password_hash.as_deref()).bind(user.full_name.as_deref())
                     .bind(user.is_admin).bind(user.is_active).bind(user.admin_origin)
                     .bind(user.password_change_required).bind(user.email_verified).bind(&user.auth_provider)
-                    .execute(&mut *$tx).await?;
+                    .execute(observed(&mut *$tx)).await?;
                 if inserted.rows_affected()==0 {
                     return Ok(false);
                 }
@@ -372,31 +383,31 @@ impl Database {
                         ",TRUE,TRUE,$5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING"))
                         .bind(Uuid::new_v4().to_string()).bind(builtin.name).bind(builtin.description)
                         .bind(builtin.scope).bind(actor).bind(json!(builtin.permissions).to_string())
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 sqlx::query(USE_ROLE).bind(Uuid::new_v4().to_string()).bind(&user.email)
                     .bind(None::<&str>).bind(actor).bind(role).bind("global")
-                    .execute(&mut *$tx).await?;
+                    .execute(observed(&mut *$tx)).await?;
                 if settings.personal_teams {
                     let description=format!("Personal workspace for {}",user.email);
                     let initial=sqlx::query(INSERT_PERSONAL_TEAM).bind(&team_id).bind(&team_name)
-                        .bind(&slug).bind(&description).bind(&user.email).execute(&mut *$tx).await?;
+                        .bind(&slug).bind(&description).bind(&user.email).execute(observed(&mut *$tx)).await?;
                     if initial.rows_affected()==0 {
                         sqlx::query(INSERT_PERSONAL_TEAM).bind(&team_id).bind(&team_name)
                             .bind(format!("{}-{}",slug,&team_id[..8])).bind(&description).bind(&user.email)
-                            .execute(&mut *$tx).await?;
+                            .execute(observed(&mut *$tx)).await?;
                     }
                     sqlx::query("INSERT INTO email_team_members
                         (id,team_id,user_email,role,joined_at,is_active)
                         VALUES($1,$2,$3,'owner',CURRENT_TIMESTAMP,TRUE)")
-                        .bind(Uuid::new_v4().to_string()).bind(&team_id).bind(&user.email).execute(&mut *$tx).await?;
+                        .bind(Uuid::new_v4().to_string()).bind(&team_id).bind(&user.email).execute(observed(&mut *$tx)).await?;
                     sqlx::query(USE_ROLE).bind(Uuid::new_v4().to_string()).bind(&user.email)
                         .bind(&team_id).bind(actor).bind(&settings.owner_role).bind("team")
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 sqlx::query("INSERT INTO email_auth_events(timestamp,user_email,event_type,success)
                     VALUES(CURRENT_TIMESTAMP,$1,'registration',TRUE)")
-                    .bind(&user.email).execute(&mut *$tx).await?;
+                    .bind(&user.email).execute(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(true)
             }};
@@ -413,7 +424,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682073)")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 create!(
                     tx,
@@ -452,7 +463,7 @@ impl Database {
                 .bind(until)
                 .bind(settings.protect_admins)
                 .bind(user.password_hash.as_deref())
-                .fetch_optional($pool)
+                .fetch_optional(observed($pool))
                 .await
             };
         }
@@ -488,7 +499,7 @@ impl Database {
                 .bind(user.password_hash.as_deref())
                 .bind(user.failed_login_attempts)
                 .bind(user.locked_until.as_deref())
-                .fetch_optional($pool)
+                .fetch_optional(observed($pool))
                 .await
             };
         }
@@ -506,7 +517,7 @@ impl Database {
             ($pool:ident) => {{
                 sqlx::query("UPDATE email_users SET password_change_required=TRUE WHERE email=$1")
                     .bind(email)
-                    .execute($pool)
+                    .execute(observed($pool))
                     .await?;
             }};
         }
@@ -537,7 +548,7 @@ impl Database {
                 .bind(&user.id)
                 .bind(user.password_hash.as_deref())
                 .bind(&user.auth_provider)
-                .fetch_optional(&mut *$tx)
+                .fetch_optional(observed(&mut *$tx))
                 .await?;
                 if account.is_none() {
                     return Ok(false);
@@ -547,7 +558,7 @@ impl Database {
                     $expired
                 ))
                 .bind(&user.email)
-                .execute(&mut *$tx)
+                .execute(observed(&mut *$tx))
                 .await?;
                 sqlx::query(concat!(
                     "INSERT INTO cf_local_sessions(jti,user_email,issued_at,expires_at)
@@ -558,7 +569,7 @@ impl Database {
                 .bind(jti)
                 .bind(&user.email)
                 .bind(expiry)
-                .execute(&mut *$tx)
+                .execute(observed(&mut *$tx))
                 .await?;
                 $tx.commit().await?;
                 Ok(true)
@@ -599,7 +610,7 @@ impl Database {
                 sqlx::query("INSERT INTO email_auth_events(timestamp,user_email,event_type,success,ip_address,user_agent,failure_reason)
                     VALUES(CURRENT_TIMESTAMP,$1,$2,$3,$4,$5,$6)")
                     .bind(email).bind(event).bind(success).bind(client.address.as_deref())
-                    .bind(client.user_agent.as_deref()).bind(reason).execute($pool).await?;
+                    .bind(client.user_agent.as_deref()).bind(reason).execute(observed($pool)).await?;
             }};
         }
         match self {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{Database, Value, json, managed_visibility};
+use crate::database::observed;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SearchKind {
@@ -147,7 +148,7 @@ impl Database {
                     .bind(local)
                     .bind(filter.limit)
                     .bind(filter.unrestricted)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await?
             }};
         }

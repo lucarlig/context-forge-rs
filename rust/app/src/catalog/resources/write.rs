@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{entry_filters::fetch_catalog_entries, *};
+use crate::database::observed;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ResourceWriteError {
@@ -30,7 +31,7 @@ macro_rules! lock_resource {
         )).bind(&$expected.id).bind($expected.version).bind(&$expected.updated_at)
             .bind($expected.owner_email.as_deref()).bind(&$expected.visibility)
             .bind($expected.team_id.as_deref()).bind($expected.enabled)
-            .fetch_optional(&mut *$tx).await?.ok_or(ResourceWriteError::Changed)?
+            .fetch_optional(observed(&mut *$tx)).await?.ok_or(ResourceWriteError::Changed)?
     };
 }
 
@@ -106,7 +107,7 @@ impl Database {
                             .bind(resource.gateway_id.as_deref())
                             .bind(resource.team_id.as_deref())
                             .bind(resource.owner_email.as_deref())
-                            .fetch_optional(&mut *$tx)
+                            .fetch_optional(observed(&mut *$tx))
                             .await?
                 {
                     return Err(ResourceWriteError::Duplicate { id, enabled });
@@ -158,10 +159,10 @@ impl Database {
                 } else {
                     query
                 };
-                query.execute(&mut *$tx).await?;
+                query.execute(observed(&mut *$tx)).await?;
                 let updated = sqlx::query_as::<_, ResourceRecord>(RESOURCE_BY_ID)
                     .bind(&resource.id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(updated)
@@ -174,7 +175,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 save!(tx, " FOR UPDATE", "CAST($14 AS JSON)", "CAST($15 AS JSON)")
             }
         }
@@ -198,12 +201,12 @@ impl Database {
                     .bind(&id)
                     .bind(enabled)
                     .bind(now)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 }
                 let updated = sqlx::query_as::<_, ResourceRecord>(RESOURCE_BY_ID)
                     .bind(id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(updated)
@@ -216,7 +219,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 change!(tx, " FOR UPDATE", "CAST(CAST($3 AS TEXT) AS TIMESTAMPTZ)")
             }
         }
@@ -250,19 +255,22 @@ impl Database {
                     }
                     if sqlx::query_scalar::<_, bool>($exists)
                         .bind(table)
-                        .fetch_one(&mut *$tx)
+                        .fetch_one(observed(&mut *$tx))
                         .await?
                     {
-                        sqlx::query(*statement).bind(&id).execute(&mut *$tx).await?;
+                        sqlx::query(*statement)
+                            .bind(&id)
+                            .execute(observed(&mut *$tx))
+                            .await?;
                     }
                 }
                 sqlx::query("DELETE FROM server_resource_association WHERE resource_id = $1")
                     .bind(&id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 sqlx::query("DELETE FROM resources WHERE id = $1")
                     .bind(id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(())
@@ -279,7 +287,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 delete!(
                     tx,
                     " FOR UPDATE",

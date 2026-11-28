@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
+use crate::database::observed;
 
 struct MemberSettings<'a> {
     teams: &'a TeamSettings,
@@ -104,13 +105,13 @@ macro_rules! insert_invite {
             return Err(AccountError::bad_request("Cannot send invitations to personal teams"));
         }
         let verified:Option<bool>=sqlx::query_scalar("SELECT email_verified_at IS NOT NULL FROM email_users WHERE email=$1")
-            .bind(email).fetch_optional(&mut *$tx).await?;
+            .bind(email).fetch_optional(observed(&mut *$tx)).await?;
         if settings.teams.verify_invite_email && verified==Some(false) {
             return Err(AccountError::bad_request("Invitee email address has not been verified"));
         }
         let member:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_team_members WHERE
             team_id=$1 AND user_email=$2 AND is_active=TRUE)")
-            .bind(&team.id).bind(email).fetch_one(&mut *$tx).await?;
+            .bind(&team.id).bind(email).fetch_one(observed(&mut *$tx)).await?;
         if member {
             return Err(AccountError::bad_request(format!("User {email} is already a member of this team")));
         }
@@ -119,16 +120,16 @@ macro_rules! insert_invite {
         } else {
             "UPDATE email_team_invitations SET is_active=FALSE WHERE team_id=$1 AND is_active=TRUE AND julianday(expires_at)<=julianday(CURRENT_TIMESTAMP)"
         };
-        sqlx::query(expire).bind(&team.id).execute(&mut *$tx).await?;
+        sqlx::query(expire).bind(&team.id).execute(observed(&mut *$tx)).await?;
         let duplicate:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_team_invitations
             WHERE team_id=$1 AND email=$2 AND is_active=TRUE)")
-            .bind(&team.id).bind(email).fetch_one(&mut *$tx).await?;
+            .bind(&team.id).bind(email).fetch_one(observed(&mut *$tx)).await?;
         if duplicate {
             return Err(AccountError::bad_request(format!("An active invitation already exists for {email}")));
         }
         let reserved:i64=sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM email_team_members m
             WHERE m.team_id=$1 AND m.is_active=TRUE) + (SELECT COUNT(*) FROM email_team_invitations i
-            WHERE i.team_id=$1 AND i.is_active=TRUE)").bind(&team.id).fetch_one(&mut *$tx).await?;
+            WHERE i.team_id=$1 AND i.is_active=TRUE)").bind(&team.id).fetch_one(observed(&mut *$tx)).await?;
         let maximum=team.max_members.unwrap_or(settings.teams.max_members);
         if reserved>=i64::from(maximum) {
             return Err(AccountError::bad_request(format!("Team has reached its member limit of {maximum}")));
@@ -145,8 +146,8 @@ macro_rules! insert_invite {
             VALUES($1,$2,$3,$4,$5,CURRENT_TIMESTAMP,datetime(CURRENT_TIMESTAMP,'+'||$6||' seconds'),$7,TRUE)"
         };
         sqlx::query(insert).bind(&id).bind(&team.id).bind(email).bind($role).bind($actor)
-            .bind(settings.teams.expires_in_seconds).bind(token).execute(&mut *$tx).await?;
-        sqlx::query_as::<_,Invitation>($crate::local_auth::teams::storage::participation::INVITATION_BY_ID).bind(id).fetch_one(&mut *$tx).await?
+            .bind(settings.teams.expires_in_seconds).bind(token).execute(observed(&mut *$tx)).await?;
+        sqlx::query_as::<_,Invitation>($crate::local_auth::teams::storage::participation::INVITATION_BY_ID).bind(id).fetch_one(observed(&mut *$tx)).await?
     }};
 }
 
@@ -208,13 +209,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_scalar(SELECT)
                     .bind(email)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await?
             }
             Self::Postgres(pool) => {
                 sqlx::query_scalar(SELECT)
                     .bind(email)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await?
             }
         };
@@ -256,7 +257,7 @@ impl Database {
     ) -> Result<Member, AccountError> {
         macro_rules! write {
             ($tx:ident,$postgres:tt) => {{
-                let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_team)?;
+                let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(observed(&mut *$tx)).await?.ok_or_else(missing_team)?;
                 if let Some(provider) = settings.sso_provider {
                     let sql = if $postgres {
                         "SELECT id FROM email_users WHERE email=$1 AND auth_provider=$2 AND is_active FOR UPDATE"
@@ -264,7 +265,7 @@ impl Database {
                         "SELECT id FROM email_users WHERE email=$1 AND auth_provider=$2 AND is_active"
                     };
                     if sqlx::query_scalar::<_,String>(sql).bind(email).bind(provider)
-                        .fetch_optional(&mut *$tx).await?.is_none() {
+                        .fetch_optional(observed(&mut *$tx)).await?.is_none() {
                         return Err(denied("SSO provider binding changed"));
                     }
                 } else {
@@ -279,21 +280,21 @@ impl Database {
                 let updated=match operation {
                     MemberMutation::Add(role)=>{
                         let user:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_users WHERE email=$1 AND is_active=TRUE)")
-                            .bind(email).fetch_one(&mut *$tx).await?;
+                            .bind(email).fetch_one(observed(&mut *$tx)).await?;
                         if !user {
                             return Err(AccountError::detail(StatusCode::NOT_FOUND,"User not found or inactive"));
                         }
                         let mut member = insert_member!($tx,team,email,role,Some(actor),actor,settings,false);
                         if settings.sso_provider.is_some() {
                             sqlx::query("UPDATE email_team_members SET grant_source='sso' WHERE id=$1")
-                                .bind(&member.id).execute(&mut *$tx).await?;
+                                .bind(&member.id).execute(observed(&mut *$tx)).await?;
                             member.grant_source = Some("sso".to_owned());
                         }
                         member
                     }
                     MemberMutation::Role(_) | MemberMutation::Remove=>{
                         let mut member:Member=sqlx::query_as(MEMBER_ANY_STATE).bind(id).bind(email)
-                            .fetch_optional(&mut *$tx).await?.filter(|member:&Member|member.is_active).ok_or_else(missing_member)?;
+                            .fetch_optional(observed(&mut *$tx)).await?.filter(|member:&Member|member.is_active).ok_or_else(missing_member)?;
                         if settings.sso_provider.is_some() && member.grant_source.as_deref()!=Some("sso") {
                             return Err(missing_member());
                         }
@@ -301,7 +302,7 @@ impl Database {
                         if member.role=="owner" && role!=Some("owner") {
                             let other_owner:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_team_members WHERE
                                 team_id=$1 AND user_email<>$2 AND role='owner' AND is_active=TRUE)")
-                                .bind(id).bind(email).fetch_one(&mut *$tx).await?;
+                                .bind(id).bind(email).fetch_one(observed(&mut *$tx)).await?;
                             if !other_owner {
                                 return Err(AccountError::bad_request("Cannot remove the last owner from a team"));
                             }
@@ -309,23 +310,23 @@ impl Database {
                         if let Some(role)=role {
                             if member.role!=role {
                                 sqlx::query("UPDATE email_team_members SET role=$2 WHERE id=$1")
-                                    .bind(&member.id).bind(role).execute(&mut *$tx).await?;
+                                    .bind(&member.id).bind(role).execute(observed(&mut *$tx)).await?;
                                 role.clone_into(&mut member.role);
                                 sync_member_role!($tx,member,actor,settings,true);
                                 log_member!($tx,member,actor,"role-changed");
                             }
                         } else {
                             sqlx::query("UPDATE email_team_members SET is_active=FALSE WHERE id=$1")
-                                .bind(&member.id).execute(&mut *$tx).await?;
+                                .bind(&member.id).execute(observed(&mut *$tx)).await?;
                             member.is_active=false;
                             sync_member_role!($tx,member,actor,settings,false);
                             log_member!($tx,member,actor,"removed");
                             sqlx::query("INSERT INTO token_revocations(jti,revoked_at,revoked_by,reason,token_expiry)
                                 SELECT jti,CURRENT_TIMESTAMP,$3,'team_membership_removed',expires_at
                                 FROM email_api_tokens WHERE team_id=$1 AND user_email=$2 ON CONFLICT(jti) DO NOTHING")
-                                .bind(id).bind(email).bind(actor).execute(&mut *$tx).await?;
+                                .bind(id).bind(email).bind(actor).execute(observed(&mut *$tx)).await?;
                             sqlx::query("UPDATE email_api_tokens SET is_active=FALSE WHERE team_id=$1 AND user_email=$2")
-                                .bind(id).bind(email).execute(&mut *$tx).await?;
+                                .bind(id).bind(email).execute(observed(&mut *$tx)).await?;
                         }
                         member
                     }
@@ -346,8 +347,8 @@ impl Database {
             " WHERE i.team_id=$1 AND i.is_active=TRUE AND t.is_active=TRUE ORDER BY i.invited_at DESC,i.id DESC"
         );
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(id).fetch_all(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(SQL).bind(id).fetch_all(pool).await,
+            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(id).fetch_all(observed(pool)).await,
+            Self::Postgres(pool) => sqlx::query_as(SQL).bind(id).fetch_all(observed(pool)).await,
         }
     }
 
@@ -359,13 +360,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(INVITATION_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(INVITATION_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -383,7 +384,7 @@ impl Database {
             ($tx:ident,$postgres:tt) => {{
                 let team: Team = sqlx::query_as(TEAM_DETAIL)
                     .bind(id)
-                    .fetch_optional(&mut *$tx)
+                    .fetch_optional(observed(&mut *$tx))
                     .await?
                     .ok_or_else(missing_team)?;
                 team_permission!($tx, id, actor, false);
@@ -403,27 +404,27 @@ impl Database {
     ) -> Result<Member, AccountError> {
         macro_rules! accept {
             ($tx:ident,$postgres:tt) => {{
-                let invite:Invitation=sqlx::query_as(INVITATION_BY_TOKEN).bind(token).fetch_optional(&mut *$tx).await?
+                let invite:Invitation=sqlx::query_as(INVITATION_BY_TOKEN).bind(token).fetch_optional(observed(&mut *$tx)).await?
                     .filter(|invite:&Invitation|!invite.expired()).ok_or_else(||AccountError::bad_request("Invitation is invalid or expired"))?;
                 if invite.email!=email {
                     return Err(AccountError::bad_request("Email address does not match invitation"));
                 }
                 let verified:Option<bool>=sqlx::query_scalar("SELECT email_verified_at IS NOT NULL FROM email_users WHERE email=$1 AND is_active=TRUE")
-                    .bind(email).fetch_optional(&mut *$tx).await?;
+                    .bind(email).fetch_optional(observed(&mut *$tx)).await?;
                 match verified {
                     None=>return Err(AccountError::bad_request("User account not found")),
                     Some(false) if settings.teams.verify_invite_email=>return Err(AccountError::bad_request("Email address has not been verified")),
                     Some(_)=>{}
                 }
-                let team:Team=sqlx::query_as(TEAM_DETAIL).bind(&invite.team_id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_team)?;
+                let team:Team=sqlx::query_as(TEAM_DETAIL).bind(&invite.team_id).fetch_optional(observed(&mut *$tx)).await?.ok_or_else(missing_team)?;
                 if team.is_personal {
                     return Err(AccountError::bad_request("Cannot join a personal team"));
                 }
                 let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_team_members
                     WHERE team_id=$1 AND user_email=$2 AND is_active=TRUE)")
-                    .bind(&team.id).bind(email).fetch_one(&mut *$tx).await?;
+                    .bind(&team.id).bind(email).fetch_one(observed(&mut *$tx)).await?;
                 sqlx::query("UPDATE email_team_invitations SET is_active=FALSE WHERE id=$1")
-                    .bind(&invite.id).execute(&mut *$tx).await?;
+                    .bind(&invite.id).execute(observed(&mut *$tx)).await?;
                 if active {
                     $tx.commit().await?;
                     return Err(AccountError::bad_request("User is already a member of this team"));
@@ -445,7 +446,7 @@ impl Database {
             ($tx:ident,$postgres:tt) => {{
                 let invite: Invitation = sqlx::query_as(INVITATION_BY_TOKEN)
                     .bind(token)
-                    .fetch_optional(&mut *$tx)
+                    .fetch_optional(observed(&mut *$tx))
                     .await?
                     .ok_or_else(missing_invite)?;
                 if invite.email != email {
@@ -453,7 +454,7 @@ impl Database {
                 }
                 sqlx::query("UPDATE email_team_invitations SET is_active=FALSE WHERE id=$1")
                     .bind(invite.id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(())
@@ -471,14 +472,14 @@ impl Database {
             ($tx:ident,$postgres:tt) => {{
                 let invite: Invitation = sqlx::query_as(INVITATION_BY_ID)
                     .bind(id)
-                    .fetch_optional(&mut *$tx)
+                    .fetch_optional(observed(&mut *$tx))
                     .await?
                     .filter(|invite: &Invitation| invite.is_active)
                     .ok_or_else(missing_invite)?;
                 team_permission!($tx, &invite.team_id, actor, invite.invited_by == actor);
                 sqlx::query("UPDATE email_team_invitations SET is_active=FALSE WHERE id=$1")
                     .bind(id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(())
@@ -497,25 +498,25 @@ impl Database {
     ) -> Result<(JoinRequest, bool), AccountError> {
         macro_rules! request {
             ($tx:ident,$postgres:tt) => {{
-                let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_team)?;
+                let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(observed(&mut *$tx)).await?.ok_or_else(missing_team)?;
                 if team.visibility!="public" || team.is_personal {
                     return Err(denied("Can only request to join public teams"));
                 }
                 let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_team_members m
                     WHERE m.team_id=$1 AND m.user_email=$2 AND m.is_active=TRUE)")
-                    .bind(id).bind(email).fetch_one(&mut *$tx).await?;
+                    .bind(id).bind(email).fetch_one(observed(&mut *$tx)).await?;
                 if active {
                     return Err(AccountError::bad_request("User is already a member of this team"));
                 }
                 let teams:i64=sqlx::query_scalar("SELECT COUNT(*) FROM email_team_members m JOIN email_teams t ON t.id=m.team_id
                     WHERE m.user_email=$1 AND m.is_active=TRUE AND t.is_active=TRUE")
-                    .bind(email).fetch_one(&mut *$tx).await?;
+                    .bind(email).fetch_one(observed(&mut *$tx)).await?;
                 if teams>=settings.max_teams {
                     return Err(AccountError::bad_request(format!("User has reached the maximum team limit of {}",settings.max_teams)));
                 }
                 let prior:Option<JoinRequest>=sqlx::query_as(concat!(join_fields!(),
                     " WHERE j.team_id=$1 AND j.user_email=$2 AND j.status='pending'"))
-                    .bind(id).bind(email).fetch_optional(&mut *$tx).await?;
+                    .bind(id).bind(email).fetch_optional(observed(&mut *$tx)).await?;
                 if let Some(prior) = prior && (!reopen_expired || !prior.expired()) {
                     $tx.commit().await?;
                     return Ok((prior, false));
@@ -532,9 +533,9 @@ impl Database {
                         expires_at=excluded.expires_at,reviewed_at=NULL,reviewed_by=NULL,notes=NULL RETURNING id"
                 };
                 let request:String=sqlx::query_scalar(command).bind(Uuid::new_v4().simple().to_string())
-                    .bind(id).bind(email).bind(message).fetch_one(&mut *$tx).await?;
+                    .bind(id).bind(email).bind(message).fetch_one(observed(&mut *$tx)).await?;
                 let row=sqlx::query_as(concat!(join_fields!()," WHERE j.id=$1"))
-                    .bind(request).fetch_one(&mut *$tx).await?;
+                    .bind(request).fetch_one(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok((row, true))
             }};
@@ -558,7 +559,7 @@ impl Database {
                 .bind(request)
                 .bind(team)
                 .bind(email)
-                .execute(&mut *$tx)
+                .execute(observed(&mut *$tx))
                 .await?
                 .rows_affected();
                 if changed == 0 {
@@ -584,8 +585,8 @@ impl Database {
             ORDER BY j.requested_at DESC,j.id DESC"
         );
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(id).fetch_all(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(SQL).bind(id).fetch_all(pool).await,
+            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(id).fetch_all(observed(pool)).await,
+            Self::Postgres(pool) => sqlx::query_as(SQL).bind(id).fetch_all(observed(pool)).await,
         }
     }
 
@@ -599,16 +600,16 @@ impl Database {
     ) -> Result<Option<Member>, AccountError> {
         macro_rules! review {
             ($tx:ident,$postgres:tt) => {{
-                let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_team)?;
+                let team:Team=sqlx::query_as(TEAM_DETAIL).bind(id).fetch_optional(observed(&mut *$tx)).await?.ok_or_else(missing_team)?;
                 team_permission!($tx,id,actor,false);
                 let row:JoinRequest=sqlx::query_as(concat!(join_fields!()," WHERE j.id=$1 AND j.team_id=$2 AND j.status='pending'"))
-                    .bind(request).bind(id).fetch_optional(&mut *$tx).await?.ok_or_else(missing_request)?;
+                    .bind(request).bind(id).fetch_optional(observed(&mut *$tx)).await?.ok_or_else(missing_request)?;
                 if approve && row.expired() {
                     return Err(AccountError::bad_request("Join request has expired"));
                 }
                 let member=if approve {
                     let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_users WHERE email=$1 AND is_active=TRUE)")
-                        .bind(&row.user_email).fetch_one(&mut *$tx).await?;
+                        .bind(&row.user_email).fetch_one(observed(&mut *$tx)).await?;
                     if !active {
                         return Err(AccountError::bad_request("User account not found"));
                     }
@@ -617,7 +618,7 @@ impl Database {
                     None
                 };
                 sqlx::query("UPDATE email_team_join_requests SET status=$2,reviewed_at=CURRENT_TIMESTAMP,reviewed_by=$3 WHERE id=$1")
-                    .bind(request).bind(if approve {"approved"} else {"rejected"}).bind(actor).execute(&mut *$tx).await?;
+                    .bind(request).bind(if approve {"approved"} else {"rejected"}).bind(actor).execute(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(member)
             }};

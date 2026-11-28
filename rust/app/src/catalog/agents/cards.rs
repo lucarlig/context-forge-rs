@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::database::observed;
 
 pub(crate) struct NewAgentCard<'a> {
     pub(crate) kind: &'static str,
@@ -53,7 +54,7 @@ macro_rules! insert_cards {
                 .bind(card.source_url)
                 .bind(card.etag.filter(|etag| etag.chars().count() <= 255))
                 .bind(card.max_age)
-                .execute(&mut *$tx)
+                .execute(observed(&mut *$tx))
                 .await?;
         }
     }};
@@ -85,14 +86,14 @@ impl Database {
                 sqlx::query_as(CURRENT_CARD)
                     .bind(agent)
                     .bind(kind)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(CURRENT_CARD)
                     .bind(agent)
                     .bind(kind)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -107,13 +108,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(SERVER_CARD_AGENTS)
                     .bind(server)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await?
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(SERVER_CARD_AGENTS)
                     .bind(server)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await?
             }
         };

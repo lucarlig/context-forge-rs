@@ -9,6 +9,7 @@ use axum::{
 use serde_json::Map;
 
 use super::{catalog_api::CatalogApiError, *};
+use crate::database::observed;
 
 mod gateway;
 
@@ -545,13 +546,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_scalar(QUERY)
                     .bind(owner)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_scalar(QUERY)
                     .bind(owner)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }

@@ -2,6 +2,7 @@
 
 use super::entry_filters::fetch_catalog_entries;
 use super::*;
+use crate::database::observed;
 use crate::uaid::GeneratedUaid;
 use sqlx::types::Json as DbJson;
 
@@ -184,13 +185,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(BY_UAID)
                     .bind(identifier)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(BY_UAID)
                     .bind(identifier)
-                    .fetch_all(pool)
+                    .fetch_all(observed(pool))
                     .await
             }
         }
@@ -215,7 +216,7 @@ impl Database {
         macro_rules! check {
             ($pool:expr, $exists:literal) => {{
                 if !sqlx::query_scalar::<_, bool>($exists)
-                    .fetch_one($pool)
+                    .fetch_one(observed($pool))
                     .await?
                 {
                     return Ok(false);
@@ -223,7 +224,7 @@ impl Database {
                 sqlx::query_scalar(BINDINGS)
                     .bind(team)
                     .bind(&agent.name)
-                    .fetch_one($pool)
+                    .fetch_one(observed($pool))
                     .await
             }};
         }
@@ -258,13 +259,13 @@ impl Database {
                 match lookup {
                     AgentLookup::Id(id) => sqlx::query_as::<_, AgentRecord>(BY_ID)
                         .bind(id)
-                        .fetch_optional($pool)
+                        .fetch_optional(observed($pool))
                         .await?
                         .filter(|agent| agent.visible(scope)),
                     AgentLookup::Name(name) => {
                         sqlx::query_as::<_, AgentRecord>(BY_NAME)
                             .bind(name)
-                            .fetch($pool)
+                            .fetch(observed($pool))
                             .try_filter(|agent| std::future::ready(agent.visible(scope)))
                             .try_next()
                             .await?
@@ -304,7 +305,7 @@ impl Database {
                     .bind(&agent.team_id)
                     .bind(&agent.owner_email)
                     .bind(&agent.id)
-                    .fetch_optional(&mut *$tx)
+                    .fetch_optional(observed(&mut *$tx))
                     .await?
                 {
                     return Err(AgentWriteError::Duplicate { id, enabled });
@@ -324,7 +325,7 @@ impl Database {
                         .bind(&agent.visibility)
                         .bind(agent.created_via.as_deref().unwrap_or("api"))
                         .bind(display_name(&agent.name))
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 }
                 sqlx::query(INSERT_AGENT)
@@ -356,12 +357,12 @@ impl Database {
                     .bind(&agent.uaid_proto)
                     .bind(&agent.uaid_native_id)
                     .bind(agent.created_via.as_deref().unwrap_or("api"))
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 cards::insert_cards!($tx, &agent.id, cards);
                 let result = sqlx::query_as(BY_ID)
                     .bind(&agent.id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(result)
@@ -374,7 +375,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *tx).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *tx))
+                    .await?;
                 insert!(tx)
             }
         }

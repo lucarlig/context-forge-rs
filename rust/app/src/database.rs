@@ -9,6 +9,7 @@ use sqlx::{
 };
 
 use crate::config::Settings;
+pub(crate) use crate::observability::telemetry::sql_client::observed;
 
 #[derive(Clone)]
 pub enum Database {
@@ -88,10 +89,10 @@ impl Database {
     pub async fn ping(&self) -> Result<(), sqlx::Error> {
         match self {
             Self::Sqlite(pool) => {
-                sqlx::query("SELECT 1").execute(pool).await?;
+                sqlx::query("SELECT 1").execute(observed(pool)).await?;
             }
             Self::Postgres(pool) => {
-                sqlx::query("SELECT 1").execute(pool).await?;
+                sqlx::query("SELECT 1").execute(observed(pool)).await?;
             }
         };
         Ok(())

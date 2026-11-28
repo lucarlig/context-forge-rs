@@ -4,6 +4,7 @@ use serde_json::Map;
 use sqlx::types::Json as DbJson;
 
 use super::*;
+use crate::database::observed;
 use crate::upstream_tls::TlsMaterial;
 
 const READ: &str = "admin.sso_providers:read";
@@ -447,22 +448,32 @@ impl Database {
     ) -> Result<Vec<(String, String, String)>, sqlx::Error> {
         const SQL: &str = "SELECT id,name,display_name FROM sso_providers WHERE is_enabled ORDER BY created_at,id";
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(SQL).fetch_all(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(SQL).fetch_all(pool).await,
+            Self::Sqlite(pool) => sqlx::query_as(SQL).fetch_all(observed(pool)).await,
+            Self::Postgres(pool) => sqlx::query_as(SQL).fetch_all(observed(pool)).await,
         }
     }
 
     async fn sso_providers(&self) -> Result<Vec<Provider>, sqlx::Error> {
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(LIST).fetch_all(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(LIST).fetch_all(pool).await,
+            Self::Sqlite(pool) => sqlx::query_as(LIST).fetch_all(observed(pool)).await,
+            Self::Postgres(pool) => sqlx::query_as(LIST).fetch_all(observed(pool)).await,
         }
     }
 
     pub(super) async fn sso_provider(&self, id: &str) -> Result<Option<Provider>, sqlx::Error> {
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(GET).bind(id).fetch_optional(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(GET).bind(id).fetch_optional(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_as(GET)
+                    .bind(id)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(GET)
+                    .bind(id)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
         }
     }
 
@@ -478,8 +489,18 @@ impl Database {
         );
         let issuer = issuer.trim_end_matches('/');
         let mut rows = match self {
-            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(issuer).fetch_all(pool).await?,
-            Self::Postgres(pool) => sqlx::query_as(SQL).bind(issuer).fetch_all(pool).await?,
+            Self::Sqlite(pool) => {
+                sqlx::query_as(SQL)
+                    .bind(issuer)
+                    .fetch_all(observed(pool))
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(SQL)
+                    .bind(issuer)
+                    .fetch_all(observed(pool))
+                    .await?
+            }
         };
         Ok(if rows.len() == 1 { rows.pop() } else { None })
     }
@@ -493,12 +514,12 @@ impl Database {
         match self {
             Self::Sqlite(pool) => {
                 bind_provider!(SQLITE_WRITE, id, config, secret, false)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 bind_provider!(POSTGRES_WRITE, id, config, secret, false)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -515,7 +536,7 @@ impl Database {
             ($tx:ident,$query:expr,$sql:ident) => {{
                 let Some(mut provider) = sqlx::query_as::<_, Provider>($query)
                     .bind(id)
-                    .fetch_optional(&mut *$tx)
+                    .fetch_optional(observed(&mut *$tx))
                     .await?
                 else {
                     return Ok(None);
@@ -528,11 +549,11 @@ impl Database {
                     &provider.client_secret_encrypted,
                     true
                 )
-                .fetch_one(&mut *$tx)
+                .fetch_one(observed(&mut *$tx))
                 .await?;
                 sqlx::query("DELETE FROM sso_auth_sessions WHERE provider_id=$1")
                     .bind(id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(Some(updated))
@@ -555,11 +576,11 @@ impl Database {
             ($tx:ident) => {{
                 sqlx::query("DELETE FROM sso_auth_sessions WHERE provider_id=$1")
                     .bind(id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 let rows = sqlx::query("DELETE FROM sso_providers WHERE id=$1")
                     .bind(id)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?
                     .rows_affected();
                 $tx.commit().await?;
@@ -575,7 +596,7 @@ impl Database {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT id FROM sso_providers WHERE id=$1 FOR UPDATE")
                     .bind(id)
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 delete!(tx)
             }

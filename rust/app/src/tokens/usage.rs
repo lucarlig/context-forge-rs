@@ -4,6 +4,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::*;
+use crate::database::observed;
 
 pub(crate) struct TokenRequest<'a> {
     pub(crate) endpoint: &'a str,
@@ -67,11 +68,11 @@ impl Database {
                     sqlx::query_as::<_, (i64, i64, i64, f64)>(statistics!($cutoff))
                         .bind(jti)
                         .bind(&cutoff)
-                        .fetch_one($pool),
+                        .fetch_one(observed($pool)),
                     sqlx::query_as::<_, (String, i64)>(endpoints!($cutoff))
                         .bind(jti)
                         .bind(&cutoff)
-                        .fetch_all($pool),
+                        .fetch_all(observed($pool)),
                 )?
             };
         }
@@ -101,7 +102,7 @@ impl Database {
                     "SELECT t.is_active,CAST(t.usage_limits AS TEXT),CAST(t.expires_at AS TEXT)
                     FROM email_api_tokens t WHERE id=$1 AND jti=$2
                       AND NOT EXISTS(SELECT 1 FROM token_revocations r WHERE r.jti=t.jti)",$lock))
-                    .bind(&token.id).bind(&token.jti).fetch_optional(&mut *$tx).await?;
+                    .bind(&token.id).bind(&token.jti).fetch_optional(observed(&mut *$tx)).await?;
                 let Some((true,limits,expiry))=row else {
                     return Ok(TokenReservation::Inactive);
                 };
@@ -121,7 +122,7 @@ impl Database {
                             "SELECT
                              (SELECT COUNT(*) FROM token_usage_logs WHERE token_jti=$1 AND NOT blocked AND ",$cutoff,")
                              + (SELECT COUNT(*) FROM cf_token_quota_events WHERE token_jti=$1 AND ",$cutoff,")"))
-                            .bind(&token.jti).bind(timestamp_before(now,seconds)?).fetch_one(&mut *$tx).await?;
+                            .bind(&token.jti).bind(timestamp_before(now,seconds)?).fetch_one(observed(&mut *$tx)).await?;
                         if count>=limit {
                             limited=Some(reason);
                             break;
@@ -136,21 +137,21 @@ impl Database {
                         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_TIMESTAMP) RETURNING CAST(id AS BIGINT)")
                         .bind(&token.jti).bind(&token.user_email).bind(endpoint).bind(method)
                         .bind(request.peer).bind(request.agent).bind(limited.is_some()).bind(limited)
-                        .bind(limited.map(|_|429_i32)).fetch_one(&mut *$tx).await?;
+                        .bind(limited.map(|_|429_i32)).fetch_one(observed(&mut *$tx)).await?;
                     Some(TokenUsageRecord::Log(id))
                 } else if has_quota && limited.is_none() {
                     sqlx::query(concat!("DELETE FROM cf_token_quota_events WHERE token_jti=$1 AND ",$outdated))
-                        .bind(&token.jti).bind(timestamp_before(now,86400)?).execute(&mut *$tx).await?;
+                        .bind(&token.jti).bind(timestamp_before(now,86400)?).execute(observed(&mut *$tx)).await?;
                     let id=sqlx::query_scalar::<_,i64>("INSERT INTO cf_token_quota_events(token_jti)
                         VALUES($1) RETURNING CAST(id AS BIGINT)")
-                        .bind(&token.jti).fetch_one(&mut *$tx).await?;
+                        .bind(&token.jti).fetch_one(observed(&mut *$tx)).await?;
                     Some(TokenUsageRecord::Quota(id))
                 } else {
                     None
                 };
                 if limited.is_none() {
                     sqlx::query(concat!("UPDATE email_api_tokens SET last_used=",$date," WHERE id=$1"))
-                        .bind(&token.id).bind(now.to_string()).execute(&mut *$tx).await?;
+                        .bind(&token.id).bind(now.to_string()).execute(observed(&mut *$tx)).await?;
                 }
                 $tx.commit().await?;
                 Ok(limited.map_or(TokenReservation::Allowed(record),TokenReservation::Limited))
@@ -193,11 +194,11 @@ impl Database {
                     TokenUsageRecord::Log(id) => {
                         sqlx::query(concat!(
                     "UPDATE token_usage_logs SET status_code=$2,response_time_ms=$3,blocked=$4 WHERE ",$id))
-                    .bind(id).bind(i32::from(status)).bind(elapsed_ms).bind(blocked).execute($pool).await?;
+                    .bind(id).bind(i32::from(status)).bind(elapsed_ms).bind(blocked).execute(observed($pool)).await?;
                     }
                     TokenUsageRecord::Quota(id) if blocked => {
                         sqlx::query(concat!("DELETE FROM cf_token_quota_events WHERE ",$id))
-                            .bind(id).execute($pool).await?;
+                            .bind(id).execute(observed($pool)).await?;
                     }
                     TokenUsageRecord::Quota(_) => {}
                 }

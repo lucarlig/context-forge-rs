@@ -6,6 +6,7 @@ use axum::extract::{Path, Query};
 
 use super::*;
 use crate::catalog::{CatalogScope, visible_team_ids};
+use crate::database::observed;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -254,7 +255,7 @@ impl Database {
                     .bind(scope.visibility == &TeamVisibility::Admin)
                     .bind(scope.can_own())
                     .bind(scope.email)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             }};
         }

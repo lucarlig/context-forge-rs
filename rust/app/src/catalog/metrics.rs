@@ -6,6 +6,7 @@ use jiff::Timestamp;
 use serde_json::json;
 
 use super::*;
+use crate::database::observed;
 
 pub(crate) mod maintenance;
 
@@ -225,7 +226,7 @@ impl Database {
                 sqlx::query_as::<_, ExecutionMetrics>(query)
                     .bind(&cutoff)
                     .bind(&ids)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await?
             }};
         }
@@ -252,7 +253,7 @@ impl Database {
                     let query = sqlx::AssertSqlSafe($dialect.query(*entity, false));
                     let rows = sqlx::query_as(query)
                         .bind(&time)
-                        .fetch_all(&mut *$tx)
+                        .fetch_all(observed(&mut *$tx))
                         .await?;
                     reports.push(summarize(rows));
                 }
@@ -268,7 +269,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 report!(tx, MetricsDialect::Postgres)
             }
@@ -282,7 +283,7 @@ impl Database {
                     let (raw, hourly, _) = entity.storage();
                     for table in [raw, hourly] {
                         sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
-                            .execute(&mut *$tx)
+                            .execute(observed(&mut *$tx))
                             .await?;
                     }
                 }
@@ -297,7 +298,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query(maintenance::MAINTENANCE_LOCK)
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 reset!(tx)
             }
@@ -324,7 +325,7 @@ impl Database {
                         .bind(id)
                         .bind(duration.as_secs_f64())
                         .bind(succeeded)
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 }
                 $tx.commit().await

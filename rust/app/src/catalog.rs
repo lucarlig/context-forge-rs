@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{
     auth::TeamVisibility,
     credentials::PreparedAuth,
-    database::Database,
+    database::{Database, observed},
     gateway_records::{REGISTRY_POSTGRES, REGISTRY_SQLITE, RegistryGateway},
     upstream::{DiscoveredMetadata, UpstreamTransport},
 };
@@ -59,15 +59,18 @@ macro_rules! delete_tool_dependencies {
             if (table == "tool_metrics" || $purge_hourly)
                 && sqlx::query_scalar::<_, bool>($table_exists)
                     .bind(table)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?
             {
-                sqlx::query(statement).bind($id).execute(&mut *$tx).await?;
+                sqlx::query(statement)
+                    .bind($id)
+                    .execute(observed(&mut *$tx))
+                    .await?;
             }
         }
         sqlx::query("DELETE FROM server_tool_association WHERE tool_id = $1")
             .bind($id)
-            .execute(&mut *$tx)
+            .execute(observed(&mut *$tx))
             .await?;
     }};
 }
@@ -892,13 +895,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as::<_, ServerRow>(SERVER_QUERY)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await?
             }
             Self::Postgres(pool) => {
                 sqlx::query_as::<_, ServerRow>(SERVER_QUERY)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await?
             }
         };
@@ -934,14 +937,14 @@ impl Database {
                 sqlx::query_scalar(QUERY)
                     .bind(server_id)
                     .bind(default_seconds)
-                    .fetch_one(pool)
+                    .fetch_one(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_scalar(QUERY)
                     .bind(server_id)
                     .bind(default_seconds)
-                    .fetch_one(pool)
+                    .fetch_one(observed(pool))
                     .await
             }
         }
@@ -951,8 +954,18 @@ impl Database {
         const QUERY: &str =
             "SELECT EXISTS (SELECT 1 FROM email_teams WHERE id = $1 AND is_active = TRUE)";
         match self {
-            Self::Sqlite(pool) => sqlx::query_scalar(QUERY).bind(id).fetch_one(pool).await,
-            Self::Postgres(pool) => sqlx::query_scalar(QUERY).bind(id).fetch_one(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar(QUERY)
+                    .bind(id)
+                    .fetch_one(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar(QUERY)
+                    .bind(id)
+                    .fetch_one(observed(pool))
+                    .await
+            }
         }
     }
 
@@ -992,7 +1005,7 @@ impl Database {
                     .bind(scope.visibility == &TeamVisibility::Admin)
                     .bind(scope.can_own())
                     .bind(teams)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await?
             };
         }
@@ -1117,7 +1130,7 @@ impl Database {
                     .bind(scope.can_own())
                     .bind(teams)
                     .bind(uris)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await?
             }};
         }
@@ -1176,7 +1189,7 @@ impl Database {
                     .bind(scope.visibility == &TeamVisibility::Admin)
                     .bind(scope.can_own())
                     .bind(teams)
-                    .fetch($pool);
+                    .fetch(observed($pool));
                 while let Some((_, _, _, _, Some(uri), _, _)) = rows.try_next().await? {
                     if uri.to_lowercase().contains(&needle) {
                         total = total.saturating_add(1);
@@ -1226,7 +1239,7 @@ impl Database {
                     .bind(uri)
                     .bind(template)
                     .bind(id)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await
             };
         }
@@ -1258,7 +1271,7 @@ impl Database {
                     .bind(teams)
                     .bind(name)
                     .bind(name_only)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await?
             };
         }
@@ -1355,7 +1368,7 @@ impl Database {
                     .bind(i64::from(limit))
                     .bind(grpc_enabled)
                     .bind(a2a_enabled)
-                    .fetch_all($pool)
+                    .fetch_all(observed($pool))
                     .await?
             };
         }
@@ -1417,7 +1430,7 @@ impl Database {
                         .bind(*visibility == TeamVisibility::Admin)
                         .bind(teams)
                         .bind(json!([gateway.url]).to_string())
-                        .fetch_optional(&mut *$tx).await?;
+                        .fetch_optional(observed(&mut *$tx)).await?;
                     // A scoped token can retry an unassigned private registration without learning its ID.
                     let unassigned_retry = matches!(visibility, TeamVisibility::Teams(_))
                         && gateway.visibility == "private"
@@ -1428,7 +1441,7 @@ impl Database {
                         )
                         .bind(gateway.url)
                         .bind(gateway.owner_email)
-                        .fetch_one(&mut *$tx)
+                        .fetch_one(observed(&mut *$tx))
                         .await?;
                     if found.is_some() || unassigned_retry {
                         return Err(RegistrationError::UrlConflict);
@@ -1441,7 +1454,7 @@ impl Database {
                     .bind(gateway.team_id)
                     .bind(gateway.owner_email)
                     .bind(options.registry_scope.is_none() && auth.is_none() && !options.one_time_auth)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 match conflict.as_deref() {
                     Some("name") => return Err(RegistrationError::NameConflict),
@@ -1454,7 +1467,7 @@ impl Database {
                         .bind(gateway.visibility)
                         .bind(gateway.team_id)
                         .bind(gateway.owner_email)
-                        .fetch_all(&mut *$tx)
+                        .fetch_all(observed(&mut *$tx))
                         .await?;
                     if existing.iter().any(|(headers, query, sigv4, oauth)| auth.matches_stored(headers.as_deref(), query.as_deref(), sigv4.as_deref(), oauth.as_deref())) {
                         return Err(RegistrationError::UrlConflict);
@@ -1466,7 +1479,7 @@ impl Database {
                     .bind(gateway.visibility)
                     .bind(gateway.team_id)
                     .bind(gateway.owner_email)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?
                 {
                     return Err(RegistrationError::ToolNameConflict);
@@ -1504,7 +1517,7 @@ impl Database {
                     .bind(options.created_via)
                     .bind(options.import_batch_id)
                     .bind(options.inactive)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 for tool in tools {
                     let definition = tool.definition;
@@ -1530,7 +1543,7 @@ impl Database {
                         .bind(gateway.visibility)
                         .bind(gateway.transport.name())
                         .bind(display_name(&definition.name))
-                        .execute(&mut *$tx)
+                        .execute(observed(&mut *$tx))
                         .await?;
                 }
                 let mut uris = HashSet::new();
@@ -1546,7 +1559,7 @@ impl Database {
                         .bind(resource.uri).bind(resource.template).bind(name).bind(resource.name).bind(slug)
                         .bind(resource.title).bind(resource.description).bind(resource.mime).bind(resource.size)
                         .bind(gateway.id).bind(gateway.owner_email).bind(gateway.team_id).bind(gateway.visibility)
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 let mut prompts = HashSet::new();
                 for prompt in &metadata.prompts {
@@ -1565,7 +1578,7 @@ impl Database {
                         .bind(name).bind(&prompt.name).bind(slug).bind(&prompt.title).bind(&prompt.description)
                         .bind(prompt_argument_schema(prompt).to_string())
                         .bind(gateway.id).bind(gateway.owner_email).bind(gateway.team_id).bind(gateway.visibility)
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 $tx.commit().await?;
             }};
@@ -1594,7 +1607,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
-                sqlx::query(CATALOG_LOCK).execute(&mut *transaction).await?;
+                sqlx::query(CATALOG_LOCK)
+                    .execute(observed(&mut *transaction))
+                    .await?;
                 register!(
                     transaction,
                     tool_conflict_query!("SELECT json_array_elements_text(CAST($1 AS JSON))"),
@@ -1633,7 +1648,7 @@ impl Database {
                     .bind(allow_disabled)
                     .bind(version)
                     .bind(lifecycle_claim)
-                    .fetch_optional($pool)
+                    .fetch_optional(observed($pool))
                     .await
             };
         }
@@ -1651,7 +1666,7 @@ impl Database {
             ($pool:expr) => {
                 sqlx::query_as::<_, DirectGatewayRow>(DIRECT_GATEWAY_QUERY)
                     .bind(id)
-                    .fetch_optional($pool)
+                    .fetch_optional(observed($pool))
                     .await?
             };
         }
@@ -1684,12 +1699,12 @@ impl Database {
         let headers = match self {
             Self::Sqlite(pool) => {
                 sqlx::query_scalar::<_, Option<String>>(QUERY)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await?
             }
             Self::Postgres(pool) => {
                 sqlx::query_scalar::<_, Option<String>>(QUERY)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await?
             }
         };
@@ -1702,8 +1717,8 @@ impl Database {
         const QUERY: &str = "SELECT DISTINCT CAST(passthrough_headers AS TEXT)
                              FROM gateways WHERE passthrough_headers IS NOT NULL";
         match self {
-            Self::Sqlite(pool) => sqlx::query_scalar(QUERY).fetch_all(pool).await,
-            Self::Postgres(pool) => sqlx::query_scalar(QUERY).fetch_all(pool).await,
+            Self::Sqlite(pool) => sqlx::query_scalar(QUERY).fetch_all(observed(pool)).await,
+            Self::Postgres(pool) => sqlx::query_scalar(QUERY).fetch_all(observed(pool)).await,
         }
     }
 }

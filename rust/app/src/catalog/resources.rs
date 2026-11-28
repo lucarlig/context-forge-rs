@@ -2,6 +2,7 @@
 
 use super::entry_filters::fetch_catalog_entries;
 use super::*;
+use crate::database::observed;
 
 #[derive(Clone, Default, Serialize, sqlx::FromRow)]
 pub(crate) struct ResourceRecord {
@@ -69,7 +70,7 @@ impl Database {
             ($pool:ident) => {
                 sqlx::query_as::<_, ResourceRecord>(RESOURCE_BY_ID)
                     .bind(id)
-                    .fetch_optional($pool)
+                    .fetch_optional(observed($pool))
                     .await
             };
         }

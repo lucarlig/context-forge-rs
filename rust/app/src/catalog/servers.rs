@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use super::entry_filters::fetch_catalog_entries;
 use super::*;
+use crate::database::observed;
 
 #[derive(Clone, Default, Serialize, sqlx::FromRow)]
 pub(crate) struct ServerRecord {
@@ -147,8 +148,18 @@ impl Database {
             FROM server_interfaces WHERE server_id=$1 AND enabled AND LOWER(protocol) LIKE 'a2a%'
             ORDER BY created_at DESC, id DESC LIMIT 1";
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(SQL).bind(id).fetch_optional(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(SQL).bind(id).fetch_optional(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_as(SQL)
+                    .bind(id)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(SQL)
+                    .bind(id)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
         }
     }
 
@@ -160,13 +171,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(SERVER_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(SERVER_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -202,10 +213,10 @@ impl Database {
                     .bind(scope.visibility == &TeamVisibility::Admin)
                     .bind(scope.can_own())
                     .bind(scope.email)
-                    .fetch_all($pool),
+                    .fetch_all(observed($pool)),
                     sqlx::query_as::<_, ServerInterface>(server_interfaces!($ids))
                         .bind(&ids)
-                        .fetch_all($pool),
+                        .fetch_all(observed($pool)),
                 )?
             };
         }
@@ -242,7 +253,7 @@ impl Database {
             ($pool:ident, $exists:literal, $ids:literal, $teams:literal) => {{
                 if sqlx::query_scalar::<_, bool>($exists)
                     .bind("server_a2a_association")
-                    .fetch_one($pool)
+                    .fetch_one(observed($pool))
                     .await?
                 {
                     sqlx::query_as::<_, (String, String)>(server_agents!($ids, $teams))
@@ -251,7 +262,7 @@ impl Database {
                         .bind(scope.visibility == &TeamVisibility::Admin)
                         .bind(scope.can_own())
                         .bind(scope.email)
-                        .fetch_all($pool)
+                        .fetch_all(observed($pool))
                         .await?
                 } else {
                     Vec::new()

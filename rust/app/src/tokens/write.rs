@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::database::observed;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TokenWriteError {
@@ -68,7 +69,7 @@ impl Database {
                     .bind(&record.name)
                     .bind(record.team_id.as_deref())
                     .bind(&record.id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 if duplicate {
                     return Err(TokenWriteError::Duplicate);
@@ -89,11 +90,11 @@ impl Database {
                     .bind(record.tags.as_deref())
                     .bind(record.expires_at.as_deref())
                     .bind(record.is_active)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 let stored = sqlx::query_as(TOKEN_BY_ID)
                     .bind(&record.id)
-                    .fetch_one(&mut *$tx)
+                    .fetch_one(observed(&mut *$tx))
                     .await?;
                 $tx.commit().await?;
                 Ok(stored)
@@ -107,7 +108,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682072)")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 insert!(
                     tx,
@@ -138,13 +139,13 @@ impl Database {
                     .bind(&prior.id).bind(&prior.name).bind(prior.is_active).bind(prior.description.as_deref())
                     .bind(prior.server_id.as_deref()).bind(prior.resource_scopes.as_deref())
                     .bind(prior.ip_restrictions.as_deref()).bind(prior.time_restrictions.as_deref())
-                    .bind(prior.usage_limits.as_deref()).bind(prior.tags.as_deref()).fetch_optional(&mut *$tx).await?;
+                    .bind(prior.usage_limits.as_deref()).bind(prior.tags.as_deref()).fetch_optional(observed(&mut *$tx)).await?;
                 if exists.is_none() {
                     return Err(TokenWriteError::Changed);
                 }
                 if prior.name!=record.name && sqlx::query_scalar::<_,bool>(ACTIVE_NAME_CONFLICT)
                     .bind(&record.user_email).bind(&record.name).bind(record.team_id.as_deref()).bind(&record.id)
-                    .fetch_one(&mut *$tx).await?
+                    .fetch_one(observed(&mut *$tx)).await?
                 {
                     return Err(TokenWriteError::Duplicate);
                 }
@@ -152,8 +153,8 @@ impl Database {
                     .bind(&record.id).bind(&record.name).bind(record.description.as_deref()).bind(record.server_id.as_deref())
                     .bind(record.resource_scopes.as_deref()).bind(record.ip_restrictions.as_deref())
                     .bind(record.time_restrictions.as_deref()).bind(record.usage_limits.as_deref())
-                    .bind(record.tags.as_deref()).bind(record.is_active).execute(&mut *$tx).await?;
-                let updated=sqlx::query_as(TOKEN_BY_ID).bind(&record.id).fetch_one(&mut *$tx).await?;
+                    .bind(record.tags.as_deref()).bind(record.is_active).execute(observed(&mut *$tx)).await?;
+                let updated=sqlx::query_as(TOKEN_BY_ID).bind(&record.id).fetch_one(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(updated)
             }};
@@ -166,7 +167,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682072)")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 update!(tx, " FOR UPDATE", "CAST(", " AS JSON)")
             }
@@ -182,13 +183,13 @@ impl Database {
         macro_rules! revoke {
             ($tx:ident) => {{
                 let changed=sqlx::query("UPDATE email_api_tokens SET is_active=FALSE WHERE id=$1 AND jti=$2")
-                    .bind(&record.id).bind(&record.jti).execute(&mut *$tx).await?;
+                    .bind(&record.id).bind(&record.jti).execute(observed(&mut *$tx)).await?;
                 if changed.rows_affected()!=1 {
                     return Err(TokenWriteError::Changed);
                 }
                 sqlx::query("INSERT INTO token_revocations(jti,revoked_by,reason,token_expiry)
                     SELECT jti,$2,$3,expires_at FROM email_api_tokens WHERE id=$1 ON CONFLICT (jti) DO NOTHING")
-                    .bind(&record.id).bind(actor).bind(reason).execute(&mut *$tx).await?;
+                    .bind(&record.id).bind(actor).bind(reason).execute(observed(&mut *$tx)).await?;
                 $tx.commit().await?;
                 Ok(())
             }};

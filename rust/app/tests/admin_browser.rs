@@ -2501,14 +2501,16 @@ async fn operation_traces_follow_mcp_workers_and_redact_resource_queries() {
 }
 
 #[tokio::test]
-async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
+async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
     use axum::{
         Json, Router,
         body::Bytes,
         http::HeaderMap,
         routing::{get, post},
     };
-    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest, trace::v1::Span,
+    };
     use prost::Message;
     use serde_json::{Value, json};
 
@@ -2546,6 +2548,7 @@ async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
         ("OBSERVABILITY_ENABLED", "false"),
         ("OTEL_ENABLE_OBSERVABILITY", "true"),
         ("OTEL_HTTPX_INSTRUMENTATION_ENABLED", "true"),
+        ("OTEL_SQLALCHEMY_INSTRUMENTATION_ENABLED", "true"),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
         ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
         ("OTEL_EXPORTER_OTLP_HEADERS", "x-fixture-export=collector"),
@@ -2618,8 +2621,9 @@ async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
             .contains("otlp-payload-sentinel")
     );
     let tool_trace = "182cf4c06e0e4efa8e5369b811a358ad";
+    let unsampled_trace = "182cf4c06e0e4efa8e5369b811a358ae";
     let mut sampled_outbound = None;
-    for flags in ["01", "00"] {
+    for (request_trace, flags) in [(tool_trace, "01"), (unsampled_trace, "00")] {
         let reply = post_json(
             "/rpc",
             json!({
@@ -2630,7 +2634,7 @@ async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
         .bearer_auth(admin)
         .header(
             "traceparent",
-            format!("00-{tool_trace}-{remote_span}-{flags}"),
+            format!("00-{request_trace}-{remote_span}-{flags}"),
         )
         .header("tracestate", "fixture=keep")
         .header("baggage", "private=otlp-baggage-sentinel")
@@ -2647,7 +2651,7 @@ async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
         let envelope = headers["traceparent"].to_str().unwrap();
         let parts = envelope.split('-').collect::<Vec<_>>();
         assert_eq!(parts.len(), 4);
-        assert_eq!(parts[1], tool_trace);
+        assert_eq!(parts[1], request_trace);
         assert_ne!(parts[2], remote_span);
         assert_eq!(parts[3], flags);
         assert!(!headers.contains_key("baggage"));
@@ -2659,9 +2663,10 @@ async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
         }
     }
 
-    let mut spans = Vec::new();
+    let is_sql = |span: &Span| span.attributes.iter().any(|field| field.key == "db.system");
+    let (mut statements, mut spans) = (Vec::new(), Vec::new());
     tokio::time::timeout(Duration::from_secs(5), async {
-        while spans.len() < 5 {
+        while spans.len() < 5 || statements.is_empty() {
             let (headers, request) = batches.recv().await.unwrap();
             assert_eq!(headers["x-fixture-export"], "collector");
             let dump = format!("{request:?}");
@@ -2670,13 +2675,18 @@ async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
             assert!(!dump.contains("otlp-upstream-sentinel"));
             assert!(!dump.contains("otlp-baggage-sentinel"));
             assert!(!dump.contains(EMAIL));
-            spans.extend(
-                request
-                    .resource_spans
-                    .into_iter()
-                    .flat_map(|resource| resource.scope_spans)
-                    .flat_map(|scope| scope.spans),
-            );
+            for span in request
+                .resource_spans
+                .into_iter()
+                .flat_map(|resource| resource.scope_spans)
+                .flat_map(|scope| scope.spans)
+            {
+                if is_sql(&span) {
+                    statements.push(span);
+                } else {
+                    spans.push(span);
+                }
+            }
         }
     })
     .await
@@ -2704,6 +2714,22 @@ async fn otlp_exports_inbound_and_outbound_spans_without_database_tracing() {
     );
     assert_eq!(child.parent_span_id, root.span_id);
     assert_eq!(child.trace_state, "fixture=keep");
+    let read = statements
+        .iter()
+        .find(|span| span.name == "WITH" && span.parent_span_id == child.span_id)
+        .expect("resource read query span");
+    assert_eq!(read.trace_id, trace_id);
+    assert_eq!(read.kind, 3);
+    let ignored_trace = u128::from_str_radix(unsampled_trace, 16)
+        .unwrap()
+        .to_be_bytes();
+    assert!(statements.iter().all(|span| {
+        span.trace_id != ignored_trace
+            && span
+                .attributes
+                .iter()
+                .all(|field| field.key != "db.statement" && field.key != "db.query.text")
+    }));
     let tool = spans
         .iter()
         .find(|span| span.name == "tool.invoke")

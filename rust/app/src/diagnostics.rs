@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 use crate::{
     access::{AuthError, Authorizer, Principal, bearer, cookie},
     config::{Settings, admin_root, flag, parse, value},
-    database::Database,
+    database::{Database, observed},
     jwt::TokenUse,
     probes::RedisProbe,
     tokens::TokenRequest,
@@ -132,13 +132,13 @@ impl Diagnostics {
             Database::Sqlite(pool) => (
                 "sqlite",
                 sqlx::query_scalar::<_, String>("SELECT sqlite_version()")
-                    .fetch_one(pool)
+                    .fetch_one(observed(pool))
                     .await,
             ),
             Database::Postgres(pool) => (
                 "postgresql",
                 sqlx::query_scalar::<_, String>("SELECT current_setting('server_version')")
-                    .fetch_one(pool)
+                    .fetch_one(observed(pool))
                     .await,
             ),
         };

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::database::observed;
 use crate::local_auth::user_lifecycle::UserPatch;
 
 pub(in crate::local_auth) struct CredentialChange<'a> {
@@ -29,18 +30,18 @@ macro_rules! revoke_credentials {
                 .bind($email)
                 .bind($actor)
                 .bind($reason)
-                .execute(&mut *$tx)
+                .execute(observed(&mut *$tx))
                 .await?;
         }
         sqlx::query(
             "UPDATE email_api_tokens SET is_active=FALSE WHERE user_email=$1 AND is_active=TRUE",
         )
         .bind($email)
-        .execute(&mut *$tx)
+        .execute(observed(&mut *$tx))
         .await?;
         sqlx::query("DELETE FROM cf_local_sessions WHERE user_email=$1")
             .bind($email)
-            .execute(&mut *$tx)
+            .execute(observed(&mut *$tx))
             .await?;
     }};
 }
@@ -60,7 +61,7 @@ impl Database {
                 )
                 .bind(email)
                 .bind(i64::from(count))
-                .fetch_all($pool)
+                .fetch_all(observed($pool))
                 .await
             };
         }
@@ -88,15 +89,15 @@ impl Database {
             ($tx:ident,$lock:literal,$history_limit:literal,$not_expired:literal) => {{
                 let current:LocalUser = sqlx::query_as(concat!(
                     "SELECT ",local_user_fields!()," FROM email_users WHERE email=$1 ",$lock))
-                    .bind(email).fetch_optional(&mut *$tx).await?.ok_or_else(AccountError::missing)?;
+                    .bind(email).fetch_optional(observed(&mut *$tx)).await?.ok_or_else(AccountError::missing)?;
                 if let Some(hash)=reset_token {
                     let updated=sqlx::query(concat!("UPDATE password_reset_tokens SET used_at=CURRENT_TIMESTAMP
                         WHERE token_hash=$1 AND user_email=$2 AND used_at IS NULL AND ",$not_expired))
-                        .bind(hash).bind(email).execute(&mut *$tx).await?;
+                        .bind(hash).bind(email).execute(observed(&mut *$tx)).await?;
                     if updated.rows_affected()==0 {
                         let link:Option<(bool,String)>=sqlx::query_as("SELECT used_at IS NOT NULL,CAST(expires_at AS TEXT)
                             FROM password_reset_tokens WHERE token_hash=$1 AND user_email=$2")
-                            .bind(hash).bind(email).fetch_optional(&mut *$tx).await?;
+                            .bind(hash).bind(email).fetch_optional(observed(&mut *$tx)).await?;
                         return Err(match link {
                             Some((true,_)) => password_reset::used(),
                             Some((false,expiry)) if parse_timestamp(&expiry)
@@ -119,7 +120,7 @@ impl Database {
                     }
                     let others:i64=sqlx::query_scalar("SELECT COUNT(*) FROM email_users
                         WHERE is_admin=TRUE AND is_active=TRUE AND email<>$1")
-                        .bind(email).fetch_one(&mut *$tx).await?;
+                        .bind(email).fetch_one(observed(&mut *$tx)).await?;
                     if others==0 {
                         return Err(AccountError::bad_request("Cannot demote or deactivate the last remaining active admin user"));
                     }
@@ -128,11 +129,11 @@ impl Database {
                     sqlx::query("INSERT INTO password_history(id,user_email,password_hash,changed_at)
                         VALUES($1,$2,$3,CURRENT_TIMESTAMP)")
                         .bind(Uuid::new_v4().to_string()).bind(email).bind(prior_hash)
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                     sqlx::query(concat!("DELETE FROM password_history WHERE id IN
                         (SELECT id FROM password_history WHERE user_email=$1 ORDER BY changed_at DESC,id DESC ",
                         $history_limit," OFFSET $2)"))
-                        .bind(email).bind(i64::from(settings.password_history)).execute(&mut *$tx).await?;
+                        .bind(email).bind(i64::from(settings.password_history)).execute(observed(&mut *$tx)).await?;
                 }
                 let updated:LocalUser=sqlx::query_as(concat!(
                     "UPDATE email_users SET full_name=COALESCE($2,full_name),is_admin=$3,is_active=$4,
@@ -147,11 +148,11 @@ impl Database {
                       updated_at=CURRENT_TIMESTAMP WHERE email=$1 RETURNING ",local_user_fields!()))
                     .bind(email).bind(patch.full_name.as_deref()).bind(admin).bind(active)
                     .bind(patch.email_verified).bind(change).bind(new_hash).bind(reset_token.is_some())
-                    .bind(patch.admin_origin.unwrap_or("api")).fetch_one(&mut *$tx).await?;
+                    .bind(patch.admin_origin.unwrap_or("api")).fetch_one(observed(&mut *$tx)).await?;
                 if new_hash.is_some() || current.is_active && !active {
                     sqlx::query("UPDATE password_reset_tokens SET used_at=CURRENT_TIMESTAMP
                         WHERE user_email=$1 AND used_at IS NULL")
-                        .bind(email).execute(&mut *$tx).await?;
+                        .bind(email).execute(observed(&mut *$tx)).await?;
                 }
                 let privilege_changed=current.is_admin!=admin;
                 if privilege_changed {
@@ -161,10 +162,10 @@ impl Database {
                     sqlx::query("UPDATE user_roles SET is_active=FALSE WHERE user_email=$1
                         AND scope='global' AND scope_id IS NULL AND role_id IN
                         (SELECT id FROM roles WHERE scope='global' AND name=$2)")
-                        .bind(email).bind(old).execute(&mut *$tx).await?;
+                        .bind(email).bind(old).execute(observed(&mut *$tx)).await?;
                     sqlx::query(USE_ROLE).bind(Uuid::new_v4().to_string()).bind(email)
                         .bind(None::<&str>).bind(actor).bind(new).bind("global")
-                        .execute(&mut *$tx).await?;
+                        .execute(observed(&mut *$tx)).await?;
                 }
                 let revoke=if privilege_changed {
                     Some("account_privileges_changed")
@@ -193,7 +194,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682073)")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 edit!(tx, "FOR UPDATE", "", "expires_at>clock_timestamp()")
             }
@@ -211,7 +212,7 @@ impl Database {
                     updated_at=CURRENT_TIMESTAMP WHERE email=$1",
                 )
                 .bind(email)
-                .execute(&mut *$tx)
+                .execute(observed(&mut *$tx))
                 .await?
                 .rows_affected()
                     != 0;
@@ -221,7 +222,7 @@ impl Database {
                        VALUES(CURRENT_TIMESTAMP,$1,'ACCOUNT_UNLOCKED',TRUE)",
                     )
                     .bind(email)
-                    .execute(&mut *$tx)
+                    .execute(observed(&mut *$tx))
                     .await?;
                 }
                 $tx.commit().await?;
@@ -252,31 +253,31 @@ impl Database {
             ($tx:ident,$lock:literal) => {{
                 let Some((admin,active))=sqlx::query_as::<_,(bool,bool)>(concat!(
                     "SELECT is_admin,is_active FROM email_users WHERE email=$1 ",$lock))
-                    .bind(email).fetch_optional(&mut *$tx).await? else {
+                    .bind(email).fetch_optional(observed(&mut *$tx)).await? else {
                     return Err(AccountError::detail(StatusCode::NOT_FOUND,format!("User {email} not found")));
                 };
                 if admin && active {
                     let others:i64=sqlx::query_scalar("SELECT COUNT(*) FROM email_users WHERE is_admin=TRUE
-                        AND is_active=TRUE AND email<>$1").bind(email).fetch_one(&mut *$tx).await?;
+                        AND is_active=TRUE AND email<>$1").bind(email).fetch_one(observed(&mut *$tx)).await?;
                     if others==0 {
                         return Err(AccountError::bad_request("Cannot delete the last remaining admin user"));
                     }
                 }
                 let teams=sqlx::query_as::<_,(String,String)>(concat!(
                     "SELECT id,name FROM email_teams WHERE created_by=$1 ORDER BY id ",$lock))
-                    .bind(email).fetch_all(&mut *$tx).await?;
+                    .bind(email).fetch_all(observed(&mut *$tx)).await?;
                 for (id,name) in teams {
                     let alternate:Option<String>=sqlx::query_scalar("SELECT m.user_email FROM email_team_members m
                         JOIN email_users u ON u.email=m.user_email AND u.is_active=TRUE
                         WHERE m.team_id=$1 AND m.user_email<>$2 AND m.is_active=TRUE AND m.role='owner'
-                        ORDER BY m.user_email LIMIT 1").bind(&id).bind(email).fetch_optional(&mut *$tx).await?;
+                        ORDER BY m.user_email LIMIT 1").bind(&id).bind(email).fetch_optional(observed(&mut *$tx)).await?;
                     if let Some(owner)=alternate {
                         sqlx::query("UPDATE email_teams SET created_by=$2,updated_at=CURRENT_TIMESTAMP WHERE id=$1")
-                            .bind(&id).bind(owner).execute(&mut *$tx).await?;
+                            .bind(&id).bind(owner).execute(observed(&mut *$tx)).await?;
                         continue;
                     }
                     let members=sqlx::query_scalar::<_,String>("SELECT user_email FROM email_team_members WHERE team_id=$1")
-                        .bind(&id).fetch_all(&mut *$tx).await?;
+                        .bind(&id).fetch_all(observed(&mut *$tx)).await?;
                     if !matches!(members.as_slice(),[owner] if owner==email) {
                         return Err(AccountError::detail(StatusCode::CONFLICT,format!(
                             "Cannot delete user {email}: owns team '{name}' with {} members but no other owners to transfer ownership to",
@@ -289,22 +290,22 @@ impl Database {
                         "DELETE FROM email_team_members WHERE team_id=$1",
                         "DELETE FROM email_teams WHERE id=$1",
                     ] {
-                        sqlx::query(command).bind(&id).execute(&mut *$tx).await?;
+                        sqlx::query(command).bind(&id).execute(observed(&mut *$tx)).await?;
                     }
                 }
                 let gateways=sqlx::query_as::<_,(String,Option<String>,String)>(concat!(
                     "SELECT id,team_id,visibility FROM gateways WHERE owner_email=$1 ORDER BY id ",$lock))
-                    .bind(email).fetch_all(&mut *$tx).await?;
+                    .bind(email).fetch_all(observed(&mut *$tx)).await?;
                 let fallback:Option<String>=sqlx::query_scalar("SELECT email FROM email_users
                     WHERE email=$1 AND is_active=TRUE AND email<>$2")
-                    .bind(platform_admin.trim().to_ascii_lowercase()).bind(email).fetch_optional(&mut *$tx).await?;
+                    .bind(platform_admin.trim().to_ascii_lowercase()).bind(email).fetch_optional(observed(&mut *$tx)).await?;
                 for (id,team,visibility) in gateways {
                     let mut replacement=fallback.clone();
                     if let Some(team)=team.filter(|_|visibility=="team") {
                         let member:Option<String>=sqlx::query_scalar("SELECT m.user_email FROM email_team_members m
                             JOIN email_users u ON u.email=m.user_email AND u.is_active=TRUE
                             WHERE m.team_id=$1 AND m.user_email<>$2 AND m.is_active=TRUE ORDER BY m.user_email LIMIT 1")
-                            .bind(team).bind(email).fetch_optional(&mut *$tx).await?;
+                            .bind(team).bind(email).fetch_optional(observed(&mut *$tx)).await?;
                         replacement=member.or(replacement);
                     }
                     let Some(owner)=replacement else {
@@ -312,13 +313,13 @@ impl Database {
                             "Cannot delete user {email}: gateway {id} would become orphaned and no fallback owner is available")));
                     };
                     sqlx::query("UPDATE gateways SET owner_email=$2 WHERE id=$1")
-                        .bind(&id).bind(&owner).execute(&mut *$tx).await?;
+                        .bind(&id).bind(&owner).execute(observed(&mut *$tx)).await?;
                     for command in [
                         "UPDATE tools SET owner_email=$3 WHERE gateway_id=$1 AND owner_email=$2",
                         "UPDATE resources SET owner_email=$3 WHERE gateway_id=$1 AND owner_email=$2",
                         "UPDATE prompts SET owner_email=$3 WHERE gateway_id=$1 AND owner_email=$2",
                     ] {
-                        sqlx::query(command).bind(&id).bind(email).bind(&owner).execute(&mut *$tx).await?;
+                        sqlx::query(command).bind(&id).bind(email).bind(&owner).execute(observed(&mut *$tx)).await?;
                     }
                 }
                 revoke_credentials!($tx,email,actor,"account_deleted");
@@ -337,7 +338,7 @@ impl Database {
                     "UPDATE pending_user_approvals SET approved_by=NULL WHERE approved_by=$1",
                     "DELETE FROM sso_auth_sessions WHERE user_email=$1",
                 ] {
-                    sqlx::query(command).bind(email).execute(&mut *$tx).await?;
+                    sqlx::query(command).bind(email).execute(observed(&mut *$tx)).await?;
                 }
                 for command in [
                     "UPDATE email_team_invitations SET invited_by=$2 WHERE invited_by=$1",
@@ -349,10 +350,10 @@ impl Database {
                     "UPDATE prompts SET owner_email=$2 WHERE owner_email=$1",
                     "UPDATE servers SET owner_email=$2 WHERE owner_email=$1",
                 ] {
-                    sqlx::query(command).bind(email).bind(actor).execute(&mut *$tx).await?;
+                    sqlx::query(command).bind(email).bind(actor).execute(observed(&mut *$tx)).await?;
                 }
                 sqlx::query("DELETE FROM email_users WHERE email=$1").bind(email)
-                    .execute(&mut *$tx).await.map_err(|error| {
+                    .execute(observed(&mut *$tx)).await.map_err(|error| {
                         if error.as_database_error().is_some_and(sqlx::error::DatabaseError::is_foreign_key_violation) {
                             AccountError::detail(StatusCode::CONFLICT,"Cannot delete user due to existing references")
                         } else {
@@ -371,7 +372,7 @@ impl Database {
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("SELECT pg_advisory_xact_lock(1128682073)")
-                    .execute(&mut *tx)
+                    .execute(observed(&mut *tx))
                     .await?;
                 delete!(tx, "FOR UPDATE")
             }

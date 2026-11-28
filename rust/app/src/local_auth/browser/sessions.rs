@@ -3,6 +3,7 @@
 use std::net::IpAddr;
 
 use super::*;
+use crate::database::observed;
 use crate::{access::AuthError, jwt::JwtError};
 use axum::http::{Uri, request::Parts};
 
@@ -375,7 +376,7 @@ impl Database {
                     .bind(email)
                     .bind(expiry.map(|time| time.to_string()))
                     .bind(activity.map(|time| time.to_string()))
-                    .execute($pool).await?;
+                    .execute(observed($pool)).await?;
             }};
         }
         match self {
@@ -392,8 +393,18 @@ impl Database {
     async fn browser_token_revoked(&self, jti: &str) -> Result<bool, sqlx::Error> {
         const QUERY: &str = "SELECT EXISTS (SELECT 1 FROM token_revocations WHERE jti=$1)";
         match self {
-            Self::Sqlite(pool) => sqlx::query_scalar(QUERY).bind(jti).fetch_one(pool).await,
-            Self::Postgres(pool) => sqlx::query_scalar(QUERY).bind(jti).fetch_one(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar(QUERY)
+                    .bind(jti)
+                    .fetch_one(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar(QUERY)
+                    .bind(jti)
+                    .fetch_one(observed(pool))
+                    .await
+            }
         }
     }
 }

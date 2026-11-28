@@ -17,6 +17,7 @@ use super::{
     providers::Provider,
     *,
 };
+use crate::database::observed;
 use crate::upstream_tls::TlsMaterial;
 
 const SESSION_COOKIE: &str = "sso_session_id";
@@ -586,7 +587,7 @@ impl Database {
                      WHERE id=$2 AND is_enabled AND CAST(updated_at AS TEXT)=$7", $lock,
                 )).bind(Uuid::new_v4().to_string()).bind(&provider.id).bind(state)
                     .bind(session.code_verifier.as_deref()).bind(session.nonce.as_deref()).bind(&session.redirect_uri)
-                    .bind(&provider.updated_at).execute($pool).await?.rows_affected()!=0
+                    .bind(&provider.updated_at).execute(observed($pool)).await?.rows_affected()!=0
             };
         }
         Ok(match self {
@@ -609,7 +610,7 @@ impl Database {
                 sqlx::query_as(concat!("DELETE FROM sso_auth_sessions WHERE provider_id=$1 AND state=$2 AND ",
                     $expiry," AND EXISTS(SELECT 1 FROM sso_providers WHERE id=$1 AND is_enabled
                         AND CAST(updated_at AS TEXT)=$3) RETURNING code_verifier,nonce,redirect_uri"))
-                    .bind(&provider.id).bind(state).bind(&provider.updated_at).fetch_optional($pool).await
+                    .bind(&provider.id).bind(state).bind(&provider.updated_at).fetch_optional(observed($pool)).await
             };
         }
         match self {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{CatalogScope, Database, TeamVisibility, visible_team_ids};
+use crate::database::observed;
 
 pub(crate) struct CatalogEntryFilters<'a> {
     pub(crate) include_inactive: bool,
@@ -124,7 +125,7 @@ impl Database {
                     .bind(scope.can_own())
                     .bind(scope.email)
                     .bind(teams)
-                    .fetch_one($pool)
+                    .fetch_one(observed($pool))
                     .await
             }};
         }
@@ -191,7 +192,7 @@ macro_rules! fetch_catalog_entries {
                     .bind(teams).bind(tags)
                     .bind(filter.offset)
                     $(.bind($additional_binding))*
-                    .fetch_all($pool).await
+                    .fetch_all(observed($pool)).await
             };
         }
         match $db {

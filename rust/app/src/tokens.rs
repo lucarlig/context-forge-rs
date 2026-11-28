@@ -3,7 +3,7 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::database::Database;
+use crate::database::{Database, observed};
 
 pub(crate) fn hash_token(token: &str) -> String {
     use std::fmt::Write as _;
@@ -138,13 +138,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(TOKEN_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(TOKEN_BY_ID)
                     .bind(id)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -158,13 +158,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_as(TOKEN_BY_JTI)
                     .bind(jti)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_as(TOKEN_BY_JTI)
                     .bind(jti)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
@@ -190,7 +190,7 @@ impl Database {
                 .bind(filters.search)
                 .bind(filters.limit)
                 .bind(filters.offset)
-                .fetch_all($pool);
+                .fetch_all(observed($pool));
                 let total = sqlx::query_scalar(concat!(
                     "SELECT COUNT(*) FROM email_api_tokens t",
                     token_filter!($teams, $expiry, $search)
@@ -200,7 +200,7 @@ impl Database {
                 .bind(filters.owner)
                 .bind(&teams)
                 .bind(filters.search)
-                .fetch_one($pool);
+                .fetch_one(observed($pool));
                 tokio::try_join!(rows, total)
             }};
         }
@@ -231,8 +231,18 @@ impl Database {
     ) -> Result<Option<(String, String, bool)>, sqlx::Error> {
         const QUERY: &str = "SELECT id,email,is_admin FROM email_users WHERE LOWER(email)=LOWER($1) AND is_active LIMIT 1";
         match self {
-            Self::Sqlite(pool) => sqlx::query_as(QUERY).bind(email).fetch_optional(pool).await,
-            Self::Postgres(pool) => sqlx::query_as(QUERY).bind(email).fetch_optional(pool).await,
+            Self::Sqlite(pool) => {
+                sqlx::query_as(QUERY)
+                    .bind(email)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(QUERY)
+                    .bind(email)
+                    .fetch_optional(observed(pool))
+                    .await
+            }
         }
     }
 
@@ -246,13 +256,13 @@ impl Database {
             Self::Sqlite(pool) => {
                 sqlx::query_scalar(QUERY)
                     .bind(email)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
             Self::Postgres(pool) => {
                 sqlx::query_scalar(QUERY)
                     .bind(email)
-                    .fetch_optional(pool)
+                    .fetch_optional(observed(pool))
                     .await
             }
         }
