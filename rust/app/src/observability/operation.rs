@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{
     bounded,
-    telemetry::{ExportContext, ExportSpan, HttpSemantics},
+    telemetry::{ExportContext, ExportSpan, SemanticConventions, redis_client::RedisConventions},
 };
 use crate::database::Database;
 
@@ -24,7 +24,9 @@ pub(crate) struct TraceContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) exported: Option<ExportContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) http_clients: Option<HttpSemantics>,
+    pub(super) http_clients: Option<SemanticConventions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) redis_commands: Option<RedisConventions>,
     #[serde(default)]
     pub(super) mcp_call: bool,
 }

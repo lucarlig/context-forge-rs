@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     config::RedisSettings,
+    observability::telemetry::redis_client,
     sessions::{SessionAccess, SessionError},
 };
 
@@ -344,7 +345,7 @@ impl RedisSessionDirectory {
                 shared
             }
         };
-        let result = command.query_async(&mut connection).await;
+        let result = redis_client::query(&self.client, command, &mut connection).await;
         if result.as_ref().is_err_and(|error| error.is_io_error()) {
             let mut cached = self.connection.lock().await;
             if cached

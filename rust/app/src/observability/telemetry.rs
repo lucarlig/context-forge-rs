@@ -53,7 +53,38 @@ use crate::{
 type SettingsError = Box<dyn Error + Send + Sync>;
 
 pub(crate) mod client;
-pub(super) use client::HttpSemantics;
+pub(crate) mod redis_client;
+use redis_client::RedisConventions;
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+pub(super) enum SemanticConventions {
+    Legacy,
+    Standard,
+    Both,
+}
+
+impl SemanticConventions {
+    fn from_env(signal: &str) -> Result<Self, SettingsError> {
+        let modes = value("OTEL_SEMCONV_STABILITY_OPT_IN", "")?;
+        let duplicate = format!("{signal}/dup");
+        let selected = |name| modes.split(',').any(|mode| mode.trim() == name);
+        Ok(if selected(duplicate.as_str()) {
+            Self::Both
+        } else if selected(signal) {
+            Self::Standard
+        } else {
+            Self::Legacy
+        })
+    }
+
+    fn legacy(self) -> bool {
+        matches!(self, Self::Legacy | Self::Both)
+    }
+
+    fn standard(self) -> bool {
+        matches!(self, Self::Standard | Self::Both)
+    }
+}
 
 pub(crate) struct Telemetry {
     provider: SdkTracerProvider,
@@ -61,7 +92,8 @@ pub(crate) struct Telemetry {
     redaction: QueryRedaction,
     host: String,
     port: u16,
-    http_clients: Option<HttpSemantics>,
+    http_clients: Option<SemanticConventions>,
+    redis_commands: Option<RedisConventions>,
 }
 
 impl Telemetry {
@@ -124,7 +156,14 @@ impl Telemetry {
         let tracer = provider.tracer_with_scope(scope());
         let redaction = QueryRedaction::from_env()?;
         let host = value("HOST", "127.0.0.1")?;
-        let http_clients = HttpSemantics::from_env()?;
+        let http_clients = flag("OTEL_HTTPX_INSTRUMENTATION_ENABLED")?
+            .unwrap_or(false)
+            .then(|| SemanticConventions::from_env("http"))
+            .transpose()?;
+        let redis_commands = flag("OTEL_REDIS_INSTRUMENTATION_ENABLED")?
+            .unwrap_or(false)
+            .then(RedisConventions::from_env)
+            .transpose()?;
         global::set_tracer_provider(provider.clone());
         Ok(Some(Self {
             provider,
@@ -133,6 +172,7 @@ impl Telemetry {
             host,
             port,
             http_clients,
+            redis_commands,
         }))
     }
 
@@ -283,7 +323,7 @@ async fn observe(
             request,
             next,
             ExportContext::child_context(&remote),
-            telemetry.http_clients,
+            &telemetry,
         )
         .await;
     }
@@ -339,7 +379,7 @@ async fn observe(
         request,
         next,
         ExportContext::from_span(span.span_context()),
-        telemetry.http_clients,
+        &telemetry,
     )
     .await;
     if !span.is_recording() {
@@ -373,11 +413,12 @@ async fn observe_request(
     mut request: Request,
     next: Next,
     exported: ExportContext,
-    http_clients: Option<HttpSemantics>,
+    telemetry: &Telemetry,
 ) -> Response {
     let context = TraceContext {
         exported: Some(exported),
-        http_clients,
+        http_clients: telemetry.http_clients,
+        redis_commands: telemetry.redis_commands,
         ..TraceContext::default()
     };
     request.extensions_mut().insert(context.clone());

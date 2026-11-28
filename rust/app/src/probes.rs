@@ -16,7 +16,7 @@ use redis::AsyncConnectionConfig;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::{config::RedisSettings, database::Database};
+use crate::{config::RedisSettings, database::Database, observability::telemetry::redis_client};
 
 #[derive(Clone)]
 pub struct RedisProbe {
@@ -51,7 +51,7 @@ impl RedisProbe {
             .client
             .get_multiplexed_async_connection_with_config(&self.config)
             .await?;
-        command.query_async(&mut connection).await
+        redis_client::query(&self.client, command, &mut connection).await
     }
 }
 

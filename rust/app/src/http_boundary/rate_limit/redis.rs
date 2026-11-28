@@ -12,7 +12,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{Admission, Lockout, WINDOW};
-use crate::config::{flag, parse, value};
+use crate::{
+    config::{flag, parse, value},
+    observability::telemetry::redis_client,
+};
 
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const ADMIT: &str = r#"
@@ -127,7 +130,7 @@ impl RedisBuckets {
             .arg(lockout.map_or_else(|| "-1".to_owned(), |lockout| lockout.threshold.to_string()))
             .arg(lockout.map_or(0, |lockout| lockout.period().as_secs()))
             .arg(Uuid::new_v4().simple().to_string());
-        match command.query_async::<(u8, usize)>(&mut connection).await {
+        match redis_client::query::<(u8, usize)>(&self.client, &command, &mut connection).await {
             Ok((0, remaining)) => Some(Admission::Allowed(remaining)),
             Ok((1, denied @ 1..=7)) => Some(Admission::Exceeded(denied as u8)),
             Ok((2, denied @ 1..=7)) => Some(Admission::Locked(denied as u8)),

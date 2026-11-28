@@ -2,52 +2,15 @@
 
 use std::future::Future;
 
+use super::{ExportSpan, SemanticConventions};
+use crate::observability::{bounded, current_trace, with_trace};
 use opentelemetry::{
     KeyValue,
     trace::{Span, SpanKind, Status},
 };
 use reqwest::{Client, Method, Request, Response, Url, Version};
-use serde::{Deserialize, Serialize};
 
-use super::{ExportSpan, SettingsError};
-use crate::{
-    config::{flag, value},
-    observability::{bounded, current_trace, with_trace},
-};
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-pub(crate) enum HttpSemantics {
-    Legacy,
-    Standard,
-    Both,
-}
-
-impl HttpSemantics {
-    pub(super) fn from_env() -> Result<Option<Self>, SettingsError> {
-        if !flag("OTEL_HTTPX_INSTRUMENTATION_ENABLED")?.unwrap_or(false) {
-            return Ok(None);
-        }
-        let modes = value("OTEL_SEMCONV_STABILITY_OPT_IN", "")?;
-        let one_of = |name| modes.split(',').any(|mode| mode.trim() == name);
-        Ok(Some(if one_of("http/dup") {
-            Self::Both
-        } else if one_of("http") {
-            Self::Standard
-        } else {
-            Self::Legacy
-        }))
-    }
-
-    fn legacy(self) -> bool {
-        matches!(self, Self::Legacy | Self::Both)
-    }
-
-    fn standard(self) -> bool {
-        matches!(self, Self::Standard | Self::Both)
-    }
-}
-
-pub(crate) struct HttpClientSpan(Option<Box<(ExportSpan, HttpSemantics)>>);
+pub(crate) struct HttpClientSpan(Option<Box<(ExportSpan, SemanticConventions)>>);
 
 impl HttpClientSpan {
     pub(crate) fn start(request: &mut Request) -> Self {
@@ -206,7 +169,7 @@ fn http_method(method: &Method) -> &'static str {
     }
 }
 
-fn request_attributes(request: &Request, mode: HttpSemantics) -> Vec<KeyValue> {
+fn request_attributes(request: &Request, mode: SemanticConventions) -> Vec<KeyValue> {
     let method = request.method().as_str();
     let url = safe_url(request.url());
     let mut attrs = Vec::new();
@@ -237,7 +200,7 @@ fn request_attributes(request: &Request, mode: HttpSemantics) -> Vec<KeyValue> {
     attrs
 }
 
-fn record_response(span: &mut impl Span, response: &Response, mode: HttpSemantics) {
+fn record_response(span: &mut impl Span, response: &Response, mode: SemanticConventions) {
     let code = i64::from(response.status().as_u16());
     let failed = response.status().is_client_error() || response.status().is_server_error();
     if mode.legacy() {

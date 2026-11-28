@@ -553,8 +553,23 @@ test verifies those exports, their wire span IDs, and unsampled propagation.
 Twelve Rust Anything cases match the pinned reference for outbound span
 status, ancestry, and wire propagation across REST, MCP, and A2A. Native
 checks verify per-request context in a reused upstream MCP session.
-Framework spans, database and Redis instrumentation, and vendor-specific
-exporters remain open.
+
+Set `OTEL_REDIS_INSTRUMENTATION_ENABLED=true` to export Redis client spans
+for request-scoped commands. This covers session affinity, legacy SSE queues,
+shared catalog and token caches, and Redis rate limiting. Command spans carry
+the command name and placeholder arguments. They omit keys, values, scripts,
+and connection credentials. Set `OTEL_SEMCONV_STABILITY_OPT_IN=database,http`
+for standard database and network attributes.
+
+Four Rust Anything replays match the pinned session registry span across
+legacy and standard attributes, disabled instrumentation, and unsampled
+requests. Live Rust checks cover Redis-backed SSE queue writes and a Redis
+rate-limit command failure that falls back to memory. All eight tests that
+require external Redis or PostgreSQL pass with disposable instances.
+
+Framework spans, SQL query instrumentation, and vendor-specific exporters
+remain open. The pinned prompt-read capture emits zero SQL query spans on
+SQLite and PostgreSQL with the SQLAlchemy instrumentation flag enabled.
 
 ## Gateway and protocol verification
 
