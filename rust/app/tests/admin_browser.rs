@@ -1880,6 +1880,105 @@ async fn registry_selects_gateways_after_enforcing_team_scope() {
 }
 
 #[tokio::test]
+async fn execution_metrics_record_live_reads_and_deny_scoped_resets() {
+    use serde_json::{Value, json};
+
+    let mut service = gateway().await;
+    let (client, origin) = (&service.client, &service.origin);
+    let post_json = |path, token: Option<&str>, body: Value| {
+        let request = client
+            .post(format!("{origin}{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        let request = match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert!(status.is_success(), "{status} {body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        }
+    };
+    let login = post_json(
+        "/auth/email/login",
+        None,
+        json!({"email":EMAIL, "password":service.password}),
+    )
+    .await;
+    let admin = login["access_token"].as_str().unwrap();
+    let resource = post_json("/resources", Some(admin), json!({
+        "resource":{"name":"live-metric","uri":"file:///fixture/live-metric","content":"Metrics fixture"},
+        "visibility":"public"
+    })).await;
+    let id = resource["id"].as_str().unwrap();
+    let read = client
+        .get(format!("{origin}/v1/resources/{id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let team = post_json("/teams", Some(admin), json!({"name":"Metric Scope"})).await;
+    let token = post_json(
+        "/tokens",
+        Some(admin),
+        json!({
+            "name":"scoped-metric-operator","team_id":team["id"],"expires_in_days":1,
+            "scope":{"permissions":["admin.system_config"]}
+        }),
+    )
+    .await;
+    let token = token["access_token"].as_str().unwrap();
+    let metrics = format!("{origin}/v1/admin/metrics");
+    let reset = format!("{metrics}/reset");
+    let denied = client.post(&reset).bearer_auth(token).send().await.unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied = client
+        .get(&metrics)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied = client
+        .post(&reset)
+        .header(header::COOKIE, format!("jwt_token={admin}"))
+        .header(header::ACCEPT, "text/html")
+        .header(header::ORIGIN, origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let summary = || async {
+        let response = client
+            .get(&metrics)
+            .bearer_auth(admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()
+    };
+    let recorded = summary().await;
+    assert_eq!(recorded["resources"]["totalExecutions"], 1);
+    assert_eq!(recorded["resources"]["successfulExecutions"], 1);
+    assert_eq!(
+        recorded["topPerformers"]["resources"][0]["name"],
+        "file:///fixture/live-metric"
+    );
+    let cleared = client.post(&reset).bearer_auth(admin).send().await.unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let cleared = summary().await;
+    assert_eq!(cleared["resources"]["totalExecutions"], 0);
+    assert_eq!(cleared["topPerformers"]["resources"], json!([]));
+    service.process.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn registry_registration_requires_browser_proof_and_serializes_oauth_duplicates() {
     use serde_json::{Value, json};
 

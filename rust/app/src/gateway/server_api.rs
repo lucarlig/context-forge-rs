@@ -168,7 +168,10 @@ async fn include_metrics(
         .iter()
         .filter_map(|row| row["id"].as_str())
         .collect::<Vec<_>>();
-    let metrics = service.database.execution_metrics(entity, &ids).await?;
+    let metrics = service
+        .database
+        .execution_metrics(entity, &ids, service.execution_metrics.raw_window)
+        .await?;
     let empty = ExecutionMetrics::default();
     for row in rows {
         let result = row["id"]

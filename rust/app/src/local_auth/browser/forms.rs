@@ -247,6 +247,9 @@ pub(super) fn render_template(
                 .add_template("registry.html", include_str!("registry.html"))
                 .expect("valid MCP registry template");
             environment
+                .add_template("metrics.html", include_str!("metrics.html"))
+                .expect("valid execution metrics template");
+            environment
                 .add_template(
                     "registry_registration.html",
                     include_str!("registry_registration.html"),

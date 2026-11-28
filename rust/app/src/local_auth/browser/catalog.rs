@@ -379,6 +379,7 @@ pub(super) struct Dashboard {
     navigation: Vec<Link>,
     search: Option<Value>,
     registry: Option<Value>,
+    metrics: Option<Value>,
     sections: Vec<Section>,
     include_inactive: bool,
     team: Option<String>,
@@ -514,6 +515,7 @@ pub(super) async fn dashboard(
     let grpc_visible = super::grpc::visible(accounts, service, principal, team).await?;
     let roots_visible = service.can_administer_roots(principal).await?;
     let diagnostics_visible = crate::diagnostics::allowed(principal);
+    let metrics_visible = service.can_administer_execution_metrics(principal).await?;
     let registry_visible = service.registry_enabled()
         && allows(accounts, principal, ManagedCatalog::Servers, "read", None).await?;
     let parameters = forms::query(uri);
@@ -528,6 +530,7 @@ pub(super) async fn dashboard(
                 || (*name == "grpc" && grpc_visible)
                 || (*name == "roots" && roots_visible)
                 || (*name == "registry" && registry_visible)
+                || (*name == "metrics" && metrics_visible)
                 || *name == "search"
                 || permitted.iter().any(|kind| kind.name() == *name)
         });
@@ -536,7 +539,7 @@ pub(super) async fn dashboard(
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
-    let mut navigation = Vec::with_capacity(permitted.len() + 10);
+    let mut navigation = Vec::with_capacity(permitted.len() + 11);
     if !permitted.is_empty()
         || tokens_visible
         || users_visible
@@ -545,6 +548,7 @@ pub(super) async fn dashboard(
         || grpc_visible
         || roots_visible
         || registry_visible
+        || metrics_visible
         || diagnostics_visible
     {
         navigation.push(Link {
@@ -574,6 +578,22 @@ pub(super) async fn dashboard(
         Some(
             service
                 .registry_panel(principal, uri.query(), &base, true)
+                .await?,
+        )
+    } else {
+        None
+    };
+    if metrics_visible {
+        navigation.push(Link {
+            label: "Execution metrics",
+            href: href(Some("metrics"), None),
+            selected: selected == Some("metrics"),
+        });
+    }
+    let metrics = if selected == Some("metrics") {
+        Some(
+            service
+                .execution_metrics_panel(principal, uri, &base, true)
                 .await?,
         )
     } else {
@@ -724,6 +744,7 @@ pub(super) async fn dashboard(
         navigation,
         search,
         registry,
+        metrics,
         sections,
         include_inactive,
         team: team.map(str::to_owned),
@@ -749,6 +770,7 @@ pub(super) async fn dashboard(
             Some("gateway_write_pending") => Some("MCP server initialization is pending."),
             Some("gateway_refreshed") => Some("MCP server tools refreshed."),
             Some("registry_registered") => Some("MCP server registered."),
+            Some("metrics_reset") => Some("Execution metrics reset."),
             _ => None,
         },
     })

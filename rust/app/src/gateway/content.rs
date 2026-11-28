@@ -18,19 +18,42 @@ use serde_json::Value;
 
 use super::{
     DirectTarget, GatewayService, Principal, Session, ToolContext, UpstreamError, UpstreamUse,
-    access,
+    access, metrics::ExecutionTarget,
 };
-use crate::catalog::{CatalogServer, ContentGateway, PromptContentRecord, ResourceContentRecord};
+use crate::catalog::{
+    CatalogServer, ContentGateway, MetricEntity, PromptContentRecord, ResourceContentRecord,
+};
 use crate::upstream::UpstreamEndpoint;
 
 impl GatewayService {
     pub(crate) async fn read_resource(
+        &self,
+        params: ReadResourceRequestParams,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        context: ToolContext<'_>,
+        downstream: Option<&Session>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let started = std::time::Instant::now();
+        let mut target = None;
+        let result = self
+            .read_resource_inner(params, principal, server, context, downstream, &mut target)
+            .await;
+        if !matches!(result, Ok(ReadResourceResponse::InputRequired(_))) {
+            self.record_target(target, server, started, result.is_ok())
+                .await;
+        }
+        result
+    }
+
+    async fn read_resource_inner(
         &self,
         mut params: ReadResourceRequestParams,
         principal: Option<&Principal>,
         server: Option<&CatalogServer>,
         context: ToolContext<'_>,
         downstream: Option<&Session>,
+        metric: &mut Option<ExecutionTarget>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         self.check_mcp_permission(principal, server, "resources.read")
             .await?;
@@ -43,7 +66,10 @@ impl GatewayService {
         {
             DirectTarget::Found {
                 gateway, timeout, ..
-            } => (gateway, Some(timeout)),
+            } => {
+                *metric = Some(ExecutionTarget::Forwarded);
+                (gateway, Some(timeout))
+            }
             DirectTarget::Denied => return Err(unknown()),
             DirectTarget::Fallback | DirectTarget::Disabled => {
                 let mut resource = self
@@ -56,6 +82,10 @@ impl GatewayService {
                     .await
                     .map_err(content_database_error)?
                     .ok_or_else(unknown)?;
+                *metric = Some(ExecutionTarget::Catalog(
+                    MetricEntity::Resource,
+                    resource.id.clone(),
+                ));
                 let Some(gateway) = resource.gateway.take() else {
                     return Ok(ReadResourceResult::new(vec![local_resource(resource, uri)]).into());
                 };
@@ -120,11 +150,32 @@ impl GatewayService {
 
     pub(crate) async fn get_prompt(
         &self,
+        params: GetPromptRequestParams,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        context: ToolContext<'_>,
+        downstream: Option<&Session>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let started = std::time::Instant::now();
+        let mut target = None;
+        let result = self
+            .get_prompt_inner(params, principal, server, context, downstream, &mut target)
+            .await;
+        if !matches!(result, Ok(GetPromptResponse::InputRequired(_))) {
+            self.record_target(target, server, started, result.is_ok())
+                .await;
+        }
+        result
+    }
+
+    async fn get_prompt_inner(
+        &self,
         mut params: GetPromptRequestParams,
         principal: Option<&Principal>,
         server: Option<&CatalogServer>,
         context: ToolContext<'_>,
         downstream: Option<&Session>,
+        metric: &mut Option<ExecutionTarget>,
     ) -> Result<GetPromptResponse, ErrorData> {
         if params
             .arguments
@@ -152,6 +203,10 @@ impl GatewayService {
             .ok_or_else(|| {
                 ErrorData::invalid_params(format!("Unknown prompt: {}", params.name), None)
             })?;
+        *metric = Some(ExecutionTarget::Catalog(
+            MetricEntity::Prompt,
+            prompt.id.clone(),
+        ));
         let Some(gateway) = prompt.gateway.as_ref() else {
             return render_prompt(
                 prompt,

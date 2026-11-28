@@ -339,6 +339,15 @@
           </select>
         </div>
         {% endif %}
+        {% if catalog.metrics %}
+        <label for="metric-entity">Entity type</label>
+        <select id="metric-entity" name="entity_type">
+          {% for entity in ["tools", "resources", "prompts", "servers"] %}
+          <option value="{{ entity }}"{% if catalog.metrics.entity_type == entity %} selected{% endif %}>{{ entity|capitalize }}</option>
+          {% endfor %}
+        </select>
+        <label>Rows per page <input type="number" name="per_page" min="1" value="{{ catalog.metrics.size }}"></label>
+        {% endif %}
         {% if catalog.selected == "a2a" %}
         <label>Search agents <input type="search" name="q" maxlength="500" value="{{ catalog.a2a.q|default('', true) }}"></label>
         <label>Tags <input name="tags" value="{{ catalog.a2a.tags|default('', true) }}"></label>
@@ -347,7 +356,7 @@
         <label>Search roots <input type="search" name="q" maxlength="500" value="{{ catalog.roots.query }}"></label>
         {% elif catalog.users %}
         <label>Search users <input type="search" name="q" maxlength="500" value="{{ catalog.users.query }}"></label>
-        {% elif not catalog.registry %}
+        {% elif not catalog.registry and not catalog.metrics %}
         {% if catalog.selected == "teams" %}
         <label>Search teams <input type="search" name="q" maxlength="500" value="{{ catalog.teams.search|default('', true) }}"></label>
         <label>Visibility <select name="visibility"><option value="">All</option><option value="private"{% if catalog.teams.visibility == "private" %} selected{% endif %}>Private</option><option value="public"{% if catalog.teams.visibility == "public" %} selected{% endif %}>Public</option></select></label>
@@ -375,6 +384,10 @@
     {% if catalog.registry %}
       {% set registry = catalog.registry %}
       {% include "registry.html" %}
+    {% endif %}
+    {% if catalog.metrics %}
+      {% set report = catalog.metrics %}
+      {% include "metrics.html" %}
     {% endif %}
     {% if catalog.tokens %}
       {% set tokens = catalog.tokens %}

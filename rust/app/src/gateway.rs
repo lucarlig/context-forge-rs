@@ -16,6 +16,8 @@ mod import_api;
 mod lifecycle;
 mod listeners;
 mod management;
+mod metrics;
+pub use metrics::ExecutionMetricsSettings;
 mod oauth_api;
 mod openapi;
 mod prompt_api;
@@ -67,8 +69,8 @@ use crate::{
     auth::TeamVisibility,
     catalog::{
         CatalogList, CatalogServer, CatalogTool, ContentGateway, GatewayConnectionRow, GatewayMode,
-        GatewayRegistration, RegisteredTls, RegisteredTool, RegistrationError, RegistrationOptions,
-        ToolDefinition, slugify,
+        GatewayRegistration, MetricEntity, RegisteredTls, RegisteredTool, RegistrationError,
+        RegistrationOptions, ToolDefinition, slugify,
     },
     config::{HeaderForwarding, IdentityForwarding, ProxyCatalogSettings, SecretKdf},
     credentials::{
@@ -132,6 +134,7 @@ pub struct GatewayService {
     a2a_timeout: Duration,
     a2a_card_timeout: Duration,
     a2a_metrics: A2aMetricsSettings,
+    execution_metrics: ExecutionMetricsSettings,
     uaid: crate::uaid::UaidSettings,
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
@@ -260,6 +263,7 @@ impl GatewayService {
             a2a_timeout: Duration::from_secs(30),
             a2a_card_timeout: Duration::from_secs(120),
             a2a_metrics: A2aMetricsSettings::default(),
+            execution_metrics: ExecutionMetricsSettings::default(),
             uaid: crate::uaid::UaidSettings::default(),
             email_auth_enabled: true,
             token_issuer: None,
@@ -335,6 +339,11 @@ impl GatewayService {
 
     pub fn with_a2a_metrics(mut self, settings: A2aMetricsSettings) -> Self {
         self.a2a_metrics = settings;
+        self
+    }
+
+    pub fn with_execution_metrics(mut self, settings: ExecutionMetricsSettings) -> Self {
+        self.execution_metrics = settings;
         self
     }
 
@@ -597,9 +606,13 @@ impl GatewayService {
         let search = self
             .access
             .protect_browser_api(unified_search::router(self), None);
-        let registry_admin = if self.search.admin {
-            self.access
-                .protect_browser_api(registry::admin_router().with_state(self.clone()), None)
+        let catalog_admin = if self.search.admin {
+            self.access.protect_browser_api(
+                registry::admin_router()
+                    .merge(metrics::router())
+                    .with_state(self.clone()),
+                None,
+            )
         } else {
             Router::new()
         };
@@ -620,7 +633,7 @@ impl GatewayService {
                     .with_state(self.clone()),
             )
             .merge(grpc_admin)
-            .merge(registry_admin)
+            .merge(catalog_admin)
             .merge(search)
             .merge(oauth_browser)
     }
@@ -798,9 +811,30 @@ impl GatewayService {
         &self,
         principal: Option<&Principal>,
         server: Option<&CatalogServer>,
+        request: CallToolRequestParams,
+        context: ToolContext<'_>,
+        downstream: Option<&Session>,
+    ) -> Result<Value, ToolError> {
+        let started = std::time::Instant::now();
+        let mut metric = None;
+        let result = self
+            .call_tool_inner(principal, server, request, context, downstream, &mut metric)
+            .await;
+        if !matches!(&result, Ok(value) if value["resultType"] == "input_required") {
+            let succeeded = matches!(&result, Ok(value) if value["isError"] != true && value["is_error"] != true);
+            self.record_target(metric, server, started, succeeded).await;
+        }
+        result
+    }
+
+    async fn call_tool_inner(
+        &self,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
         mut request: CallToolRequestParams,
         mut context: ToolContext<'_>,
         downstream: Option<&Session>,
+        metric: &mut Option<metrics::ExecutionTarget>,
     ) -> Result<Value, ToolError> {
         let target = tokio::select! {
             biased;
@@ -813,7 +847,10 @@ impl GatewayService {
         let (gateway, direct_timeout, response_filter) = match target {
             DirectTarget::Found {
                 gateway, timeout, ..
-            } => (gateway, Some(timeout), String::new()),
+            } => {
+                *metric = Some(metrics::ExecutionTarget::Forwarded);
+                (gateway, Some(timeout), String::new())
+            }
             DirectTarget::Denied => {
                 return tool_result_error(format!("Tool not found: {}", request.name));
             }
@@ -824,6 +861,10 @@ impl GatewayService {
                     result = self.lookup_tool(principal, server, &request.name) => result?,
                 }
                 .ok_or(ToolError::NotFound)?;
+                *metric = Some(metrics::ExecutionTarget::Catalog(
+                    MetricEntity::Tool,
+                    tool.id.clone(),
+                ));
                 if !tool.reachable {
                     return tool_result_error(format!("Unknown tool: {}", request.name));
                 }

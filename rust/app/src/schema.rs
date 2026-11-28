@@ -21,7 +21,8 @@ const A2A_CARDS: &str = include_str!("../migrations/008_a2a_cards.sql");
 const A2A_UAID: &str = include_str!("../migrations/009_a2a_uaid.sql");
 const A2A_METRICS: &str = include_str!("../migrations/010_a2a_metrics.sql");
 const SECURITY_EVENTS: &str = include_str!("../migrations/011_security_events.sql");
-const MIGRATIONS: [&str; 14] = [
+const EXECUTION_METRICS: &str = include_str!("../migrations/012_execution_metrics.sql");
+const MIGRATIONS: [&str; 15] = [
     "identity",
     "catalog",
     "legacy_sse",
@@ -36,6 +37,7 @@ const MIGRATIONS: [&str; 14] = [
     "a2a_metrics",
     "historical_a2a",
     "security_events",
+    "execution_metrics",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -249,7 +251,7 @@ impl Database {
             return Ok(());
         }
         macro_rules! upgrade {
-            ($transaction:ident, $usage:expr, $accounts:expr, $columns:expr, $metrics:expr) => {{
+            ($transaction:ident, $usage:expr, $accounts:expr, $columns:expr, $agent_metrics:expr, $execution_metrics:expr) => {{
                 sqlx::query(CREATE_HISTORY)
                     .execute(&mut *$transaction)
                     .await?;
@@ -327,7 +329,9 @@ impl Database {
                             sqlx::raw_sql(A2A_UAID).execute(&mut *$transaction).await?;
                         }
                         11 => {
-                            sqlx::raw_sql($metrics).execute(&mut *$transaction).await?;
+                            sqlx::raw_sql($agent_metrics)
+                                .execute(&mut *$transaction)
+                                .await?;
                         }
                         12 => {
                             add_columns!(
@@ -345,6 +349,11 @@ impl Database {
                         }
                         13 => {
                             sqlx::raw_sql(SECURITY_EVENTS)
+                                .execute(&mut *$transaction)
+                                .await?;
+                        }
+                        14 => {
+                            sqlx::raw_sql($execution_metrics)
                                 .execute(&mut *$transaction)
                                 .await?;
                         }
@@ -368,7 +377,8 @@ impl Database {
                     crate::tokens::SQLITE_USAGE_MIGRATION,
                     crate::local_auth::SQLITE_MIGRATION,
                     "SELECT name FROM pragma_table_info($1)",
-                    sqlx::AssertSqlSafe(A2A_METRICS.replace("BIGSERIAL", "INTEGER"))
+                    sqlx::AssertSqlSafe(A2A_METRICS.replace("BIGSERIAL", "INTEGER")),
+                    sqlx::AssertSqlSafe(EXECUTION_METRICS.replace("BIGSERIAL", "INTEGER"))
                 );
             }
             Self::Postgres(pool) => {
@@ -386,7 +396,8 @@ impl Database {
                     crate::local_auth::POSTGRES_MIGRATION,
                     "SELECT CAST(column_name AS TEXT) FROM information_schema.columns
                      WHERE table_schema = current_schema() AND table_name = $1",
-                    A2A_METRICS
+                    A2A_METRICS,
+                    EXECUTION_METRICS
                 );
             }
         }

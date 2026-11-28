@@ -5,7 +5,7 @@ use rmcp::model::{GetPromptRequest, GetPromptRequestParams, GetPromptResult, Pro
 use tokio_util::sync::CancellationToken;
 
 use super::{catalog_api::*, *};
-use crate::catalog::PromptRecord;
+use crate::catalog::{MetricEntity, PromptRecord};
 
 mod write;
 pub(super) use write::{
@@ -142,65 +142,82 @@ async fn retrieve(
             return Err(error_value.into());
         }
     };
-    let mut result = if let Some(gateway) = record.gateway.as_ref()
-        && record.template.as_deref().is_none_or(str::is_empty)
-    {
-        let mut params = GetPromptRequestParams::new(record.original_name.clone());
-        params.arguments = Some(arguments);
-        let cancellation = CancellationToken::new();
-        service
-            .request_content(
-                gateway,
-                GetPromptRequest::new(params).into(),
-                Some(principal),
-                ToolContext {
-                    cancellation: &cancellation,
-                    progress: None,
-                    notifications: None,
-                    client_capabilities: None,
-                    request_headers: Some(headers),
-                },
-                None,
-                None,
-            )
-            .await
-            .map_err(|remote| {
-                error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    remote.message.into_owned(),
+    let resolved_id = record.id.clone();
+    let started = std::time::Instant::now();
+    let result = async {
+        let mut result = if let Some(gateway) = record.gateway.as_ref()
+            && record.template.as_deref().is_none_or(str::is_empty)
+        {
+            let mut params = GetPromptRequestParams::new(record.original_name.clone());
+            params.arguments = Some(arguments);
+            let cancellation = CancellationToken::new();
+            service
+                .request_content(
+                    gateway,
+                    GetPromptRequest::new(params).into(),
+                    Some(principal),
+                    ToolContext {
+                        cancellation: &cancellation,
+                        progress: None,
+                        notifications: None,
+                        client_capabilities: None,
+                        request_headers: Some(headers),
+                    },
+                    None,
+                    None,
                 )
-            })?
-    } else if arguments.is_empty() {
-        let mut raw = GetPromptResult::new(vec![PromptMessage::new_text(
-            Role::User,
-            record.template.unwrap_or_default(),
-        )]);
-        raw.description = record.description;
-        json!(raw)
-    } else {
-        json!(
-            content::render_prompt(record, arguments, false).map_err(|render| error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                render.message.into_owned()
-            ))?
-        )
-    };
-    if let Some(fields) = result.as_object_mut()
-        && fields.get("resultType").and_then(Value::as_str) != Some("input_required")
-    {
-        fields.remove("resultType");
-        fields.entry("description").or_insert(Value::Null);
-    }
-    if let Some(messages) = result["messages"].as_array_mut() {
-        for message in messages {
-            let content = &mut message["content"];
-            if let Some(fields) = content.as_object_mut() {
-                fields.entry("_meta").or_insert(Value::Null);
-                fields.entry("annotations").or_insert(Value::Null);
+                .await
+                .map_err(|remote| {
+                    error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        remote.message.into_owned(),
+                    )
+                })?
+        } else if arguments.is_empty() {
+            let mut raw = GetPromptResult::new(vec![PromptMessage::new_text(
+                Role::User,
+                record.template.unwrap_or_default(),
+            )]);
+            raw.description = record.description;
+            json!(raw)
+        } else {
+            json!(
+                content::render_prompt(record, arguments, false).map_err(|render| error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    render.message.into_owned()
+                ))?
+            )
+        };
+        if let Some(fields) = result.as_object_mut()
+            && fields.get("resultType").and_then(Value::as_str) != Some("input_required")
+        {
+            fields.remove("resultType");
+            fields.entry("description").or_insert(Value::Null);
+        }
+        if let Some(messages) = result["messages"].as_array_mut() {
+            for message in messages {
+                let content = &mut message["content"];
+                if let Some(fields) = content.as_object_mut() {
+                    fields.entry("_meta").or_insert(Value::Null);
+                    fields.entry("annotations").or_insert(Value::Null);
+                }
             }
         }
+        Ok(Json(result))
     }
-    Ok(Json(result))
+    .await;
+    if !matches!(&result, Ok(Json(value)) if value["resultType"] == "input_required") {
+        service
+            .record_rest_execution(
+                (MetricEntity::Prompt, &resolved_id),
+                principal,
+                server,
+                started,
+                result.is_ok(),
+            )
+            .await;
+    }
+    result
 }
 
 pub(super) fn metadata(record: &PromptRecord, aliases: bool) -> Value {

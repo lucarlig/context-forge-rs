@@ -32,7 +32,7 @@ pub(crate) use agents::{
     AdminAgentFilters, AgentInteraction, AgentLookup, AgentRecord, AgentWriteError, NewAgentCard,
 };
 pub(crate) use entry_filters::{CatalogEntryFilters, ManagedCatalog, managed_visibility};
-pub(crate) use metrics::{ExecutionMetrics, MetricEntity};
+pub(crate) use metrics::{ExecutionMetrics, MetricEntity, MetricReport};
 pub(crate) use prompts::{PromptRecord, PromptWriteError};
 pub(crate) use resources::{ResourceRecord, ResourceWriteError};
 pub(crate) use search::{SearchFilters, SearchKind, escape_like, parse_tag_groups};
@@ -244,6 +244,7 @@ enum ResourceLookup<'a> {
 }
 
 pub(crate) struct PromptContentRecord {
+    pub(crate) id: String,
     pub(crate) original_name: String,
     pub(crate) description: Option<String>,
     pub(crate) template: Option<String>,
@@ -1275,7 +1276,7 @@ impl Database {
             ));
         }
         let Some((
-            _,
+            prompt_id,
             _,
             _,
             description,
@@ -1292,6 +1293,7 @@ impl Database {
             return Ok(None);
         };
         Ok(Some(PromptContentRecord {
+            id: prompt_id,
             original_name,
             description,
             template,

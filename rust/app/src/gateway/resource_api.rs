@@ -11,7 +11,7 @@ use super::{
     },
     *,
 };
-use crate::catalog::{CatalogEntryFilters, ResourceContentRecord, ResourceRecord};
+use crate::catalog::{CatalogEntryFilters, MetricEntity, ResourceContentRecord, ResourceRecord};
 
 mod events;
 mod write;
@@ -135,9 +135,19 @@ async fn read(
         .await?
         .ok_or_else(|| missing_resource(&id))?;
     let uri = record.uri.clone();
-    Ok(Json(
-        resource_content(&service, &principal, record, uri, &headers, false).await?,
-    ))
+    let resolved_id = record.id.clone();
+    let started = std::time::Instant::now();
+    let result = resource_content(&service, &principal, record, uri, &headers, false).await;
+    service
+        .record_rest_execution(
+            (MetricEntity::Resource, &resolved_id),
+            &principal,
+            server,
+            started,
+            result.is_ok(),
+        )
+        .await;
+    result.map(Json)
 }
 
 async fn test_uri(
@@ -152,7 +162,19 @@ async fn test_uri(
         .resource_content(access::catalog_scope(Some(&principal)), None, &uri)
         .await?
         .ok_or_else(|| missing_resource(&uri))?;
-    let content = resource_content(&service, &principal, record, uri, &headers, true).await?;
+    let resolved_id = record.id.clone();
+    let started = std::time::Instant::now();
+    let result = resource_content(&service, &principal, record, uri, &headers, true).await;
+    service
+        .record_rest_execution(
+            (MetricEntity::Resource, &resolved_id),
+            &principal,
+            None,
+            started,
+            result.is_ok(),
+        )
+        .await;
+    let content = result?;
     Ok(Json(json!({"content":content})))
 }
 

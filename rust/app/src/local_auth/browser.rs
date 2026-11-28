@@ -5,6 +5,7 @@ mod catalog;
 mod forms;
 mod grpc;
 mod keycloak;
+mod metrics;
 mod recovery;
 mod registry;
 mod roots;
@@ -26,6 +27,11 @@ use percent_encoding::utf8_percent_encode;
 use self::forms::{Form, csrf, render};
 use self::sessions::{Denial, Session, access, clear_session_cookies, create_session};
 use super::*;
+
+pub(crate) fn execution_metrics_partial(report: Value) -> Response {
+    forms::render_template("metrics.html", context! { report })
+        .unwrap_or_else(IntoResponse::into_response)
+}
 
 pub(crate) fn registry_partial(registry: Value) -> Response {
     forms::render_template("registry.html", minijinja::context! { registry })
@@ -184,6 +190,7 @@ pub(super) fn router(
         router = grpc::routes(router, path);
         router = roots::routes(router, path);
         router = registry::routes(router, path);
+        router = metrics::routes(router, path);
         for kind in ManagedCatalog::ALL {
             let base = format!("{path}/{}", kind.name());
             router = router

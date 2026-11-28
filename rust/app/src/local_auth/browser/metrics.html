@@ -1,0 +1,39 @@
+<section aria-labelledby="metrics-heading">
+  <h2 id="metrics-heading">Execution metrics</h2>
+  {% if report.summaries %}
+  <table aria-label="Execution totals">
+    <thead><tr><th scope="col">Entity type</th><th scope="col">Executions</th><th scope="col">Succeeded</th><th scope="col">Failed</th></tr></thead>
+    <tbody>
+    {% for item in report.summaries %}
+    <tr><th scope="row">{{ item.name|capitalize }}</th><td>{{ item.data.totalExecutions }}</td><td>{{ item.data.successfulExecutions }}</td><td>{{ item.data.failedExecutions }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <details>
+    <summary>Reset execution metrics</summary>
+    <p>Clear raw and hourly metrics for tools, resources, prompts, and virtual servers.</p>
+    <form method="post" action="{{ root }}/admin/metrics/reset/form">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <button type="submit">Confirm reset</button>
+    </form>
+  </details>
+  {% endif %}
+  <h3>{{ report.entity_type|capitalize }} by execution count</h3>
+  {% if report.data %}
+  <table aria-label="{{ report.entity_type|capitalize }} by execution count">
+    <thead><tr><th scope="col">Name</th><th scope="col">Executions</th><th scope="col">Success rate</th><th scope="col">Average duration (s)</th><th scope="col">Last execution</th></tr></thead>
+    <tbody>
+    {% for item in report.data %}
+    <tr><th scope="row">{{ item.name }}</th><td>{{ item.executionCount }}</td><td>{{ "%.1f"|format(item.successRate) }}%</td><td>{{ ("%.3f"|format(item.avgResponseTime)) if item.avgResponseTime is not none else "—" }}</td><td>{{ item.lastExecution|default("—", true) }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p>No recorded executions on this page.</p>{% endif %}
+  {% if report.previous or report.next %}
+  <nav aria-label="Execution metrics pages">
+    {% if report.previous %}<a href="{{ report.previous }}">Previous</a>{% endif %}
+    {% if report.pages %}<span>Page {{ report.page }} of {{ report.pages }}</span>{% endif %}
+    {% if report.next %}<a href="{{ report.next }}">Next</a>{% endif %}
+  </nav>
+  {% endif %}
+</section>

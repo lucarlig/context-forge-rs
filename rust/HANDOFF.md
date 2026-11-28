@@ -409,6 +409,29 @@ OAuth overrides, HTMX feedback, and tool discovery after authorization.
 Chromium verifies single and bulk registration. A live Rust test checks
 browser CSRF denial and concurrent attempts to register the same OAuth entry.
 
+## Execution metrics
+
+The gateway records completed tool calls, resource reads, and prompt requests.
+Requests through virtual servers also record an execution for that server.
+An MCP tool result with `isError` counts as a failure. Set
+`DB_METRICS_RECORDING_ENABLED=false` to disable recording.
+
+`/v1/admin/metrics` serves execution totals and ranked results for tools,
+resources, prompts, and servers. The dashboard includes category filters and
+pagination. The reset endpoint clears raw and hourly data in one transaction.
+Global metrics require an unrestricted administrator with
+`admin.system_config`. Browser resets require CSRF proof.
+
+Reports combine recent executions with existing hourly aggregates. They
+retain older raw executions when the corresponding hourly aggregate is
+absent. Scheduled rollups and retention cleanup remain pending.
+
+Eight Rust Anything cases match on SQLite and PostgreSQL. They cover
+live executions, recorded failures, disabled recording, overlapping
+raw and hourly rows, authorization, and reset. Chromium verifies the
+dashboard and confirmed reset. A live Rust test verifies recording through
+the REST resource route, denial for team-scoped tokens, and CSRF enforcement.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.
