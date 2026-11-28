@@ -307,6 +307,13 @@ pub(in crate::gateway) async fn create_record(
         .await
         .map_err(|error| persistence_error(error, &record))?;
     publish(service, &record, ResourceEvent::Added);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Create,
+            audit::Subject::Resource(&record),
+        )
+        .await;
     Ok(record)
 }
 
@@ -411,6 +418,13 @@ pub(in crate::gateway) async fn update_record(
         );
     }
     publish(service, &record, ResourceEvent::Updated);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Update,
+            audit::Subject::Resource(&record),
+        )
+        .await;
     Ok(record)
 }
 
@@ -464,6 +478,13 @@ pub(in crate::gateway) async fn change_state(
             ResourceEvent::Deactivated
         };
         publish(service, &record, event);
+        service
+            .audit_catalog(
+                principal,
+                audit::Change::State,
+                audit::Subject::Resource(&record),
+            )
+            .await;
     }
     Ok(record)
 }
@@ -498,6 +519,13 @@ pub(in crate::gateway) async fn remove(
         .await
         .map_err(|error| persistence_error(error, &resource))?;
     publish(service, &resource, ResourceEvent::Deleted);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Delete,
+            audit::Subject::Resource(&resource),
+        )
+        .await;
     Ok(())
 }
 

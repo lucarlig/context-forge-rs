@@ -87,6 +87,13 @@ async fn detail(
 ) -> Result<Json<Value>, CatalogApiError> {
     require_catalog_permission(&service, &principal, "servers.read", true).await?;
     let server = find_visible(&service, &principal, &id).await?;
+    service
+        .audit_catalog(
+            &principal,
+            audit::Change::ViewServer,
+            audit::Subject::Server(&server),
+        )
+        .await;
     Ok(Json(with_links(&service, &principal, &server).await?))
 }
 

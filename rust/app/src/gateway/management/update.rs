@@ -443,6 +443,13 @@ async fn update_existing(
         .into_iter()
         .next()
         .ok_or(ManagementError::ConcurrentChange)?;
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Update,
+            audit::Subject::Gateway(&updated),
+        )
+        .await;
     let payload = response(&updated, service.credential_cipher.as_ref());
     Ok(match lifecycle {
         Some(lifecycle) => lifecycle.pending(payload),

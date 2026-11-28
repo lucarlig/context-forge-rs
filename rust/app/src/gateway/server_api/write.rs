@@ -323,6 +323,13 @@ pub(in crate::gateway) async fn create_record(
         .await
         .map_err(|error| persistence_error(error, &server, true))?;
     publish(service, &server);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Create,
+            audit::Subject::Server(&server),
+        )
+        .await;
     Ok(server)
 }
 
@@ -392,6 +399,13 @@ pub(in crate::gateway) async fn update_record(
         publish(service, &prior);
     }
     publish(service, &server);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Update,
+            audit::Subject::Server(&server),
+        )
+        .await;
     Ok(server)
 }
 
@@ -451,6 +465,13 @@ pub(in crate::gateway) async fn change_state(
         .map_err(|error| persistence_error(error, &prior, false))?;
     if prior.enabled != server.enabled {
         publish(service, &server);
+        service
+            .audit_catalog(
+                principal,
+                audit::Change::State,
+                audit::Subject::Server(&server),
+            )
+            .await;
     }
     Ok(server)
 }
@@ -482,11 +503,25 @@ pub(in crate::gateway) async fn remove(
     )
     .await?;
     service
+        .audit_catalog(
+            principal,
+            audit::Change::ViewServer,
+            audit::Subject::Server(&server),
+        )
+        .await;
+    service
         .database
         .delete_managed_server(&server, flag(purge_metrics)?)
         .await
         .map_err(|error| persistence_error(error, &server, false))?;
     publish(service, &server);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Delete,
+            audit::Subject::Server(&server),
+        )
+        .await;
     Ok(())
 }
 

@@ -269,6 +269,10 @@ impl CorrelationId {
         REQUEST_ID.try_with(Clone::clone).ok().flatten()
     }
 
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        self.0.to_str().ok()
+    }
+
     pub(crate) fn write_header(self, headers: &mut HeaderMap) {
         headers.insert("x-correlation-id", self.0);
     }

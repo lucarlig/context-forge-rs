@@ -3,6 +3,7 @@
 mod a2a_api;
 pub(crate) use a2a_api::{AdminA2aQuery, AdminAgentAction, a2a_agent_metadata};
 mod admin_catalog;
+mod audit;
 mod catalog_api;
 pub(crate) use admin_catalog::{AdminListQuery, CatalogListing, CatalogMutation};
 pub(crate) use catalog_api::{CatalogApiError, PaginationMeta, flag as catalog_query_flag};
@@ -136,6 +137,7 @@ pub struct GatewayService {
     a2a_card_timeout: Duration,
     a2a_metrics: A2aMetricsSettings,
     execution_metrics: ExecutionMetricsSettings,
+    audit: audit::AuditSettings,
     metrics_maintenance_stats: metrics_maintenance::MaintenanceStats,
     uaid: crate::uaid::UaidSettings,
     email_auth_enabled: bool,
@@ -266,6 +268,7 @@ impl GatewayService {
             a2a_card_timeout: Duration::from_secs(120),
             a2a_metrics: A2aMetricsSettings::default(),
             execution_metrics: ExecutionMetricsSettings::default(),
+            audit: audit::AuditSettings::default(),
             metrics_maintenance_stats: metrics_maintenance::MaintenanceStats::default(),
             uaid: crate::uaid::UaidSettings::default(),
             email_auth_enabled: true,
@@ -638,6 +641,7 @@ impl GatewayService {
             .merge(grpc_admin)
             .merge(catalog_admin)
             .merge(metrics_maintenance::router(self))
+            .merge(audit::router(self))
             .merge(search)
             .merge(oauth_browser)
     }
@@ -1970,6 +1974,18 @@ async fn register_gateway(
         )));
     }
     created?;
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Create,
+            audit::Subject::RegisteredGateway {
+                registration: &registration,
+                address: address.as_deref(),
+                agent,
+                via: created_via,
+            },
+        )
+        .await;
     if let Some(lifecycle) = lifecycle {
         let record = service
             .database

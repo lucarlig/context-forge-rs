@@ -22,7 +22,8 @@ const A2A_UAID: &str = include_str!("../migrations/009_a2a_uaid.sql");
 const A2A_METRICS: &str = include_str!("../migrations/010_a2a_metrics.sql");
 const SECURITY_EVENTS: &str = include_str!("../migrations/011_security_events.sql");
 const EXECUTION_METRICS: &str = include_str!("../migrations/012_execution_metrics.sql");
-const MIGRATIONS: [&str; 15] = [
+const AUDIT_TRAILS: &str = include_str!("../migrations/013_audit_trails.sql");
+const MIGRATIONS: [&str; 16] = [
     "identity",
     "catalog",
     "legacy_sse",
@@ -38,6 +39,7 @@ const MIGRATIONS: [&str; 15] = [
     "historical_a2a",
     "security_events",
     "execution_metrics",
+    "audit_trails",
 ];
 
 type ColumnDefinition = (&'static str, &'static str);
@@ -354,6 +356,11 @@ impl Database {
                         }
                         14 => {
                             sqlx::raw_sql($execution_metrics)
+                                .execute(&mut *$transaction)
+                                .await?;
+                        }
+                        15 => {
+                            sqlx::raw_sql(AUDIT_TRAILS)
                                 .execute(&mut *$transaction)
                                 .await?;
                         }

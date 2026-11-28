@@ -451,6 +451,32 @@ The v1.1.2 SQLite reference falls back to 24 hours because its minimum
 timestamp lacks a timezone. A live check verifies the Rust gateway rolls up a
 two-day-old SQLite sample and preserves current-hour data.
 
+## Audit trails and activity
+
+Set `AUDIT_TRAIL_ENABLED=true` to persist catalog audit records. The gateway
+records creates, updates, state changes, and deletions for tools, resources,
+prompts, virtual servers, and gateways. The audit write uses a separate
+database operation after the catalog mutation commits. Records carry the
+correlation ID, actor, team, and selected resource metadata and state.
+
+`/api/logs/audit-trails` returns filtered history to unrestricted administrators
+with `audit:read`. `/api/logs/activity` scopes audit rows to the caller's teams
+and their own unscoped activity. Restricted rows require unrestricted access.
+The feed includes security events when the caller also has `security:read`.
+Scoped callers see only their own security events. Set
+`STRUCTURED_LOGGING_ENABLED=false` to disable the query routes.
+
+Existing Python audit records remain readable after adopting the database.
+Rust records gateway state changes after the SQLite transaction releases its
+write lock. The v1.1.2 reference omitted the audit event in a live SQLite
+case where the gateway had no downstream resources.
+
+Seven Rust Anything cases match on SQLite and PostgreSQL. They cover
+catalog writes, filters, activity ordering, feature flags, scoped access,
+validation, and historical database adoption. A live Rust test checks
+authorization and verifies that an audit insert failure preserves the catalog
+mutation.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

@@ -2052,6 +2052,155 @@ async fn execution_metrics_record_live_reads_and_deny_scoped_resets() {
 }
 
 #[tokio::test]
+async fn audit_feed_scopes_records_and_survives_audit_storage_failure() {
+    use serde_json::{Value, json};
+
+    let mut service = gateway_with_env(&[("AUDIT_TRAIL_ENABLED", "true")]).await;
+    let (client, origin) = (&service.client, &service.origin);
+    let post_json = |path: &str, token: Option<&str>, body: Value| {
+        let request = client
+            .post(format!("{origin}{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-correlation-id", "audit-live-fixture")
+            .body(body.to_string());
+        let request = match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        async move {
+            let result = request.send().await.unwrap();
+            let status = result.status();
+            let body = result.text().await.unwrap();
+            assert!(status.is_success(), "{status} {body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        }
+    };
+    let login = post_json(
+        "/auth/email/login",
+        None,
+        json!({"email":EMAIL,"password":service.password}),
+    )
+    .await;
+    let admin = login["access_token"].as_str().unwrap();
+    let team = post_json("/teams", Some(admin), json!({"name":"Audit Team"})).await;
+    let scoped = post_json(
+        "/tokens",
+        Some(admin),
+        json!({
+            "name":"activity only","team_id":team["id"],"scope":{"permissions":["audit:read"]},
+            "expires_in_days":1,
+        }),
+    )
+    .await;
+    let scoped = scoped["access_token"].as_str().unwrap();
+    let insufficient = post_json(
+        "/tokens",
+        Some(admin),
+        json!({
+            "name":"catalog only","team_id":team["id"],"scope":{"permissions":["tools.read"]},
+                "expires_in_days":1,
+        }),
+    )
+    .await;
+    let insufficient = insufficient["access_token"].as_str().unwrap();
+    let resource = post_json(
+        "/resources",
+        Some(admin),
+        json!({
+            "resource":{"name":"audit-live","uri":"file:///audit-live","content":"fixture"},
+            "team_id":team["id"],"visibility":"team",
+        }),
+    )
+    .await;
+    let resource_id = resource["id"].as_str().unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        service.fixture.0.join("mcp.db").display()
+    ))
+    .await
+    .unwrap();
+    let audit: (String, String, String) = sqlx::query_as(
+        "SELECT user_email,team_id,correlation_id FROM audit_trails WHERE resource_id=$1",
+    )
+    .bind(resource_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audit,
+        (
+            EMAIL.into(),
+            team["id"].as_str().unwrap().into(),
+            "audit-live-fixture".into()
+        )
+    );
+    sqlx::query(
+        "INSERT INTO audit_trails (id,action,resource_type,resource_name,user_id,user_email,team_id,data_classification,success)
+         VALUES ('wrong-team','create_tool','tool','wrong team','actor','actor','other-team',NULL,TRUE),
+                ('restricted','create_tool','tool','restricted','actor','actor',$1,'restricted',TRUE)",
+    ).bind(team["id"].as_str().unwrap()).execute(&pool).await.unwrap();
+    let activity = format!("{origin}/api/logs/activity");
+    let trails = format!("{origin}/api/logs/audit-trails");
+    for path in [&activity, &trails] {
+        assert_eq!(
+            client.get(path).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .get(path)
+                .bearer_auth(insufficient)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        client
+            .get(&trails)
+            .bearer_auth(scoped)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = client
+        .get(&activity)
+        .bearer_auth(scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let feed: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    let items = feed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["title"], "Resource created");
+    assert_eq!(items[0]["resource_name"], "audit-live");
+    assert_eq!(items[0]["correlation_id"], "audit-live-fixture");
+
+    sqlx::raw_sql(
+        "CREATE TRIGGER reject_audit BEFORE INSERT ON audit_trails
+         BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second = post_json("/resources", Some(admin), json!({
+        "resource":{"name":"still-committed","uri":"file:///still-committed","content":"fixture"},
+    })).await;
+    let persisted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM resources WHERE id=$1)")
+        .bind(second["id"].as_str().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(persisted);
+    service.process.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn registry_registration_requires_browser_proof_and_serializes_oauth_duplicates() {
     use serde_json::{Value, json};
 

@@ -213,6 +213,13 @@ pub(super) async fn remove(
     if !changed {
         return Err(ManagementError::ConcurrentChange);
     }
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Delete,
+            audit::Subject::Gateway(&record),
+        )
+        .await;
     service.subscriptions.removed(
         &record.id,
         &record.visibility,
@@ -454,6 +461,13 @@ pub(super) async fn change_state(
             );
         }
         record = lookup(service, principal, record.id).await?;
+        service
+            .audit_catalog(
+                principal,
+                audit::Change::State,
+                audit::Subject::Gateway(&record),
+            )
+            .await;
     }
     Ok(record)
 }

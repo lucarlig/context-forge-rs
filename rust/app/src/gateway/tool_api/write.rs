@@ -332,6 +332,13 @@ pub(in crate::gateway) async fn create_record(
         .await
         .map_err(|error| persistence_error(error, &record))?;
     publish(service, &created);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Create,
+            audit::Subject::Tool(&created),
+        )
+        .await;
     Ok(created)
 }
 
@@ -384,6 +391,13 @@ pub(in crate::gateway) async fn update_record(
         publish(service, &previous);
     }
     publish(service, &updated);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Update,
+            audit::Subject::Tool(&updated),
+        )
+        .await;
     Ok(updated)
 }
 
@@ -429,6 +443,13 @@ pub(in crate::gateway) async fn change_state(
         .map_err(|error| persistence_error(error, &previous))?;
     if previous.enabled != updated.enabled || previous.reachable != updated.reachable {
         publish(service, &updated);
+        service
+            .audit_catalog(
+                principal,
+                audit::Change::State,
+                audit::Subject::Tool(&updated),
+            )
+            .await;
     }
     Ok(updated)
 }
@@ -458,6 +479,13 @@ pub(in crate::gateway) async fn remove(
         .await
         .map_err(|error| persistence_error(error, &previous))?;
     publish(service, &previous);
+    service
+        .audit_catalog(
+            principal,
+            audit::Change::Delete,
+            audit::Subject::Tool(&previous),
+        )
+        .await;
     Ok(())
 }
 

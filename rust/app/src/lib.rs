@@ -2,6 +2,7 @@
 
 pub mod access;
 mod affinity;
+mod audit;
 pub mod auth;
 pub mod catalog;
 mod client_assertion;
