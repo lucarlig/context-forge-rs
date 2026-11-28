@@ -183,7 +183,12 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                     .run_gateway_health(health_settings, shutdown.clone()),
             ),
             tokio::spawn(service.clone().run_gateway_lifecycle(shutdown.clone())),
-            tokio::spawn(service.run_gateway_listeners(gateway_listeners, shutdown.clone())),
+            tokio::spawn(
+                service
+                    .clone()
+                    .run_gateway_listeners(gateway_listeners, shutdown.clone()),
+            ),
+            tokio::spawn(service.run_metrics_maintenance(shutdown.clone())),
         ]
     });
     tracing::info!(address = %listener.local_addr()?, "gateway listening");

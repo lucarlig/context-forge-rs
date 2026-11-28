@@ -1909,6 +1909,20 @@ async fn execution_metrics_record_live_reads_and_deny_scoped_resets() {
     )
     .await;
     let admin = login["access_token"].as_str().unwrap();
+    let stats = format!("{origin}/v1/api/metrics/stats");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = client.get(&stats).bearer_auth(admin).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let state: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+            if state["rollup"]["rollup_runs"].as_u64().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     let resource = post_json("/resources", Some(admin), json!({
         "resource":{"name":"live-metric","uri":"file:///fixture/live-metric","content":"Metrics fixture"},
         "visibility":"public"
@@ -1934,6 +1948,8 @@ async fn execution_metrics_record_live_reads_and_deny_scoped_resets() {
     let token = token["access_token"].as_str().unwrap();
     let metrics = format!("{origin}/v1/admin/metrics");
     let reset = format!("{metrics}/reset");
+    let rollup = format!("{origin}/v1/api/metrics/rollup");
+    let cleanup = format!("{origin}/v1/api/metrics/cleanup");
     let denied = client.post(&reset).bearer_auth(token).send().await.unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     let denied = client
@@ -1953,6 +1969,22 @@ async fn execution_metrics_record_live_reads_and_deny_scoped_resets() {
         .unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
+    for path in [&rollup, &cleanup] {
+        let unauthenticated = client.post(path).send().await.unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let scoped = client.post(path).bearer_auth(token).send().await.unwrap();
+        assert_eq!(scoped.status(), StatusCode::FORBIDDEN);
+        let cookie = client
+            .post(path)
+            .header(header::COOKIE, format!("jwt_token={admin}"))
+            .header(header::ACCEPT, "text/html")
+            .header(header::ORIGIN, origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cookie.status(), StatusCode::FORBIDDEN);
+    }
+
     let summary = || async {
         let response = client
             .get(&metrics)
@@ -1970,6 +2002,47 @@ async fn execution_metrics_record_live_reads_and_deny_scoped_resets() {
         recorded["topPerformers"]["resources"][0]["name"],
         "file:///fixture/live-metric"
     );
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        service.fixture.0.join("mcp.db").display(),
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE resource_metrics SET timestamp = datetime('now', '-4 hours') WHERE resource_id = $1")
+        .bind(id).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO resource_metrics_hourly (resource_id,resource_name,hour_start)
+         SELECT resource_id,'live-metric',strftime('%Y-%m-%dT%H:00:00Z',timestamp)
+         FROM resource_metrics WHERE resource_id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (first, second) = tokio::join!(
+        post_json(
+            "/v1/api/metrics/rollup",
+            Some(admin),
+            json!({"hours_back":8})
+        ),
+        post_json("/api/metrics/rollup", Some(admin), json!({"hours_back":8})),
+    );
+    let updated = |result: &Value| {
+        assert_eq!(result["tables"]["resource_metrics"]["error"], Value::Null);
+        result["total_rollups_updated"].as_u64().unwrap()
+    };
+    assert_eq!(updated(&first) + updated(&second), 1);
+    let raw: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_metrics")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(raw, 0);
+    let hourly: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_metrics_hourly")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(hourly, 1);
+    assert_eq!(summary().await["resources"]["totalExecutions"], 1);
     let cleared = client.post(&reset).bearer_auth(admin).send().await.unwrap();
     assert_eq!(cleared.status(), StatusCode::OK);
     let cleared = summary().await;

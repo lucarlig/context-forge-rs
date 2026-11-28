@@ -7,6 +7,8 @@ use serde_json::json;
 
 use super::*;
 
+pub(crate) mod maintenance;
+
 #[derive(Clone, Copy)]
 pub(crate) enum MetricEntity {
     Server,
@@ -294,6 +296,9 @@ impl Database {
             }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
+                sqlx::query(maintenance::MAINTENANCE_LOCK)
+                    .execute(&mut *tx)
+                    .await?;
                 reset!(tx)
             }
         }

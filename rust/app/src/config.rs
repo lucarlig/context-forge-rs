@@ -159,19 +159,7 @@ impl Settings {
 
     pub fn execution_metrics()
     -> Result<crate::gateway::ExecutionMetricsSettings, Box<dyn Error + Send + Sync>> {
-        let retention_days: u64 = parse("METRICS_RETENTION_DAYS", 7)?;
-        let delete_raw_hours: u64 = parse("METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS", 1)?;
-        if !(1..=365).contains(&retention_days) || !(1..=8760).contains(&delete_raw_hours) {
-            return Err("Invalid execution metric retention window".into());
-        }
-        let mut raw_hours = retention_days * 24;
-        if flag("METRICS_DELETE_RAW_AFTER_ROLLUP")?.unwrap_or(true) {
-            raw_hours = raw_hours.min(delete_raw_hours);
-        }
-        Ok(crate::gateway::ExecutionMetricsSettings {
-            record: flag("DB_METRICS_RECORDING_ENABLED")?.unwrap_or(true),
-            raw_window: Duration::from_secs(raw_hours * 3600),
-        })
+        crate::gateway::ExecutionMetricsSettings::from_env()
     }
 
     pub fn uaid_settings(

@@ -424,13 +424,32 @@ Global metrics require an unrestricted administrator with
 
 Reports combine recent executions with existing hourly aggregates. They
 retain older raw executions when the corresponding hourly aggregate is
-absent. Scheduled rollups and retention cleanup remain pending.
+absent.
 
 Eight Rust Anything cases match on SQLite and PostgreSQL. They cover
 live executions, recorded failures, disabled recording, overlapping
 raw and hourly rows, authorization, and reset. Chromium verifies the
 dashboard and confirmed reset. A live Rust test verifies recording through
 the REST resource route, denial for team-scoped tokens, and CSRF enforcement.
+
+The gateway rolls up completed hours on startup and at the configured
+interval. Cleanup deletes expired raw and hourly metrics in bounded batches.
+Rollups preserve p50, p95, and p99 and group A2A metrics by interaction type.
+Eligible raw samples are deleted in the same transaction as the rollup.
+
+`/v1/api/metrics/{config,stats,rollup,cleanup}` exposes maintenance to global
+administrators with `admin.system_config`. Cookie-authenticated writes require
+CSRF proof. The legacy mount follows `LEGACY_API_ENABLED`.
+
+Ten Rust Anything maintenance cases match on SQLite and PostgreSQL.
+They cover the HTTP summaries, startup, percentile calculation, retention
+batches, and disabled operations. A live Rust test verifies concurrent
+rollups, reuse of an adopted SQLite hour, and denial for unauthorized writes.
+
+Rust applies the configured startup backfill window on both databases.
+The v1.1.2 SQLite reference falls back to 24 hours because its minimum
+timestamp lacks a timezone. A live check verifies the Rust gateway rolls up a
+two-day-old SQLite sample and preserves current-hour data.
 
 ## Gateway and protocol verification
 

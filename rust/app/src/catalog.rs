@@ -21,6 +21,7 @@ mod agent_tasks;
 mod agents;
 mod entry_filters;
 mod metrics;
+pub(crate) use metrics::maintenance;
 mod prompts;
 mod resources;
 mod search;

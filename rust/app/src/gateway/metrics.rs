@@ -14,6 +14,7 @@ use crate::{
 pub struct ExecutionMetricsSettings {
     pub(crate) record: bool,
     pub(crate) raw_window: Duration,
+    pub(super) maintenance: super::metrics_maintenance::MaintenanceSettings,
 }
 
 impl Default for ExecutionMetricsSettings {
@@ -21,7 +22,25 @@ impl Default for ExecutionMetricsSettings {
         Self {
             record: true,
             raw_window: Duration::from_secs(3600),
+            maintenance: Default::default(),
         }
+    }
+}
+
+impl ExecutionMetricsSettings {
+    pub(crate) fn from_env() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::config::flag;
+
+        let maintenance = super::metrics_maintenance::MaintenanceSettings::from_env()?;
+        let mut raw_hours = maintenance.raw_retention_days * 24;
+        if maintenance.delete_raw_after_rollup {
+            raw_hours = raw_hours.min(maintenance.delete_raw_hours);
+        }
+        Ok(Self {
+            record: flag("DB_METRICS_RECORDING_ENABLED")?.unwrap_or(true),
+            raw_window: Duration::from_secs(raw_hours * 3600),
+            maintenance,
+        })
     }
 }
 
@@ -99,7 +118,10 @@ impl GatewayService {
                 .await?)
     }
 
-    async fn check_execution_metrics(&self, principal: &Principal) -> Result<(), CatalogApiError> {
+    pub(super) async fn check_execution_metrics(
+        &self,
+        principal: &Principal,
+    ) -> Result<(), CatalogApiError> {
         if self.can_administer_execution_metrics(principal).await? {
             Ok(())
         } else {
@@ -294,22 +316,34 @@ async fn reset(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Json<Value>, CatalogApiError> {
-    let settings = &service.gateway_oauth;
-    if browser.is_some()
-        && !browser_proof_valid(
-            &settings.browser_origin,
-            &settings.csrf_origins,
-            &uri,
-            &headers,
-        )
-    {
-        return Err(CatalogApiError::detail(
-            StatusCode::FORBIDDEN,
-            "CSRF validation failed",
-        ));
-    }
+    service.check_metrics_csrf(browser.is_some(), &uri, &headers)?;
     service.clear_execution_metrics(&principal).await?;
     Ok(Json(
         json!({"message":"All metrics reset successfully", "success":true}),
     ))
+}
+
+impl GatewayService {
+    pub(super) fn check_metrics_csrf(
+        &self,
+        browser: bool,
+        uri: &axum::http::Uri,
+        headers: &HeaderMap,
+    ) -> Result<(), CatalogApiError> {
+        let settings = &self.gateway_oauth;
+        if browser
+            && !browser_proof_valid(
+                &settings.browser_origin,
+                &settings.csrf_origins,
+                uri,
+                headers,
+            )
+        {
+            return Err(CatalogApiError::detail(
+                StatusCode::FORBIDDEN,
+                "CSRF validation failed",
+            ));
+        }
+        Ok(())
+    }
 }

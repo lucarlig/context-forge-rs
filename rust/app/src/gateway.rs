@@ -18,6 +18,7 @@ mod listeners;
 mod management;
 mod metrics;
 pub use metrics::ExecutionMetricsSettings;
+mod metrics_maintenance;
 mod oauth_api;
 mod openapi;
 mod prompt_api;
@@ -135,6 +136,7 @@ pub struct GatewayService {
     a2a_card_timeout: Duration,
     a2a_metrics: A2aMetricsSettings,
     execution_metrics: ExecutionMetricsSettings,
+    metrics_maintenance_stats: metrics_maintenance::MaintenanceStats,
     uaid: crate::uaid::UaidSettings,
     email_auth_enabled: bool,
     token_issuer: Option<crate::jwt::JwtIssuer>,
@@ -264,6 +266,7 @@ impl GatewayService {
             a2a_card_timeout: Duration::from_secs(120),
             a2a_metrics: A2aMetricsSettings::default(),
             execution_metrics: ExecutionMetricsSettings::default(),
+            metrics_maintenance_stats: metrics_maintenance::MaintenanceStats::default(),
             uaid: crate::uaid::UaidSettings::default(),
             email_auth_enabled: true,
             token_issuer: None,
@@ -634,6 +637,7 @@ impl GatewayService {
             )
             .merge(grpc_admin)
             .merge(catalog_admin)
+            .merge(metrics_maintenance::router(self))
             .merge(search)
             .merge(oauth_browser)
     }
