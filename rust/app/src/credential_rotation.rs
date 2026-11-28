@@ -10,6 +10,7 @@ use crate::{
     config::{SecretKdf, Settings, value},
     credentials::CredentialCipher,
     database::Database,
+    environment,
     secret_envelope::SecretEnvelope,
 };
 
@@ -49,6 +50,7 @@ pub async fn cli(mut args: impl Iterator<Item = String>) -> Result<(), CommandEr
             _ => return Err("unknown rotation option. See rotate-credentials --help.".into()),
         }
     }
+    environment::load(None)?;
     let old = old.map_or_else(
         || value("OLD_AUTH_ENCRYPTION_SECRET", "").map(Zeroizing::new),
         Ok,

@@ -23,6 +23,7 @@ use crate::{
     access::Authorizer,
     config::{allowlist, flag, parse, value},
     database::Database,
+    environment,
 };
 
 const WINDOW: Duration = Duration::from_secs(60);
@@ -145,7 +146,7 @@ impl RateLimiter {
                 || flag("SECURITY_LOGGING_ENABLED")?.unwrap_or(false)
                 || flag("MCPGATEWAY_ADMIN_API_ENABLED")?.unwrap_or(false)
                 || flag("SIEM_EXPORT_ENABLED")?.unwrap_or(false)
-                    && (std::env::var_os("SIEM_EXPORT_EVENT_SOURCES").is_none()
+                    && (environment::var_os("SIEM_EXPORT_EVENT_SOURCES").is_none()
                         || allowlist("SIEM_EXPORT_EVENT_SOURCES")?
                             .iter()
                             .any(|source| source.eq_ignore_ascii_case("auth"))),

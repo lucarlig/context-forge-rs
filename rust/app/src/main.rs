@@ -6,7 +6,7 @@ use axum::{Json, http::StatusCode};
 use clap::Parser;
 use context_forge_rs::{
     access::Authorizer,
-    config::Settings,
+    config::{Settings, load_environment},
     database::Database,
     diagnostics::Diagnostics,
     gateway::{GatewayService, SearchSettings},
@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some("init-secrets") => context_forge_rs::init_secrets::run(),
         _ => {
             let arguments = ServerArgs::parse();
+            load_environment(arguments.env_file.as_deref())?;
             #[cfg(unix)]
             let inherited = arguments
                 .fd

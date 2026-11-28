@@ -15,7 +15,7 @@ static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
 static COMMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[ \t]+#").expect("valid environment comment pattern"));
 
-pub(super) struct EnvFile<'a> {
+pub(crate) struct EnvFile<'a> {
     source: &'a str,
     assignments: Vec<Assignment<'a>>,
 }
@@ -28,7 +28,17 @@ struct Assignment<'a> {
 }
 
 impl<'a> EnvFile<'a> {
-    pub(super) fn parse(source: &'a str) -> io::Result<Self> {
+    pub(crate) fn parse(source: &'a str) -> io::Result<Self> {
+        Self::parse_with(source, false, |name| {
+            env::var(name).ok().map(Zeroizing::new)
+        })
+    }
+
+    pub(crate) fn parse_with(
+        source: &'a str,
+        environment_first: bool,
+        environment: impl Fn(&str) -> Option<Zeroizing<String>>,
+    ) -> io::Result<Self> {
         let mut assignments: Vec<Assignment<'a>> = Vec::new();
         let mut parsed = 0;
         for captures in ASSIGNMENT.captures_iter(source) {
@@ -50,14 +60,17 @@ impl<'a> EnvFile<'a> {
                     continue;
                 };
                 expanded.push_str(&value[consumed..expression.start()]);
-                if let Some(previous) = assignments
-                    .iter()
-                    .rev()
-                    .find(|entry| entry.name == name.as_str())
-                {
+                let name = name.as_str();
+                let previous = assignments.iter().rev().find(|entry| entry.name == name);
+                let external = if environment_first || previous.is_none() {
+                    environment(name)
+                } else {
+                    None
+                };
+                if let Some(environment) = external {
+                    expanded.push_str(&environment);
+                } else if let Some(previous) = previous {
                     expanded.push_str(previous.value.as_str());
-                } else if let Ok(environment) = env::var(name.as_str()) {
-                    expanded.push_str(&Zeroizing::new(environment));
                 } else if let Some(default) = reference.get(2) {
                     expanded.push_str(default.as_str());
                 }
@@ -77,7 +90,13 @@ impl<'a> EnvFile<'a> {
         })
     }
 
-    pub(super) fn get(&self, name: &str) -> Option<&str> {
+    pub(crate) fn variables(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.assignments
+            .iter()
+            .map(|entry| (entry.name, entry.value.as_str()))
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.assignments
             .iter()
             .rev()
@@ -85,7 +104,7 @@ impl<'a> EnvFile<'a> {
             .map(|entry| entry.value.as_str())
     }
 
-    pub(super) fn update(&self, updates: &[(&str, Zeroizing<String>)]) -> Zeroizing<String> {
+    pub(crate) fn update(&self, updates: &[(&str, Zeroizing<String>)]) -> Zeroizing<String> {
         let mut updated = vec![false; updates.len()];
         let mut out = Zeroizing::new(String::new());
         let mut copied = 0;
@@ -176,6 +195,17 @@ fn next_line(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expands_references_with_the_selected_source_precedence() {
+        let source = "ORIGIN=file\nSELECTED=${ORIGIN}\nDEFAULTED=${MISSING:-fallback}\n";
+        let process = |name: &str| (name == "ORIGIN").then(|| Zeroizing::new("process".to_owned()));
+        let defaults = EnvFile::parse_with(source, false, process).unwrap();
+        let overlay = EnvFile::parse_with(source, true, process).unwrap();
+        assert_eq!(defaults.get("SELECTED"), Some("file"));
+        assert_eq!(overlay.get("SELECTED"), Some("process"));
+        assert_eq!(overlay.get("DEFAULTED"), Some("fallback"));
+    }
 
     #[test]
     fn patch_replaces_assignments_and_preserves_multiline_values() {

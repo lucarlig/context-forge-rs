@@ -15,9 +15,7 @@ use clap::Parser;
 use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::Zeroizing;
 
-use crate::private_file;
-
-mod env_file;
+use crate::{env_file::EnvFile, private_file};
 
 type CliError = Box<dyn Error + Send + Sync>;
 const KEY_BYTES: usize = 32;
@@ -122,7 +120,7 @@ fn patch(path: &Path) -> Result<(), CliError> {
     } else {
         None
     };
-    let document = env_file::EnvFile::parse(&original)?;
+    let document = EnvFile::parse(&original)?;
     let configured_minimum = secret_minimum(document.get("MIN_SECRET_LENGTH"))?;
     let mut changes = Vec::new();
     for (name, bytes) in FIELDS {

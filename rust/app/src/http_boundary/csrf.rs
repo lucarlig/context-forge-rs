@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 use crate::{
     access::{Authorizer, auth_cookie, cookie},
     config::{allowlist, flag, parse, value},
+    environment,
 };
 
 const INTERNAL_MCP: &str = "/_internal/mcp/";
@@ -172,7 +173,7 @@ impl Csrf {
         if !flag("CSRF_ENABLED")?.unwrap_or(true) || !flag("AUTH_REQUIRED")?.unwrap_or(true) {
             return Ok(None);
         }
-        let mut exempt = if std::env::var_os("CSRF_EXEMPT_PATHS").is_some() {
+        let mut exempt = if environment::var_os("CSRF_EXEMPT_PATHS").is_some() {
             allowlist("CSRF_EXEMPT_PATHS")?
         } else {
             EXEMPT.iter().map(|path| (*path).to_owned()).collect()

@@ -12,6 +12,8 @@ pub mod credential_rotation;
 mod credentials;
 pub mod database;
 pub mod diagnostics;
+mod env_file;
+mod environment;
 mod events;
 mod forward_headers;
 mod forward_identity;

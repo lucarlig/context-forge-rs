@@ -6,6 +6,7 @@ use jsonwebtoken::EncodingKey;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    environment,
     gateway::{
         CIMD_DOCUMENT_PATH, CatalogRefresh, CimdSettings, DcrSettings, ExportSettings,
         GatewayHealth, GatewayLifecycle, GatewayListeners, GatewayOAuthSettings, ListenerElection,
@@ -24,6 +25,8 @@ use crate::{
     redis_sessions::{DEFAULT_AFFINITY_TTL, DEFAULT_LISTENER_TTL},
     upstream::{ConnectMode, EgressPolicy, UpstreamClient},
 };
+
+pub use crate::environment::load as load_environment;
 
 pub struct Settings {
     pub host: String,
@@ -270,11 +273,16 @@ impl Settings {
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let host = match host {
             Some(host) => host,
-            None => value(listener_env("HOST", "MCG_HOST"), "127.0.0.1")?,
+            None => {
+                environment::listener("HOST", "MCG_HOST")?.unwrap_or_else(|| "127.0.0.1".to_owned())
+            }
         };
         let port = match port {
             Some(port) => port,
-            None => parse(listener_env("PORT", "MCG_PORT"), 4444)?,
+            None => match environment::listener("PORT", "MCG_PORT")? {
+                Some(port) => port.parse().map_err(|_| "invalid PORT")?,
+                None => 4444,
+            },
         };
         let redis = match value("CACHE_TYPE", "database")?.as_str() {
             "redis" => Self::redis_connection()?,
@@ -529,7 +537,7 @@ impl Settings {
         Ok(AccountSettings {
             bootstrap_email: value("PLATFORM_ADMIN_EMAIL", "admin@example.com")?,
             bootstrap_name: value("PLATFORM_ADMIN_FULL_NAME", "Platform Administrator")?,
-            bootstrap_password: env::var("PLATFORM_ADMIN_PASSWORD")
+            bootstrap_password: environment::var("PLATFORM_ADMIN_PASSWORD")
                 .ok()
                 .filter(|password| !password.is_empty())
                 .map(Zeroizing::new),
@@ -669,7 +677,7 @@ impl Settings {
         if !(1..=525_600).contains(&expires) || !(1..=525_600).contains(&window) || limit < 1 {
             return Err("invalid password reset settings".into());
         }
-        let ui = env::var("UI_BASE_URL")
+        let ui = environment::var("UI_BASE_URL")
             .ok()
             .filter(|url| !url.trim().is_empty());
         let mut frontend = if let Some(url) = ui.as_deref() {
@@ -730,11 +738,11 @@ impl Settings {
         } else {
             MailTls::Disabled
         };
-        let auth = env::var("SMTP_USER")
+        let auth = environment::var("SMTP_USER")
             .ok()
             .filter(|username| !username.is_empty())
             .zip(
-                env::var("SMTP_PASSWORD")
+                environment::var("SMTP_PASSWORD")
                     .ok()
                     .filter(|password| !password.is_empty())
                     .map(zeroize::Zeroizing::new),
@@ -765,7 +773,7 @@ impl Settings {
             "merge" => HeaderSource::Merge,
             _ => return Err("invalid PASSTHROUGH_HEADERS_SOURCE".into()),
         };
-        let configured = if env::var_os("DEFAULT_PASSTHROUGH_HEADERS").is_some() {
+        let configured = if environment::var_os("DEFAULT_PASSTHROUGH_HEADERS").is_some() {
             allowlist("DEFAULT_PASSTHROUGH_HEADERS")?
         } else {
             defaults.defaults
@@ -1207,7 +1215,7 @@ impl Settings {
         if !flag("GATEWAY_MODERN_LISTENERS_ENABLED")?.unwrap_or(false) {
             return Ok(None);
         }
-        let path = env::var_os("PRIMARY_WORKER_LOCK_PATH")
+        let path = environment::var_os("PRIMARY_WORKER_LOCK_PATH")
             .filter(|path| !path.is_empty())
             .map_or_else(
                 || env::temp_dir().join(format!("mcpgw_plugin_primary_{}.lock", self.port)),
@@ -1251,7 +1259,7 @@ impl Settings {
             return Err("invalid CONTENT_MAX_RESOURCE_SIZE".into());
         }
         limits.strict_mime = flag("CONTENT_STRICT_MIME_VALIDATION")?.unwrap_or(false);
-        if env::var_os("CONTENT_ALLOWED_RESOURCE_MIMETYPES").is_some() {
+        if environment::var_os("CONTENT_ALLOWED_RESOURCE_MIMETYPES").is_some() {
             let configured = value("CONTENT_ALLOWED_RESOURCE_MIMETYPES", "[]")?;
             limits.allowed_mime = serde_json::from_str(&configured)
                 .map_err(|_| "invalid CONTENT_ALLOWED_RESOURCE_MIMETYPES")?;
@@ -1306,7 +1314,7 @@ pub(crate) fn allowlist(name: &str) -> Result<HashSet<String>, Box<dyn Error + S
         .collect())
 }
 pub(crate) fn flag(name: &str) -> Result<Option<bool>, Box<dyn Error + Send + Sync>> {
-    match env::var(name) {
+    match environment::var(name) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "on" | "t" | "y" | "yes" => Ok(Some(true)),
             "0" | "false" | "off" | "f" | "n" | "no" => Ok(Some(false)),
@@ -1316,16 +1324,8 @@ pub(crate) fn flag(name: &str) -> Result<Option<bool>, Box<dyn Error + Send + Sy
         Err(env::VarError::NotUnicode(_)) => Err(format!("invalid Unicode in {name}").into()),
     }
 }
-fn listener_env(primary: &'static str, legacy: &'static str) -> &'static str {
-    if env::var_os(primary).is_none() && env::var_os(legacy).is_some() {
-        legacy
-    } else {
-        primary
-    }
-}
-
 pub(crate) fn value(name: &str, default: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-    match env::var(name) {
+    match environment::var(name) {
         Ok(value) => Ok(value),
         Err(env::VarError::NotPresent) => Ok(default.to_owned()),
         Err(env::VarError::NotUnicode(_)) => Err(format!("invalid Unicode in {name}").into()),
@@ -1342,7 +1342,7 @@ pub(crate) fn admin_root(root: &str) -> Result<String, Box<dyn Error + Send + Sy
 }
 
 pub(crate) fn parse<T: FromStr>(name: &str, default: T) -> Result<T, Box<dyn Error + Send + Sync>> {
-    match env::var(name) {
+    match environment::var(name) {
         Ok(value) => value.parse().map_err(|_| format!("invalid {name}").into()),
         Err(env::VarError::NotPresent) => Ok(default),
         Err(env::VarError::NotUnicode(_)) => Err(format!("invalid Unicode in {name}").into()),

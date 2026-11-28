@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{env, fmt, time::Duration};
+use std::{fmt, time::Duration};
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use opentelemetry::{
@@ -27,7 +27,10 @@ use super::{
     SettingsError, collector_http_client, collector_json_value, collector_service_name,
     duration_micros, timestamp_micros, validate_collector_url,
 };
-use crate::config::{parse, value};
+use crate::{
+    config::{parse, value},
+    environment,
+};
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:14268/api/traces";
 
@@ -110,7 +113,7 @@ impl SpanExporter for Exporter {
 fn collector_authorization() -> Result<Option<HeaderValue>, SettingsError> {
     const USER: &str = "OTEL_EXPORTER_JAEGER_USER";
     const PASSWORD: &str = "OTEL_EXPORTER_JAEGER_PASSWORD";
-    if env::var_os(USER).is_none() || env::var_os(PASSWORD).is_none() {
+    if environment::var_os(USER).is_none() || environment::var_os(PASSWORD).is_none() {
         return Ok(None);
     }
     let username = value(USER, "")?;

@@ -13,7 +13,10 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 
 use super::compression::{Coding, Compression};
-use crate::config::{allowlist, flag, parse, value};
+use crate::{
+    config::{allowlist, flag, parse, value},
+    environment,
+};
 
 const EXPOSE_HEADERS: &str = "Content-Length, X-Request-ID, X-Password-Change-Required";
 const PREFLIGHT_METHODS: &str = "GET, POST, PUT, DELETE, OPTIONS";
@@ -46,7 +49,7 @@ impl ResponsePolicy {
 }
 
 pub(crate) fn allowed_origins(port: u16) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
-    if std::env::var_os("ALLOWED_ORIGINS").is_some() {
+    if environment::var_os("ALLOWED_ORIGINS").is_some() {
         return allowlist("ALLOWED_ORIGINS");
     }
     if value("ENVIRONMENT", "development")? == "development" {

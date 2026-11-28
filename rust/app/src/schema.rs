@@ -8,6 +8,7 @@ use crate::{
     catalog::{CATALOG_LOCK, slugify_with_separator},
     config::{Settings, flag},
     database::Database,
+    environment,
 };
 
 const IDENTITY: &str = include_str!("../migrations/001_identity.sql");
@@ -126,6 +127,7 @@ pub async fn cli(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     match args.next().as_deref() {
         None => {
+            environment::load(None)?;
             let database = Database::from_settings(&Settings::from_env()?)?;
             database.migrate_schema().await?;
             println!(
@@ -212,7 +214,7 @@ fn resource_name(original: &str, slug: &str, gateway: Option<&str>, separator: &
 }
 
 fn resource_name_separator() -> &'static str {
-    match std::env::var("GATEWAY_TOOL_NAME_SEPARATOR").as_deref() {
+    match environment::var("GATEWAY_TOOL_NAME_SEPARATOR").as_deref() {
         Ok("--") => "--",
         Ok("_") => "_",
         Ok(".") => ".",

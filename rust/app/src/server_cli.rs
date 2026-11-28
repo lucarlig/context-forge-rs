@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{future::Future, io, net::SocketAddr};
+use std::{future::Future, io, net::SocketAddr, path::PathBuf};
 
 use axum::Router;
 use clap::Parser;
@@ -12,7 +12,6 @@ use tokio_util::sync::CancellationToken;
 use std::{
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt},
-    path::PathBuf,
 };
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -43,6 +42,10 @@ pub(crate) struct ServerArgs {
     #[arg(long, value_name = "PORT")]
     pub(crate) port: Option<u16>,
 
+    /// Read additional gateway settings from this environment file.
+    #[arg(long, value_name = "PATH", value_parser = env_file_path())]
+    pub(crate) env_file: Option<PathBuf>,
+
     /// Listen on a Unix domain socket.
     #[cfg(unix)]
     #[arg(long, value_name = "PATH")]
@@ -52,6 +55,21 @@ pub(crate) struct ServerArgs {
     #[cfg(unix)]
     #[arg(long, value_name = "FD", value_parser = clap::value_parser!(i32).range(0..))]
     pub(crate) fd: Option<std::os::fd::RawFd>,
+}
+
+fn env_file_path() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
+    use clap::builder::{PathBufValueParser, TypedValueParser};
+
+    PathBufValueParser::new().try_map(|path| {
+        if path.metadata()?.is_file() {
+            Ok(path)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a regular file",
+            ))
+        }
+    })
 }
 
 pub(crate) enum ServerListener {

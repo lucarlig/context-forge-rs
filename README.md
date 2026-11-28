@@ -16,6 +16,8 @@ cargo run --locked
 
 The binary listens on `127.0.0.1:4444` and uses `sqlite:///./mcp.db` by default. Set `HOST`, `PORT`, and `DATABASE_URL` to configure it. SQLite paths follow the upstream SQLAlchemy URL format. PostgreSQL URLs accept the upstream `postgresql+psycopg://` scheme.
 
+The gateway, migration, configuration export and import, and credential rotation commands read `.env` from the working directory. Process variables take precedence. The server's `--env-file PATH` overlays application settings from another file. Set the bind address and port through `.env`, process variables, or listener flags.
+
 `--host` and `--port` override the listener environment variables. The gateway uses `MCG_HOST` and `MCG_PORT` when their canonical variables are unset. Use `--port 0` to select an available port. On Unix, `--uds /path/to/gateway.sock` binds a filesystem socket with permissions set by the process umask.
 
 Use `--fd 3` when a supervisor passes a TCP or Unix stream socket as descriptor 3. The inherited socket takes precedence over the bind options. The supervisor retains ownership of any Unix socket path.

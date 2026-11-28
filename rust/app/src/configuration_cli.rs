@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::{Settings, flag, value},
-    private_file,
+    environment, private_file,
 };
 
 type CliError = Box<dyn Error + Send + Sync>;
@@ -87,6 +87,7 @@ struct GatewayApi {
 
 impl GatewayApi {
     fn new() -> Result<Self, CliError> {
+        environment::load(None)?;
         let token = Zeroizing::new(value("MCPGATEWAY_BEARER_TOKEN", "")?);
         let mut authorization = if !token.is_empty() {
             if token.starts_with("Basic ") {
