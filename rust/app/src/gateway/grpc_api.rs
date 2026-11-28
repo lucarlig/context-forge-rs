@@ -685,16 +685,20 @@ pub(super) async fn invoke(
     service_id: &str,
     request: &CallToolRequestParams,
     principal: Option<&Principal>,
+    phases: &mut super::tool_phases::ToolPhases,
 ) -> Result<Value, ToolError> {
     if tool.requires_gateway_policy || !tool.response_filter.trim().is_empty() {
         return Err(ToolError::Unavailable);
     }
-    let record = app
-        .database
-        .load_grpc_service(service_id)
-        .await?
-        .filter(|record| record.enabled && record.visible(principal))
-        .ok_or(ToolError::NotFound)?;
+    let record = phases
+        .observe("tool.lookup", async {
+            app.database
+                .load_grpc_service(service_id)
+                .await?
+                .filter(|record| record.enabled && record.visible(principal))
+                .ok_or(ToolError::NotFound)
+        })
+        .await?;
 
     let arguments = request
         .arguments
@@ -712,6 +716,7 @@ pub(super) async fn invoke(
     .await
     {
         Ok(value) => {
+            phases.mark_result_ready();
             let text = serde_json::to_string_pretty(&value).map_err(|_| ToolError::Unavailable)?;
             Ok(json!({"content":[ContentBlock::text(text)],"isError":false}))
         }
@@ -720,6 +725,7 @@ pub(super) async fn invoke(
             app.rest_timeout.as_secs_f64(),
         )),
         Err(error) => {
+            phases.mark_result_ready();
             tracing::debug!(reason = %error, "gRPC tool invocation failed");
             tool_result_error(
                 "gRPC invocation error: Method invocation failed: An unexpected error occurred",

@@ -2701,7 +2701,7 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
     let missing_trace_id = id(missing_trace);
     let (mut statements, mut spans, mut phases) = (Vec::new(), Vec::new(), Vec::new());
     tokio::time::timeout(Duration::from_secs(5), async {
-        while spans.len() < 5 || statements.is_empty() || phases.len() < 9 {
+        while spans.len() < 8 || statements.is_empty() || phases.len() < 9 {
             let (headers, request) = batches.recv().await.unwrap();
             assert_eq!(headers["x-fixture-export"], "collector");
             let dump = format!("{request:?}");
@@ -2742,7 +2742,7 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
             .await
             .is_err()
     );
-    assert_eq!(spans.len(), 5);
+    assert_eq!(spans.len(), 8);
     assert_eq!(phases.len(), 9);
     for span in spans.iter().chain(&statements).chain(&phases) {
         for (key, expected) in [
@@ -2839,9 +2839,40 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
         .iter()
         .find(|span| span.name == "tool.invoke")
         .unwrap();
+    let tool_phase = |name| {
+        let span = spans.iter().find(|span| span.name == name).unwrap();
+        assert_eq!(span.parent_span_id, tool.span_id);
+        assert_eq!(span.trace_id, tool_trace_id);
+        assert_eq!(span.status.as_ref().unwrap().code, 1);
+        let attribute = |key| {
+            span.attributes
+                .iter()
+                .find(|field| field.key == key)
+                .and_then(|field| field.value.as_ref()?.value.as_ref())
+        };
+        assert_eq!(
+            attribute("tool.name"),
+            Some(&Attribute::StringValue("otlp-rest".to_owned()))
+        );
+        assert!(
+            matches!(attribute("tool.id"), Some(Attribute::StringValue(value)) if !value.is_empty())
+        );
+        if name == "tool.post_process" {
+            assert!(attribute("tool.integration_type").is_none());
+        } else {
+            assert_eq!(
+                attribute("tool.integration_type"),
+                Some(&Attribute::StringValue("REST".to_owned()))
+            );
+        }
+        span
+    };
+    tool_phase("tool.lookup");
+    tool_phase("tool.post_process");
+    let gateway_call = tool_phase("tool.gateway_call");
     let outbound = spans.iter().find(|span| span.name == "GET").unwrap();
     assert_eq!(outbound.kind, 3);
-    assert_eq!(outbound.parent_span_id, tool.span_id);
+    assert_eq!(outbound.parent_span_id, gateway_call.span_id);
     assert_eq!(outbound.span_id, sampled_outbound.unwrap());
     assert_eq!(outbound.trace_id, tool_trace_id);
     gateway.process.kill().await.unwrap();

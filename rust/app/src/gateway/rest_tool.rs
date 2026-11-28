@@ -33,6 +33,7 @@ pub(super) async fn execute(
     params: &CallToolRequestParams,
     principal: Option<&Principal>,
     incoming: Option<&HeaderMap>,
+    phases: &mut tool_phases::ToolPhases,
 ) -> Result<Value, ToolError> {
     if config.pending_policy {
         return tool_result_error("REST tool requires an unavailable invocation policy");
@@ -63,23 +64,32 @@ pub(super) async fn execute(
             }
         }
     }
-    let connection = if tool.needs_upstream_config {
+    let mut lookup = phases.start("tool.lookup");
+    let connection = with_trace(lookup.context(), async {
+        if !tool.needs_upstream_config {
+            return Ok(None);
+        }
         let version = tool.gateway_version.ok_or(ToolError::Unavailable)?;
-        Some(
-            service
-                .database
-                .gateway_connection(
-                    &tool.gateway_id,
-                    &tool.gateway_url,
-                    false,
-                    Some(version),
-                    None,
-                )
-                .await?
-                .ok_or(ToolError::Unavailable)?,
-        )
-    } else {
-        None
+        let connection = service
+            .database
+            .gateway_connection(
+                &tool.gateway_id,
+                &tool.gateway_url,
+                false,
+                Some(version),
+                None,
+            )
+            .await?
+            .ok_or(ToolError::Unavailable)?;
+        Ok::<_, ToolError>(Some(connection))
+    })
+    .await;
+    let connection = match connection {
+        Ok(connection) => connection,
+        Err(error) => {
+            lookup.finish(Some("REST tool configuration lookup failed"));
+            return Err(error);
+        }
     };
     let gateway_signer = connection
         .as_ref()
@@ -91,9 +101,16 @@ pub(super) async fn execute(
         .is_some_and(|kind| kind.eq_ignore_ascii_case("sigv4"));
     let inherited_signer = uses_signer && stored_sigv4(config.sigv4_config.as_deref()).is_none();
     if inherited_signer && gateway_signer.is_none() {
+        lookup.finish(Some("No stored REST tool credentials"));
         return tool_result_error("Tool invocation failed: SigV4 tool has no stored credentials");
     }
-    let (mut credentials, managed) = match stored_credentials(service, config, gateway_signer) {
+    let stored = stored_credentials(service, config, gateway_signer);
+    lookup.finish(
+        stored
+            .is_err()
+            .then_some("REST tool credential lookup failed"),
+    );
+    let (mut credentials, managed) = match stored {
         Ok(config) => config,
         Err(_) if uses_signer => {
             return tool_result_error(
@@ -159,9 +176,12 @@ pub(super) async fn execute(
     *request.headers_mut() = credentials.headers;
     let upstream = service.upstream.with_timeout(service.rest_timeout);
     let retry = exchange.and_then(|_| request.try_clone());
-    let initial = upstream
-        .rest_response(request, credentials.sigv4.as_deref())
-        .await;
+    let mut call = phases.start("tool.gateway_call");
+    let initial = with_trace(
+        call.context(),
+        upstream.rest_response(request, credentials.sigv4.as_deref()),
+    )
+    .await;
     let result = match (initial, exchange, retry) {
         (
             Ok(RestResponse {
@@ -171,31 +191,37 @@ pub(super) async fn execute(
             Some((gateway, encoded)),
             Some(mut retry),
         ) => {
-            let authorization = match refreshed_exchange(
-                service, tool, gateway, encoded, principal, incoming,
+            let authorization = match with_trace(
+                call.context(),
+                refreshed_exchange(service, tool, gateway, encoded, principal, incoming),
             )
             .await
             {
                 Ok(header) => header,
                 Err(message) => {
+                    call.finish(Some("Upstream credential refresh failed"));
                     return tool_result_error(format!("Tool invocation failed: {message}"));
                 }
             };
             retry
                 .headers_mut()
                 .insert(header::AUTHORIZATION, authorization);
-            upstream.rest_response(retry, None).await
+            with_trace(call.context(), upstream.rest_response(retry, None)).await
         }
         (result, _, _) => result,
     };
+    call.finish(result.is_err().then_some("Upstream REST request failed"));
     match result {
-        Ok(response) => Ok(response_result(
-            service,
-            &tool.response_filter,
-            &response,
-            tool.definition.output_schema.as_ref(),
-        )
-        .await),
+        Ok(response) => {
+            phases.mark_result_ready();
+            Ok(response_result(
+                service,
+                &tool.response_filter,
+                &response,
+                tool.definition.output_schema.as_ref(),
+            )
+            .await)
+        }
         Err(UpstreamError::BlockedDestination | UpstreamError::InvalidUrl) => {
             tool_result_error("Tool invocation failed: Outbound URL blocked by URL policy")
         }

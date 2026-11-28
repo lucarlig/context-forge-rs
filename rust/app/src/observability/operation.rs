@@ -256,7 +256,11 @@ impl OperationSpan {
     }
 
     pub(crate) async fn scope<T>(&self, operation: impl Future<Output = T>) -> T {
-        let child = current_trace().map(|mut context| {
+        with_trace(self.context(), operation).await
+    }
+
+    pub(crate) fn context(&self) -> Option<TraceContext> {
+        current_trace().map(|mut context| {
             if let Some(span) = &self.active {
                 context.stored = Some(StoredTrace {
                     trace_id: span.parent.trace_id.clone(),
@@ -267,8 +271,7 @@ impl OperationSpan {
                 context.exported = Some(span.span.context());
             }
             context
-        });
-        with_trace(child, operation).await
+        })
     }
 
     pub(crate) fn inject_trace_context(&self, headers: &mut axum::http::HeaderMap) {

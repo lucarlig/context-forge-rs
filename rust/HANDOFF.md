@@ -569,6 +569,18 @@ initialization and tool calls. The reference can send an extra
 `tools/list` for tool metadata. A live Rust test checks status, ancestry,
 and redaction of the upstream session handle and URL query credential.
 
+Tool invocations record `tool.lookup` for configuration resolution.
+REST, MCP, and A2A calls place upstream work under `tool.gateway_call`.
+Completed results enter `tool.post_process` for output capture and metrics.
+Timed-out calls end before result processing.
+
+Twelve Rust Anything cases cover REST, MCP, A2A, and gRPC success and error
+paths, including validation, timeouts, and unsampled requests. They compare
+phase status and ancestry. They check each runtime's `tool.invoke` status
+independently. Rust records returned tool failures and invalid arguments
+as errors on `tool.invoke`. A live Rust test checks that the phase spans
+inherit baggage and that the HTTP span links to `tool.gateway_call`.
+
 MCP catalog requests emit `tool.list`, `resource.list`, or `prompt.list`
 spans. Each span records the method, configured page size, and whether the
 request continues a previous page. Successful pages record their item count

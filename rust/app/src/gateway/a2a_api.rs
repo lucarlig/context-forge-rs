@@ -11,6 +11,7 @@ use super::{catalog_api::*, *};
 use crate::catalog::{AgentInteraction, AgentLookup, AgentRecord, AgentWriteError};
 use crate::schema_validation::Target;
 use crate::uaid::{self, UaidInput};
+use crate::upstream::RestResponse;
 
 mod admin;
 pub(crate) use admin::{AdminA2aQuery, AdminAgentAction, a2a_agent_metadata};
@@ -609,9 +610,9 @@ fn rpc_error(status: StatusCode, code: i32, message: &str, id: Option<Value>) ->
     (status, Json(body)).into_response()
 }
 
-enum InvocationSource {
+enum InvocationSource<'a> {
     Api,
-    Tool,
+    Tool(&'a mut super::tool_phases::ToolPhases),
 }
 
 async fn invoke(
@@ -620,7 +621,7 @@ async fn invoke(
     input: Invocation,
     principal: Option<&Principal>,
     incoming: Option<&HeaderMap>,
-    source: InvocationSource,
+    mut source: InvocationSource<'_>,
 ) -> Result<Value, CatalogApiError> {
     let fail = || CatalogApiError::detail(StatusCode::BAD_REQUEST, FAILURE);
     let hops = incoming.map_or(0, uaid::hop_count);
@@ -750,7 +751,13 @@ async fn invoke(
     *request.body_mut() = Some(payload.to_string().into());
     span.inject_trace_context(request.headers_mut());
     let started = std::time::Instant::now();
-    let result = span.scope(Box::pin(dispatch_upstream(app, request))).await;
+    let response = span.scope(Box::pin(dispatch_upstream(app, request))).await;
+    if let InvocationSource::Tool(phases) = &mut source
+        && response.is_ok()
+    {
+        phases.mark_result_ready();
+    }
+    let result = response.and_then(decode_upstream_response);
     let failure = match &result {
         Ok(body) if protocol::has_rpc_error(body) => Some("A2A agent returned a JSON-RPC error"),
         Err(_) => Some(FAILURE),
@@ -762,7 +769,7 @@ async fn invoke(
     {
         span.capture_output(body);
     }
-    if matches!(source, InvocationSource::Tool) {
+    if matches!(source, InvocationSource::Tool(_)) {
         span.finish(outcome).await;
         return result;
     }
@@ -785,10 +792,9 @@ async fn invoke(
 async fn dispatch_upstream(
     app: &GatewayService,
     request: reqwest::Request,
-) -> Result<Value, CatalogApiError> {
+) -> Result<RestResponse, CatalogApiError> {
     let fail = || CatalogApiError::detail(StatusCode::BAD_REQUEST, FAILURE);
-    let response = app
-        .upstream
+    app.upstream
         .with_timeout_cap(app.a2a_timeout)
         .rest_response(request, None)
         .await
@@ -800,14 +806,18 @@ async fn dispatch_upstream(
                 )
             }
             _ => fail(),
-        })?;
+        })
+}
+
+fn decode_upstream_response(response: RestResponse) -> Result<Value, CatalogApiError> {
     if response.status != StatusCode::OK {
         return Err(CatalogApiError::detail(
             StatusCode::BAD_REQUEST,
             format!("A2A agent returned HTTP {}", response.status.as_u16()),
         ));
     }
-    serde_json::from_slice(&response.body).map_err(|_| fail())
+    serde_json::from_slice(&response.body)
+        .map_err(|_| CatalogApiError::detail(StatusCode::BAD_REQUEST, FAILURE))
 }
 
 pub(super) async fn call_tool(
@@ -817,16 +827,20 @@ pub(super) async fn call_tool(
     request: &CallToolRequestParams,
     principal: Option<&Principal>,
     headers: Option<&HeaderMap>,
+    phases: &mut super::tool_phases::ToolPhases,
 ) -> Result<Value, ToolError> {
     if tool.requires_gateway_policy || !tool.response_filter.trim().is_empty() {
         return Err(ToolError::Unavailable);
     }
-    let agent = app
-        .database
-        .find_agent(access::catalog_scope(principal), AgentLookup::Id(id))
-        .await?
-        .filter(|agent| agent.enabled)
-        .ok_or(ToolError::NotFound)?;
+    let agent = phases
+        .observe("tool.lookup", async {
+            app.database
+                .find_agent(access::catalog_scope(principal), AgentLookup::Id(id))
+                .await?
+                .filter(|agent| agent.enabled)
+                .ok_or(ToolError::NotFound)
+        })
+        .await?;
     let arguments = request.arguments.clone().unwrap_or_default();
     match app
         .schema_validation
@@ -851,19 +865,24 @@ pub(super) async fn call_tool(
         .and_then(Value::as_str)
         .unwrap_or("query")
         .to_owned();
-    match invoke(
-        app,
-        &agent,
-        Invocation {
-            parameters: arguments,
-            interaction_type,
-        },
-        principal,
-        headers,
-        InvocationSource::Tool,
+    let mut call = phases.start("tool.gateway_call");
+    let result = with_trace(
+        call.context(),
+        invoke(
+            app,
+            &agent,
+            Invocation {
+                parameters: arguments,
+                interaction_type,
+            },
+            principal,
+            headers,
+            InvocationSource::Tool(phases),
+        ),
     )
-    .await
-    {
+    .await;
+    call.finish((!phases.result_ready()).then_some("Upstream A2A request failed"));
+    match result {
         Ok(result) => {
             let value = result.get("response").unwrap_or(&result);
             let text = value

@@ -36,6 +36,7 @@ mod token_api;
 pub(crate) use token_api::{AdminTokenPage, AdminTokenQuery};
 mod registry;
 mod tool_api;
+mod tool_phases;
 mod unified_search;
 pub use unified_search::SearchSettings;
 
@@ -886,16 +887,35 @@ impl GatewayService {
             Err(ToolError::InvalidArguments(_)) => Outcome::Error("Invalid tool arguments"),
             Err(_) => Outcome::Error("Tool execution failed"),
         };
-        if matches!(outcome, Outcome::Ok)
-            && let Ok(value) = &result
-        {
-            execution.span.capture_output(value);
-        }
-        if !matches!(&result, Ok(value) if value["resultType"] == "input_required") {
-            let succeeded = matches!(&result, Ok(value) if value["isError"] != true && value["is_error"] != true);
-            self.record_target(execution.metric, server, started, succeeded)
-                .await;
-        }
+        with_trace(execution.span.context(), async {
+            let mut post = if let Ok(value) = &result
+                && value["resultType"] != "input_required"
+                && let Some(phases) = execution.phases.as_ref()
+            {
+                phases.post_process()
+            } else {
+                ScopedSpan::default()
+            };
+            with_trace(post.context(), async {
+                if matches!(outcome, Outcome::Ok)
+                    && let Ok(value) = &result
+                {
+                    execution.span.capture_output(value);
+                }
+                if !matches!(outcome, Outcome::InputRequired) {
+                    self.record_target(
+                        execution.metric.take(),
+                        server,
+                        started,
+                        matches!(outcome, Outcome::Ok),
+                    )
+                    .await;
+                }
+            })
+            .await;
+            post.finish(None);
+        })
+        .await;
         execution.span.finish(outcome).await;
         result
     }
@@ -942,8 +962,7 @@ impl GatewayService {
                 self.direct_target(context.request_headers, principal).await.map_err(ToolError::from)
             } => result?,
         };
-        let invoked_as = request.name.clone();
-        let (gateway, direct_timeout, response_filter, tool_id) = match target {
+        let (gateway, direct_timeout, response_filter, phases) = match target {
             DirectTarget::Found {
                 gateway, timeout, ..
             } => {
@@ -958,7 +977,12 @@ impl GatewayService {
                         "MCP",
                     )
                     .await;
-                (gateway, Some(timeout), String::new(), None)
+                let phases = execution.phases.insert(tool_phases::ToolPhases::new(
+                    &request.name,
+                    None,
+                    "MCP",
+                ));
+                (gateway, Some(timeout), String::new(), phases)
             }
             DirectTarget::Denied => {
                 return tool_result_error(format!("Tool not found: {}", request.name));
@@ -999,12 +1023,17 @@ impl GatewayService {
                 if tool.deprecated {
                     return tool_result_error(tool_api::deprecated_message(&request.name));
                 }
+                let phases = execution.phases.insert(tool_phases::ToolPhases::new(
+                    &request.name,
+                    Some(&tool.id),
+                    integration,
+                ));
                 if let Some(rest) = &tool.rest {
                     return tokio::select! {
                         biased;
                         () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
                         result = execution.span.scope(
-                            Box::pin(rest_tool::execute(self, &tool, rest, &request, principal, context.request_headers))
+                            Box::pin(rest_tool::execute(self, &tool, rest, &request, principal, context.request_headers, phases))
                         ) => {
                             result.map(|value| rest_tool::for_caller(value, context.client_capabilities.is_some()))
                         }
@@ -1014,7 +1043,9 @@ impl GatewayService {
                     return tokio::select! {
                         biased;
                         () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
-                        result = grpc_api::invoke(self, &tool, service_id, &request, principal) => result,
+                        result = execution.span.scope(
+                            Box::pin(grpc_api::invoke(self, &tool, service_id, &request, principal, phases))
+                        ) => result,
                     };
                 }
                 if let Some(agent_id) = &tool.a2a_agent_id {
@@ -1022,7 +1053,7 @@ impl GatewayService {
                         biased;
                         () = context.cancellation.cancelled() => Err(ToolError::Cancelled),
                         result = execution.span.scope(
-                            Box::pin(a2a_api::call_tool(self, &tool, agent_id, &request, principal, context.request_headers))
+                            Box::pin(a2a_api::call_tool(self, &tool, agent_id, &request, principal, context.request_headers, phases))
                         ) => result,
                     };
                 }
@@ -1041,7 +1072,7 @@ impl GatewayService {
                     },
                     None,
                     tool.response_filter,
-                    Some(tool.id),
+                    phases,
                 )
             }
         };
@@ -1051,13 +1082,16 @@ impl GatewayService {
             .ok_or(ToolError::Unavailable)?;
         let mut credentials = match execution
             .span
-            .scope(Box::pin(self.configured_upstream(
-                &gateway.id,
-                &gateway.url,
-                gateway.needs_upstream_config,
-                context.request_headers,
-                principal,
-                UpstreamUse::Invocation,
+            .scope(Box::pin(phases.observe(
+                "tool.lookup",
+                self.configured_upstream(
+                    &gateway.id,
+                    &gateway.url,
+                    gateway.needs_upstream_config,
+                    context.request_headers,
+                    principal,
+                    UpstreamUse::Invocation,
+                ),
             )))
             .await
         {
@@ -1113,18 +1147,12 @@ impl GatewayService {
         let (result, upstream_hash) = execution
             .span
             .scope(Box::pin(async {
-                let mut outer = ScopedSpan::start("tool.gateway_call", || {
-                    json!({
-                        "tool.name": invoked_as,
-                        "tool.id": tool_id.as_deref(),
-                        "tool.integration_type": "MCP",
-                    })
-                });
+                let mut outer = phases.start("tool.gateway_call");
                 let (result, hash) = with_trace(
                     outer.context(),
                     Box::pin(async {
                         let mut trace =
-                            McpCallSpan::start(&gateway.id, tool_id.as_deref(), &tool, endpoint);
+                            McpCallSpan::start(&gateway.id, phases.id.as_deref(), &tool, endpoint);
                         let context_for_call = trace.as_ref().and_then(McpCallSpan::context);
                         let invoke = client
                             .as_ref()
@@ -1147,6 +1175,9 @@ impl GatewayService {
             }))
             .await;
         execution.span.upstream_session(upstream_hash.as_deref());
+        if result.is_ok() {
+            phases.mark_result_ready();
+        }
         match result {
             Ok(result) if legacy_caller && result["resultType"] == "input_required" => {
                 input_error_result("Elicitation not supported", None)
@@ -1542,6 +1573,7 @@ pub(crate) enum ToolError {
 struct ToolExecution {
     metric: Option<metrics::ExecutionTarget>,
     span: OperationSpan,
+    phases: Option<tool_phases::ToolPhases>,
 }
 
 #[derive(Serialize)]
