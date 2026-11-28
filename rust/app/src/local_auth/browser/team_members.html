@@ -1,0 +1,56 @@
+{% if result %}
+  <div role="status">
+    {% if result.added %}<p>Added {{ result.added }} member(s)</p>{% endif %}
+    {% if result.updated %}<p>Updated {{ result.updated }} member(s)</p>{% endif %}
+    {% if result.removed %}<p>Removed {{ result.removed }} member(s)</p>{% endif %}
+    {% if result.errors %}
+    <p>{{ result.errors|length }} error(s)</p>
+    <ul>{% for error in result.errors[:5] %}<li>{{ error }}</li>{% endfor %}</ul>
+    {% elif not result.added and not result.updated and not result.removed %}<p>No changes made.</p>{% endif %}
+  </div>
+  <p><a href="{{ root }}/admin/teams/{{ team_id }}/members">Back to team members</a></p>
+{% elif required %}
+  <p>Enter at least two characters of a name or email address to find users.</p>
+{% elif members.rows %}
+  <div class="table-scroll">
+    <table aria-label="{% if current %}Current team members{% else %}Available users{% endif %}">
+      <thead><tr><th scope="col">Email</th><th scope="col">Name</th>{% if current %}<th scope="col">Role</th>{% endif %}{% if manage %}<th scope="col">Actions</th>{% endif %}</tr></thead>
+      <tbody>
+      {% for member in members.rows %}
+        <tr>
+          <th scope="row">{{ member.email }}</th>
+          <td>{{ member.full_name|default('', true) }}</td>
+          {% if current %}<td>{{ member.role|capitalize }}</td>{% endif %}
+          {% if manage %}
+          <td class="actions">
+            <form method="post" action="{{ root }}/admin/teams/{{ team.id }}/{% if current %}update-member-role{% else %}add-member{% endif %}?directory=1">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <input type="hidden" name="user_email" value="{{ member.email }}">
+              <label>Role <select name="role"><option value="member">Member</option><option value="owner"{% if member.role == "owner" %} selected{% endif %}>Owner</option></select></label>
+              <button type="submit">{% if current %}Save role{% else %}Add member{% endif %}</button>
+            </form>
+            {% if current %}
+            <details><summary>Remove</summary>
+              <form method="post" action="{{ root }}/admin/teams/{{ team.id }}/remove-member?directory=1">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <input type="hidden" name="user_email" value="{{ member.email }}">
+                <button type="submit">Confirm removal</button>
+              </form>
+            </details>
+            {% endif %}
+          </td>
+          {% endif %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if members.previous or members.next %}
+  <nav class="page-links" aria-label="Member pages">
+    {% if members.previous %}<a href="{{ members.previous }}">Previous</a>{% endif %}
+    {% if members.next %}<a href="{{ members.next }}">Next</a>{% endif %}
+  </nav>
+  {% endif %}
+{% else %}
+  <p>No matching users.</p>
+{% endif %}

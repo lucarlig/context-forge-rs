@@ -223,6 +223,17 @@ pub(super) async fn authorized_form(
     peer: IpAddr,
     json_allowed: bool,
 ) -> Result<AuthorizedForm, Box<Response>> {
+    authorized_form_for_team(accounts, permission, request, peer, json_allowed, None).await
+}
+
+pub(super) async fn authorized_form_for_team(
+    accounts: &Accounts,
+    permission: &str,
+    request: Request,
+    peer: IpAddr,
+    json_allowed: bool,
+    target: Option<&str>,
+) -> Result<AuthorizedForm, Box<Response>> {
     let settings = settings_for(accounts);
     let Session { principal, .. } =
         match access(accounts, request.headers(), request.uri(), peer).await {
@@ -282,8 +293,8 @@ pub(super) async fn authorized_form(
         ).into_response()));
     }
     let team = sessions::request_team(&parts.uri, &principal);
-    let role = team
-        .as_deref()
+    let role = target
+        .or(team.as_deref())
         .map_or(RoleContext::AnyTeam, RoleContext::Team);
     if !accounts
         .access
@@ -372,6 +383,7 @@ pub(super) struct Dashboard {
     selected: Option<String>,
     pub(super) tokens: Option<super::token::Panel>,
     pub(super) users: Option<super::users::Panel>,
+    pub(super) teams: Option<super::team::Panel>,
     error: Option<&'static str>,
     message: Option<&'static str>,
 }
@@ -492,6 +504,7 @@ pub(super) async fn dashboard(
     }
     let tokens_visible = super::token::visible(accounts, principal, team).await?;
     let users_visible = super::users::visible(accounts, principal).await?;
+    let teams_visible = super::team::visible(accounts, principal).await?;
     let parameters = forms::query(uri);
     let selected = parameters
         .get("section")
@@ -499,6 +512,7 @@ pub(super) async fn dashboard(
         .filter(|name| {
             (*name == "tokens" && tokens_visible)
                 || (*name == "users" && users_visible)
+                || (*name == "teams" && teams_visible)
                 || permitted.iter().any(|kind| kind.name() == *name)
         });
     if selected.is_none() {
@@ -506,8 +520,8 @@ pub(super) async fn dashboard(
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
-    let mut navigation = Vec::with_capacity(permitted.len() + 3);
-    if !permitted.is_empty() || tokens_visible || users_visible {
+    let mut navigation = Vec::with_capacity(permitted.len() + 4);
+    if !permitted.is_empty() || tokens_visible || users_visible || teams_visible {
         navigation.push(Link {
             label: "All sections",
             href: href(None, None),
@@ -535,6 +549,13 @@ pub(super) async fn dashboard(
             selected: selected == Some("users"),
         });
     }
+    if teams_visible {
+        navigation.push(Link {
+            label: "Teams",
+            href: href(Some("teams"), None),
+            selected: selected == Some("teams"),
+        });
+    }
     let tokens = if selected == Some("tokens") {
         Some(super::token::panel(accounts, service, principal, uri).await?)
     } else {
@@ -542,6 +563,12 @@ pub(super) async fn dashboard(
     };
     let users = if selected == Some("users") {
         Some(super::users::panel(accounts, service, principal, uri).await?)
+    } else {
+        None
+    };
+    let teams = if selected == Some("teams") || selected.is_none() && teams_visible {
+        let team_query = (selected == Some("teams")).then_some(uri);
+        Some(super::team::panel(accounts, service, principal, team_query, include_inactive).await?)
     } else {
         None
     };
@@ -588,6 +615,7 @@ pub(super) async fn dashboard(
         selected: selected.map(str::to_owned),
         tokens,
         users,
+        teams,
         error: match parameters.get("error").map(String::as_str) {
             Some("conflict") => Some("This entry changed. Check its current state and try again."),
             Some("delete_failed") => Some("Could not delete the entry."),

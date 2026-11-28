@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub(super) mod dashboard;
 mod membership;
 mod storage;
 
@@ -132,10 +133,19 @@ impl<'a> From<&'a Principal> for TeamActor<'a> {
 async fn create(
     State(accounts): State<Arc<Accounts>>,
     Extension(principal): Extension<Principal>,
-    Json(mut input): Json<TeamCreate>,
+    Json(input): Json<TeamCreate>,
 ) -> Result<(StatusCode, Json<Value>), AccountError> {
     permit(&accounts, &principal, "teams.create", None).await?;
-    let actor = TeamActor::from(&principal);
+    let result = create_team(&accounts, &principal, input).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn create_team(
+    accounts: &Arc<Accounts>,
+    principal: &Principal,
+    mut input: TeamCreate,
+) -> Result<Value, AccountError> {
+    let actor = TeamActor::from(principal);
     if !accounts.settings.teams.allow_creation && !actor.admin {
         return Err(denied("Team creation is currently disabled"));
     }
@@ -178,13 +188,14 @@ async fn create(
             .collect::<Vec<_>>()
     );
     if !result.invites.is_empty() && accounts.settings.mailer.is_some() {
+        let accounts = accounts.clone();
         tokio::spawn(async move {
             for invitation in &result.invites {
                 membership::send_invitation(&accounts, invitation).await;
             }
         });
     }
-    Ok((StatusCode::CREATED, Json(body)))
+    Ok(body)
 }
 
 async fn detail(
@@ -253,7 +264,7 @@ async fn edit(
     State(accounts): State<Arc<Accounts>>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
-    Json(mut input): Json<TeamPatch>,
+    Json(input): Json<TeamPatch>,
 ) -> Result<Json<Value>, AccountError> {
     access_team(
         &accounts,
@@ -263,7 +274,17 @@ async fn edit(
         TeamAccess::OwnerOrAdmin,
     )
     .await?;
-    let actor = TeamActor::from(&principal);
+    let team = update_team(&accounts, &principal, &id, input).await?;
+    Ok(Json(team.metadata()))
+}
+
+async fn update_team(
+    accounts: &Accounts,
+    principal: &Principal,
+    id: &str,
+    mut input: TeamPatch,
+) -> Result<storage::Team, AccountError> {
+    let actor = TeamActor::from(principal);
     if let Some(name) = input.name.as_deref() {
         input.name = Some(team_name(name)?);
     }
@@ -274,13 +295,10 @@ async fn edit(
         input.visibility.as_deref(),
         input.max_members.flatten(),
     )?;
-    Ok(Json(
-        accounts
-            .database
-            .edit_managed_team(&id, &input, actor, &accounts.settings.teams)
-            .await?
-            .metadata(),
-    ))
+    accounts
+        .database
+        .edit_managed_team(id, &input, actor, &accounts.settings.teams)
+        .await
 }
 
 async fn remove(
@@ -368,14 +386,23 @@ async fn access_team(
     rule: TeamAccess,
 ) -> Result<storage::Team, AccountError> {
     permit(accounts, principal, permission, Some(id)).await?;
+    scoped_team(accounts, principal, id, rule).await
+}
+
+async fn scoped_team(
+    accounts: &Accounts,
+    principal: &Principal,
+    id: &str,
+    rule: TeamAccess,
+) -> Result<storage::Team, AccountError> {
+    if !in_token_scope(principal, id) {
+        return Err(denied("Access denied"));
+    }
     let team = accounts
         .database
         .managed_team(id)
         .await?
         .ok_or_else(missing_team)?;
-    if !in_token_scope(principal, id) {
-        return Err(denied("Access denied"));
-    }
     if principal.is_global_admin()
         && matches!(rule, TeamAccess::MemberOrAdmin | TeamAccess::OwnerOrAdmin)
     {

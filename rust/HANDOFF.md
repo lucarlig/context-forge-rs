@@ -269,7 +269,19 @@ responses. Both admin route prefixes expose the listing and actions.
 Six Rust Anything scenarios match on SQLite and PostgreSQL. They cover
 pagination, dropdowns, search, the versioned alias, HTML partials, and the
 account lifecycle. Chromium verifies the dashboard forms and navigation.
-Team membership selection remains part of the open team dashboard work.
+
+## Teams dashboard
+
+The Teams section supports scoped listings, pagination, search, filters, and
+team creation, editing, and deletion. Owners can search for users, add or
+remove members, and change their roles. Team forms share the account
+service's membership, capacity, and last-owner checks.
+
+Six Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+directory filters, the versioned alias, settings, and individual and bulk
+membership changes.
+Chromium verifies team and member forms with security headers enabled.
+Browser join requests and their review flow remain open.
 
 ## Gateway and protocol verification
 

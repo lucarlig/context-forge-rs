@@ -4,7 +4,7 @@ mod a2a_api;
 mod admin_catalog;
 mod catalog_api;
 pub(crate) use admin_catalog::{AdminListQuery, CatalogListing, CatalogMutation};
-pub(crate) use catalog_api::{CatalogApiError, PaginationMeta};
+pub(crate) use catalog_api::{CatalogApiError, PaginationMeta, flag as catalog_query_flag};
 mod content;
 mod exchanged_tokens;
 mod export_api;

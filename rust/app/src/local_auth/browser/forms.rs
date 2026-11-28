@@ -220,6 +220,12 @@ pub(super) fn render_template(
                 .add_template("users.html", include_str!("users.html"))
                 .expect("valid users template");
             environment
+                .add_template("teams.html", include_str!("teams.html"))
+                .expect("valid teams template");
+            environment
+                .add_template("team_members.html", include_str!("team_members.html"))
+                .expect("valid team members template");
+            environment
         });
     let html = TEMPLATES
         .get_template(template)

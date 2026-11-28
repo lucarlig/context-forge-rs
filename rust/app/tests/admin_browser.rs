@@ -942,3 +942,107 @@ async fn admin_users_apply_directory_permissions_and_account_lifecycle() {
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn admin_team_directory_applies_token_scope_before_pagination_and_updates() {
+    let mut gateway = gateway().await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let session = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email": EMAIL, "password": password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::OK);
+    let session: serde_json::Value = serde_json::from_str(&session.text().await.unwrap()).unwrap();
+    let administrator = session["access_token"].as_str().unwrap();
+    let directory = format!("{origin}/admin/teams");
+    for name in ["Fixture+Alpha", "Fixture+Zulu"] {
+        let response = client
+            .post(&directory)
+            .bearer_auth(administrator)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(format!("name={name}&visibility=private"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let response = client
+        .get(format!("{directory}/search?q=fixture"))
+        .bearer_auth(administrator)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let teams: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    let other = teams[0]["id"].as_str().unwrap();
+    let own = teams[1]["id"].as_str().unwrap();
+
+    let issued = client
+        .post(format!("{origin}/tokens"))
+        .bearer_auth(administrator)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::json!({
+                "name": "fixture-team",
+                "expires_in_days": 1,
+                "team_id": own,
+                "scope": {"permissions": ["admin.dashboard", "teams.read", "teams.update"]}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued: serde_json::Value = serde_json::from_str(&issued.text().await.unwrap()).unwrap();
+    let scoped = issued["access_token"].as_str().unwrap();
+
+    let page = client
+        .get(format!("{directory}/partial?q=fixture&per_page=1"))
+        .bearer_auth(scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let content = page.text().await.unwrap();
+    assert!(content.contains("Fixture Zulu"));
+    assert!(!content.contains("Fixture Alpha"));
+    let missing_scope = client
+        .get(format!("{directory}/{other}/members"))
+        .bearer_auth(scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_scope.status(), StatusCode::FORBIDDEN);
+    let update = |id: &str, credential: &str| {
+        client
+            .post(format!("{directory}/{id}/update"))
+            .bearer_auth(credential)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body("name=New+Fixture&visibility=private")
+    };
+    assert_eq!(
+        update(other, scoped).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        update(own, scoped).send().await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+    let denied = client
+        .post(format!("{directory}/{own}/delete"))
+        .bearer_auth(scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    gateway.process.kill().await.unwrap();
+}

@@ -6,8 +6,8 @@ use super::*;
 pub(super) struct Team {
     pub(super) id: String,
     pub(super) name: String,
-    slug: String,
-    description: Option<String>,
+    pub(super) slug: String,
+    pub(super) description: Option<String>,
     created_by: String,
     pub(super) is_personal: bool,
     pub(super) visibility: String,
@@ -15,10 +15,15 @@ pub(super) struct Team {
     member_count: i64,
     created_at: String,
     updated_at: String,
-    is_active: bool,
+    pub(super) is_active: bool,
 }
 
 impl Team {
+    pub(super) fn directory_metadata(&self) -> Value {
+        json!({"id": self.id, "name": self.name, "slug": self.slug, "description": self.description,
+               "visibility": self.visibility, "is_active": self.is_active})
+    }
+
     pub(super) fn metadata(&self) -> Value {
         json!({
             "id":self.id, "name":self.name, "slug":self.slug, "description":self.description,
@@ -32,6 +37,13 @@ impl Team {
         json!({"id":self.id,"name":self.name,"description":self.description,"member_count":self.member_count,
                "is_joinable":true,"created_at":iso(&self.created_at)})
     }
+}
+
+#[derive(sqlx::FromRow)]
+pub(super) struct DirectoryTeam {
+    #[sqlx(flatten)]
+    pub(super) team: Team,
+    pub(super) role: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -203,6 +215,38 @@ macro_rules! team_transaction {
 }
 
 impl Database {
+    pub(super) async fn team_directory(
+        &self,
+        actor: TeamActor<'_>,
+        discover: bool,
+        include_inactive: bool,
+    ) -> Result<Vec<DirectoryTeam>, sqlx::Error> {
+        const SQL: &str = concat!(
+            "SELECT ", team_fields!(), ", m.role FROM email_teams t
+             LEFT JOIN email_team_members m ON m.team_id=t.id AND m.user_email=$1 AND m.is_active=TRUE
+             WHERE (t.is_active OR $3)
+               AND ((NOT t.is_personal AND $2) OR (t.is_personal AND t.created_by=$1)
+                    OR (NOT t.is_personal AND m.user_email IS NOT NULL)
+                    OR ($4 AND NOT t.is_personal AND t.is_active AND t.visibility='public'))
+             ORDER BY t.name,t.id"
+        );
+        macro_rules! directory {
+            ($pool:expr) => {
+                sqlx::query_as(SQL)
+                    .bind(actor.email)
+                    .bind(actor.admin)
+                    .bind(include_inactive)
+                    .bind(discover)
+                    .fetch_all($pool)
+                    .await
+            };
+        }
+        match self {
+            Self::Sqlite(pool) => directory!(pool),
+            Self::Postgres(pool) => directory!(pool),
+        }
+    }
+
     pub(super) async fn managed_team(&self, id: &str) -> Result<Option<Team>, sqlx::Error> {
         match self {
             Self::Sqlite(pool) => {
@@ -258,6 +302,34 @@ impl Database {
         match self {
             Self::Sqlite(pool) => list!(pool),
             Self::Postgres(pool) => list!(pool),
+        }
+    }
+
+    pub(super) async fn team_member_directory(
+        &self,
+        id: &str,
+        search: &str,
+        current: bool,
+    ) -> Result<Vec<dashboard::DirectoryMember>, sqlx::Error> {
+        const SQL: &str = "SELECT u.email,u.full_name,m.role FROM email_users u
+            LEFT JOIN email_team_members m ON m.team_id=$1 AND m.user_email=u.email AND m.is_active
+            WHERE ((m.team_id IS NOT NULL AND $2) OR (m.team_id IS NULL AND NOT $2 AND u.is_active))
+              AND ($3='' OR SUBSTR(LOWER(u.email),1,LENGTH($3))=$3
+                   OR SUBSTR(LOWER(u.full_name),1,LENGTH($3))=$3)
+            ORDER BY (u.full_name IS NOT NULL),u.full_name,u.email";
+        macro_rules! directory {
+            ($pool:expr) => {
+                sqlx::query_as(SQL)
+                    .bind(id)
+                    .bind(current)
+                    .bind(search)
+                    .fetch_all($pool)
+                    .await
+            };
+        }
+        match self {
+            Self::Sqlite(pool) => directory!(pool),
+            Self::Postgres(pool) => directory!(pool),
         }
     }
 

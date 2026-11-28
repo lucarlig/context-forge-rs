@@ -5,6 +5,7 @@ mod forms;
 mod keycloak;
 mod recovery;
 mod sessions;
+mod team;
 mod token;
 mod users;
 
@@ -152,6 +153,7 @@ pub(super) fn router(
             .route(&format!("{path}/tokens/{{id}}/revoke"), post(token::revoke))
             .route(&format!("{path}/tokens/{{id}}/usage"), get(token::usage));
         router = users::routes(router, path);
+        router = team::routes(router, path);
         for kind in ManagedCatalog::ALL {
             let base = format!("{path}/{}", kind.name());
             router = router

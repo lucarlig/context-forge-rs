@@ -1,0 +1,60 @@
+{% if mode == "selector" %}
+  <ul aria-label="Teams">
+    {% for item in teams.rows %}
+    <li><a href="{{ root }}/admin/?team_id={{ item.team.id }}">{{ item.team.name }}</a></li>
+    {% else %}<li>No teams found.</li>{% endfor %}
+  </ul>
+{% elif mode != "controls" %}
+<section id="teams" aria-labelledby="heading-teams">
+  <h2 id="heading-teams">Teams</h2>
+  {% if teams.can_create %}
+  <details>
+    <summary>Add team</summary>
+    <form method="post" action="{{ root }}/admin/teams?directory=1">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Team name <input name="name" maxlength="255" required></label>
+      <label>Description <textarea name="description" maxlength="1000"></textarea></label>
+      <label>Visibility <select name="visibility"><option value="private">Private</option><option value="public">Public</option></select></label>
+      <label>Maximum members <input name="max_members" type="number" min="1"></label>
+      <button type="submit">Create team</button>
+    </form>
+  </details>
+  {% endif %}
+  {% if teams.rows %}
+  <div class="table-scroll">
+    <table aria-labelledby="heading-teams">
+      <thead><tr><th scope="col">Team</th><th scope="col">Visibility</th><th scope="col">Relationship</th><th scope="col">Members</th><th scope="col">Actions</th></tr></thead>
+      <tbody>
+      {% for item in teams.rows %}
+        <tr>
+          <th scope="row">{{ item.team.name }}{% if item.team.description %}<p>{{ item.team.description }}</p>{% endif %}</th>
+          <td>{{ item.team.visibility|capitalize }}{% if not item.team.is_active %} · Inactive{% endif %}</td>
+          <td>{{ item.relationship }}</td>
+          <td>{{ item.team.member_count }}{% if item.team.max_members %} of {{ item.team.max_members }}{% endif %}</td>
+          <td class="actions">
+            {% if item.members %}<a href="{{ root }}/admin/teams/{{ item.team.id }}/members">Members</a>{% endif %}
+            {% if item.edit %}<a href="{{ root }}/admin/teams/{{ item.team.id }}/edit?directory=1">Edit</a>{% endif %}
+            {% if item.delete %}
+            <details><summary>Delete</summary>
+              <form method="post" action="{{ root }}/admin/teams/{{ item.team.id }}/delete?directory=1">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <button type="submit">Confirm delete</button>
+              </form>
+            </details>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p>No teams found.</p>{% endif %}
+{% endif %}
+{% if teams.pagination.total_items %}
+  <nav class="page-links" aria-label="Team pages">
+    {% if teams.previous %}<a href="{{ teams.previous }}">Previous</a>{% endif %}
+    <span>Page {{ teams.pagination.page }} of {{ teams.pagination.total_pages }}</span>
+    {% if teams.next %}<a href="{{ teams.next }}">Next</a>{% endif %}
+  </nav>
+{% endif %}
+{% if mode != "selector" and mode != "controls" %}</section>{% endif %}

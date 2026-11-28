@@ -32,7 +32,7 @@
     th { white-space: nowrap; }
   </style>
 </head>
-<body{% if page == "home" %} class="dashboard"{% endif %}>
+<body{% if page == "home" or page == "team-members" %} class="dashboard"{% endif %}>
   <main>
     {% if page == "login" %}
     <h1>Sign in to ContextForge</h1>
@@ -86,6 +86,31 @@
     </form>
     {% endif %}
     <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
+    {% elif page == "team-edit" %}
+    <h1>Edit team</h1>
+    <form method="post" action="{{ root }}/admin/teams/{{ team.id }}/update{% if from_directory %}?directory=1{% endif %}">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Team name <input name="name" required maxlength="255" value="{{ team.name }}"></label>
+      <label>Description <textarea name="description" maxlength="1000">{{ team.description|default('', true) }}</textarea></label>
+      <label>Visibility <select name="visibility"><option value="private"{% if team.visibility == 'private' %} selected{% endif %}>Private</option><option value="public"{% if team.visibility == 'public' %} selected{% endif %}>Public</option></select></label>
+      <label>Maximum members <input name="max_members" type="number" min="1" value="{{ team.max_members|default('', true) }}"></label>
+      <label><input type="checkbox" name="use_default_max_members"> Use the default member limit</label>
+      <button type="submit">Save team</button>
+    </form>
+    <p><a href="{{ root }}/admin/?section=teams#teams">Back to teams</a></p>
+    {% elif page == "team-error" %}
+    <h1>Team request failed</h1>
+    <p role="alert">{{ error }}</p>
+    <p><a href="{{ root }}/admin/?section=teams#teams">Back to teams</a></p>
+    {% elif page == "team-members" %}
+    <p><a href="{{ root }}/admin/?section=teams#teams">Back to teams</a></p>
+    <h1>Team members · {{ team.name }}</h1>
+    {% if manage %}<p>{% if current %}<a href="{{ root }}/admin/teams/{{ team.id }}/members/add">Add members</a>{% else %}<a href="{{ root }}/admin/teams/{{ team.id }}/members">Current members</a>{% endif %}</p>{% endif %}
+    <form method="get" action="{{ root }}/admin/teams/{{ team.id }}/{{ endpoint }}">
+      <label>{% if current %}Search members{% else %}Find users to add{% endif %} <input type="search" name="search" value="{{ search }}" maxlength="255"></label>
+      <button type="submit">Search</button>
+    </form>
+    {% include "team_members.html" %}
     {% elif page == "user-edit" %}
     <h1>Edit user</h1>
     <p>{{ user.user.email }}</p>
@@ -232,6 +257,11 @@
         {% if catalog.users %}
         <label>Search users <input type="search" name="q" maxlength="500" value="{{ catalog.users.query }}"></label>
         {% else %}
+        {% if catalog.selected == "teams" %}
+        <label>Search teams <input type="search" name="q" maxlength="500" value="{{ catalog.teams.search|default('', true) }}"></label>
+        <label>Visibility <select name="visibility"><option value="">All</option><option value="private"{% if catalog.teams.visibility == "private" %} selected{% endif %}>Private</option><option value="public"{% if catalog.teams.visibility == "public" %} selected{% endif %}>Public</option></select></label>
+        <label>Relationship <select name="relationship"><option value="">All</option><option value="owner"{% if catalog.teams.relationship == "owner" %} selected{% endif %}>Owner</option><option value="member"{% if catalog.teams.relationship == "member" %} selected{% endif %}>Member</option><option value="public"{% if catalog.teams.relationship == "public" %} selected{% endif %}>Public</option></select></label>
+        {% endif %}
         <label><input type="checkbox" name="include_inactive" value="true"{% if catalog.include_inactive %} checked{% endif %}> Show inactive</label>
         {% endif %}
         <button type="submit">Apply</button>
@@ -244,6 +274,10 @@
     {% if catalog.users %}
       {% set users = catalog.users %}
       {% include "users.html" %}
+    {% endif %}
+    {% if catalog.teams %}
+      {% set teams = catalog.teams %}
+      {% include "teams.html" %}
     {% endif %}
     {% for part in catalog.sections %}
     <section id="{{ part.fragment }}" aria-labelledby="heading-{{ part.name }}">

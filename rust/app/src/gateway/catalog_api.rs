@@ -181,7 +181,7 @@ impl<'a> CatalogPage<'a> {
     }
 }
 
-pub(super) fn flag(input: Option<&str>) -> Result<bool, CatalogApiError> {
+pub(crate) fn flag(input: Option<&str>) -> Result<bool, CatalogApiError> {
     match input.map(str::to_ascii_lowercase).as_deref() {
         None | Some("0" | "false" | "f" | "off" | "n" | "no") => Ok(false),
         Some("1" | "true" | "t" | "on" | "y" | "yes") => Ok(true),
