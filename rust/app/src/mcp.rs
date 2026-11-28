@@ -962,6 +962,14 @@ async fn dispatch(
             None => (None, None),
         };
         let service = state.service.clone();
+        let trace = crate::observability::current_trace().map(|mut trace| {
+            if principal.is_some()
+                && let Some(id) = session_id.as_ref().and_then(|id| id.to_str().ok())
+            {
+                trace.set_mcp_session(id);
+            }
+            trace
+        });
         let reply = async move {
             let principal = principal.as_ref();
             let server = server.as_ref();
@@ -1157,7 +1165,7 @@ async fn dispatch(
             crate::http_boundary::CorrelationId::current(),
             Box::pin(reply),
         );
-        let reply = crate::observability::with_trace(crate::observability::current_trace(), reply);
+        let reply = crate::observability::with_trace(trace, reply);
         if stateful {
             // Keep processing if the client loses the HTTP connection.
             let task = tokio::spawn(reply);

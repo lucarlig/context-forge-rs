@@ -31,6 +31,8 @@ pub(crate) struct TraceContext {
     pub(super) redis_commands: Option<RedisConventions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) sql_queries: Option<SemanticConventions>,
+    #[serde(skip)]
+    pub(super) mcp_session: Option<String>,
     #[serde(default)]
     pub(super) mcp_call: bool,
 }
@@ -42,6 +44,12 @@ pub(super) struct StoredTrace {
 }
 
 impl TraceContext {
+    pub(crate) fn set_mcp_session(&mut self, session_id: &str) {
+        if self.exported.is_some() {
+            self.mcp_session = Some(session_id.to_owned());
+        }
+    }
+
     pub(super) fn with_stored(mut self, trace_id: String, span_id: String) -> Self {
         self.stored = Some(StoredTrace { trace_id, span_id });
         self
@@ -192,7 +200,7 @@ impl OperationSpan {
             if let ExportSpan::Recording(span) = &mut span
                 && let Some(policy) = langfuse::policy()
             {
-                policy.label(name, &attributes, span);
+                policy.label(name, &attributes, context.mcp_session.as_deref(), span);
             }
             Box::new(ExportedOperation {
                 span,
@@ -264,6 +272,20 @@ impl OperationSpan {
 
     pub(crate) fn capture_input<T: Serialize + ?Sized>(&mut self, value: &T) {
         self.capture(true, value);
+    }
+
+    pub(crate) fn prompt_rendered(&mut self, name: &str, version: Option<i32>, messages: usize) {
+        if let Some(exported) = &mut self.exported
+            && let ExportSpan::Recording(span) = &mut exported.span
+        {
+            span.set_attribute(KeyValue::new(
+                "messages.count",
+                i64::try_from(messages).unwrap_or(i64::MAX),
+            ));
+            if let Some(policy) = langfuse::policy() {
+                policy.prompt(name, version, span);
+            }
+        }
     }
 
     pub(crate) fn capture_output<T: Serialize + ?Sized>(&mut self, value: &T) {

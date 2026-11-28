@@ -205,24 +205,42 @@ impl GatewayService {
                 server.map(|server| server.id.as_str()),
             )
             .await;
-        let mut target = None;
+        let mut resolved = None;
         let result = span
-            .scope(Box::pin(self.get_prompt_inner(
-                params,
-                principal,
-                server,
-                context,
-                downstream,
-                &mut target,
-            )))
+            .scope(Box::pin(async {
+                let prompt = self
+                    .database
+                    .prompt_content(
+                        access::catalog_scope(principal),
+                        server.map(|server| server.id.as_str()),
+                        &params.name,
+                        false,
+                    )
+                    .await
+                    .map_err(content_database_error)?
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(format!("Unknown prompt: {}", params.name), None)
+                    })?;
+                resolved = Some((prompt.id.clone(), prompt.name.clone(), prompt.version));
+                self.get_prompt_inner(prompt, params, principal, context, downstream)
+                    .await
+            }))
             .await;
         let pending = matches!(result, Ok(GetPromptResponse::InputRequired(_)));
-        if let Ok(GetPromptResponse::Complete(response)) = &result {
-            span.capture_output(response);
-        }
-        if !pending {
-            self.record_target(target, server, started, result.is_ok())
-                .await;
+        if let Some((id, name, version)) = resolved
+            && !pending
+        {
+            if let Ok(GetPromptResponse::Complete(response)) = &result {
+                span.prompt_rendered(&name, version, response.messages.len());
+                span.capture_output(response);
+            }
+            self.record_target(
+                Some(ExecutionTarget::Catalog(MetricEntity::Prompt, id)),
+                server,
+                started,
+                result.is_ok(),
+            )
+            .await;
         }
         span.finish(content_outcome(&result, pending, "Prompt render failed"))
             .await;
@@ -231,30 +249,12 @@ impl GatewayService {
 
     async fn get_prompt_inner(
         &self,
+        prompt: PromptContentRecord,
         mut params: GetPromptRequestParams,
         principal: Option<&Principal>,
-        server: Option<&CatalogServer>,
         context: ToolContext<'_>,
         downstream: Option<&Session>,
-        metric: &mut Option<ExecutionTarget>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        let prompt = self
-            .database
-            .prompt_content(
-                access::catalog_scope(principal),
-                server.map(|server| server.id.as_str()),
-                &params.name,
-                false,
-            )
-            .await
-            .map_err(content_database_error)?
-            .ok_or_else(|| {
-                ErrorData::invalid_params(format!("Unknown prompt: {}", params.name), None)
-            })?;
-        *metric = Some(ExecutionTarget::Catalog(
-            MetricEntity::Prompt,
-            prompt.id.clone(),
-        ));
         let Some(gateway) = prompt.gateway.as_ref() else {
             return render_prompt(
                 prompt,

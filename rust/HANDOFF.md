@@ -599,9 +599,18 @@ defaults to off.
 
 Nine Rust Anything cases verify credential selection, startup rejection,
 endpoint handling, metadata controls, and opt-in redacted prompt payloads.
+A successful prompt render exports the catalog name and version when
+Langfuse metadata is enabled. A Rust Anything replay verifies these fields
+and the session ID on authenticated Streamable HTTP. Legacy SSE also
+correlates the authenticated session and preserves the message trace across
+the worker queue. The pinned SSE worker renders on a separate trace without
+the session ID. Native checks cover memory, database, and Redis queues.
+Anonymous sessions omit the session ID from trace exports.
+
 A live Rust collector test checks the validated authorization against a
-signal-specific header override. Framework spans, Jaeger and Zipkin export,
-and Langfuse prompt version and session metadata remain open.
+signal-specific header override and verifies that a stateless request
+cannot attach session metadata. Framework spans and Jaeger and Zipkin
+export remain open.
 
 Set `OTEL_COPY_RESOURCE_ATTRS_TO_SPANS=true` to copy `arize.project.name`
 and `model_id` from the OpenTelemetry resource to recorded spans. Other

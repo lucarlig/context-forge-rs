@@ -143,6 +143,8 @@ async fn retrieve(
         }
     };
     let resolved_id = record.id.clone();
+    let resolved_name = record.name.clone();
+    let version = record.version;
     let started = std::time::Instant::now();
     let mut span = service
         .prompt_span(id, Some(&arguments), Some(principal), server)
@@ -212,6 +214,11 @@ async fn retrieve(
     let pending = matches!(&result, Ok(Json(value)) if value["resultType"] == "input_required");
     if !pending {
         if let Ok(Json(value)) = &result {
+            span.prompt_rendered(
+                &resolved_name,
+                version,
+                value["messages"].as_array().map_or(0, Vec::len),
+            );
             span.capture_output(value);
         }
         service

@@ -2774,9 +2774,14 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
 }
 
 #[tokio::test]
-async fn langfuse_exports_to_the_vendor_endpoint_with_validated_credentials() {
-    use axum::{Router, http::HeaderMap, routing::post};
+async fn langfuse_exports_validated_credentials_and_authenticated_session_metadata() {
+    use axum::{Router, body::Bytes, http::HeaderMap, routing::post};
     use base64::{Engine as _, prelude::BASE64_STANDARD};
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value::Value as Attribute,
+    };
+    use prost::Message;
+    use serde_json::{Value, json};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/api/public/otel", listener.local_addr().unwrap());
@@ -2784,10 +2789,12 @@ async fn langfuse_exports_to_the_vendor_endpoint_with_validated_credentials() {
     let collector = tokio::spawn(async move {
         let router = Router::new().route(
             "/api/public/otel/v1/traces",
-            post(move |headers: HeaderMap| {
+            post(move |headers: HeaderMap, body: Bytes| {
                 let exports = exports.clone();
                 async move {
-                    exports.send(headers).unwrap();
+                    exports
+                        .send((headers, ExportTraceServiceRequest::decode(body).unwrap()))
+                        .unwrap();
                     ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
                 }
             }),
@@ -2809,38 +2816,119 @@ async fn langfuse_exports_to_the_vendor_endpoint_with_validated_credentials() {
             "authorization=Bearer overridden",
         ),
         ("OTEL_BSP_SCHEDULE_DELAY", "30"),
+        ("USE_STATEFUL_SESSIONS", "true"),
     ])
     .await;
     let login = gateway
         .client
         .post(format!("{}/auth/email/login", gateway.origin))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(serde_json::json!({"email":EMAIL,"password":gateway.password}).to_string())
+        .body(json!({"email":EMAIL,"password":gateway.password}).to_string())
         .send()
         .await
         .unwrap()
         .error_for_status()
         .unwrap();
-    let login: serde_json::Value = serde_json::from_slice(&login.bytes().await.unwrap()).unwrap();
-    let response = gateway
-        .client
-        .post(format!("{}/rpc", gateway.origin))
-        .bearer_auth(login["access_token"].as_str().unwrap())
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+    let login: Value = serde_json::from_slice(&login.bytes().await.unwrap()).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    let post = |path, body: Value| {
+        gateway
+            .client
+            .post(format!("{}{path}", gateway.origin))
+            .bearer_auth(token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+    };
+    let prompt = "langfuse-fixture-prompt";
+    post(
+        "/prompts",
+        json!({"prompt":{"name":prompt,"template":"fixture text"}}),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let mcp = |body| {
+        post("/mcp/", body)
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+    };
+    let initialized = mcp(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+    }})).send().await.unwrap().error_for_status().unwrap();
+    let session = initialized.headers()["mcp-session-id"].clone();
+    initialized.bytes().await.unwrap();
+    let notice = mcp(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .header("mcp-session-id", &session)
         .send()
         .await
-        .unwrap()
-        .error_for_status()
         .unwrap();
-    assert!(response.text().await.unwrap().contains("\"result\""));
-    let headers = tokio::time::timeout(Duration::from_secs(5), batches.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(headers[header::AUTHORIZATION], authorization);
-    assert_eq!(headers["x-fixture"], "preserved");
-    assert_eq!(headers["x-langfuse-ingestion-version"], "4");
+    assert_eq!(notice.status(), StatusCode::ACCEPTED);
+
+    let request = json!({"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":prompt}});
+    let stateful = "1b5e227112cf42ebc70fd2868c8edf91";
+    let stateless = "1b5e227112cf42ebc70fd2868c8edf92";
+    let traceparent = |trace| format!("00-{trace}-b7ad6b7169203331-01");
+    for (trace, request) in [
+        (stateful, mcp(request.clone())),
+        (stateless, post("/rpc", request)),
+    ] {
+        let response = request
+            .header("mcp-session-id", &session)
+            .header("traceparent", traceparent(trace))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert!(response.text().await.unwrap().contains("fixture text"));
+    }
+    let trace_ids =
+        [stateful, stateless].map(|value| u128::from_str_radix(value, 16).unwrap().to_be_bytes());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut observed = [false; 2];
+        while !observed.into_iter().all(|seen| seen) {
+            let (headers, batch) = batches.recv().await.unwrap();
+            assert_eq!(headers[header::AUTHORIZATION], authorization);
+            assert_eq!(headers["x-fixture"], "preserved");
+            assert_eq!(headers["x-langfuse-ingestion-version"], "4");
+            for span in batch
+                .resource_spans
+                .into_iter()
+                .flat_map(|resource| resource.scope_spans)
+                .flat_map(|scope| scope.spans)
+            {
+                if span.name != "prompt.render" {
+                    continue;
+                }
+                let index = trace_ids
+                    .iter()
+                    .position(|id| span.trace_id == *id)
+                    .unwrap();
+                let attr = |key| {
+                    span.attributes
+                        .iter()
+                        .find(|attribute| attribute.key == key)
+                        .and_then(|attribute| attribute.value.as_ref()?.value.as_ref())
+                };
+                assert_eq!(
+                    attr("langfuse.observation.prompt.name"),
+                    Some(&Attribute::StringValue(prompt.to_owned()))
+                );
+                assert_eq!(
+                    attr("langfuse.observation.prompt.version"),
+                    Some(&Attribute::IntValue(1))
+                );
+                let expected = (index == 0)
+                    .then(|| Attribute::StringValue(session.to_str().unwrap().to_owned()));
+                assert_eq!(attr("langfuse.session.id"), expected.as_ref());
+                observed[index] = true;
+            }
+        }
+    })
+    .await
+    .unwrap();
     gateway.process.kill().await.unwrap();
     collector.abort();
 }

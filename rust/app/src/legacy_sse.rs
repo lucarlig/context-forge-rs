@@ -211,7 +211,7 @@ async fn open(State(state): State<Arc<SseState>>, request: Request) -> Response 
     };
     tokio::spawn(respond(
         connection.state.gateway.clone(),
-        principal,
+        (principal, id),
         server,
         relay,
         connection.cancel.clone(),
@@ -440,19 +440,23 @@ impl Output {
 
 async fn respond(
     gateway: Arc<GatewayService>,
-    principal: Option<Principal>,
+    (principal, session): (Option<Principal>, Uuid),
     server: Option<CatalogServer>,
     relay: RelayContext,
     cancel: CancellationToken,
     mut incoming: Inbox,
     outgoing: mpsc::Sender<Value>,
 ) {
+    let session = principal.as_ref().map(|_| session.hyphenated().to_string());
     let run = async {
         while let Some(mut request) = incoming.receive().await {
-            let trace = request
+            let mut trace: Option<TraceContext> = request
                 .as_object_mut()
                 .and_then(|object| object.remove(QUEUED_TRACE))
                 .and_then(|context| serde_json::from_value(context).ok());
+            if let (Some(trace), Some(session)) = (&mut trace, &session) {
+                trace.set_mcp_session(session);
+            }
             let initialized = request["method"] == "initialize";
             let Some(reply) = with_trace(
                 trace,

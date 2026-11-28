@@ -249,6 +249,8 @@ enum ResourceLookup<'a> {
 
 pub(crate) struct PromptContentRecord {
     pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) version: Option<i32>,
     pub(crate) original_name: String,
     pub(crate) description: Option<String>,
     pub(crate) template: Option<String>,
@@ -657,7 +659,7 @@ macro_rules! prompt_content_query {
         metadata_query!(
             $teams,
             concat!(
-                "item.original_name, item.template, CAST(item.argument_schema AS TEXT), ",
+                "item.original_name, item.version, item.template, CAST(item.argument_schema AS TEXT), ",
                 content_gateway_columns!()
             ),
             "prompts",
@@ -690,6 +692,7 @@ type PromptContentRow = (
     Option<String>,
     Option<String>,
     String,
+    Option<i32>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -1291,10 +1294,11 @@ impl Database {
         }
         let Some((
             prompt_id,
-            _,
+            prompt_name,
             _,
             description,
             original_name,
+            version,
             template,
             schema,
             id,
@@ -1308,6 +1312,8 @@ impl Database {
         };
         Ok(Some(PromptContentRecord {
             id: prompt_id,
+            name: prompt_name,
+            version,
             original_name,
             description,
             template,

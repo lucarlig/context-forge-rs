@@ -183,6 +183,7 @@ impl OperationPolicy {
         &self,
         name: &'static str,
         metadata: &Value,
+        session_id: Option<&str>,
         span: &mut impl Span,
     ) {
         if !self.labels {
@@ -206,7 +207,33 @@ impl OperationPolicy {
             ),
             KeyValue::new("langfuse.observation.level", "DEFAULT"),
         ]);
+        if let Some(session_id) = session_id {
+            span.set_attribute(KeyValue::new(
+                "langfuse.session.id",
+                bounded(session_id, 255),
+            ));
+        }
         self.tag(span, None, None);
+    }
+
+    pub(in crate::observability) fn prompt(
+        &self,
+        name: &str,
+        version: Option<i32>,
+        span: &mut impl Span,
+    ) {
+        if self.labels {
+            span.set_attribute(KeyValue::new(
+                "langfuse.observation.prompt.name",
+                bounded(&self.redaction.text(name), 255),
+            ));
+            if let Some(version) = version {
+                span.set_attribute(KeyValue::new(
+                    "langfuse.observation.prompt.version",
+                    i64::from(version),
+                ));
+            }
+        }
     }
 
     pub(in crate::observability) fn identify(&self, principal: &Principal, span: &mut impl Span) {
