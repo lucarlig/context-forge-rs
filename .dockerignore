@@ -1,0 +1,12 @@
+*
+!Containerfile
+!LICENSE
+!Cargo.toml
+!Cargo.lock
+!rust/
+!rust/app/
+!rust/app/Cargo.toml
+!rust/app/src/
+!rust/app/src/**
+!rust/app/migrations/
+!rust/app/migrations/**

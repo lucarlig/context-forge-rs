@@ -96,6 +96,22 @@ round-trip replay. It exported a filtered bundle, previewed an import,
 applied only the selected tool, and returned exit code 1 for a failed item
 or missing authentication. The Rust check also verified Unix output mode `0600`.
 
+## Container deployment
+
+`Containerfile` builds both binaries from the Cargo lockfile and copies
+them into a Debian runtime image. The runtime checks `/ready`, runs as
+UID and GID 10001, and stores SQLite under `/var/lib/context-forge`.
+Compose runs the native migration job before the gateway starts and
+connects the gateway to PostgreSQL and Redis on the Compose network.
+
+Two Rust Anything cases compare the Linux arm64 image with the pinned
+upstream image. They cover health, readiness, bootstrap login, anonymous
+access denial, and the resource catalog over JSON-RPC. Docker checks
+inspect the runtime for Python executables and files, repeat SQLite
+migrations, and verify data after container replacement. The Compose
+check covers migration ordering, PostgreSQL data persistence after
+gateway restart, and readiness during a Redis outage and recovery.
+
 ## HTTP request boundary
 
 The gateway enables correlation IDs and request header limits by default.

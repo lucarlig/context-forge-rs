@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+
+x-context-forge: &context-forge
+  image: ${CONTEXT_FORGE_IMAGE:-context-forge-rs:local}
+  build:
+    context: .
+    dockerfile: Containerfile
+
+services:
+  gateway:
+    <<: *context-forge
+    restart: unless-stopped
+    env_file:
+      - path: ${CONTEXT_FORGE_ENV_FILE:-.env}
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: "4444"
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL for the Compose gateway}
+      MCPGATEWAY_SKIP_MIGRATIONS: "true"
+      CACHE_TYPE: redis
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "127.0.0.1:${CONTEXT_FORGE_PORT:-4444}:4444"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  migrate:
+    <<: *context-forge
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL for the Compose gateway}
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: contextforge
+      POSTGRES_USER: contextforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "contextforge", "-d", "contextforge"]
+      interval: 3s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  postgres-data:
+  redis-data:

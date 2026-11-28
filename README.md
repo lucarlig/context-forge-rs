@@ -16,6 +16,33 @@ cargo run --locked
 
 The binary listens on `127.0.0.1:4444` and uses `sqlite:///./mcp.db` by default. Set `HOST`, `PORT`, and `DATABASE_URL` to configure it. SQLite paths follow the upstream SQLAlchemy URL format. PostgreSQL URLs accept the upstream `postgresql+psycopg://` scheme.
 
+### Containers
+
+The image contains the gateway and `context-forge-translate`. It runs as UID 10001 and checks `/ready`. Put a strong `PLATFORM_ADMIN_PASSWORD` and independent random values for `JWT_SECRET_KEY` and `AUTH_ENCRYPTION_SECRET` in a private `.env` file.
+
+```sh
+docker build -f Containerfile -t context-forge-rs:local .
+docker run --rm --env-file .env -p 127.0.0.1:4444:4444 \
+  -e DATABASE_URL=sqlite:////var/lib/context-forge/mcp.db \
+  --mount source=context-forge-data,target=/var/lib/context-forge \
+  context-forge-rs:local
+```
+
+The named volume stores the SQLite database. For PostgreSQL and Redis, add the following settings to `.env`. Use the same URL-safe password in both values.
+
+```dotenv
+POSTGRES_PASSWORD=replace-with-a-random-hex-password
+DATABASE_URL=postgresql://contextforge:replace-with-a-random-hex-password@postgres:5432/contextforge
+```
+
+```sh
+docker compose up --build -d --wait
+```
+
+Compose runs `context-forge-rs migrate` before starting the gateway. PostgreSQL and Redis use named volumes and private service addresses. Set `CONTEXT_FORGE_PORT` to change the host port.
+
+### Database and configuration commands
+
 Run `context-forge-rs migrate` to prepare the native database schema before starting the gateway. Set `MCPGATEWAY_SKIP_MIGRATIONS=true` on gateway workers to require a current native schema at startup.
 
 Set `MCPGATEWAY_BEARER_TOKEN` to use the configuration CLI. Both commands connect to the gateway at `HOST` and `PORT`.
