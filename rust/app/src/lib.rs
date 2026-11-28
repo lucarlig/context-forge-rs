@@ -10,6 +10,7 @@ pub mod configuration_cli;
 pub mod credential_rotation;
 mod credentials;
 pub mod database;
+pub mod diagnostics;
 mod events;
 mod forward_headers;
 mod forward_identity;

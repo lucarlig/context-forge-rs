@@ -1,0 +1,52 @@
+{% if not partial %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ContextForge diagnostics</title>
+  <style>
+    body { font: 1rem/1.5 system-ui, sans-serif; margin: 2rem; }
+    main { max-width: 72rem; margin: auto; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #aaa; padding: .45rem; text-align: left; overflow-wrap: anywhere; }
+    th { width: 16rem; }
+    dt { font-weight: 600; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="{{ root }}/admin/">Back to administration</a></p>
+  <h1>ContextForge diagnostics</h1>
+{% endif %}
+<div class="gateway-diagnostics">
+  <p>Host {{ payload.host }} · Uptime {{ payload.uptime_seconds }}s · {{ payload.timestamp }}</p>
+  {% for key, title in [("app", "Application Information"), ("platform", "Platform"), ("database", "Database"), ("redis", "Redis"), ("settings", "Settings"), ("system", "System"), ("env", "Environment")] %}
+  <section>
+    <h2 id="diagnostics-{{ key }}">{{ title }}</h2>
+    {% if payload[key] %}
+    <table aria-labelledby="diagnostics-{{ key }}">
+      <tbody>
+        {% for name, value in payload[key]|items %}
+        <tr>
+          <th scope="row">{{ name }}</th>
+          <td>
+            {% if value is mapping %}
+            <dl>{% for field, detail in value|items %}<dt>{{ field }}</dt><dd>{{ detail if detail is not none else "Unavailable" }}</dd>{% endfor %}</dl>
+            {% else %}{{ value if value is not none else "Unavailable" }}{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p>Unavailable</p>
+    {% endif %}
+  </section>
+  {% endfor %}
+</div>
+{% if not partial %}
+</main>
+</body>
+</html>
+{% endif %}

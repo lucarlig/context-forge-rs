@@ -878,7 +878,7 @@ pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> 
         })
 }
 
-fn bearer(headers: &HeaderMap) -> Result<Option<&str>, AuthError> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Result<Option<&str>, AuthError> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let Some(value) = values.next() else {
         return Ok(None);

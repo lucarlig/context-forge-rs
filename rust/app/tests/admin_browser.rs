@@ -1826,3 +1826,102 @@ async fn disabling_legacy_api_preserves_versioned_browser_forms_and_server_sse()
     drop(stream);
     gateway.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn diagnostics_require_unrestricted_admin_and_redact_sensitive_settings() {
+    let omitted = format!("fixture-{}", Uuid::new_v4().simple());
+    let label = "Fixture <status>";
+    let mut gateway = gateway_with_env(&[
+        ("APP_NAME", label),
+        ("MCPGATEWAY_DIAGNOSTICS_SECRET", &omitted),
+        ("MCPGATEWAY_FIXTURE_HEADERS", &omitted),
+        ("MCPGATEWAY_FIXTURE_LABEL", label),
+    ])
+    .await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let endpoint = format!("{origin}/v1/version");
+    let anonymous = client.get(&endpoint).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    assert!(!anonymous.text().await.unwrap().contains("uptime_seconds"));
+    let login = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email":EMAIL,"password":password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value = serde_json::from_str(&login.text().await.unwrap()).unwrap();
+    let admin = login["access_token"].as_str().unwrap();
+    let team = client
+        .post(format!("{origin}/teams"))
+        .bearer_auth(admin)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"Diagnostics fixture","visibility":"private"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(team.status(), StatusCode::CREATED);
+    let team: serde_json::Value = serde_json::from_str(&team.text().await.unwrap()).unwrap();
+    let scoped = client
+        .post(format!("{origin}/tokens"))
+        .bearer_auth(admin)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::json!({"name":"team-diagnostics","expires_in_days":1,"team_id":team["id"],
+            "scope":{"permissions":["admin.dashboard","admin.system_config"]}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scoped.status(), StatusCode::CREATED);
+    let scoped: serde_json::Value = serde_json::from_str(&scoped.text().await.unwrap()).unwrap();
+    let scoped = scoped["access_token"].as_str().unwrap();
+    let denied = client
+        .get(&endpoint)
+        .bearer_auth(scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(!denied.text().await.unwrap().contains("uptime_seconds"));
+
+    let response = client
+        .get(&endpoint)
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("no-store")
+    );
+    let body = response.text().await.unwrap();
+    assert!(!body.contains(&omitted));
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["platform"]["runtime"], "Rust");
+    assert_eq!(payload["database"]["reachable"], true);
+    assert_eq!(payload["env"]["MCPGATEWAY_FIXTURE_LABEL"], label);
+
+    let html = client
+        .get(format!("{endpoint}?fmt=html"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(html.status(), StatusCode::OK);
+    let html = html.text().await.unwrap();
+    assert!(html.contains("Fixture &lt;status&gt;"));
+    assert!(!html.contains(label));
+    assert!(!html.contains(&omitted));
+    gateway.process.kill().await.unwrap();
+}

@@ -7,6 +7,7 @@ use context_forge_rs::{
     access::Authorizer,
     config::Settings,
     database::Database,
+    diagnostics::Diagnostics,
     gateway::GatewayService,
     http_boundary::HttpBoundary,
     local_auth,
@@ -78,6 +79,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_external_identity(external_identity)
         .with_token_usage_logging(Settings::token_usage_logging()?),
     );
+    let diagnostics =
+        Diagnostics::from_settings(&settings, database.clone(), redis.clone(), access.clone())?;
     let http_boundary = HttpBoundary::from_env(settings.port, access.clone(), database.clone())?;
     let email_auth_enabled = Settings::email_auth_enabled()?;
     let issuer = Settings::jwt_issuer()?;
@@ -157,6 +160,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let management =
         service.registration_router_with_probe(transport.clone(), health_settings.timeout);
     let app = probes::router(database, redis)
+        .merge(diagnostics.router())
         .merge(transport)
         .merge(management)
         .merge(accounts)

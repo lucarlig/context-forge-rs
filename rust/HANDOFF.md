@@ -333,6 +333,23 @@ denials. Chromium verifies the workflow through the downloaded JSON file. A
 Rust test checks that a team-scoped admin token cannot manage global roots
 and that authorized browser writes reach the REST change stream.
 
+## Version diagnostics
+
+`/version` and `/v1/version` serve JSON, full HTML, and embeddable HTML.
+The admin dashboard links to the versioned page. Diagnostics require an
+unrestricted administrator or explicitly enabled API Basic authentication.
+Responses use `no-store`. The payload reports the native Rust runtime and
+omits credentials, connection query strings, and sensitive environment keys.
+
+Database and Redis versions come from live queries. System counters use the
+MIT-licensed `sysinfo` 0.38 series with the system and disk features. This
+keeps the gateway's Rust 1.94 minimum. Unsupported counters return null.
+[sysinfo documentation](https://docs.rs/sysinfo/0.38.4/sysinfo/)
+
+Six Rust Anything scenarios match on SQLite and PostgreSQL. A separate case
+checks the Redis version and redaction with an authenticated Redis server.
+Chromium verifies sign-in, the Version info link, and the partial HTML.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

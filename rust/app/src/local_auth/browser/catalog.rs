@@ -511,6 +511,7 @@ pub(super) async fn dashboard(
     let a2a_visible = super::a2a::visible(accounts, service, principal, team).await?;
     let grpc_visible = super::grpc::visible(accounts, service, principal, team).await?;
     let roots_visible = service.can_administer_roots(principal).await?;
+    let diagnostics_visible = crate::diagnostics::allowed(principal);
     let parameters = forms::query(uri);
     let selected = parameters
         .get("section")
@@ -529,7 +530,7 @@ pub(super) async fn dashboard(
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
-    let mut navigation = Vec::with_capacity(permitted.len() + 7);
+    let mut navigation = Vec::with_capacity(permitted.len() + 8);
     if !permitted.is_empty()
         || tokens_visible
         || users_visible
@@ -537,6 +538,7 @@ pub(super) async fn dashboard(
         || a2a_visible
         || grpc_visible
         || roots_visible
+        || diagnostics_visible
     {
         navigation.push(Link {
             label: "All sections",
@@ -591,6 +593,13 @@ pub(super) async fn dashboard(
             label: "Roots",
             href: href(Some("roots"), None),
             selected: selected == Some("roots"),
+        });
+    }
+    if diagnostics_visible {
+        navigation.push(Link {
+            label: "Version info",
+            href: format!("{}/v1/version?fmt=html", settings_for(accounts).mount_path),
+            selected: false,
         });
     }
     let tokens = if selected == Some("tokens") {

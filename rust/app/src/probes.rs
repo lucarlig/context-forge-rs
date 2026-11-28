@@ -34,17 +34,24 @@ impl RedisProbe {
     }
 
     async fn ping(&self) -> bool {
-        let result = async {
-            let mut connection = self
-                .client
-                .get_multiplexed_async_connection_with_config(&self.config)
-                .await?;
-            redis::cmd("PING")
-                .query_async::<String>(&mut connection)
-                .await
-        }
-        .await;
+        let result = self.query(&redis::cmd("PING")).await;
         matches!(result.as_deref(), Ok("PONG"))
+    }
+
+    pub(crate) async fn server_version(&self) -> Option<String> {
+        let info = self.query(redis::cmd("INFO").arg("server")).await.ok()?;
+        let version = info
+            .lines()
+            .find_map(|line| line.strip_prefix("redis_version:"));
+        Some(version.unwrap_or("unknown").to_owned())
+    }
+
+    async fn query(&self, command: &redis::Cmd) -> redis::RedisResult<String> {
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection_with_config(&self.config)
+            .await?;
+        command.query_async(&mut connection).await
     }
 }
 
