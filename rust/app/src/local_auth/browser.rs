@@ -6,6 +6,7 @@ mod keycloak;
 mod recovery;
 mod sessions;
 mod token;
+mod users;
 
 use std::error::Error;
 
@@ -150,6 +151,7 @@ pub(super) fn router(
             )
             .route(&format!("{path}/tokens/{{id}}/revoke"), post(token::revoke))
             .route(&format!("{path}/tokens/{{id}}/usage"), get(token::usage));
+        router = users::routes(router, path);
         for kind in ManagedCatalog::ALL {
             let base = format!("{path}/{}", kind.name());
             router = router

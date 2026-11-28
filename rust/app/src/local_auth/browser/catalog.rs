@@ -371,6 +371,7 @@ pub(super) struct Dashboard {
     team: Option<String>,
     selected: Option<String>,
     pub(super) tokens: Option<super::token::Panel>,
+    pub(super) users: Option<super::users::Panel>,
     error: Option<&'static str>,
     message: Option<&'static str>,
 }
@@ -490,12 +491,14 @@ pub(super) async fn dashboard(
         }
     }
     let tokens_visible = super::token::visible(accounts, principal, team).await?;
+    let users_visible = super::users::visible(accounts, principal).await?;
     let parameters = forms::query(uri);
     let selected = parameters
         .get("section")
         .map(String::as_str)
         .filter(|name| {
             (*name == "tokens" && tokens_visible)
+                || (*name == "users" && users_visible)
                 || permitted.iter().any(|kind| kind.name() == *name)
         });
     if selected.is_none() {
@@ -503,8 +506,8 @@ pub(super) async fn dashboard(
     }
     let base = format!("{}/admin/", settings_for(accounts).root);
     let href = |name, page| catalogue_link(&base, name, page, include_inactive, team);
-    let mut navigation = Vec::with_capacity(permitted.len() + 1);
-    if !permitted.is_empty() || tokens_visible {
+    let mut navigation = Vec::with_capacity(permitted.len() + 3);
+    if !permitted.is_empty() || tokens_visible || users_visible {
         navigation.push(Link {
             label: "All sections",
             href: href(None, None),
@@ -525,8 +528,20 @@ pub(super) async fn dashboard(
             selected: selected == Some("tokens"),
         });
     }
+    if users_visible {
+        navigation.push(Link {
+            label: "Users",
+            href: href(Some("users"), None),
+            selected: selected == Some("users"),
+        });
+    }
     let tokens = if selected == Some("tokens") {
         Some(super::token::panel(accounts, service, principal, uri).await?)
+    } else {
+        None
+    };
+    let users = if selected == Some("users") {
+        Some(super::users::panel(accounts, service, principal, uri).await?)
     } else {
         None
     };
@@ -572,6 +587,7 @@ pub(super) async fn dashboard(
         team: team.map(str::to_owned),
         selected: selected.map(str::to_owned),
         tokens,
+        users,
         error: match parameters.get("error").map(String::as_str) {
             Some("conflict") => Some("This entry changed. Check its current state and try again."),
             Some("delete_failed") => Some("Could not delete the entry."),

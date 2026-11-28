@@ -1,0 +1,85 @@
+{% if row %}
+<article>
+  <strong>{{ row.user.full_name|default(row.user.email, true) }}</strong>
+  <p>{{ row.user.email }}</p>
+  <p>{% if row.user.is_active %}Active{% else %}Inactive{% endif %}
+  {% if row.user.is_locked %} · Locked{% endif %}
+  {% if row.user.password_change_required %} · Password change required{% endif %}</p>
+  <a href="{{ root }}{{ row.path }}/edit?directory=1">Edit user</a>
+</article>
+{% else %}
+{% if not controls %}
+<section id="users" aria-labelledby="heading-users">
+  <h2 id="heading-users">Users</h2>
+  <details>
+    <summary>Add user</summary>
+    <form method="post" action="{{ root }}/admin/users?directory=1">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Email <input name="email" type="email" maxlength="255" required></label>
+      <label>Full name <input name="full_name" maxlength="255"></label>
+      <label>Password <input name="password" type="password" autocomplete="new-password" required></label>
+      {% if users.can_promote %}<label><input type="checkbox" name="is_admin"> Administrator</label>{% endif %}
+      <button type="submit">Create user</button>
+    </form>
+  </details>
+  {% if users.rows %}
+  <div class="table-scroll">
+    <table aria-labelledby="heading-users">
+      <thead><tr><th scope="col">Email</th><th scope="col">Name</th><th scope="col">Status</th><th scope="col">Provider</th><th scope="col">Actions</th></tr></thead>
+      <tbody>
+      {% for item in users.rows %}
+        {% set account = item.user %}
+        <tr>
+          <th scope="row">{{ account.email }}</th>
+          <td>{{ account.full_name|default('', true) }}</td>
+          <td>{% if account.is_active %}Active{% else %}Inactive{% endif %}
+            {% if account.is_admin %} · Administrator{% endif %}
+            {% if account.is_locked %} · Locked{% endif %}
+            {% if account.password_change_required %} · Password change required{% endif %}</td>
+          <td>{{ account.auth_provider }}</td>
+          <td class="actions">
+            <a href="{{ root }}{{ item.path }}/edit?directory=1">Edit</a>
+            {% if item.can_change_state %}
+            <form method="post" action="{{ root }}{{ item.path }}/{% if account.is_active %}deactivate{% else %}activate{% endif %}?directory=1">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <button type="submit">{% if account.is_active %}Deactivate{% else %}Activate{% endif %}</button>
+            </form>
+            {% endif %}
+            {% if account.is_locked or account.failed_login_attempts %}
+            <form method="post" action="{{ root }}{{ item.path }}/unlock?directory=1">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <button type="submit">Unlock</button>
+            </form>
+            {% endif %}
+            {% if item.has_password and not account.password_change_required %}
+            <form method="post" action="{{ root }}{{ item.path }}/force-password-change?directory=1">
+              <input type="hidden" name="csrf_token" value="{{ proof }}">
+              <button type="submit">Require password change</button>
+            </form>
+            {% endif %}
+            {% if item.can_delete %}
+            <details>
+              <summary>Delete</summary>
+              <form method="post" action="{{ root }}{{ item.path }}/delete?directory=1">
+                <input type="hidden" name="csrf_token" value="{{ proof }}">
+                <button type="submit">Confirm delete</button>
+              </form>
+            </details>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p>No users found.</p>{% endif %}
+{% endif %}
+{% if users.pagination.total_items %}
+  <nav class="page-links" aria-label="User pages">
+    {% if users.previous %}<a href="{{ users.previous }}">Previous</a>{% endif %}
+    <span>Page {{ users.pagination.page }} of {{ users.pagination.total_pages }} · {{ users.pagination.total_items }} users</span>
+    {% if users.next %}<a href="{{ users.next }}">Next</a>{% endif %}
+  </nav>
+{% endif %}
+{% if not controls %}</section>{% endif %}
+{% endif %}

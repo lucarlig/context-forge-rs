@@ -86,6 +86,26 @@
     </form>
     {% endif %}
     <p><a href="{{ root }}/admin/login">Back to sign-in</a></p>
+    {% elif page == "user-edit" %}
+    <h1>Edit user</h1>
+    <p>{{ user.user.email }}</p>
+    <form method="post" action="{{ root }}{{ user.path }}/update{% if from_directory %}?directory=1{% endif %}">
+      <input type="hidden" name="csrf_token" value="{{ proof }}">
+      <label>Full name <input name="full_name" value="{{ user.user.full_name|default('', true) }}" maxlength="255"></label>
+      {% if can_promote %}<label><input type="checkbox" name="is_admin"{% if user.user.is_admin %} checked{% endif %}> Administrator</label>{% endif %}
+      <label><input type="checkbox" name="email_verified"{% if user.user.email_verified %} checked{% endif %}> Email verified</label>
+      {% if user.has_password %}
+      <label>New password <input name="password" type="password" autocomplete="new-password"></label>
+      <label>Confirm new password <input name="confirm_password" type="password" autocomplete="new-password"></label>
+      {% endif %}
+      <div id="edit-user-error" role="alert"></div>
+      <button type="submit">Save user</button>
+    </form>
+    <p><a href="{{ root }}/admin/?section=users#users">Back to users</a></p>
+    {% elif page == "user-error" %}
+    <h1>Account change failed</h1>
+    <p role="alert" data-error-message="{{ error }}">{{ error }}</p>
+    <p><a href="{{ root }}/admin/?section=users#users">Back to users</a></p>
     {% elif page == "token-issued" %}
     <h1>API token created</h1>
     <p>Copy this token now. It is displayed once.</p>
@@ -209,13 +229,21 @@
         {% if catalog.team %}<input type="hidden" name="team_id" value="{{ catalog.team }}">{% endif %}
         {% if catalog.selected %}<input type="hidden" name="section" value="{{ catalog.selected }}">{% endif %}
         {% if catalog.tokens %}<label>Search tokens <input type="search" name="q" maxlength="500" value="{{ catalog.tokens.search|default('', true) }}"></label>{% endif %}
+        {% if catalog.users %}
+        <label>Search users <input type="search" name="q" maxlength="500" value="{{ catalog.users.query }}"></label>
+        {% else %}
         <label><input type="checkbox" name="include_inactive" value="true"{% if catalog.include_inactive %} checked{% endif %}> Show inactive</label>
+        {% endif %}
         <button type="submit">Apply</button>
       </form>
     </div>
     {% if catalog.tokens %}
       {% set tokens = catalog.tokens %}
       {% include "tokens.html" %}
+    {% endif %}
+    {% if catalog.users %}
+      {% set users = catalog.users %}
+      {% include "users.html" %}
     {% endif %}
     {% for part in catalog.sections %}
     <section id="{{ part.fragment }}" aria-labelledby="heading-{{ part.name }}">

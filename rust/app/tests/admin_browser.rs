@@ -795,3 +795,150 @@ async fn dashboard_token_is_issued_once_and_revoked_by_its_owner() {
     assert_eq!(rows[0]["is_revoked"], true);
     fixture.process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn admin_users_apply_directory_permissions_and_account_lifecycle() {
+    let mut gateway = gateway().await;
+    let BrowserGateway {
+        client,
+        origin,
+        password,
+        ..
+    } = &gateway;
+    let encode = |fields: &[(&str, &str)]| {
+        let mut body = url::form_urlencoded::Serializer::new(String::new());
+        body.extend_pairs(fields.iter().copied());
+        body.finish()
+    };
+    let login_url = format!("{origin}/admin/login");
+    let login = client.get(&login_url).send().await.unwrap();
+    let proof = cookie(&login, "mcpgateway_csrf_token");
+    let signed_in = client
+        .post(&login_url)
+        .header(header::ORIGIN, origin)
+        .header(header::COOKIE, format!("mcpgateway_csrf_token={proof}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(encode(&[
+            ("email", EMAIL),
+            ("password", password),
+            ("csrf_token", proof),
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed_in.status(), StatusCode::SEE_OTHER);
+    let proof = cookie(&signed_in, "mcpgateway_csrf_token");
+    let cookies = format!(
+        "jwt_token={}; mcpgateway_csrf_token={proof}",
+        cookie(&signed_in, "jwt_token")
+    );
+    let directory = format!("{origin}/admin/users");
+    let email = "mary+fixture@example.test";
+    let new_password = "Fixture!NewAccount_83zP";
+    let create = |proof: &str| {
+        client
+            .post(&directory)
+            .header(header::ORIGIN, origin)
+            .header(header::ACCEPT, "text/html")
+            .header(header::COOKIE, &cookies)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(encode(&[
+                ("email", email),
+                ("full_name", "Literal_% <name>"),
+                ("password", new_password),
+                ("csrf_token", proof),
+            ]))
+    };
+    assert_eq!(
+        create("forged").send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        create(proof).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let search = client
+        .get(format!(
+            "{directory}/search?{}",
+            encode(&[("q", " Literal_% ")])
+        ))
+        .header(header::ACCEPT, "text/html")
+        .header(header::COOKIE, &cookies)
+        .send()
+        .await
+        .unwrap();
+    let results: serde_json::Value = serde_json::from_str(&search.text().await.unwrap()).unwrap();
+    assert_eq!(results["count"], 1);
+    assert_eq!(results["items"][0]["email"], email);
+    assert_eq!(results["items"][0]["full_name"], "Literal_% <name>");
+
+    let dashboard = client
+        .get(format!("{origin}/admin/?section=users"))
+        .header(header::ACCEPT, "text/html")
+        .header(header::COOKIE, &cookies)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dashboard.status(), StatusCode::OK);
+    let body = dashboard.text().await.unwrap();
+    assert!(body.contains("Literal_% &lt;name&gt;"));
+    assert!(body.contains("mary%2Bfixture%40example%2Etest/edit"));
+    assert!(!body.contains(new_password));
+    assert!(!body.contains("admin%40example%2Ecom/deactivate"));
+
+    let unprivileged = client
+        .post(format!("{origin}/auth/email/login"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::json!({"email": email, "password": new_password}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unprivileged.status(), StatusCode::OK);
+    let session: serde_json::Value =
+        serde_json::from_str(&unprivileged.text().await.unwrap()).unwrap();
+    let session = session["access_token"].as_str().unwrap();
+    for path in ["", "/partial", "/search"] {
+        let rejected = client
+            .get(format!("{directory}{path}"))
+            .bearer_auth(session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    }
+    let anonymous = client.get(&directory).send().await.unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let action = |path: &str| {
+        client
+            .post(format!("{directory}/{path}"))
+            .header(header::ORIGIN, origin)
+            .header(header::ACCEPT, "text/html")
+            .header(header::COOKIE, &cookies)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(encode(&[("csrf_token", proof)]))
+    };
+    assert_eq!(
+        action("admin%40example.com/deactivate")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let changed = action("mary%2Bfixture%40example.test/deactivate")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert!(changed.text().await.unwrap().contains("Inactive"));
+    let revoked = client
+        .get(format!("{origin}/auth/email/me"))
+        .bearer_auth(session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    gateway.process.kill().await.unwrap();
+}

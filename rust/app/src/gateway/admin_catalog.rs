@@ -139,6 +139,38 @@ impl GatewayService {
         }
     }
 
+    pub(crate) fn admin_page_params(
+        &self,
+        page: Option<i64>,
+        per_page: Option<i64>,
+    ) -> Result<(i64, i64), CatalogApiError> {
+        let page = page.unwrap_or(1);
+        let per_page = per_page.unwrap_or(i64::from(self.management_page_size));
+        if page < 1 || !(1..=i64::from(self.management_max_page_size)).contains(&per_page) {
+            return Err(CatalogApiError::detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid pagination",
+            ));
+        }
+        Ok((page, per_page.max(i64::from(self.grpc.min_page_size))))
+    }
+
+    pub(crate) fn admin_page_offset(&self, page: &PaginationMeta) -> i64 {
+        page.offset(self.grpc.max_page_offset)
+    }
+
+    pub(crate) fn admin_page_links(
+        &self,
+        pagination: &PaginationMeta,
+        base: &str,
+        include_inactive: bool,
+        team: Option<&str>,
+    ) -> Option<Value> {
+        self.grpc
+            .include_page_links
+            .then(|| pagination.links(base, include_inactive, team))
+    }
+
     pub(crate) async fn admin_catalog(
         &self,
         kind: ManagedCatalog,
@@ -147,17 +179,7 @@ impl GatewayService {
         team: Option<&str>,
     ) -> Result<CatalogListing, CatalogApiError> {
         let include_inactive = query.include_inactive()?;
-        let page = query.page.unwrap_or(1);
-        let per_page = query
-            .per_page
-            .unwrap_or(i64::from(self.management_page_size));
-        if page < 1 || !(1..=i64::from(self.management_max_page_size)).contains(&per_page) {
-            return Err(CatalogApiError::detail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "Invalid pagination",
-            ));
-        }
-        let per_page = per_page.max(i64::from(self.grpc.min_page_size));
+        let (page, per_page) = self.admin_page_params(query.page, query.per_page)?;
         let scope = access::catalog_scope(Some(principal));
         let total = self
             .database
@@ -167,7 +189,7 @@ impl GatewayService {
         let filters = CatalogEntryFilters {
             team,
             limit: per_page,
-            offset: pagination.offset(self.grpc.max_page_offset),
+            offset: self.admin_page_offset(&pagination),
             ..CatalogEntryFilters::associated(include_inactive)
         };
         let data = match kind {
@@ -238,10 +260,12 @@ impl GatewayService {
                 .map(|row| management::response(row, self.credential_cipher.as_ref()))
                 .collect(),
         };
-        let links = self
-            .grpc
-            .include_page_links
-            .then(|| pagination.links(&format!("/admin/{}", kind.name()), include_inactive, team));
+        let links = self.admin_page_links(
+            &pagination,
+            &format!("/admin/{}", kind.name()),
+            include_inactive,
+            team,
+        );
         Ok(CatalogListing {
             data,
             pagination,

@@ -16,7 +16,9 @@ pub(super) struct UserPatch {
     pub(super) is_active: Option<bool>,
     pub(super) email_verified: Option<bool>,
     pub(super) password_change_required: Option<bool>,
-    password: Option<String>,
+    pub(super) password: Option<String>,
+    #[serde(skip)]
+    pub(super) admin_origin: Option<&'static str>,
 }
 
 pub(super) async fn change_password(
@@ -86,9 +88,19 @@ pub(super) async fn edit_user(
     State(accounts): State<Arc<Accounts>>,
     Extension(principal): Extension<Principal>,
     Path(email): Path<String>,
-    Json(mut patch): Json<UserPatch>,
+    Json(patch): Json<UserPatch>,
 ) -> Result<Json<Value>, AccountError> {
     require_user_admin(&accounts, &principal).await?;
+    let user = update_account(&accounts, &principal, &email, patch).await?;
+    Ok(Json(user.metadata()))
+}
+
+pub(super) async fn update_account(
+    accounts: &Accounts,
+    principal: &Principal,
+    email: &str,
+    mut patch: UserPatch,
+) -> Result<storage::LocalUser, AccountError> {
     let email = email.trim().to_ascii_lowercase();
     let user = accounts
         .database
@@ -121,7 +133,7 @@ pub(super) async fn edit_user(
     let hash = if let Some(password) = patch.password.take() {
         Some(
             prepare_password(
-                &accounts,
+                accounts,
                 &user,
                 patch.is_admin.unwrap_or(user.is_admin),
                 Zeroizing::new(password),
@@ -131,7 +143,7 @@ pub(super) async fn edit_user(
     } else {
         None
     };
-    let edited = accounts
+    accounts
         .database
         .edit_local_user(
             &user,
@@ -144,8 +156,7 @@ pub(super) async fn edit_user(
             &principal.email,
             &accounts.settings,
         )
-        .await?;
-    Ok(Json(edited.metadata()))
+        .await
 }
 
 pub(super) async fn unlock_user(
@@ -171,14 +182,22 @@ pub(super) async fn delete_user(
 ) -> Result<Json<Value>, AccountError> {
     require_user_admin(&accounts, &principal).await?;
     let email = email.trim().to_ascii_lowercase();
+    remove_account(&accounts, &principal, &email).await?;
+    Ok(success(format!("User {email} has been deleted")))
+}
+
+pub(super) async fn remove_account(
+    accounts: &Accounts,
+    principal: &Principal,
+    email: &str,
+) -> Result<(), AccountError> {
     if email == principal.email {
         return Err(AccountError::bad_request("Cannot delete your own account"));
     }
     accounts
         .database
-        .delete_local_user(&email, &principal.email, &accounts.settings.bootstrap_email)
-        .await?;
-    Ok(success(format!("User {email} has been deleted")))
+        .delete_local_user(email, &principal.email, &accounts.settings.bootstrap_email)
+        .await
 }
 
 pub(super) async fn prepare_password(

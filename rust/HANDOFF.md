@@ -258,6 +258,19 @@ search, pagination, the versioned alias, CSRF-protected revocation, and both
 expiration policy settings. Chromium verifies issuance, scoped use, usage
 statistics, search, and revocation.
 
+## Users dashboard
+
+The Users section supports paginated account listings, literal prefix search,
+account creation, edits, activation, deactivation, unlock, required password
+changes, and deletion. Forms use the shared account lifecycle and session
+protections. Initial passwords and password hashes stay out of directory
+responses. Both admin route prefixes expose the listing and actions.
+
+Six Rust Anything scenarios match on SQLite and PostgreSQL. They cover
+pagination, dropdowns, search, the versioned alias, HTML partials, and the
+account lifecycle. Chromium verifies the dashboard forms and navigation.
+Team membership selection remains part of the open team dashboard work.
+
 ## Gateway and protocol verification
 
 The Rust workspace lives in `rust/app`. The probe and authentication-required cases are in `rust/app-cases`. Replay the original with rust-anything v5.0.1 and a reference launcher named `context-forge-reference-server` on PATH. Bind the original to the supplied `PORT` and use an isolated SQLite database. Set `RATE_LIMITING_ENABLED=false`, `CORRELATION_ID_ENABLED=false`, and `SECURITY_HEADERS_ENABLED=false` for both profiles.

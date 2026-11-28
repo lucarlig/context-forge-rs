@@ -128,6 +128,13 @@ const SELECT_LOCAL_USER: &str = concat!(
     " FROM email_users WHERE email=$1"
 );
 
+macro_rules! directory_filter {
+    () => {
+        "FROM email_users WHERE CAST($1 AS TEXT) IS NULL
+         OR LOWER(email) LIKE $1 ESCAPE '\\' OR LOWER(full_name) LIKE $1 ESCAPE '\\'"
+    };
+}
+
 const CREATE_LOCAL_USER: &str = "INSERT INTO email_users
     (id,email,password_hash,full_name,is_admin,is_active,auth_provider,admin_origin,
      password_hash_type,failed_login_attempts,password_change_required,
@@ -168,6 +175,49 @@ pub(super) struct LocalEvent {
 }
 
 impl Database {
+    pub(super) async fn user_directory_counts(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<(i64, i64), sqlx::Error> {
+        let count = concat!(
+            "SELECT COUNT(*), (SELECT COUNT(*) FROM email_users WHERE is_admin AND is_active) ",
+            directory_filter!()
+        );
+        match self {
+            Self::Sqlite(pool) => sqlx::query_as(count).bind(prefix).fetch_one(pool).await,
+            Self::Postgres(pool) => sqlx::query_as(count).bind(prefix).fetch_one(pool).await,
+        }
+    }
+
+    pub(super) async fn user_directory(
+        &self,
+        prefix: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<LocalUser>, sqlx::Error> {
+        let query = concat!(
+            "SELECT ",
+            local_user_fields!(),
+            " ",
+            directory_filter!(),
+            " ORDER BY created_at DESC,email DESC LIMIT $2 OFFSET $3"
+        );
+        macro_rules! select {
+            ($pool:ident) => {
+                sqlx::query_as(query)
+                    .bind(prefix)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all($pool)
+                    .await
+            };
+        }
+        match self {
+            Self::Sqlite(pool) => select!(pool),
+            Self::Postgres(pool) => select!(pool),
+        }
+    }
+
     pub(super) async fn local_users(
         &self,
         cursor: Option<&UserCursor>,

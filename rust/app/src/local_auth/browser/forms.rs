@@ -217,6 +217,9 @@ pub(super) fn render_template(
                 .add_template("tokens.html", include_str!("tokens.html"))
                 .expect("valid API tokens template");
             environment
+                .add_template("users.html", include_str!("users.html"))
+                .expect("valid users template");
+            environment
         });
     let html = TEMPLATES
         .get_template(template)

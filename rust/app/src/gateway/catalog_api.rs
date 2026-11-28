@@ -379,7 +379,7 @@ pub(crate) struct PaginationMeta {
 }
 
 impl PaginationMeta {
-    pub(super) fn new(mut page: i64, per_page: i64, total_items: i64) -> Self {
+    pub(crate) fn new(mut page: i64, per_page: i64, total_items: i64) -> Self {
         let total_pages = total_items / per_page + i64::from(total_items % per_page != 0);
         if total_pages > 0 {
             page = page.min(total_pages);

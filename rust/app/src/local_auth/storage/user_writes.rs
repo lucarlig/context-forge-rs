@@ -143,10 +143,11 @@ impl Database {
                       password_hash_type=CASE WHEN CAST($7 AS TEXT) IS NULL THEN password_hash_type ELSE 'argon2id' END,
                       locked_until=CASE WHEN $8 THEN NULL ELSE locked_until END,
                       failed_login_attempts=CASE WHEN $8 THEN 0 ELSE failed_login_attempts END,
-                      admin_origin=CASE WHEN $3 AND NOT is_admin THEN 'api' WHEN NOT $3 THEN NULL ELSE admin_origin END,
+                      admin_origin=CASE WHEN $3 AND NOT is_admin THEN $9 WHEN NOT $3 THEN NULL ELSE admin_origin END,
                       updated_at=CURRENT_TIMESTAMP WHERE email=$1 RETURNING ",local_user_fields!()))
                     .bind(email).bind(patch.full_name.as_deref()).bind(admin).bind(active)
-                    .bind(patch.email_verified).bind(change).bind(new_hash).bind(reset_token.is_some()).fetch_one(&mut *$tx).await?;
+                    .bind(patch.email_verified).bind(change).bind(new_hash).bind(reset_token.is_some())
+                    .bind(patch.admin_origin.unwrap_or("api")).fetch_one(&mut *$tx).await?;
                 if new_hash.is_some() || current.is_active && !active {
                     sqlx::query("UPDATE password_reset_tokens SET used_at=CURRENT_TIMESTAMP
                         WHERE user_email=$1 AND used_at IS NULL")
