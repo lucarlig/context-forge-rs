@@ -206,6 +206,28 @@ Both implementations validate the pinned deployment template after secret
 generation. The Linux arm64 image validates its generated `.env`, honors
 the container port override, and rejects an invalid port without an override.
 
+## Support bundles
+
+`--support-bundle` creates a timestamped ZIP with a manifest, runtime metadata,
+system diagnostics, settings, process environment, and a log tail. The
+optional sections follow the three exclusion flags. Logs are read up to
+10 MiB. The archive reports the Rust package version and runtime.
+
+The settings snapshot uses the pinned schema and its captured computed
+defaults. It excludes credential fields and redacts nested credentials,
+credential-like environment values, and credential patterns in logs and URLs.
+Writes are atomic and private on Unix. Same-second runs keep both archives.
+The snapshot uses JSON arrays for sets and null default paths for bundled assets.
+
+ZIP writing uses the MIT-licensed `zip` crate with only Deflate enabled. It
+reuses the workspace's Rust compression backend. [zip 9.9.0](https://docs.rs/crate/zip/9.9.0)
+
+Fifteen Rust Anything cases compare ZIP member names, normalized values for
+all 804 exported settings, exclusion flags, destination behavior, redaction,
+and log tailing. A Rust integration test verifies the archive mode, redacted
+structured logs, safe log member names, and credential removal. The Linux
+arm64 image also produces a private archive.
+
 ## HTTP request boundary
 
 The gateway enables correlation IDs and request header limits by default.

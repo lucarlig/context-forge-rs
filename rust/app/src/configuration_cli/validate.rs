@@ -210,7 +210,11 @@ fn schema_type(property: &Value) -> Option<&str> {
     })
 }
 
-fn parse(field: &str, property: &Value, mut raw: Zeroizing<String>) -> serde_json::Result<Value> {
+pub(super) fn parse(
+    field: &str,
+    property: &Value,
+    mut raw: Zeroizing<String>,
+) -> serde_json::Result<Value> {
     let value = match (field, schema_type(property)) {
         ("sqlalchemy_echo", _) => Value::Bool(matches!(
             raw.to_ascii_lowercase().as_str(),

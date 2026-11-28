@@ -54,6 +54,8 @@ Use `context-forge-rs --config-schema [OUTPUT]` to print or save the configurati
 
 Use `context-forge-rs --validate-config [PATH]` to check an environment file with process overrides. The default path is `.env`. The command reports invalid field names and redacts their values.
 
+Use `context-forge-rs --support-bundle --output-dir PATH` to create a diagnostic ZIP. It includes runtime metadata, settings, process environment, system metrics, and log text with credential redaction. Use `--log-lines N` to set the log tail. Use `--no-logs`, `--no-env`, or `--no-system` to omit those sections. The output defaults to the system temporary directory. Archives use mode `0600` on Unix.
+
 `context-forge-rs init-secrets` writes `.env.secrets` by default. Use `--output` to choose another file, `--force` to overwrite it, or `--stdout` to print the generated values. On Unix, files written by this command have mode `0600`.
 
 Run `context-forge-rs migrate` to prepare the native database schema before starting the gateway. Set `MCPGATEWAY_SKIP_MIGRATIONS=true` on gateway workers to require a current native schema at startup.

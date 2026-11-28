@@ -33,6 +33,7 @@ pub(crate) use inherited::InheritedListener;
   import               Import gateway configuration
   --validate-config    Validate an environment file (default: .env)
   --config-schema      Print the configuration JSON Schema or write it to a file
+  --support-bundle     Create a sanitized diagnostic ZIP archive
   init-secrets         Generate deployment secrets
   rotate-credentials   Rotate stored credentials")]
 pub(crate) struct ServerArgs {

@@ -792,6 +792,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "144e7f1de087984240b7816d47f698b414979faa6f40839c5b86d6bd47db57b7"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "context-forge-rs"
 version = "0.1.0"
 dependencies = [
@@ -867,6 +876,7 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+ "zip",
 ]
 
 [[package]]
@@ -2367,6 +2377,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a198f9589efc03f544388dfc4a19fe8af4323662b62f598b8dcfdac62c14771c"
 dependencies = [
  "byteorder",
+]
+
+[[package]]
+name = "nix"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -4422,6 +4444,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6af6ae20167a9ece4bcb41af5b80f8a1f1df981f6391189ce00fd257af04126a"
 
 [[package]]
+name = "typed-path"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5068,6 +5096,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "zip"
+version = "9.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07db37dec4a7c468df4723fba4cadb4822d1d0f10dbea367100b6a6881b2a9c9"
+dependencies = [
+ "constant_time_eq",
+ "crc32fast",
+ "flate2",
+ "getrandom 0.4.3",
+ "indexmap",
+ "libc",
+ "memchr",
+ "nix",
+ "typed-path",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

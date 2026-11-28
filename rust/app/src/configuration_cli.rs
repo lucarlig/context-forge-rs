@@ -19,7 +19,9 @@ use crate::{
     environment, private_file,
 };
 
+mod support_bundle;
 mod validate;
+pub use support_bundle::run as support_bundle;
 pub use validate::run as validate_settings_file;
 
 type CliError = Box<dyn Error + Send + Sync>;

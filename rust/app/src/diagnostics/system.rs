@@ -7,19 +7,19 @@ use serde_json::{Value, json};
 use sysinfo::{Disks, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[derive(Default)]
-pub(super) struct Metrics {
+pub(crate) struct Metrics {
     system: System,
     disks: Disks,
 }
 
-pub(super) fn platform() -> String {
+pub(crate) fn platform() -> String {
     let name = System::name().unwrap_or_else(|| consts::OS.to_owned());
     let kernel = System::kernel_version().unwrap_or_default();
     format!("{name} {kernel} ({})", System::cpu_arch())
 }
 
 impl Metrics {
-    pub(super) fn sample(&mut self) -> Value {
+    pub(crate) fn sample(&mut self) -> Value {
         if !sysinfo::IS_SUPPORTED_SYSTEM {
             return json!({});
         }

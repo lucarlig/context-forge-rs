@@ -51,6 +51,9 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some("export") => run(Startup::Configuration("export")),
         Some("import") => run(Startup::Configuration("import")),
         Some("init-secrets") => context_forge_rs::init_secrets::run(),
+        Some("--support-bundle") => {
+            context_forge_rs::configuration_cli::support_bundle(std::env::args_os().skip(2))
+        }
         Some("--validate-config") => {
             let path = std::env::args_os().nth(2).unwrap_or_else(|| ".env".into());
             if !context_forge_rs::configuration_cli::validate_settings_file(path.as_ref())? {
