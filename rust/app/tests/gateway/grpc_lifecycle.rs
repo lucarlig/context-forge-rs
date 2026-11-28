@@ -27,8 +27,7 @@ async fn grpc_writes_check_team_scope_and_reject_stale_reflection() {
                 'gRPC', 'grpc', '{}', 'team', 'alpha', 'member@example.test');
          INSERT INTO servers (id, name, visibility) VALUES ('grpc-server', 'gRPC server', 'public');
          INSERT INTO server_tool_association (server_id, tool_id) VALUES ('grpc-server', 'grpc-tool');
-         CREATE TABLE tool_metrics (tool_id TEXT REFERENCES tools(id));
-         INSERT INTO tool_metrics VALUES ('grpc-tool');",
+         INSERT INTO tool_metrics (tool_id, response_time, is_success) VALUES ('grpc-tool', 0.25, TRUE);",
     )
     .execute(pool)
     .await
