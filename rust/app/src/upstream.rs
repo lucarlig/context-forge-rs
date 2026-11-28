@@ -49,7 +49,12 @@ use zeroize::Zeroizing;
 use crate::{
     credentials::{QueryValues, UpstreamCredentials},
     events::PassiveEvents,
-    observability::telemetry::client::{HttpClientSpan, execute as execute_http},
+    observability::{
+        mcp_client::{McpCallSpan, add_session_attribute},
+        scoped::ScopedSpan,
+        telemetry::client::{HttpClientSpan, execute as execute_http},
+        with_trace,
+    },
     sessions::SessionLifetime,
     sigv4::SigV4,
     upstream_tls,
@@ -745,6 +750,7 @@ impl UpstreamClient {
                 request_headers: None,
             },
             None,
+            None,
         )
         .await
     }
@@ -755,6 +761,7 @@ impl UpstreamClient {
         mut params: CallToolRequestParams,
         context: ToolContext<'_>,
         association: Option<&UpstreamAssociation>,
+        trace: Option<&mut McpCallSpan>,
     ) -> Result<Value, UpstreamError> {
         params.meta = None;
         params.arguments.get_or_insert_default();
@@ -763,6 +770,7 @@ impl UpstreamClient {
             CallToolRequest::new(params).into(),
             context,
             association,
+            trace,
         )
         .await
     }
@@ -773,6 +781,7 @@ impl UpstreamClient {
         mut request: ClientRequest,
         context: ToolContext<'_>,
         association: Option<&UpstreamAssociation>,
+        mut trace: Option<&mut McpCallSpan>,
     ) -> Result<Value, UpstreamError> {
         let cancellation = context.cancellation;
         if cancellation.is_cancelled() {
@@ -806,6 +815,9 @@ impl UpstreamClient {
             }
             None => Arc::new(self.open_session(endpoint, deadline).await?),
         };
+        if let Some(trace) = &mut trace {
+            trace.set_session(session.trace_hash());
+        }
         if cancellation.is_cancelled() {
             if association.is_none() {
                 session.close().await;
@@ -814,21 +826,28 @@ impl UpstreamClient {
         }
         let id = session.next_request_id();
         let mut started = false;
-        let result = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => Err(UpstreamError::Cancelled),
-            result = timeout_at(deadline, async {
-                if matches!(request, ClientRequest::CompleteRequest(_))
-                    && !session.capabilities["completions"].is_object()
-                {
-                    return Err(UpstreamError::CompletionUnsupported);
+        let request_span = trace.as_deref().map(McpCallSpan::request);
+        let result = with_trace(request_span.as_ref().and_then(ScopedSpan::context), async {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(UpstreamError::Cancelled),
+                result = timeout_at(deadline, async {
+                    if matches!(request, ClientRequest::CompleteRequest(_))
+                        && !session.capabilities["completions"].is_object()
+                    {
+                        return Err(UpstreamError::CompletionUnsupported);
+                    }
+                    started = true;
+                    session.request_with_id(request, id, Some(&context)).await
+                }) => {
+                    result.unwrap_or(Err(UpstreamError::Timeout)).map(|reply| reply.result)
                 }
-                started = true;
-                session.request_with_id(request, id, Some(&context)).await
-            }) => {
-                result.unwrap_or(Err(UpstreamError::Timeout)).map(|reply| reply.result)
             }
-        };
+        })
+        .await;
+        if let (Some(trace), Some(request_span)) = (trace, request_span) {
+            trace.reply(request_span, &result);
+        }
         if started
             && matches!(
                 result,
@@ -1035,6 +1054,36 @@ impl UpstreamClient {
     }
 
     async fn open_negotiated_session(
+        &self,
+        endpoint: UpstreamEndpoint<'_>,
+        deadline: Instant,
+    ) -> Result<(Session, Negotiation), UpstreamError> {
+        let mut span = ScopedSpan::start("mcp.client.initialize", || {
+            serde_json::json!({
+                "contextforge.transport": endpoint.transport.name().to_ascii_lowercase(),
+                "contextforge.runtime": "rust",
+            })
+        });
+        let result = with_trace(
+            span.context(),
+            Box::pin(self.negotiate_new_session(endpoint, deadline)),
+        )
+        .await;
+        if let Ok((session, _)) = &result
+            && span.recording().is_some()
+        {
+            add_session_attribute(&mut span, session.trace_hash().as_deref());
+        }
+        span.finish(
+            result
+                .as_ref()
+                .err()
+                .map(|_| "Upstream MCP initialization failed"),
+        );
+        result
+    }
+
+    async fn negotiate_new_session(
         &self,
         endpoint: UpstreamEndpoint<'_>,
         deadline: Instant,
@@ -1312,6 +1361,26 @@ struct Session {
 }
 
 impl Session {
+    fn trace_hash(&self) -> Option<String> {
+        let hash = |raw: &[u8]| {
+            let digest: [u8; 32] = Sha256::digest(raw).into();
+            let prefix =
+                u64::from_be_bytes(*digest.first_chunk::<8>().expect("SHA-256 digest size"));
+            format!("{prefix:016x}")
+        };
+        if let Some(id) = self.session_id.as_ref() {
+            return Some(hash(id.as_bytes()));
+        }
+        if self.sse.is_some() {
+            return self
+                .url
+                .query_pairs()
+                .find(|(name, value)| name == "session_id" && !value.is_empty())
+                .map(|(_, value)| hash(value.as_bytes()));
+        }
+        None
+    }
+
     async fn open_sse(&mut self) -> Result<(), UpstreamError> {
         let response = self.send(self.request_builder(Method::GET, None)).await?;
         if !response.status().is_success() {

@@ -38,8 +38,10 @@ pub(crate) struct TraceContext {
     pub(super) mcp_session: Option<String>,
     #[serde(skip)]
     pub(super) framework: Option<Box<super::framework::RequestTrace>>,
-    #[serde(default)]
-    pub(super) mcp_call: bool,
+    #[serde(skip)]
+    pub(super) mcp_call: Option<ExportContext>,
+    #[serde(skip)]
+    pub(super) system_root: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -272,6 +274,18 @@ impl OperationSpan {
     pub(crate) fn inject_trace_context(&self, headers: &mut axum::http::HeaderMap) {
         if let Some(exported) = &self.exported {
             exported.span.context().inject(headers);
+        }
+    }
+
+    pub(crate) fn upstream_session(&mut self, hash: Option<&str>) {
+        if let Some(hash) = hash
+            && let Some(exported) = &mut self.exported
+            && let ExportSpan::Recording(span) = &mut exported.span
+        {
+            span.set_attribute(KeyValue::new(
+                super::mcp_client::SESSION_ATTRIBUTE,
+                hash.to_owned(),
+            ));
         }
     }
 

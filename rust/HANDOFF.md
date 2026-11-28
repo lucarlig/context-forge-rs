@@ -554,6 +554,21 @@ Twelve Rust Anything cases match the pinned reference for outbound span
 status, ancestry, and wire propagation across REST, MCP, and A2A. Native
 checks verify per-request context in a reused upstream MCP session.
 
+MCP tool traces record `tool.gateway_call`, `mcp.client.call`, and separate
+initialization, request, and response spans. A reused session skips the
+initialization span. Tool results with `isError` mark the request and
+response spans as errors. A failed handshake ends the trace before the
+tool request. A JSON-RPC error terminates tracing at the request span.
+Trace attributes correlate upstream sessions with the first 16 hexadecimal
+characters of their SHA-256 digest.
+
+Eight Rust Anything cases cover Streamable HTTP and legacy SSE, pooled
+sessions, handshake and call failures, manual propagation, and unsampled
+requests. The comparison covers MCP phases and the wire ancestry of
+initialization and tool calls. The reference can send an extra
+`tools/list` for tool metadata. A live Rust test checks status, ancestry,
+and redaction of the upstream session handle and URL query credential.
+
 Set `OTEL_REDIS_INSTRUMENTATION_ENABLED=true` to export Redis client spans
 for request-scoped commands. This covers session affinity, legacy SSE queues,
 shared catalog and token caches, and Redis rate limiting. Command spans carry

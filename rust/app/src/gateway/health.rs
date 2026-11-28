@@ -14,7 +14,7 @@ use url::Url;
 use super::*;
 use crate::{
     gateway_records::{CatalogRefreshCompletion, CatalogRefreshInput, GatewayRecord},
-    observability::{background::SystemSpan, safe_upstream_url, with_trace},
+    observability::{safe_upstream_url, scoped::ScopedSpan, with_trace},
 };
 
 const PAGE_SIZE: i64 = 100;
@@ -77,7 +77,7 @@ impl GatewayService {
             return Ok(HashMap::new());
         }
         let started = Instant::now();
-        let mut span = SystemSpan::start(
+        let mut span = ScopedSpan::start(
             "gateway.health_check_batch",
             || json!({"check.type": "health"}),
         );
@@ -164,7 +164,7 @@ impl GatewayService {
         let Some(transport) = UpstreamTransport::from_name(&record.transport) else {
             return Ok(0);
         };
-        let mut span = SystemSpan::start("gateway.health_check", || {
+        let mut span = ScopedSpan::start("gateway.health_check", || {
             let url = Url::parse(&record.url)
                 .ok()
                 .map(|url| safe_upstream_url(&url));
@@ -197,7 +197,7 @@ impl GatewayService {
         settings: &GatewayHealth,
         failures: u32,
         transport: UpstreamTransport,
-        span: &mut SystemSpan,
+        span: &mut ScopedSpan,
     ) -> Result<u32, sqlx::Error> {
         let Some(connection) = self
             .database

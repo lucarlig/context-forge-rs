@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::Future;
-
 use super::{ExportSpan, SemanticConventions};
-use crate::observability::{baggage, bounded, current_trace, safe_upstream_url, with_trace};
+use crate::observability::{baggage, bounded, current_trace, safe_upstream_url};
 use opentelemetry::{
     KeyValue,
     trace::{Span, SpanKind, Status},
@@ -35,8 +33,10 @@ impl HttpClientSpan {
             }
             Self(Some(Box::new((span, mode))))
         } else {
-            if trace.mcp_call && !signature_owns_headers(request.url(), PROPAGATION_HEADERS) {
-                parent.inject(request.headers_mut());
+            if let Some(mcp_call) = trace.mcp_call
+                && !signature_owns_headers(request.url(), PROPAGATION_HEADERS)
+            {
+                mcp_call.inject(request.headers_mut());
             }
             Self(None)
         }
@@ -94,51 +94,6 @@ pub(crate) async fn execute(
     HttpClientSpan::start(&mut request)
         .execute(client, request)
         .await
-}
-
-pub(crate) async fn mcp_call<T, E>(
-    gateway_id: &str,
-    endpoint: &str,
-    transport: &'static str,
-    tool: &str,
-    operation: impl Future<Output = Result<T, E>>,
-) -> Result<T, E> {
-    let Some(mut context) = current_trace() else {
-        return operation.await;
-    };
-    let Some(parent) = context.exported.take() else {
-        return operation.await;
-    };
-    let mut attributes = vec![
-        KeyValue::new("mcp.tool.name", bounded(tool, 255)),
-        KeyValue::new("contextforge.gateway_id", bounded(gateway_id, 36)),
-        KeyValue::new("contextforge.runtime", "rust"),
-        KeyValue::new("contextforge.transport", transport.to_ascii_lowercase()),
-        KeyValue::new("network.protocol.name", "mcp"),
-    ];
-    if let Ok(url) = Url::parse(endpoint) {
-        attributes.push(KeyValue::new("url.path", bounded(url.path(), 2000)));
-        attributes.push(KeyValue::new("url.full", safe_upstream_url(&url)));
-        if let Some(host) = url.host_str() {
-            attributes.push(KeyValue::new("server.address", bounded(host, 255)));
-        }
-        if let Some(port) = url.port() {
-            attributes.push(KeyValue::new("server.port", i64::from(port)));
-        }
-    }
-    let span = parent.start_span("mcp.client.call", SpanKind::Internal, attributes);
-    context.exported = Some(span.context());
-    context.mcp_call = true;
-    let result = with_trace(Some(context), operation).await;
-    if let ExportSpan::Recording(mut span) = span {
-        span.set_status(if result.is_ok() {
-            Status::Ok
-        } else {
-            Status::error("Upstream MCP call failed")
-        });
-        span.end();
-    }
-    result
 }
 
 fn signature_owns_headers(url: &Url, headers: &[&str]) -> bool {

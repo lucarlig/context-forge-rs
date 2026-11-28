@@ -217,7 +217,10 @@ impl Telemetry {
     }
 
     pub(crate) fn system_context(&self) -> Option<TraceContext> {
-        self.system_traces.then(|| self.trace_context())
+        self.system_traces.then(|| TraceContext {
+            system_root: true,
+            ..self.trace_context()
+        })
     }
 
     fn trace_context(&self) -> TraceContext {

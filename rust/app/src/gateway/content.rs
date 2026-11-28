@@ -484,7 +484,7 @@ impl GatewayService {
         let modern = context.client_capabilities.is_some();
         let completion = matches!(request, ClientRequest::CompleteRequest(_));
         let client = timeout.map(|timeout| self.upstream.with_timeout_cap(timeout));
-        client.as_ref().unwrap_or(&self.upstream).request_with_context(endpoint, request, context, association.as_deref())
+        client.as_ref().unwrap_or(&self.upstream).request_with_context(endpoint, request, context, association.as_deref(), None)
             .await.map_err(|error| match error {
                 UpstreamError::CompletionUnsupported => ErrorData::new(
                     ErrorCode::METHOD_NOT_FOUND,

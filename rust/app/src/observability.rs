@@ -20,11 +20,12 @@ use crate::{
     database::Database,
 };
 
-pub(crate) mod background;
 pub(crate) mod baggage;
 pub(crate) mod framework;
+pub(crate) mod mcp_client;
 mod operation;
 pub(crate) mod query;
+pub(crate) mod scoped;
 mod store;
 pub(crate) mod telemetry;
 pub(crate) use operation::{

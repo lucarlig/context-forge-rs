@@ -85,7 +85,10 @@ use crate::{
     grpc::GrpcSettings,
     mcp::{HttpOptions, ProtocolMode, SessionSettings, SseSettings, WebSocketSettings},
     oauth_client::OAuthConfig,
-    observability::{OperationSpan, Outcome, SpanResource, telemetry::client::mcp_call},
+    observability::{
+        OperationSpan, Outcome, SpanResource, mcp_client::McpCallSpan, scoped::ScopedSpan,
+        with_trace,
+    },
     proxy_catalog_cache::ProxyCatalogCache,
     secret_envelope::SecretEnvelope,
     sessions::Session,
@@ -906,7 +909,8 @@ impl GatewayService {
                 self.direct_target(context.request_headers, principal).await.map_err(ToolError::from)
             } => result?,
         };
-        let (gateway, direct_timeout, response_filter) = match target {
+        let invoked_as = request.name.clone();
+        let (gateway, direct_timeout, response_filter, tool_id) = match target {
             DirectTarget::Found {
                 gateway, timeout, ..
             } => {
@@ -921,7 +925,7 @@ impl GatewayService {
                         "MCP",
                     )
                     .await;
-                (gateway, Some(timeout), String::new())
+                (gateway, Some(timeout), String::new(), None)
             }
             DirectTarget::Denied => {
                 return tool_result_error(format!("Tool not found: {}", request.name));
@@ -1004,6 +1008,7 @@ impl GatewayService {
                     },
                     None,
                     tool.response_filter,
+                    Some(tool.id),
                 )
             }
         };
@@ -1072,20 +1077,43 @@ impl GatewayService {
         let cancellation = context.cancellation;
         let client = direct_timeout.map(|timeout| self.upstream.with_timeout_cap(timeout));
         let tool = request.name.clone();
-        let invoke = client
-            .as_ref()
-            .unwrap_or(&self.upstream)
-            .call_tool_with_context(endpoint, request, context, association.as_deref());
-        let result = execution
+        let (result, upstream_hash) = execution
             .span
-            .scope(Box::pin(mcp_call(
-                &gateway.id,
-                &gateway.url,
-                transport.name(),
-                &tool,
-                Box::pin(invoke),
-            )))
+            .scope(Box::pin(async {
+                let mut outer = ScopedSpan::start("tool.gateway_call", || {
+                    json!({
+                        "tool.name": invoked_as,
+                        "tool.id": tool_id.as_deref(),
+                        "tool.integration_type": "MCP",
+                    })
+                });
+                let (result, hash) = with_trace(
+                    outer.context(),
+                    Box::pin(async {
+                        let mut trace =
+                            McpCallSpan::start(&gateway.id, tool_id.as_deref(), &tool, endpoint);
+                        let context_for_call = trace.as_ref().and_then(McpCallSpan::context);
+                        let invoke = client
+                            .as_ref()
+                            .unwrap_or(&self.upstream)
+                            .call_tool_with_context(
+                                endpoint,
+                                request,
+                                context,
+                                association.as_deref(),
+                                trace.as_mut(),
+                            );
+                        let result = with_trace(context_for_call, Box::pin(invoke)).await;
+                        let hash = trace.and_then(|trace| trace.finish(&result));
+                        (result, hash)
+                    }),
+                )
+                .await;
+                outer.finish(result.as_ref().err().map(|_| "Upstream MCP call failed"));
+                (result, hash)
+            }))
             .await;
+        execution.span.upstream_session(upstream_hash.as_deref());
         match result {
             Ok(result) if legacy_caller && result["resultType"] == "input_required" => {
                 input_error_result("Elicitation not supported", None)

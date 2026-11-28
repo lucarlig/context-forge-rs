@@ -2849,7 +2849,7 @@ async fn otlp_exports_http_operations_and_sql_without_database_trace_storage() {
 }
 
 #[tokio::test]
-async fn system_trace_records_gateway_probe_outcomes_without_query_credentials() {
+async fn traces_background_probes_and_mcp_tool_errors_without_upstream_credentials() {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -2862,6 +2862,19 @@ async fn system_trace_records_gateway_probe_outcomes_without_query_credentials()
     use prost::Message;
     use serde_json::{Value, json};
 
+    const SESSION: &str = "probe-private-upstream-mcp-session";
+    const SECRET: &str = "probe-query-private-fixture";
+    let session_hash = format!(
+        "{:016x}",
+        u64::from_be_bytes(
+            Sha256::digest(SESSION)
+                .get(..8)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+    );
+    let tool_trace = 0x39abf40bc3ea4d8d9910c267f6982344_u128.to_be_bytes();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer = format!("http://{}", listener.local_addr().unwrap());
     let (trace_tx, mut trace_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2898,11 +2911,21 @@ async fn system_trace_records_gateway_probe_outcomes_without_query_credentials()
                                 "capabilities": {"tools": {}},
                                 "serverInfo": {"name": "health-test", "version": "1"},
                             }),
-                            Some("tools/list") => json!({"tools": []}),
+                            Some("tools/list") => json!({"tools": [
+                                {"name":"echo","inputSchema":{"type":"object"}},
+                            ]}),
+                            Some("tools/call") => json!({
+                                "content": [{"type":"text","text":"tool fixture error"}], "isError":true,
+                            }),
                             _ => json!({}),
                         };
-                        Json(json!({"jsonrpc": "2.0", "id": message["id"], "result": result}))
-                            .into_response()
+                        let mut response = Json(json!({
+                            "jsonrpc": "2.0", "id": message["id"], "result": result
+                        })).into_response();
+                        if message["method"] == "initialize" {
+                            response.headers_mut().insert("mcp-session-id", header::HeaderValue::from_static(SESSION));
+                        }
+                        response
                     }
                 }),
             );
@@ -2917,6 +2940,7 @@ async fn system_trace_records_gateway_probe_outcomes_without_query_credentials()
         ("OTEL_EXPORTER_OTLP_ENDPOINT", &format!("{peer}/v1/traces")),
         ("OTEL_BSP_SCHEDULE_DELAY", "25"),
         ("HEALTH_CHECK_INTERVAL", "1"),
+        ("MCP_CLIENT_CONNECT_MODE", "legacy"),
     ])
     .await;
     let jwt: Value = serde_json::from_slice(
@@ -2935,7 +2959,6 @@ async fn system_trace_records_gateway_probe_outcomes_without_query_credentials()
             .unwrap(),
     )
     .unwrap();
-    const SECRET: &str = "probe-query-private-fixture";
     let gateway_url = format!("{peer}/mcp");
     gateway
         .client
@@ -2955,12 +2978,38 @@ async fn system_trace_records_gateway_probe_outcomes_without_query_credentials()
         .error_for_status()
         .unwrap();
 
+    let result = gateway
+        .client
+        .post(format!("{}/rpc", gateway.origin))
+        .bearer_auth(jwt["access_token"].as_str().unwrap())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            "traceparent",
+            "00-39abf40bc3ea4d8d9910c267f6982344-1865e10be1d880d4-01",
+        )
+        .body(
+            json!({"jsonrpc":"2.0","id":15,"method":"tools/call",
+            "params":{"name":"health-trace-fixture-echo","arguments":{}}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(result.contains("tool fixture error"), "{result}");
+
     for (health, status) in [("healthy", 1), ("unhealthy", 2)] {
         let mut collected = Vec::new();
         tokio::time::timeout(Duration::from_secs(6), async {
             loop {
                 let batch = trace_rx.recv().await.unwrap();
-                assert!(!format!("{batch:?}").contains(SECRET));
+                let exported = format!("{batch:?}");
+                assert!(!exported.contains(SECRET));
+                assert!(!exported.contains(SESSION));
                 collected.extend(
                     batch
                         .resource_spans
@@ -2985,10 +3034,17 @@ async fn system_trace_records_gateway_probe_outcomes_without_query_credentials()
                 };
                 assert!(batch.parent_span_id.is_empty());
                 assert_eq!(batch.trace_id, check.trace_id);
+                let init = collected
+                    .iter()
+                    .find(|span| {
+                        span.name == "mcp.client.initialize" && span.parent_span_id == check.span_id
+                    })
+                    .unwrap();
+                assert_eq!(init.status.as_ref().unwrap().code, status);
                 assert!(
                     collected
                         .iter()
-                        .any(|span| span.name == "POST" && span.parent_span_id == check.span_id)
+                        .any(|span| span.name == "POST" && span.parent_span_id == init.span_id)
                 );
                 for (key, expected) in [
                     ("health.status", Attribute::StringValue(health.to_owned())),
@@ -3011,6 +3067,46 @@ async fn system_trace_records_gateway_probe_outcomes_without_query_credentials()
                                 Some(Attribute::IntValue(1))
                             ))
                 );
+                if health == "healthy" {
+                    let tool_span = |name| {
+                        collected
+                            .iter()
+                            .find(|span| span.trace_id == tool_trace && span.name == name)
+                    };
+                    let Some(call) = tool_span("mcp.client.call") else {
+                        continue;
+                    };
+                    let gateway = tool_span("tool.gateway_call").unwrap();
+                    let tool = tool_span("tool.invoke").unwrap();
+                    assert_eq!(call.parent_span_id, gateway.span_id);
+                    assert_eq!(gateway.parent_span_id, tool.span_id);
+                    for (name, result) in [
+                        ("tool.invoke", 2),
+                        ("mcp.client.call", 2),
+                        ("mcp.client.initialize", 1),
+                        ("mcp.client.request", 2),
+                        ("mcp.client.response", 2),
+                    ] {
+                        let span = tool_span(name).unwrap();
+                        assert_eq!(span.status.as_ref().unwrap().code, result);
+                        assert!(
+                            span.attributes
+                                .iter()
+                                .any(|field| field.key == "gateway.upstream.session_id"
+                                    && field.value.as_ref().and_then(|value| value.value.as_ref())
+                                        == Some(&Attribute::StringValue(session_hash.clone())))
+                        );
+                        if matches!(name, "mcp.client.request" | "mcp.client.response") {
+                            assert_eq!(span.parent_span_id, call.span_id);
+                            assert!(
+                                span.attributes.iter().any(|field| field.key
+                                    == "upstream.response.success"
+                                    && field.value.as_ref().and_then(|value| value.value.as_ref())
+                                        == Some(&Attribute::BoolValue(false)))
+                            );
+                        }
+                    }
+                }
                 break;
             }
         })
