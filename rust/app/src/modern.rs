@@ -198,7 +198,15 @@ impl Modern {
         }
         if matches!(
             body["method"].as_str(),
-            Some("resources/read" | "prompts/get" | "completion/complete")
+            Some(
+                "resources/read"
+                    | "prompts/get"
+                    | "completion/complete"
+                    | "tools/list"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "prompts/list"
+            )
         ) {
             parts.extensions.insert(HandlerErrorStatus::default());
         }
@@ -336,34 +344,35 @@ impl GatewayHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<R, ErrorData> {
         let parts = request_parts(&context)?;
-        let server = parts.extensions.get::<CatalogServer>();
-        let principal = parts.extensions.get::<Principal>();
-        let cursor = request.as_ref().and_then(|params| params.cursor.as_deref());
-        let proxy_page = if matches!(list, CatalogList::Resources) {
-            let result = self
-                .gateway
-                .direct_catalog(
-                    ProxyCatalogKind::Resources,
-                    principal,
-                    server,
-                    Some(&parts.headers),
-                    cursor,
-                )
-                .await;
-            HandlerErrorStatus::record(parts, &result);
-            result?
-        } else {
-            None
-        };
-        let page = match proxy_page {
-            Some(page) => page,
-            None => self
+        crate::observability::with_trace(parts.extensions.get().cloned(), async {
+            let server = parts.extensions.get::<CatalogServer>();
+            let principal = parts.extensions.get::<Principal>();
+            let cursor = request.as_ref().and_then(|params| params.cursor.as_deref());
+            if matches!(list, CatalogList::Resources) {
+                let result = self
+                    .gateway
+                    .direct_catalog(
+                        ProxyCatalogKind::Resources,
+                        principal,
+                        server,
+                        Some(&parts.headers),
+                        cursor,
+                    )
+                    .await;
+                HandlerErrorStatus::record(parts, &result);
+                if let Some(page) = result? {
+                    return self.catalog_result(page, server, list.method()).await;
+                }
+            }
+            let page = self
                 .gateway
                 .list_catalog_metadata(list, principal, server, cursor)
                 .await
-                .map_err(tool_error)?,
-        };
-        self.catalog_result(page, server, list.method()).await
+                .map_err(tool_error);
+            HandlerErrorStatus::record(parts, &page);
+            self.catalog_result(page?, server, list.method()).await
+        })
+        .await
     }
 
     async fn catalog_result<R: DeserializeOwned>(
@@ -441,38 +450,43 @@ impl ServerHandler for GatewayHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let parts = request_parts(&context)?;
-        let server = parts.extensions.get::<CatalogServer>();
-        let principal = parts.extensions.get::<Principal>();
-        let cursor = request.as_ref().and_then(|params| params.cursor.as_deref());
-        let proxy_page = self
-            .gateway
-            .direct_catalog(
-                ProxyCatalogKind::Tools,
-                principal,
-                server,
-                Some(&parts.headers),
-                cursor,
-            )
-            .await;
-        HandlerErrorStatus::record(parts, &proxy_page);
-        if let Some(page) = proxy_page? {
-            return self.catalog_result(page, server, "tools/list").await;
-        }
-        let page = self
-            .gateway
-            .list_tools(principal, server, cursor)
-            .await
-            .map_err(tool_error)?;
-        let tools = page
-            .tools
-            .into_iter()
-            .map(protocol_tool)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut result = ListToolsResult::with_all_items(tools)
-            .with_ttl_ms(self.gateway.catalog_ttl_ms(server).await);
-        result.next_cursor = page.next_cursor;
-        stamp_server_info(&mut result.meta);
-        Ok(result)
+        crate::observability::with_trace(parts.extensions.get().cloned(), async {
+            let server = parts.extensions.get::<CatalogServer>();
+            let principal = parts.extensions.get::<Principal>();
+            let cursor = request.as_ref().and_then(|params| params.cursor.as_deref());
+            let proxy_page = self
+                .gateway
+                .direct_catalog(
+                    ProxyCatalogKind::Tools,
+                    principal,
+                    server,
+                    Some(&parts.headers),
+                    cursor,
+                )
+                .await;
+            HandlerErrorStatus::record(parts, &proxy_page);
+            if let Some(page) = proxy_page? {
+                return self.catalog_result(page, server, "tools/list").await;
+            }
+            let page = self
+                .gateway
+                .list_tools(principal, server, cursor)
+                .await
+                .map_err(tool_error);
+            HandlerErrorStatus::record(parts, &page);
+            let page = page?;
+            let tools = page
+                .tools
+                .into_iter()
+                .map(protocol_tool)
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut result = ListToolsResult::with_all_items(tools)
+                .with_ttl_ms(self.gateway.catalog_ttl_ms(server).await);
+            result.next_cursor = page.next_cursor;
+            stamp_server_info(&mut result.meta);
+            Ok(result)
+        })
+        .await
     }
 
     async fn list_resources(

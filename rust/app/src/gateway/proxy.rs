@@ -12,6 +12,7 @@ use uuid::Uuid;
 use super::{GatewayService, Principal, UpstreamUse, access, list_fingerprint};
 use crate::{
     catalog::{CatalogServer, ContentGateway},
+    observability::catalog as catalog_trace,
     proxy_catalog_cache::{Manifest, Reservation, SnapshotPage},
     upstream::{ProxyCatalogKind, UpstreamEndpoint, UpstreamError},
 };
@@ -66,32 +67,48 @@ impl GatewayService {
         let Some(server) = server else {
             return Ok(None);
         };
-        let (gateway, timeout, revision) = match self
-            .direct_target(headers, principal)
-            .await
-            .map_err(|_| unavailable("MCP catalog lookup failed"))?
-        {
-            DirectTarget::Fallback => return Ok(None),
-            DirectTarget::Disabled => {
-                return Err(ErrorData::new(
-                    ErrorCode(-32003),
-                    "Direct proxy is disabled",
-                    None,
-                ));
-            }
-            DirectTarget::Denied => {
-                return Err(ErrorData::new(
-                    ErrorCode(-32003),
-                    "Access denied to direct-proxy gateway",
-                    None,
-                ));
-            }
-            DirectTarget::Found {
+        let target = match self.direct_target(headers, principal).await {
+            Ok(DirectTarget::Fallback) => return Ok(None),
+            Ok(DirectTarget::Disabled) => Err(ErrorData::new(
+                ErrorCode(-32003),
+                "Direct proxy is disabled",
+                None,
+            )),
+            Ok(DirectTarget::Denied) => Err(ErrorData::new(
+                ErrorCode(-32003),
+                "Access denied to direct-proxy gateway",
+                None,
+            )),
+            Ok(DirectTarget::Found {
                 gateway,
                 timeout,
                 revision,
-            } => (gateway, timeout, revision),
+            }) => Ok((gateway, timeout, revision)),
+            Err(_) => Err(unavailable("MCP catalog lookup failed")),
         };
+        catalog_trace::page(
+            kind.method(),
+            self.pagination.page_size,
+            cursor.is_some(),
+            async {
+                self.load_direct_catalog(kind, principal, server, headers, cursor, target?)
+                    .await
+            },
+            |page| catalog_trace::page_summary(page, kind.key()),
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn load_direct_catalog(
+        &self,
+        kind: ProxyCatalogKind,
+        principal: Option<&Principal>,
+        server: &CatalogServer,
+        headers: Option<&HeaderMap>,
+        cursor: Option<&str>,
+        (gateway, timeout, revision): (ContentGateway, Duration, String),
+    ) -> Result<Value, ErrorData> {
         let permission = match kind {
             ProxyCatalogKind::Tools => "tools.read",
             ProxyCatalogKind::Resources => "resources.read",
@@ -164,9 +181,7 @@ impl GatewayService {
                 .await
                 .map_err(|error| unavailable(error.to_string()))?
                 .ok_or_else(invalid_cursor)?;
-            return self
-                .proxy_catalog_page(kind, snapshot, page, &scope, payload)
-                .map(Some);
+            return self.proxy_catalog_page(kind, snapshot, page, &scope, payload);
         }
 
         let reservation = self
@@ -183,9 +198,7 @@ impl GatewayService {
                 .ok_or_else(|| {
                     unavailable("MCP proxy snapshot expired during reuse; restart traversal")
                 })?;
-            return self
-                .proxy_catalog_page(kind, snapshot, 0, &scope, payload)
-                .map(Some);
+            return self.proxy_catalog_page(kind, snapshot, 0, &scope, payload);
         }
 
         let client = self.upstream.with_timeout_cap(timeout);
@@ -200,7 +213,7 @@ impl GatewayService {
             })?;
         let page_size = self.pagination.page_size as usize;
         if items.len() <= page_size {
-            return Ok(Some(json!({ (kind.key()): items })));
+            return Ok(json!({ (kind.key()): items }));
         }
         let Reservation::Shared(lease) = reservation else {
             return Err(unavailable("Multi-page MCP proxy catalogs require Redis"));
@@ -218,7 +231,6 @@ impl GatewayService {
             .map_err(|error| unavailable(error.to_string()))?;
         let items = items.into_iter().take(page_size).collect();
         self.proxy_catalog_page(kind, lease.id, 0, &scope, SnapshotPage { manifest, items })
-            .map(Some)
     }
 
     fn proxy_catalog_page(

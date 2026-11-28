@@ -733,6 +733,22 @@ impl GatewayService {
         server: Option<&CatalogServer>,
         cursor: Option<&str>,
     ) -> Result<ToolPage, ToolError> {
+        crate::observability::catalog::page(
+            "tools/list",
+            self.pagination.page_size,
+            cursor.is_some(),
+            self.list_tools_page(principal, server, cursor),
+            |page| (page.tools.len(), page.next_cursor.is_some()),
+        )
+        .await
+    }
+
+    async fn list_tools_page(
+        &self,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        cursor: Option<&str>,
+    ) -> Result<ToolPage, ToolError> {
         if principal.is_some_and(|principal| !principal.token_allows("tools.read")) {
             return Err(ToolError::Denied);
         }
@@ -777,6 +793,23 @@ impl GatewayService {
     }
 
     pub(crate) async fn list_catalog_metadata(
+        &self,
+        list: CatalogList,
+        principal: Option<&Principal>,
+        server: Option<&CatalogServer>,
+        cursor: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        crate::observability::catalog::page(
+            list.method(),
+            self.pagination.page_size,
+            cursor.is_some(),
+            self.list_catalog_metadata_page(list, principal, server, cursor),
+            |page| crate::observability::catalog::page_summary(page, list.result_key()),
+        )
+        .await
+    }
+
+    async fn list_catalog_metadata_page(
         &self,
         list: CatalogList,
         principal: Option<&Principal>,

@@ -569,6 +569,18 @@ initialization and tool calls. The reference can send an extra
 `tools/list` for tool metadata. A live Rust test checks status, ancestry,
 and redaction of the upstream session handle and URL query credential.
 
+MCP catalog requests emit `tool.list`, `resource.list`, or `prompt.list`
+spans. Each span records the method, configured page size, and whether the
+request continues a previous page. Successful pages record their item count
+and whether more items are available. Invalid cursors mark the span as an
+error. Modern Streamable HTTP returns HTTP 400 for invalid cursors.
+
+Seven Rust Anything cases compare catalog spans and HTTP statuses across
+JSON-RPC, legacy and modern Streamable HTTP, and direct-proxy listings.
+The cases cover Redis snapshot continuations, empty pages, invalid cursors,
+and unsampled requests. A live Rust test checks SQL span ancestry and
+cursor redaction in collector exports.
+
 Set `OTEL_REDIS_INSTRUMENTATION_ENABLED=true` to export Redis client spans
 for request-scoped commands. This covers session affinity, legacy SSE queues,
 shared catalog and token caches, and Redis rate limiting. Command spans carry

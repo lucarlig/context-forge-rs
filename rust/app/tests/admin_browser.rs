@@ -3119,6 +3119,204 @@ async fn traces_background_probes_and_mcp_tool_errors_without_upstream_credentia
 }
 
 #[tokio::test]
+async fn traces_catalog_pagination_without_exporting_cursor_values() {
+    use axum::{Router, body::Bytes, routing::post};
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value::Value as Attribute,
+    };
+    use prost::Message;
+    use serde_json::{Value, json};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = format!("http://{}", listener.local_addr().unwrap());
+    let (exports, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let collector = tokio::spawn(async move {
+        let router = Router::new().route(
+            "/v1/traces",
+            post(move |body: Bytes| {
+                let exports = exports.clone();
+                async move {
+                    let _ = exports.send(ExportTraceServiceRequest::decode(body).unwrap());
+                    ([(header::CONTENT_TYPE, "application/x-protobuf")], "")
+                }
+            }),
+        );
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut gateway = gateway_with_env(&[
+        ("OTEL_ENABLE_OBSERVABILITY", "true"),
+        ("OTEL_SQLALCHEMY_INSTRUMENTATION_ENABLED", "true"),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", &format!("{peer}/v1/traces")),
+        ("OTEL_BSP_SCHEDULE_DELAY", "25"),
+        ("MCP_LIST_PAGE_SIZE", "1"),
+        ("JSON_RESPONSE_ENABLED", "true"),
+    ])
+    .await;
+    let post_json = |path: &str, data: Value| {
+        gateway
+            .client
+            .post(format!("{}{path}", gateway.origin))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(data.to_string())
+    };
+    let login = post_json(
+        "/auth/email/login",
+        json!({"email":EMAIL, "password":gateway.password}),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap();
+    let login: Value = serde_json::from_slice(&login).unwrap();
+    let token = login["access_token"].as_str().unwrap();
+    for name in ["trace-page-a", "trace-page-b"] {
+        post_json(
+            "/tools",
+            json!({"tool":{
+            "name":name,"url":format!("{peer}/upstream"),"request_type":"GET",
+            "integration_type":"REST","input_schema":{"type":"object"}
+        },"visibility":"public"}),
+        )
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    }
+
+    const INVALID: &str = "cursor-private-trace-fixture";
+    let mut next = None;
+    let mut trace_ids = Vec::new();
+    for index in 0..4u128 {
+        let trace_id = 0x8c0a21524bfc40bbb7fc0d3330d7b590 + index;
+        trace_ids.push(trace_id.to_be_bytes());
+        let modern = index == 3;
+        let params = match index {
+            0 => json!({}),
+            1 => json!({"cursor":next}),
+            3 => json!({
+                "cursor": INVALID,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }
+            }),
+            _ => json!({"cursor":INVALID}),
+        };
+        let mut request = post_json(
+            if modern { "/mcp" } else { "/rpc" },
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":params}),
+        )
+        .bearer_auth(token)
+        .header(
+            "traceparent",
+            format!("00-{trace_id:032x}-3008aa57abb39cab-01"),
+        );
+        if modern {
+            request = request
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "tools/list")
+                .header(header::ACCEPT, "application/json, text/event-stream");
+        }
+        let reply = request.send().await.unwrap();
+        assert_eq!(
+            reply.status(),
+            if modern {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            }
+        );
+        let reply = reply.bytes().await.unwrap();
+        let reply: Value = serde_json::from_slice(&reply).unwrap();
+        if index >= 2 {
+            assert_eq!(reply["error"]["code"], -32602);
+        } else {
+            assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 1);
+            if index == 0 {
+                next = Some(reply["result"]["nextCursor"].as_str().unwrap().to_owned());
+            } else {
+                assert!(reply["result"].get("nextCursor").is_none());
+            }
+        }
+    }
+
+    let cursor = next.unwrap();
+    let mut spans = Vec::new();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let batch = received.recv().await.unwrap();
+            let exported = format!("{batch:?}");
+            assert!(!exported.contains(INVALID));
+            assert!(!exported.contains(&cursor));
+            spans.extend(
+                batch
+                    .resource_spans
+                    .into_iter()
+                    .flat_map(|resource| resource.scope_spans)
+                    .flat_map(|scope| scope.spans)
+                    .filter(|span| trace_ids.iter().any(|id| span.trace_id == *id)),
+            );
+            let pages: Vec<_> = spans
+                .iter()
+                .filter(|span| span.name == "tool.list")
+                .collect();
+            if pages.len() != trace_ids.len()
+                || !spans.iter().any(|span| {
+                    pages.iter().any(|page| span.parent_span_id == page.span_id)
+                        && span.attributes.iter().any(|field| field.key == "db.system")
+                })
+            {
+                continue;
+            }
+            for (index, id) in trace_ids.iter().enumerate() {
+                let span = pages.iter().find(|span| span.trace_id == *id).unwrap();
+                let attr = |key| {
+                    span.attributes
+                        .iter()
+                        .find(|field| field.key == key)
+                        .and_then(|field| field.value.as_ref()?.value.as_ref())
+                };
+                assert_eq!(
+                    attr("mcp.method"),
+                    Some(&Attribute::StringValue("tools/list".to_owned()))
+                );
+                assert_eq!(attr("mcp.catalog.page_size"), Some(&Attribute::IntValue(1)));
+                assert_eq!(
+                    attr("mcp.catalog.continuation"),
+                    Some(&Attribute::BoolValue(index != 0))
+                );
+                assert_eq!(
+                    span.status.as_ref().unwrap().code,
+                    if index >= 2 { 2 } else { 1 }
+                );
+                if index >= 2 {
+                    assert!(attr("mcp.catalog.count").is_none());
+                    assert!(attr("mcp.catalog.has_more").is_none());
+                } else {
+                    assert_eq!(attr("mcp.catalog.count"), Some(&Attribute::IntValue(1)));
+                    assert_eq!(
+                        attr("mcp.catalog.has_more"),
+                        Some(&Attribute::BoolValue(index == 0))
+                    );
+                }
+            }
+            break;
+        }
+    })
+    .await
+    .unwrap();
+    gateway.process.kill().await.unwrap();
+    collector.abort();
+}
+
+#[tokio::test]
 #[ignore = "requires a disposable Redis or Valkey database in REDIS_URL"]
 async fn affinity_spans_link_sender_and_owner_for_http_and_rpc() {
     use axum::{

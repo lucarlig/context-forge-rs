@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(crate) mod baggage;
+pub(crate) mod catalog;
 pub(crate) mod framework;
 pub(crate) mod mcp_client;
 mod operation;
